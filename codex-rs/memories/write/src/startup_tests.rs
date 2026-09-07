@@ -62,8 +62,7 @@ async fn memories_startup_creates_memory_root() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn memories_startup_phase2_contributor_completes_and_tracks_workspace_diff()
--> anyhow::Result<()> {
+async fn memories_startup_phase2_tracks_workspace_diff_across_runs() -> anyhow::Result<()> {
     let server = start_mock_server().await;
     let home = Arc::new(TempDir::new()?);
     let test = build_test_codex(&server, home.clone()).await?;
@@ -97,12 +96,6 @@ async fn memories_startup_phase2_contributor_completes_and_tracks_workspace_diff
     )
     .await?;
     reset_git_repository(&memory_root).await?;
-    assert!(
-        !memory_root
-            .join(".codex/validation/completion-proof.toml")
-            .exists(),
-        "the memory workspace must not define terminal certification"
-    );
 
     let _thread_b = seed_stage1_output(
         db.as_ref(),
@@ -133,17 +126,7 @@ async fn memories_startup_phase2_contributor_completes_and_tracks_workspace_diff
         "expected workspace diff file in prompt: {prompt}"
     );
 
-    // The workspace is a dirty Git repository once phase 2 writes this diff. A
-    // terminal-root thread would stop after the single assistant response because
-    // this repository has no canonical proof command. Reaching the completion
-    // handler and resetting the baseline proves the public memory scheduler used
-    // contributor admission for the consolidation thread.
     wait_for_phase2_workspace_reset(&memory_root).await?;
-    assert_eq!(
-        phase2.requests().len(),
-        1,
-        "the contributor should complete from the single scheduled response"
-    );
     let raw_memories = tokio::fs::read_to_string(memory_root.join("raw_memories.md")).await?;
     assert!(raw_memories.contains("raw memory B"));
     assert!(!raw_memories.contains("raw memory A"));

@@ -119,7 +119,6 @@ fn retry_uses_original_unified_exec_request_and_stops_after_second_failure() {
             password: "old".to_string(),
         },
         &request,
-        true,
         |codex_home, cwd, sandbox_creds, logs_base_dir, spawn_request| {
             spawn_observations.borrow_mut().push(SpawnObservation {
                 codex_home: codex_home.to_path_buf(),
@@ -197,80 +196,4 @@ fn retry_uses_original_unified_exec_request_and_stops_after_second_failure() {
         *spawn_observations.borrow()
     );
     assert_eq!(vec![expected_refresh], *refresh_observations.borrow());
-}
-
-#[test]
-fn prepared_login_failure_is_returned_without_refresh_or_retry() {
-    let workspace_root = AbsolutePathBuf::from_absolute_path(PathBuf::from(r"C:\workspace"))
-        .expect("absolute workspace root");
-    let permission_profile = PermissionProfile::workspace_write();
-    let permissions =
-        ResolvedWindowsSandboxPermissions::try_from_permission_profile_for_workspace_roots(
-            &permission_profile,
-            std::slice::from_ref(&workspace_root),
-        )
-        .expect("resolved permissions");
-    let request = RunnerTransportRequest {
-        permissions,
-        codex_home: PathBuf::from(r"C:\Users\codex"),
-        cwd: PathBuf::from(r"C:\workspace"),
-        env_map: HashMap::new(),
-        logs_base_dir: Some(PathBuf::from(r"C:\Users\codex\.sandbox")),
-        spawn_request: SpawnRequest {
-            command: vec!["pwsh.exe".to_string(), "-NoProfile".to_string()],
-            cwd: PathBuf::from(r"C:\workspace"),
-            env: HashMap::new(),
-            permission_profile,
-            workspace_roots: vec![workspace_root],
-            codex_home: PathBuf::from(r"C:\Users\codex\.sandbox"),
-            real_codex_home: PathBuf::from(r"C:\Users\codex"),
-            cap_sids: vec!["S-1-15-3-1024-1".to_string()],
-            timeout_ms: Some(5_000),
-            tty: false,
-            stdin_open: false,
-            use_private_desktop: true,
-        },
-        read_roots_override: None,
-        additional_read_roots: Vec::new(),
-        read_roots_include_platform_defaults: false,
-        write_roots_override: None,
-        deny_read_paths_override: Vec::new(),
-        deny_write_paths_override: Vec::new(),
-        proxy_enforced: false,
-        proxy_settings_mode: WindowsSandboxProxySettingsMode::Reconcile,
-    };
-    let spawn_attempts = Cell::new(0);
-    let refresh_attempts = Cell::new(0);
-
-    let result = spawn_runner_transport_with_retry(
-        SandboxCreds {
-            username: "prepared".to_string(),
-            password: "prepared-password".to_string(),
-        },
-        &request,
-        false,
-        |_, _, _, _, _| {
-            spawn_attempts.set(spawn_attempts.get() + 1);
-            Err::<(), _>(anyhow::Error::new(RunnerStartupError::new(ErrorPayload {
-                message: "prepared credentials were rejected".to_string(),
-                stage: ErrorStage::SpawnChild,
-                windows_error_code: Some(ERROR_NO_SUCH_LOGON_SESSION),
-            })))
-        },
-        |_, _, _, _, _, _, _, _, _, _, _, _| {
-            refresh_attempts.set(refresh_attempts.get() + 1);
-            Ok(SandboxCreds {
-                username: "refreshed".to_string(),
-                password: "refreshed-password".to_string(),
-            })
-        },
-    );
-
-    let error = result.expect_err("prepared login failure must be returned");
-    assert_eq!(
-        "runner failed during SpawnChild: prepared credentials were rejected (Windows error 1312)",
-        error.to_string()
-    );
-    assert_eq!(1, spawn_attempts.get());
-    assert_eq!(0, refresh_attempts.get());
 }

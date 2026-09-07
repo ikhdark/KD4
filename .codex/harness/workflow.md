@@ -1,190 +1,76 @@
 # KD4 Harness Workflow
 
-The KD4 harness is an optional durable-artifact layer for substantial work in
-this fork. It preserves plans, decisions, evals, evidence, audits, and handoffs
-without redefining repository implementation policy.
+Use this workflow when saved context or explicitly requested delegation helps.
+Follow the root [AGENTS.md](../../AGENTS.md) and nearest scoped instructions for
+implementation, validation, and reporting.
 
-## Ownership Boundaries
+## Plan, Implement, Check
 
-- Root `AGENTS.md` owns repository inspection, implementation discipline,
-  validation selection, and final reporting.
-- `.codex/harness` owns optional durable task artifacts, lifecycle guidance, and
-  the completion-status definitions below.
-- This file owns delegated-role and architect-lane procedure; load those sections
-  only when such a workflow is active.
-- Give assignments a durable identity when preflight or multi-agent coordination
-  is active. Path and named-contract claims are diagnostic metadata and may
-  overlap.
+1. Establish the outcome, affected owners and consumers, open questions, and
+   validation route. Use [PLAN.md](templates/PLAN.md) if this needs to survive
+   later turns; otherwise keep it in conversation.
+2. Implement the change and keep useful decisions and progress in that same plan.
+   Distinguish observed facts from assumptions and cite sources when needed.
+3. Run the relevant checks. Record commands, results, and any skipped checks with
+   reasons. Rerun a check when later changes affect what it tested.
+4. Report what changed, what was verified, and what remains unfinished or uncertain.
 
-## Phase 1: Intake
+Use [EVAL.md](templates/EVAL.md) when success criteria need a separate record, or
+[QA_CHECKLIST.md](templates/QA_CHECKLIST.md) for a broader review. Do not copy the
+same evidence into each document.
 
-1. Confirm the concrete objective and choose the smallest sufficient workflow.
-2. Identify the owner directory, nearest scoped instructions, and validation
-   route.
-3. Decide whether durable state will materially help.
+## Resume
 
-Use durable artifacts for broad, risky, interrupted, resumable, explicitly
-auditable, or multi-agent work. For a focused one-turn task, keep the workflow
-in conversation and create no run directory.
-
-## Phase 2: Preflight and Plan
-
-Create a copy of [`templates/PLAN.md`](templates/PLAN.md) only when durable
-planning is useful. Capture the objective, non-goals, owner scope, validation
-intent, risks, and a short milestone list. Add a copy of
-[`templates/EVAL.md`](templates/EVAL.md) before implementation when capability
-or regression criteria need to survive later turns.
-
-Before starting concurrent writers or validation lanes, copy
-[`templates/PREFLIGHT.json`](templates/PREFLIGHT.json), replace every `<...>`
-placeholder, and resolve it with
-`just workflow-preflight <manifest> <receipt>`. The
-preflight publishes the receipt into the repository's locked active-receipt
-registry and checks every registered receipt atomically. Use
-`just workflow-preflight-release <assignment-id>` when the assignment becomes
-terminal. Receipts are leases (one hour by default); long-running assignments
-must rerun the same preflight before expiry to renew them, or pass a bounded
-`--lease-seconds` value to the script. Expired and legacy non-lease receipts are
-removed under the registry lock so stale advisories do not accumulate forever.
-The preflight must name the assignment and root task, starting
-revision, path and contract claims, dependencies, generated-output owner,
-validation owner, exact validation commands, Cargo lane, and shared/isolated
-workspace strategy.
-
-Path, contract, and Cargo-lane overlap is returned in the resolved receipt's
-`advisories` array. Use isolated worktrees when separation is useful, but overlap
-does not block shared-worktree execution. If overlap is discovered after work
-starts, stop new mutations, resolve ownership or sequencing, and renew preflight
-before continuing.
-
-## Phase 3: Implement
-
-Follow root `AGENTS.md`, the nearest scoped instructions, and any explicitly
-selected or clearly applicable skill. The harness may record implementation
-decisions in a copy of [`templates/IMPLEMENT.md`](templates/IMPLEMENT.md), but
-that artifact does not replace owner-path inspection or task-scoped validation.
-
-Keep unrelated dirty changes intact. Keep generated output under its owning
-workflow. Do not add logs, screenshots, binaries, or large transcripts to
-reviewable changes unless requested.
-
-Use supporting reads and current file state to reduce accidental overwrites.
-Freshness and ownership mismatches become review risk; they do not reject writes.
-Immediately before and after each patch, reread the exact target region and its
-task-relevant diff. If the target changed, reconcile the current versions once;
-do not replay a stale patch or add duplicate patch blocks.
-
-## Phase 4: Check
-
-Run the nearest sufficient proof required by root `AGENTS.md`, then record only
-the evidence that matters for resumption or audit. For each material claim, keep
-its source, provenance kind, freshness or revision, and exact covered contract.
-Name skipped checks and their reasons. Do not turn a passing narrow check into a
-broader completion claim.
-
-Validation is check-only and bound to the revision and covered path/contract
-manifest. A relevant mutation supersedes the result. Generated-output
-regeneration is a separate, explicitly owner-attributed command serialized by
-the repository generation lock.
-
-One workspace epoch that supersedes several proofs counts as one stale event.
-After the first event, reconcile once and run one targeted validation. Repeated
-staleness pauses the task for root and offers an isolated-worktree restart
-instead of beginning another validation loop.
-
-Use the completion-gate status definitions below and the repository rules from
-root `AGENTS.md`. Use [`templates/QA_CHECKLIST.md`](templates/QA_CHECKLIST.md)
-for broad verification and
-[`templates/HARNESS_AUDIT.md`](templates/HARNESS_AUDIT.md) for harness-policy or
-skill changes.
-
-### Completion Gate Status
-
-- `passed`: the objective is implemented, the intended runtime path is wired,
-  and the nearest sufficient validation passed with no known task-relevant
-  defect remaining.
-- `partial`: a useful subset is complete, but an explicitly identified part of
-  the accepted scope or its required proof remains unfinished.
-- `blocked`: completion cannot proceed without a named external state change,
-  authority, dependency, or user decision; the blocker and completed evidence
-  are recorded.
-
-## Phase 5: Finish
-
-Summarize the material changes, focused validation, and remaining risk. Write a
-copy of [`templates/HANDOFF.md`](templates/HANDOFF.md) before stopping only when
-unresolved work or important context must survive. Release any active preflight
-receipt after its assignment is terminal.
+Before interruption or compaction, update the plan with the current state and
+next step. Use [HANDOFF.md](templates/HANDOFF.md) only when the plan or conversation
+will not give the next turn enough context. Preserve key decisions, failed
+approaches, relevant check results, and unresolved questions; omit exploration
+that no longer matters.
 
 ## Optional Multi-Agent Mode
 
-Use [`templates/ORCHESTRATOR.md`](templates/ORCHESTRATOR.md) when multi-agent
-work is active. Give each agent a bounded task, durable identity, claim set, and
-evidence target. Every subagent stays within its assigned scope and does not
-broaden the task or make unrelated edits. Name one owner for each complete
-behavioral contract and one owner for final validation; overlaps remain visible
-as risk metadata. Before root completion, linked assignments, validations, and
-gates must be terminal. Root completion rechecks sealed receipt evidence so
-later relevant drift remains a blocker; unrelated task roots only warn and do
-not join this barrier.
+Use agents only when requested or required by applicable instructions. For work
+that needs saved coordination, use
+[`templates/ORCHESTRATOR.md`](templates/ORCHESTRATOR.md).
 
-Investigation agents remain read-only, load root and nearest scoped
-instructions, inspect the smallest owner/caller/test/contract surface, separate
-evidence from inference, and report dependencies, validation implications, and
-a stop condition. Implementation agents reinspect their focused diff before
-editing, preserve unrelated work, stop on competing ownership or unfinished
-dependencies, and report changed paths, validation, runtime wiring, and risk.
-Subagents do not mutate shared harness state or stage, commit, push, or publish.
+- Give each agent a bounded task, relevant instructions, dependencies, and expected
+  output. Name one coordinator to integrate the work and run final validation.
+- Investigators and reviewers are read-only. Workers may edit their assigned
+  scope. Agents report findings or changes, supporting evidence, and open issues.
+- Keep shared notes with the coordinator. Children do not stage, commit, push,
+  publish, or spawn more agents unless explicitly assigned that authority.
+- Sequence competing edits or use separate worktrees. Reconcile overlapping work
+  before continuing affected edits or checks.
+- Collect assigned results before claiming completion. If a child fails to start,
+  returns a tool error, or omits its output, finish that work in the primary agent.
 
-### Bounded Subagent Review
+### Concurrent Writers and Validation
 
-When bounded subagent review is active:
+Before concurrent writers or validation lanes start, copy
+[PREFLIGHT.json](templates/PREFLIGHT.json) and replace its placeholders. Resolve
+`repository_root` relative to the copied manifest; claims are repository-relative.
+Keep assignment details in the manifest rather than copying them into the plan.
 
-- Subagents are read-only. They never edit code, run fixers, or initiate
-  additional agents.
-- Run exactly one initial review pass. Each reviewer may report at most 25
-  findings from that pass.
-- The main agent independently verifies the findings and performs at most one
-  remediation batch.
-- After remediation, run exactly one verification pass with the same reviewers.
-- Limit the verification pass to determining whether each previously reported
-  finding is resolved and identifying regressions directly introduced by the
-  remediation hunks.
-- Reviewers do not reopen the original implementation, broaden scope, introduce
-  new design preferences, or perform another exhaustive review during
-  verification.
-- Allow a new verification-pass finding only when it is a concrete correctness
-  or safety regression caused by the remediation diff. It must cite the
-  responsible remediation hunk.
-- The main agent may fix verification-pass regressions locally but does not
-  start another review cycle.
-- After the verification reports return, all subagent work terminates regardless
-  of whether findings remain.
-- Report unresolved findings to the user; they do not trigger another agent pass
-  automatically.
-- The required verification assignment is the only permitted reviewer
-  follow-up. After it returns, do not resume, follow up with, or replace a
-  reviewer unless the user explicitly requests another review.
-- Both `no findings` and `findings remain` are terminal reviewer outcomes.
+Run `just workflow-preflight <manifest> <receipt>`. Overlap in paths, contracts,
+and Cargo lanes is advisory; coordinate any competing work. Receipts expire after
+one hour by default. Rerun preflight before expiry to renew a long assignment, and
+run `just workflow-preflight-release <assignment-id>` when it ends.
 
-### Architect-Driven Implementation Lane
+The manifest format and registry behavior are owned by
+[workflow_preflight.py](../../scripts/workflow_preflight.py).
 
-For risky work selected under root `AGENTS.md`, use `explorer` as the
-read-only contract architect, then copy its completed
-`KD4_ARCHITECT_CONTRACT_V1` JSON assignment block into a dependent `worker`
-assignment. Preserve every stable obligation ID and copied typed field exactly.
-If the receipt is ambiguous or cannot be copied without interpretation, the
-coordinator treats the architect assignment as incomplete and does not spawn the
-coder. Bind the reviewer and verifier to the coder as their sole evaluation
-target, with both architect and coder assignments as dependencies.
+### Bounded Review
 
-The store and runtime enforce active-assignment lifecycle, root-only task control,
-independent-review read-only boundaries, successful sealed dependencies, and
-cleared gates. Path and named-contract claims are advisory. The receipt format,
-transcription fidelity, exact
-obligation-ID comparison, and refusal to complete with unresolved copied
-obligations are coordinator-policy checks. They are not store validation. The
-coder's copied typed assignment is authoritative for review and verification;
-tests and other validation remain supporting evidence rather than proof of
-completeness. Drift-proof receipt-to-assignment binding would require a future
-Rust change and is outside this workflow.
+Run one read-only review pass with at most 25 findings per reviewer. The primary
+agent verifies findings and fixes them in one batch. If fixes were made, ask the
+same reviewers to check those fixes and any regressions they introduced. Keep
+that verification limited to the changed areas. End the review after this pass;
+fix remaining issues locally and report anything unresolved. Another agent review
+requires an explicit user request.
+
+### Architect Lane
+
+When requested, have a read-only architect describe the affected interfaces,
+constraints, acceptance criteria, and validation route. Give that result to the
+worker, then review the implementation against it. Resolve unclear requirements
+before dependent work starts. A separate typed assignment contract is unnecessary.

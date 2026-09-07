@@ -16,8 +16,6 @@ mod suite {
     mod agents_md;
     #[path = "cli_stream.rs"]
     mod cli_stream;
-    #[path = "completion_proof_gate.rs"]
-    mod completion_proof_gate;
     #[path = "deprecation_notice.rs"]
     mod deprecation_notice;
     #[path = "live_cli.rs"]

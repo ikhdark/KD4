@@ -24,7 +24,6 @@ use codex_mcp::ToolInfo;
 use codex_protocol::dynamic_tools::DynamicToolSpec;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::models::SearchToolCallParams;
-use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ToolManifestItem;
 use codex_tools::DiscoverableTool;
@@ -686,15 +685,7 @@ async fn authorize_bound_typed_tool_call(
     _external_mutation_intent: ExternalMutationIntent,
 ) -> Result<(), FunctionCallError> {
     let coordinator = session.services.agent_control.task_coordinator();
-    let Some(binding) = step_context.turn.typed_agent_task_binding() else {
-        if step_context.turn.multi_agent_version == MultiAgentVersion::V2
-            && step_context.turn.session_source.get_agent_path().is_some()
-        {
-            return Err(FunctionCallError::DeniedToModel(format!(
-                "{}: this typed child turn has no immutable task authority",
-                call.tool_name.name
-            )));
-        }
+    let Some(binding) = coordinator.binding_for_source(&step_context.turn.session_source) else {
         return Ok(());
     };
     let authorization = coordinator

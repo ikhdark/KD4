@@ -2,7 +2,6 @@ use crate::agent::AgentStatus;
 use crate::agent::agent_status_from_task;
 use crate::agent::registry::AgentMetadata;
 use crate::agent::registry::AgentRegistry;
-use crate::agent::registry::AgentTreeClosingGuard;
 use crate::agent::role::DEFAULT_ROLE_NAME;
 use crate::agent::role::resolve_role_config;
 use crate::agent::status::is_final;
@@ -19,7 +18,6 @@ use crate::session_prefix::format_subagent_notification_message;
 use crate::thread_manager::ResumeThreadWithHistoryOptions;
 use crate::thread_manager::ThreadManagerState;
 use crate::thread_rollout_truncation::truncate_rollout_to_last_n_fork_turns;
-use codex_agent_task_store::AgentTaskBinding;
 use codex_protocol::AgentPath;
 use codex_protocol::SessionId;
 use codex_protocol::ThreadId;
@@ -161,7 +159,6 @@ struct AgentControlTestHooks {
     before_initial_submission: std::sync::Mutex<Option<Arc<AgentControlTestBarrier>>>,
     before_v2_cold_load: std::sync::Mutex<Option<Arc<AgentControlTestBarrier>>>,
     after_execution_reservation: std::sync::Mutex<Option<Arc<AgentControlTestBarrier>>>,
-    after_terminal_tree_freeze: std::sync::Mutex<Option<Arc<AgentControlTestBarrier>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -183,13 +180,6 @@ pub(crate) struct AgentControl {
     /// ID shared by the whole agent control session. This means every sub-agents from a common
     /// root share the same session ID.
     session_id: SessionId,
-    /// Durable task aggregation follows the original session lineage across resume and fork.
-    /// Keep this separate from the runtime session ID so forked threads retain their own identity.
-    task_lineage_id: String,
-    /// Manager-issued root whose complete task lineage must be quiescent before this session can
-    /// publish terminal success. Forks retain the original root rather than narrowing the check to
-    /// the fork's newer thread ID.
-    terminal_quiescence_root_thread_id: Option<ThreadId>,
     /// Weak handle back to the global thread registry/state.
     /// This is `Weak` to avoid reference cycles and shadow persistence of the form
     /// `ThreadManagerState -> CodexThread -> Session -> SessionServices -> ThreadManagerState`.
@@ -201,27 +191,8 @@ pub(crate) struct AgentControl {
     agent_execution_limiter: Arc<AgentExecutionLimiter>,
     /// Durable typed-task state shared by the root thread and all of its sub-agents.
     task_coordinator: AgentTaskCoordinator,
-    /// Fresh typed reviewer admissions exist only in this live control tree. Durable task rows
-    /// and resumed session-source strings cannot reconstruct this authority.
-    fresh_typed_reviews: Arc<
-        std::sync::Mutex<HashMap<codex_agent_task_store::AttemptId, FreshTypedReviewAdmission>>,
-    >,
     #[cfg(test)]
     test_hooks: Arc<AgentControlTestHooks>,
-}
-
-/// A single-use, process-private proof of the exact freshly admitted reviewer contract.
-/// It is deliberately neither serializable nor cloneable.
-pub(crate) struct FreshTypedReviewAdmission {
-    assignment: codex_agent_task_store::Assignment,
-    binding: AgentTaskBinding,
-    runtime_session_id: SessionId,
-}
-
-impl FreshTypedReviewAdmission {
-    pub(crate) fn assignment(&self) -> &codex_agent_task_store::Assignment {
-        &self.assignment
-    }
 }
 
 impl AgentControl {
@@ -233,31 +204,11 @@ impl AgentControl {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn with_session_id(self, session_id: SessionId, max_threads: usize) -> Self {
-        let task_lineage_id = session_id.to_string();
-        self.with_session_and_task_lineage(session_id, task_lineage_id, max_threads)
-    }
-
-    pub(crate) fn with_session_and_task_lineage(
-        mut self,
-        session_id: SessionId,
-        task_lineage_id: String,
-        max_threads: usize,
-    ) -> Self {
+    pub(crate) fn with_session_id(mut self, session_id: SessionId, max_threads: usize) -> Self {
         self.session_id = session_id;
-        self.task_lineage_id = task_lineage_id;
         self.agent_execution_limiter.initialize(max_threads);
         self.task_coordinator
             .initialize_metric_capacity(max_threads);
-        self
-    }
-
-    pub(crate) fn with_terminal_quiescence_root_thread_id(
-        mut self,
-        root_thread_id: ThreadId,
-    ) -> Self {
-        self.terminal_quiescence_root_thread_id = Some(root_thread_id);
         self
     }
 
@@ -265,162 +216,19 @@ impl AgentControl {
         self.session_id
     }
 
-    pub(crate) fn task_lineage_id(&self) -> &str {
-        &self.task_lineage_id
-    }
-
     pub(crate) fn task_coordinator(&self) -> &AgentTaskCoordinator {
         &self.task_coordinator
-    }
-
-    pub(crate) fn take_fresh_historical_review_admission(
-        &self,
-        binding: &AgentTaskBinding,
-        reviewer: &codex_agent_task_store::AgentTask,
-        live_thread_id: ThreadId,
-    ) -> Result<FreshTypedReviewAdmission, String> {
-        let mut admissions = self
-            .fresh_typed_reviews
-            .lock()
-            .map_err(|_| "fresh reviewer admission state is unavailable".to_string())?;
-        let admission = admissions.get(&binding.attempt_id).ok_or_else(|| {
-            "historical acceptance requires a fresh live typed reviewer admission; restored task rows and replayed bindings are not authority".to_string()
-        })?;
-        let admitted = &admission.binding;
-        if admission.runtime_session_id != self.session_id
-            || admission.assignment != reviewer.assignment
-            || reviewer.current_attempt.attempt_id != admitted.attempt_id
-            || reviewer.current_attempt.amendment.is_some()
-            || binding.assignment_id != admitted.assignment_id
-            || binding.attempt_id != admitted.attempt_id
-            || binding.root_session_id != admitted.root_session_id
-            || binding.root_session_id != self.task_lineage_id
-            || binding.agent_path != admitted.agent_path
-            || binding.task_name != admitted.task_name
-            || binding.thread_id != admitted.thread_id
-            || admitted.thread_id.as_deref() != Some(live_thread_id.to_string().as_str())
-        {
-            return Err(
-                "the live reviewer binding or assignment differs from its fresh typed admission"
-                    .to_string(),
-            );
-        }
-        admissions
-            .remove(&binding.attempt_id)
-            .ok_or_else(|| "the fresh reviewer admission was already consumed".to_string())
     }
 
     pub(crate) fn has_live_agents(&self) -> bool {
         self.state.has_live_agents()
     }
 
-    /// Freeze spawn admission for the complete in-memory tree and reject terminal publication
-    /// while any descendant can still produce work. The returned guard must remain alive until
-    /// successful terminal persistence has finished.
-    pub(crate) async fn begin_terminal_publication(
-        &self,
-        current_thread_id: ThreadId,
-    ) -> CodexResult<AgentTreeClosingGuard> {
-        let root_thread_id = self
-            .terminal_quiescence_root_thread_id
-            .unwrap_or(current_thread_id);
-        let mut publication_roots = vec![root_thread_id];
-        if current_thread_id != root_thread_id {
-            publication_roots.push(current_thread_id);
-        }
-        let publication_root_ids = publication_roots.iter().copied().collect::<HashSet<_>>();
-        let mut closing_guard = self
-            .state
-            .begin_closing_registered_agent_tree(root_thread_id);
-        closing_guard.mark_threads(publication_roots.iter().copied());
-        #[cfg(test)]
-        {
-            let barrier = self
-                .test_hooks
-                .after_terminal_tree_freeze
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone();
-            if let Some(barrier) = barrier {
-                barrier.pause().await;
-            }
-        }
-        let mut known_thread_ids = publication_root_ids.clone();
-        loop {
-            let mut newly_discovered = Vec::new();
-            for publication_root in &publication_roots {
-                newly_discovered.extend(
-                    self.live_thread_spawn_descendants(*publication_root)
-                        .await?
-                        .into_iter()
-                        .filter(|thread_id| known_thread_ids.insert(*thread_id)),
-                );
-            }
-            if newly_discovered.is_empty() {
-                break;
-            }
-            closing_guard.mark_threads(newly_discovered);
-        }
-
-        let persisted_topologies = self
-            .persisted_thread_spawn_readiness(&publication_roots)
-            .await?;
-        let mut persisted_open_descendants = HashSet::new();
-        let mut persisted_descendants = HashSet::new();
-        for (_, persisted_topology) in persisted_topologies {
-            persisted_open_descendants.extend(persisted_topology.open_descendants);
-            let mut newly_discovered = Vec::new();
-            for thread_id in persisted_topology.descendants {
-                if publication_root_ids.contains(&thread_id)
-                    || !persisted_descendants.insert(thread_id)
-                {
-                    return Err(CodexErr::Fatal(format!(
-                        "persisted thread-spawn topology is ambiguous: thread {thread_id} appears in multiple terminal publication roots"
-                    )));
-                }
-                if known_thread_ids.insert(thread_id) {
-                    newly_discovered.push(thread_id);
-                }
-            }
-            closing_guard.mark_threads(newly_discovered);
-        }
-
-        let mut active_descendants = Vec::new();
-        for thread_id in known_thread_ids
-            .into_iter()
-            .filter(|thread_id| !publication_root_ids.contains(thread_id))
-        {
-            let status = self.get_status(thread_id).await;
-            if persisted_open_descendants.contains(&thread_id) {
-                active_descendants.push(format!("{thread_id} (persisted open)"));
-            } else if !is_final(&status) {
-                active_descendants.push(format!("{thread_id} ({status:?})"));
-            }
-        }
-        if !active_descendants.is_empty() {
-            active_descendants.sort();
-            return Err(CodexErr::UnsupportedOperation(format!(
-                "terminal completion is waiting for active child agents: {}",
-                active_descendants.join(", ")
-            )));
-        }
-        Ok(closing_guard)
-    }
-
     pub(crate) fn start_typed_actor_heartbeat_watcher(
         &self,
-        binding: AgentTaskBinding,
+        agent_path: AgentPath,
         thread_id: ThreadId,
     ) {
-        if binding.thread_id.as_deref() != Some(thread_id.to_string().as_str()) {
-            warn!(
-                %thread_id,
-                agent_path = %binding.agent_path,
-                attempt_id = %binding.attempt_id,
-                "live typed agent binding points at a different thread"
-            );
-            return;
-        }
         let control = self.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(TYPED_ACTOR_HEARTBEAT_INTERVAL);
@@ -432,20 +240,28 @@ impl AgentControl {
                 ) {
                     break;
                 }
+                let Some(binding) = control
+                    .task_coordinator()
+                    .binding_for_agent_path(&agent_path)
+                else {
+                    warn!(%thread_id, %agent_path, "live typed agent has no durable binding to heartbeat");
+                    continue;
+                };
+                if binding.thread_id.as_deref() != Some(thread_id.to_string().as_str()) {
+                    warn!(%thread_id, %agent_path, "live typed agent binding points at a different thread");
+                    continue;
+                }
                 match control
                     .task_coordinator()
                     .heartbeat_typed_actor_binding(&binding)
                     .await
                 {
                     Ok(true) => {}
-                    Ok(false) => {
-                        warn!(
-                            %thread_id,
-                            attempt_id = %binding.attempt_id,
-                            "live typed actor heartbeat was rejected"
-                        );
-                        break;
-                    }
+                    Ok(false) => warn!(
+                        %thread_id,
+                        attempt_id = %binding.attempt_id,
+                        "live typed actor heartbeat was rejected"
+                    ),
                     Err(error) => warn!(
                         %thread_id,
                         attempt_id = %binding.attempt_id,
@@ -506,18 +322,6 @@ impl AgentControl {
         *self
             .test_hooks
             .before_initial_submission
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = barrier;
-    }
-
-    #[cfg(test)]
-    pub(crate) fn set_after_terminal_tree_freeze_barrier(
-        &self,
-        barrier: Option<Arc<AgentControlTestBarrier>>,
-    ) {
-        *self
-            .test_hooks
-            .after_terminal_tree_freeze
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = barrier;
     }
@@ -594,51 +398,6 @@ impl AgentControl {
             execution_guard,
         )
         .await
-    }
-
-    pub(crate) async fn send_typed_child_completion_with_admission(
-        &self,
-        agent_id: ThreadId,
-        communication: InterAgentCommunication,
-        context: AgentCommunicationContext,
-    ) -> CodexResult<String> {
-        if communication.trigger_turn {
-            return Err(CodexErr::InvalidRequest(
-                "typed child completion cannot trigger a parent turn".to_string(),
-            ));
-        }
-        let state = self.upgrade()?;
-        let last_task_message = last_task_message_from_communication(&communication);
-        let communication_log_metadata = crate::agent_communication::logging_enabled()
-            .then(|| crate::agent_communication::agent_communication_log_metadata(&communication));
-        let result = self
-            .handle_thread_request_result(
-                agent_id,
-                &state,
-                state
-                    .send_typed_child_completion_with_admission(agent_id, communication)
-                    .await,
-            )
-            .await;
-        if let (Some(metadata), Ok(communication_id)) =
-            (communication_log_metadata, result.as_ref())
-        {
-            crate::agent_communication::emit_agent_communication_send(
-                communication_id,
-                &context,
-                metadata,
-                agent_id,
-            );
-        }
-        if result.is_ok() {
-            match last_task_message {
-                Some(last_task_message) => self
-                    .state
-                    .update_last_task_message(agent_id, last_task_message),
-                None => self.state.clear_last_task_message(agent_id),
-            }
-        }
-        result
     }
 
     async fn send_inter_agent_communication_after_capacity_check(
@@ -955,19 +714,17 @@ impl AgentControl {
             };
             if let Some(child_agent_path) = child_agent_path.as_ref() {
                 let task_coordinator = control.task_coordinator();
-                let binding = task_coordinator.binding_for_agent_path(child_agent_path);
-                let assignment_id = binding.as_ref().map(|binding| binding.assignment_id);
-                match match binding.as_ref() {
-                    Some(binding) => task_coordinator
-                        .seal_missing_receipt(
-                            binding,
+                let assignment_id = task_coordinator
+                    .binding_for_agent_path(child_agent_path)
+                    .map(|binding| binding.assignment_id);
+                match task_coordinator
+                    .seal_missing_receipt(
+                        child_agent_path,
                         format!(
                             "typed agent {child_agent_path} finished with status {status:?} without submitting a receipt"
                         ),
                     )
-                        .await,
-                    None => Ok(None),
-                }
+                    .await
                 {
                     Ok(Some(receipt)) => {
                         if let Some(child_thread) = child_thread.as_ref() {
@@ -1228,27 +985,6 @@ impl AgentControl {
             .map_err(|err| CodexErr::Fatal(format!("failed to persist thread-spawn edge: {err}")))
     }
 
-    pub(crate) async fn close_persisted_thread_spawn_edge(
-        &self,
-        child_thread_id: ThreadId,
-    ) -> CodexResult<()> {
-        let state = self.upgrade()?;
-        let Some(agent_graph_store) = state.agent_graph_store() else {
-            return Ok(());
-        };
-        agent_graph_store
-            .set_thread_spawn_edge_status(
-                child_thread_id,
-                codex_agent_graph_store::ThreadSpawnEdgeStatus::Closed,
-            )
-            .await
-            .map_err(|err| {
-                CodexErr::Fatal(format!(
-                    "failed to close persisted thread-spawn edge for {child_thread_id}: {err}"
-                ))
-            })
-    }
-
     async fn live_thread_spawn_descendants(
         &self,
         root_thread_id: ThreadId,
@@ -1274,192 +1010,6 @@ impl AgentControl {
 
         Ok(descendants)
     }
-
-    /// Read persisted legacy topology without filtering traversal by edge status. Filtering the
-    /// traversal itself would miss an open grandchild whose parent edge is already closed.
-    async fn persisted_thread_spawn_readiness(
-        &self,
-        root_thread_ids: &[ThreadId],
-    ) -> CodexResult<Vec<(ThreadId, PersistedThreadSpawnTopology)>> {
-        let state = self.upgrade()?;
-        let Some(agent_graph_store) = state.agent_graph_store() else {
-            return Ok(root_thread_ids
-                .iter()
-                .copied()
-                .map(|thread_id| (thread_id, PersistedThreadSpawnTopology::default()))
-                .collect());
-        };
-
-        let mut topologies = Vec::with_capacity(root_thread_ids.len());
-        for root_thread_id in root_thread_ids {
-            topologies.push((
-                *root_thread_id,
-                read_persisted_thread_spawn_topology(agent_graph_store.as_ref(), *root_thread_id)
-                    .await?,
-            ));
-        }
-        let mut confirmed_topologies = Vec::with_capacity(root_thread_ids.len());
-        for root_thread_id in root_thread_ids {
-            confirmed_topologies.push((
-                *root_thread_id,
-                read_persisted_thread_spawn_topology(agent_graph_store.as_ref(), *root_thread_id)
-                    .await?,
-            ));
-        }
-        if topologies != confirmed_topologies {
-            return Err(CodexErr::Fatal(
-                "persisted thread-spawn topology changed while terminal publication readiness was read"
-                    .to_string(),
-            ));
-        }
-
-        Ok(topologies)
-    }
-}
-
-#[derive(Debug, Default, PartialEq, Eq)]
-struct PersistedThreadSpawnTopology {
-    descendants: Vec<ThreadId>,
-    open_descendants: HashSet<ThreadId>,
-    edges: Vec<(
-        ThreadId,
-        ThreadId,
-        codex_agent_graph_store::ThreadSpawnEdgeStatus,
-    )>,
-}
-
-async fn read_persisted_thread_spawn_topology(
-    agent_graph_store: &dyn codex_agent_graph_store::AgentGraphStore,
-    root_thread_id: ThreadId,
-) -> CodexResult<PersistedThreadSpawnTopology> {
-    use codex_agent_graph_store::ThreadSpawnEdgeStatus;
-
-    let mut descendants = agent_graph_store
-        .list_thread_spawn_descendants(root_thread_id, None)
-        .await
-        .map_err(|err| {
-            CodexErr::Fatal(format!(
-                "failed to load persisted thread-spawn descendants for terminal publication: {err}"
-            ))
-        })?;
-    let descendant_ids = descendants.iter().copied().collect::<HashSet<_>>();
-    if descendant_ids.len() != descendants.len() || descendant_ids.contains(&root_thread_id) {
-        return Err(CodexErr::Fatal(
-            "persisted thread-spawn topology is ambiguous: descendant traversal returned duplicate or cyclic thread IDs"
-                .to_string(),
-        ));
-    }
-
-    let mut parent_thread_ids = Vec::with_capacity(descendants.len() + 1);
-    parent_thread_ids.push(root_thread_id);
-    parent_thread_ids.extend(descendants.iter().copied());
-    let mut parent_by_child = HashMap::with_capacity(descendants.len());
-    let mut open_descendants = HashSet::new();
-    let mut edges = Vec::with_capacity(descendants.len());
-
-    for parent_thread_id in parent_thread_ids {
-        let all_children =
-            read_persisted_thread_spawn_children(agent_graph_store, parent_thread_id, None).await?;
-        let open_children = read_persisted_thread_spawn_children(
-            agent_graph_store,
-            parent_thread_id,
-            Some(ThreadSpawnEdgeStatus::Open),
-        )
-        .await?;
-        let closed_children = read_persisted_thread_spawn_children(
-            agent_graph_store,
-            parent_thread_id,
-            Some(ThreadSpawnEdgeStatus::Closed),
-        )
-        .await?;
-
-        let all_child_ids = unique_persisted_child_ids(parent_thread_id, "all", all_children)?;
-        let open_child_ids = unique_persisted_child_ids(parent_thread_id, "open", open_children)?;
-        let closed_child_ids =
-            unique_persisted_child_ids(parent_thread_id, "closed", closed_children)?;
-        if !open_child_ids.is_disjoint(&closed_child_ids)
-            || open_child_ids
-                .union(&closed_child_ids)
-                .copied()
-                .collect::<HashSet<_>>()
-                != all_child_ids
-        {
-            return Err(CodexErr::Fatal(format!(
-                "persisted thread-spawn topology is ambiguous: status projections disagree for parent {parent_thread_id}"
-            )));
-        }
-
-        for child_thread_id in all_child_ids {
-            if !descendant_ids.contains(&child_thread_id) {
-                return Err(CodexErr::Fatal(format!(
-                    "persisted thread-spawn topology is ambiguous: child {child_thread_id} of parent {parent_thread_id} was absent from descendant traversal"
-                )));
-            }
-            if let Some(previous_parent) = parent_by_child.insert(child_thread_id, parent_thread_id)
-            {
-                return Err(CodexErr::Fatal(format!(
-                    "persisted thread-spawn topology is ambiguous: child {child_thread_id} has parents {previous_parent} and {parent_thread_id}"
-                )));
-            }
-            let status = if open_child_ids.contains(&child_thread_id) {
-                open_descendants.insert(child_thread_id);
-                ThreadSpawnEdgeStatus::Open
-            } else {
-                ThreadSpawnEdgeStatus::Closed
-            };
-            edges.push((parent_thread_id, child_thread_id, status));
-        }
-    }
-
-    if parent_by_child.len() != descendant_ids.len() {
-        return Err(CodexErr::Fatal(
-            "persisted thread-spawn topology is ambiguous: descendant traversal and direct edges disagree"
-                .to_string(),
-        ));
-    }
-    descendants.sort_by_key(std::string::ToString::to_string);
-    edges.sort_by_key(|(parent, child, status)| {
-        (
-            parent.to_string(),
-            child.to_string(),
-            matches!(status, ThreadSpawnEdgeStatus::Closed),
-        )
-    });
-    Ok(PersistedThreadSpawnTopology {
-        descendants,
-        open_descendants,
-        edges,
-    })
-}
-
-async fn read_persisted_thread_spawn_children(
-    agent_graph_store: &dyn codex_agent_graph_store::AgentGraphStore,
-    parent_thread_id: ThreadId,
-    status_filter: Option<codex_agent_graph_store::ThreadSpawnEdgeStatus>,
-) -> CodexResult<Vec<ThreadId>> {
-    agent_graph_store
-        .list_thread_spawn_children(parent_thread_id, status_filter)
-        .await
-        .map_err(|err| {
-            CodexErr::Fatal(format!(
-                "failed to load persisted thread-spawn children for terminal publication: {err}"
-            ))
-        })
-}
-
-fn unique_persisted_child_ids(
-    parent_thread_id: ThreadId,
-    projection: &str,
-    child_thread_ids: Vec<ThreadId>,
-) -> CodexResult<HashSet<ThreadId>> {
-    let child_count = child_thread_ids.len();
-    let child_ids = child_thread_ids.into_iter().collect::<HashSet<_>>();
-    if child_ids.len() != child_count {
-        return Err(CodexErr::Fatal(format!(
-            "persisted thread-spawn topology is ambiguous: {projection} child projection for parent {parent_thread_id} returned duplicate thread IDs"
-        )));
-    }
-    Ok(child_ids)
 }
 
 fn agent_matches_prefix(agent_path: Option<&AgentPath>, prefix: &AgentPath) -> bool {

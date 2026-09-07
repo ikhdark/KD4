@@ -137,10 +137,6 @@ pub(crate) async fn run_codex_thread_interactive(
         attestation_provider: parent_session.services.attestation_provider.clone(),
         external_time_provider: Some(Arc::clone(&parent_session.services.time_provider)),
         inherited_multi_agent_version: Some(MultiAgentVersion::Disabled),
-        completion_proof_authority: parent_session
-            .services
-            .completion_proof
-            .descendant_authority(),
     }))
     .or_cancel(&cancel_token)
     .await??;
@@ -281,11 +277,6 @@ impl PreparedCodexOneShot {
             child_cancel,
             submitted: false,
         })
-    }
-
-    /// Returns the initialized child identity before its first model request.
-    pub(crate) fn thread_id(&self) -> String {
-        self.io.session.thread_id.to_string()
     }
 
     pub(crate) async fn submit_once(

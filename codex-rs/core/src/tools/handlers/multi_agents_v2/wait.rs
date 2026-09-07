@@ -141,7 +141,7 @@ impl Handler {
                     session.services.state_db.clone(),
                     turn.config.sqlite_home.clone(),
                     turn.config.model_provider_id.clone(),
-                    session.services.agent_control.task_lineage_id().to_string(),
+                    session.services.agent_control.session_id().to_string(),
                 )
                 .await
                 .map_err(|error| {

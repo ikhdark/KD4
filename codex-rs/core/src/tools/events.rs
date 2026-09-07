@@ -46,7 +46,6 @@ pub(crate) struct ToolEventCtx<'a> {
     pub parent_call_id: Option<&'a str>,
     pub parent_cell_id: Option<&'a str>,
     pub runtime_tool_call_id: Option<&'a str>,
-    suppress_post_proof_mutation_observation: bool,
 }
 
 impl<'a> ToolEventCtx<'a> {
@@ -64,7 +63,6 @@ impl<'a> ToolEventCtx<'a> {
             parent_call_id: None,
             parent_cell_id: None,
             runtime_tool_call_id: None,
-            suppress_post_proof_mutation_observation: false,
         }
     }
 
@@ -79,11 +77,6 @@ impl<'a> ToolEventCtx<'a> {
             self.parent_cell_id = Some(cell_id);
             self.runtime_tool_call_id = Some(runtime_tool_call_id);
         }
-        self
-    }
-
-    pub fn without_post_proof_mutation_observation(mut self) -> Self {
-        self.suppress_post_proof_mutation_observation = true;
         self
     }
 }
@@ -655,40 +648,6 @@ async fn emit_exec_stage(
                 exec_input.command,
                 native_cwd.as_ref().map(AbsolutePathBuf::as_path),
             );
-            if mutation.may_have_mutated()
-                && !ctx.suppress_post_proof_mutation_observation
-                && let Some(cwd) = native_cwd.as_ref()
-                && let Some(repository_root) = ctx
-                    .session
-                    .services
-                    .completion_proof
-                    .repository_root_for_cwd(cwd.as_path())
-            {
-                let source_observation = ctx
-                    .session
-                    .services
-                    .git_workspace
-                    .begin_source_path_change_observation_after_barrier(&repository_root)
-                    .await;
-                let proof_observation = ctx
-                    .session
-                    .services
-                    .completion_proof
-                    .begin_post_proof_mutation_observation(cwd.as_path())
-                    .await;
-                ctx.session
-                    .services
-                    .command_execution
-                    .record_post_proof_mutation_baseline(
-                        ctx.call_id,
-                        &ctx.turn.sub_id,
-                        crate::tools::command_execution::PostProofMutationBaseline {
-                            proof_observation,
-                            source_observation,
-                        },
-                    )
-                    .await;
-            }
             if matches!(
                 mutation,
                 crate::turn_diff_tracker::CommandMutation::Uncertain
@@ -814,7 +773,7 @@ pub(crate) async fn begin_exec_mutation_evidence(
         return;
     };
     let coordinator = ctx.session.services.agent_control.task_coordinator();
-    let Some(binding) = ctx.turn.typed_agent_task_binding() else {
+    let Some(binding) = coordinator.binding_for_source(&ctx.turn.session_source) else {
         return;
     };
     let Some(store) = coordinator.store() else {
@@ -920,29 +879,6 @@ async fn emit_exec_end(
     exec_result: ExecCommandResult,
 ) {
     let native_cwd = exec_input.cwd.to_abs_path().ok();
-    let post_proof_mutation_baseline = ctx
-        .session
-        .services
-        .command_execution
-        .take_post_proof_mutation_baseline(ctx.call_id)
-        .await;
-    let observed_post_proof_paths = if exec_result.status == ExecCommandStatus::Declined {
-        None
-    } else {
-        match post_proof_mutation_baseline
-            .as_ref()
-            .and_then(|baseline| baseline.source_observation.as_ref())
-        {
-            Some(observation) => {
-                ctx.session
-                    .services
-                    .git_workspace
-                    .finish_source_path_change_observation(observation)
-                    .await
-            }
-            None => None,
-        }
-    };
     let mut mutation = crate::turn_diff_tracker::command_mutation(
         exec_input.command,
         native_cwd.as_ref().map(AbsolutePathBuf::as_path),
@@ -1016,27 +952,25 @@ async fn emit_exec_end(
         observed_workspace_identity
     };
     if possible_mutation && exec_result.status != ExecCommandStatus::Declined {
-        if !ctx.suppress_post_proof_mutation_observation {
-            if let Some(paths) = mutation_paths {
-                let paths = paths
-                    .iter()
-                    .map(|path| path.to_string_lossy().into_owned())
-                    .collect::<Vec<_>>();
-                ctx.session
-                    .services
-                    .git_workspace
-                    .note_host_workspace_mutation_paths(
-                        native_cwd
-                            .as_ref()
-                            .map_or_else(|| std::path::Path::new("."), AbsolutePathBuf::as_path),
-                        &paths,
-                    );
-            } else {
-                ctx.session
-                    .services
-                    .git_workspace
-                    .note_host_workspace_mutation();
-            }
+        if let Some(paths) = mutation_paths {
+            let paths = paths
+                .iter()
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            ctx.session
+                .services
+                .git_workspace
+                .note_host_workspace_mutation_paths(
+                    native_cwd
+                        .as_ref()
+                        .map_or_else(|| std::path::Path::new("."), AbsolutePathBuf::as_path),
+                    &paths,
+                );
+        } else {
+            ctx.session
+                .services
+                .git_workspace
+                .note_host_workspace_mutation();
         }
         if !defer_workspace_identity {
             ctx.session
@@ -1044,46 +978,6 @@ async fn emit_exec_end(
                     ctx.turn.config.codex_home.as_path(),
                     mutation_paths,
                     current_workspace_identity.as_ref(),
-                )
-                .await;
-        }
-        if !ctx.suppress_post_proof_mutation_observation {
-            ctx.session
-                .services
-                .completion_proof
-                .note_mutation_paths(
-                    native_cwd
-                        .as_ref()
-                        .map_or_else(|| ctx.turn.config.cwd.as_path(), AbsolutePathBuf::as_path),
-                    mutation_paths,
-                )
-                .await;
-        }
-    }
-    if !ctx.suppress_post_proof_mutation_observation
-        && exec_result.status != ExecCommandStatus::Declined
-        && let Some(baseline) = post_proof_mutation_baseline
-    {
-        let proof_observation = match baseline.proof_observation {
-            Some(observation) => Some(observation),
-            None => {
-                let cwd = native_cwd
-                    .as_ref()
-                    .map_or_else(|| ctx.turn.config.cwd.as_path(), AbsolutePathBuf::as_path);
-                ctx.session
-                    .services
-                    .completion_proof
-                    .begin_post_proof_mutation_observation(cwd)
-                    .await
-            }
-        };
-        if let Some(proof_observation) = proof_observation {
-            ctx.session
-                .services
-                .completion_proof
-                .finish_post_proof_mutation_observation(
-                    proof_observation,
-                    observed_post_proof_paths,
                 )
                 .await;
         }
@@ -1243,16 +1137,6 @@ async fn emit_patch_end(
                 )
                 .await;
         }
-        ctx.session
-            .services
-            .completion_proof
-            .note_mutation_paths(
-                evidence_cwd
-                    .as_ref()
-                    .map_or_else(|| ctx.turn.config.cwd.as_path(), AbsolutePathBuf::as_path),
-                affected_paths.as_ref(),
-            )
-            .await;
     }
     ctx.session
         .emit_turn_item_completed(

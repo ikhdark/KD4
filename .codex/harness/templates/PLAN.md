@@ -1,62 +1,23 @@
 # Plan
 
-## Objective
+## Outcome and Scope
 
-State the concrete user-facing outcome.
+<user-facing outcome, affected owners and consumers, and important exclusions>
 
-## Non-Goals
+## Steps
 
-List what this task intentionally will not change.
+- [ ] <concrete step>
 
-## Approach
+## Decisions and Open Questions
 
-- Why durable planning is useful:
-- Applicable instructions or selected skill:
-- Validation intent:
+- <decision and reason, or question to resolve; cite relevant sources>
 
-## Scope
+## Validation
 
-Owner files and directories to inspect:
+| Check                     | Expected result  | Actual result                     |
+| ------------------------- | ---------------- | --------------------------------- |
+| <command or manual check> | <what it proves> | <pending, result, or skip reason> |
 
-- <owner file or directory>
+## Current State and Next Step
 
-Related call paths, configs, tests, or runtime entrypoints:
-
-- <call path, config, test, or entrypoint>
-
-## Coordination (Delete Unless Active)
-
-Preflight receipt:
-
-- Root task ID:
-- Assignment ID:
-- Starting revision:
-- Named contract claims:
-- Path claims:
-- Dependencies:
-- Generated-output owner:
-- Validation owner:
-- Cargo target lane:
-- Workspace strategy:
-
-## Facts, Hypotheses, And Unknowns
-
-| Claim | Kind | Source | Freshness or dependency |
-| --- | --- | --- | --- |
-| <material claim> | <provenance kind> | <file, command, or observation> | <revision, timestamp, or dependency> |
-
-- Hypotheses to test (maximum three):
-- Material unknowns:
-
-## Risks
-
-- <risk>
-
-## Milestones
-
-- [ ] Inspect owner scope and nearest `AGENTS.md`
-- [ ] Apply root and scoped instructions plus any selected or applicable skill
-- [ ] Inspect call path and validation route
-- [ ] Implement focused changes
-- [ ] Run focused validation
-- [ ] Summarize evidence and remaining risk
+<progress, remaining work, and the next action; link supporting artifacts if used>

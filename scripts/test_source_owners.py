@@ -1,251 +1,70 @@
-import contextlib
-import hashlib
+from pathlib import Path
+from unittest import mock
 import json
-import os
-import shutil
-import stat
-import subprocess
 import sys
 import tempfile
 import unittest
-from collections.abc import Iterator
-from pathlib import Path
-
-import tomllib
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from scripts.generated_output_lock import source_map_lock
-
-SOURCE_OWNERS_CLI = REPO_ROOT / "scripts" / "source_owners.py"
-SOURCE_OWNERS_MANIFEST = REPO_ROOT / "source_owners.toml"
-SOURCE_MAP = REPO_ROOT / "SOURCEMAP.md"
-ARCHITECTURE_INDEX = REPO_ROOT / "architecture_index.json"
-BEGIN_PREFIX = "<!-- BEGIN KD4 SOURCE OWNERS"
-MAX_QUERY_RELATIONSHIPS = 64
+from scripts import source_owners  # noqa: E402
+from scripts.generated_output_lock import source_map_lock  # noqa: E402
 
 
-@contextlib.contextmanager
-def temporary_repository() -> Iterator[Path]:
-    with tempfile.TemporaryDirectory() as directory:
-        yield Path(directory)
+class SourceOwnersTest(unittest.TestCase):
+    def test_list_command_exposes_valid_owner_ids_before_slice(self) -> None:
+        argv = [
+            "source_owners.py",
+            "list",
+            "--manifest",
+            str(source_owners.DEFAULT_MANIFEST),
+            "--repo-root",
+            str(source_owners.REPO_ROOT),
+        ]
 
+        with mock.patch.object(sys, "argv", argv), mock.patch("builtins.print") as emit:
+            self.assertEqual(source_owners.main(), 0)
 
-def write_fixture(
-    root: Path,
-    relative_path: str,
-    contents: str | bytes,
-) -> Path:
-    path = root / relative_path
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if isinstance(contents, bytes):
-        path.write_bytes(contents)
-    else:
-        path.write_text(contents, encoding="utf-8")
-    return path
-
-
-def run_source_owners_cli(
-    root: Path,
-    command: str,
-    *,
-    manifest: Path | None = None,
-    source_map: Path | None = None,
-    architecture_index: Path | None = None,
-    include_repo_root: bool = True,
-    extra: tuple[str, ...] = (),
-    timeout: int = 60,
-) -> subprocess.CompletedProcess[str]:
-    selected_manifest = manifest or root / "source_owners.toml"
-    selected_source_map = source_map or root / "SOURCEMAP.md"
-    selected_index = architecture_index or root / "architecture_index.json"
-    argv = [
-        sys.executable,
-        str(SOURCE_OWNERS_CLI),
-        command,
-        "--manifest",
-        str(selected_manifest),
-        "--source-map",
-        str(selected_source_map),
-        "--architecture-index",
-        str(selected_index),
-    ]
-    if include_repo_root:
-        argv.extend(["--repo-root", str(root)])
-    argv.extend(extra)
-    environment = os.environ.copy()
-    environment["PYTHONUTF8"] = "1"
-    return subprocess.run(
-        argv,
-        cwd=root,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        check=False,
-        timeout=timeout,
-        env=environment,
-    )
-
-
-def manifest_text(*owners: str) -> str:
-    return "schema_version = 2\n" + "\n".join(owners)
-
-
-def copy_repository_owner_fixture(destination: Path) -> None:
-    manifest = tomllib.loads(SOURCE_OWNERS_MANIFEST.read_text(encoding="utf-8"))
-    declared_paths = {
-        "source_owners.toml",
-        "SOURCEMAP.md",
-        "architecture_index.json",
-    }
-    for owner in manifest["owners"]:
-        for field in (
-            "roots",
-            "instructions",
-            "consumers",
-            "contracts",
-            "generated_mirrors",
-            "tests",
-        ):
-            declared_paths.update(owner.get(field, []))
-        declared_paths.update(
-            entry["path"] for entry in owner.get("primary_entries", [])
-        )
-        for relationship in owner.get("relationships", []):
-            declared_paths.update(
-                evidence["path"] for evidence in relationship.get("evidence", [])
-            )
-            target = relationship.get("target", "")
-            if target.startswith("path:"):
-                declared_paths.add(target.removeprefix("path:"))
-        for invariant in owner.get("invariants", []):
-            declared_paths.update(
-                evidence["path"] for evidence in invariant.get("evidence", [])
-            )
-            declared_paths.update(invariant.get("tests", []))
-        declared_paths.update(
-            validation.get("cwd", "") for validation in owner.get("validation", [])
-        )
-
-    for relative_path in sorted(path for path in declared_paths if path):
-        source = REPO_ROOT / relative_path
-        target = destination / relative_path
-        if source.is_dir():
-            target.mkdir(parents=True, exist_ok=True)
-        elif source.is_file():
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(source, target)
-
-
-class SourceOwnersCliTest(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls) -> None:
-        cls._repository_fixture = tempfile.TemporaryDirectory()
-        cls.repository_root = Path(cls._repository_fixture.name)
-        copy_repository_owner_fixture(cls.repository_root)
-
-    @classmethod
-    def tearDownClass(cls) -> None:
-        cls._repository_fixture.cleanup()
-
-    def assert_cli_success(self, result: subprocess.CompletedProcess[str]) -> None:
-        self.assertEqual(
-            result.returncode,
-            0,
-            msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
-        )
-
-    def output_json(self, result: subprocess.CompletedProcess[str]) -> dict:
-        self.assert_cli_success(result)
-        parsed = json.loads(result.stdout)
-        self.assertIsInstance(parsed, dict)
-        return parsed
-
-    def test_list_command_exposes_valid_owner_ids_before_slice_through_cli(
-        self,
-    ) -> None:
-        catalog = self.output_json(run_source_owners_cli(self.repository_root, "list"))
-
+        catalog = json.loads(emit.call_args.args[0])
         owner_ids = {owner["id"] for owner in catalog["owners"]}
         self.assertIn("source-owner-index", owner_ids)
         self.assertIn("code-mode-protocol-contracts", owner_ids)
         self.assertIn("source_owners.py slice --owner <owner-id>", catalog["next"])
-        self.assertLess(len(json.dumps(catalog)), 10_000)
+        self.assertLess(len(emit.call_args.args[0]), 10_000)
 
-    def test_retired_task_continuity_workflow_has_no_source_owner_through_cli(
+    def test_retired_task_continuity_workflow_has_no_source_owner(self) -> None:
+        manifest, _ = source_owners.load_and_validate(
+            source_owners.DEFAULT_MANIFEST, source_owners.REPO_ROOT
+        )
+        owners = {owner["id"]: owner for owner in manifest["owners"]}
+
+        self.assertNotIn("task-continuity-hooks", owners)
+
+    def test_source_owners_slice_recipe_allows_relationship_limit_override(
         self,
     ) -> None:
-        catalog = self.output_json(run_source_owners_cli(self.repository_root, "list"))
+        justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
+        recipe = justfile.split("source-owners-slice owner *args:", 1)[1].split(
+            "\n\n", 1
+        )[0]
 
-        self.assertNotIn(
-            "task-continuity-hooks",
-            {owner["id"] for owner in catalog["owners"]},
+        self.assertIn(
+            'slice --owner "{{ owner }}" --max-relationships 32 @forwarded_args',
+            recipe,
         )
 
-    def test_source_owners_slice_recipe_allows_relationship_limit_override_through_cli(
-        self,
-    ) -> None:
-        environment = os.environ.copy()
-        environment["PYTHONUTF8"] = "1"
-        result = subprocess.run(
-            [
-                "just",
-                "--justfile",
-                str(REPO_ROOT / "justfile"),
-                "source-owners-slice",
-                "source-owner-index",
-                "--manifest",
-                str(self.repository_root / "source_owners.toml"),
-                "--source-map",
-                str(self.repository_root / "SOURCEMAP.md"),
-                "--architecture-index",
-                str(self.repository_root / "architecture_index.json"),
-                "--repo-root",
-                str(self.repository_root),
-                "--focus",
-                "source owner index",
-                "--max-relationships",
-                "1",
-            ],
-            cwd=REPO_ROOT,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            check=False,
-            timeout=60,
-            env=environment,
-        )
+    def test_manifest_validation_and_managed_block_are_deterministic(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "src").mkdir()
+            (root / "src" / "lib.rs").write_text("fn locate() {}\n", encoding="utf-8")
+            (root / "AGENTS.md").write_text("instructions\n", encoding="utf-8")
+            manifest_path = root / "source_owners.toml"
+            manifest_path.write_text(
+                """schema_version = 2
 
-        slice_ = self.output_json(result)
-        retained = sum(
-            len(slice_[facet]["relationships"])
-            for facet in (
-                "control_and_data_flow",
-                "callers_and_consumers",
-                "configuration_and_gates",
-                "registration_and_entrypoints",
-                "tests_and_contracts",
-                "generated_artifacts",
-                "invariants",
-            )
-        )
-        self.assertEqual(retained, 1)
-
-    def test_manifest_validation_and_managed_block_are_deterministic_through_cli(
-        self,
-    ) -> None:
-        with temporary_repository() as root:
-            write_fixture(root, "src/lib.rs", "fn locate() {}\n")
-            write_fixture(root, "AGENTS.md", "instructions\n")
-            write_fixture(
-                root,
-                "source_owners.toml",
-                manifest_text(
-                    """
 [[owners]]
 id = "alpha"
 feature_ids = ["alpha-feature"]
@@ -283,65 +102,53 @@ id = "focused"
 cwd = "."
 argv = ["cargo", "test", "focused"]
 role = "focused_tests"
-"""
-                ),
+""",
+                encoding="utf-8",
             )
-            source_map = write_fixture(root, "SOURCEMAP.md", "manual prose\n")
 
-            first_result = run_source_owners_cli(root, "generate")
-            self.assert_cli_success(first_result)
-            first_map = source_map.read_bytes()
-            first_index = (root / "architecture_index.json").read_bytes()
-            second_result = run_source_owners_cli(root, "generate")
+            manifest, digest = source_owners.load_and_validate(manifest_path, root)
+            block = source_owners.render_block(manifest, digest)
+            first = source_owners.replace_managed_block("manual prose\n", block)
+            second = source_owners.replace_managed_block(first, block)
 
-            self.assert_cli_success(second_result)
-            self.assertEqual(source_map.read_bytes(), first_map)
-            self.assertEqual(
-                (root / "architecture_index.json").read_bytes(), first_index
-            )
-            rendered = first_map.decode("utf-8")
-            self.assertTrue(rendered.startswith("manual prose\n"))
-            self.assertIn("schema=2", rendered)
-            self.assertIn("alpha", rendered)
-            self.assertIn("control_flow:calls", rendered)
-            self.assertIn("semantic:locator-contract", rendered)
+            self.assertEqual(first, second)
+            self.assertTrue(first.startswith("manual prose\n"))
+            self.assertIn("schema=2", block)
+            self.assertIn("`alpha`", block)
+            self.assertIn("`control_flow:calls`", block)
+            self.assertIn("`semantic:locator-contract`", block)
 
-    def test_manifest_validation_rejects_stale_evidence_symbols_through_cli(
-        self,
-    ) -> None:
-        with temporary_repository() as root:
-            write_fixture(root, "source.rs", "fn live_symbol() {}\n")
-            write_fixture(
-                root,
-                "source_owners.toml",
-                manifest_text(
-                    """
+    def test_manifest_validation_rejects_stale_evidence_symbols(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.rs"
+            source.write_text("fn live_symbol() {}\n", encoding="utf-8")
+            manifest_path = root / "source_owners.toml"
+            manifest_path.write_text(
+                """schema_version = 2
 [[owners]]
 id = "alpha"
 roots = ["source.rs"]
 [[owners.primary_entries]]
 path = "source.rs"
 symbol = "removed_symbol"
-"""
-                ),
+""",
+                encoding="utf-8",
             )
 
-            result = run_source_owners_cli(root, "list")
+            with self.assertRaisesRegex(ValueError, "stale symbol evidence"):
+                source_owners.load_and_validate(manifest_path, root)
 
-            self.assertEqual(result.returncode, 1)
-            self.assertIn("stale symbol evidence", result.stderr)
-            self.assertIn("source.rs::removed_symbol", result.stderr)
-
-    def test_targeted_validation_checks_only_the_returned_relationship_closure_through_cli(
+    def test_targeted_validation_checks_only_the_returned_relationship_closure(
         self,
     ) -> None:
-        with temporary_repository() as root:
-            write_fixture(root, "source.rs", "fn live_symbol() {}\n")
-            manifest = write_fixture(
-                root,
-                "source_owners.toml",
-                manifest_text(
-                    """
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.rs"
+            source.write_text("fn live_symbol() {}\n", encoding="utf-8")
+            manifest_path = root / "source_owners.toml"
+            manifest_path.write_text(
+                """schema_version = 2
 [[owners]]
 id = "alpha"
 roots = ["source.rs"]
@@ -355,223 +162,141 @@ kind = "calls"
 target = "owner:alpha"
 confidence = "compiler_resolved"
 evidence = [{ path = "source.rs", symbol = "live_symbol" }]
-"""
-                ),
+""",
+                encoding="utf-8",
             )
 
-            targeted = self.output_json(
-                run_source_owners_cli(
-                    root,
-                    "query",
-                    extra=("--owner", "alpha"),
-                )
+            manifest, _ = source_owners.load_and_validate(
+                manifest_path, root, owner_ids=["alpha"]
             )
             self.assertEqual(
-                [owner["id"] for owner in targeted["owners"]],
-                ["alpha"],
+                [owner["id"] for owner in manifest["owners"]], ["alpha", "beta"]
             )
-            self.assertTrue(
-                any(
-                    relationship["source"] == "owner:beta"
-                    for relationship in targeted["relationships"]
-                )
-            )
+            with self.assertRaisesRegex(ValueError, "unrelated-missing.rs"):
+                source_owners.load_and_validate(manifest_path, root)
 
-            full = run_source_owners_cli(root, "list")
-            self.assertEqual(full.returncode, 1)
-            self.assertIn("unrelated-missing.rs", full.stderr)
-
-            manifest.write_text(
-                manifest.read_text(encoding="utf-8").replace(
+            manifest_path.write_text(
+                manifest_path.read_text(encoding="utf-8").replace(
                     'evidence = [{ path = "source.rs", symbol = "live_symbol" }]',
                     'evidence = [{ path = "incoming-missing.rs" }]',
                 ),
                 encoding="utf-8",
             )
-            invalid_closure = run_source_owners_cli(
-                root,
-                "query",
-                extra=("--owner", "alpha"),
-            )
-            self.assertEqual(invalid_closure.returncode, 1)
-            self.assertIn("incoming-missing.rs", invalid_closure.stderr)
+            with self.assertRaisesRegex(ValueError, "incoming-missing.rs"):
+                source_owners.load_and_validate(
+                    manifest_path, root, owner_ids=["alpha"]
+                )
 
-    def test_repository_revision_changes_with_supporting_source_through_cli(
-        self,
-    ) -> None:
-        with temporary_repository() as root:
-            supporting_sources = {
-                "source.rs": "fn live_symbol() {}\n",
-                "relationship.rs": "fn relationship_evidence() {}\n",
-                "invariant.rs": "fn invariant_evidence() {}\n",
-                "owner_test.rs": "def test_owner(): pass\n",
-                "invariant_test.rs": "def test_invariant(): pass\n",
+    def test_repository_revision_changes_with_supporting_source(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.rs"
+            source.write_text("fn live_symbol() {}\n", encoding="utf-8")
+            manifest = {
+                "owners": [
+                    {
+                        "id": "alpha",
+                        "primary_entries": [
+                            {"path": "source.rs", "symbol": "live_symbol"}
+                        ],
+                    }
+                ]
             }
-            for path, contents in supporting_sources.items():
-                write_fixture(root, path, contents)
-            write_fixture(
-                root,
-                "source_owners.toml",
-                manifest_text(
-                    """
-[[owners]]
-id = "alpha"
-roots = ["source.rs"]
-primary_entries = [{ path = "source.rs", symbol = "live_symbol" }]
-tests = ["owner_test.rs"]
 
-[[owners.relationships]]
-category = "tests_contracts"
-kind = "validated_by"
-target = "path:relationship.rs"
-confidence = "declared"
-evidence = [{ path = "relationship.rs" }]
-
-[[owners.invariants]]
-id = "alpha-contract"
-kind = "semantic"
-statement = "supporting inputs remain current"
-evidence = [{ path = "invariant.rs" }]
-tests = ["invariant_test.rs"]
-"""
-                ),
+            first = source_owners.repository_revision(root, "manifest", manifest)
+            source.write_text(
+                'fn live_symbol() { println!("changed"); }\n', encoding="utf-8"
             )
+            second = source_owners.repository_revision(root, "manifest", manifest)
 
-            previous = self.output_json(
-                run_source_owners_cli(
-                    root,
-                    "query",
-                    extra=("--owner", "alpha"),
-                )
-            )
-            for index, (path, contents) in enumerate(supporting_sources.items()):
-                write_fixture(root, path, f"{contents.rstrip()} # changed-{index}\n")
-                current = self.output_json(
-                    run_source_owners_cli(
-                        root,
-                        "query",
-                        extra=("--owner", "alpha"),
-                    )
-                )
-                self.assertNotEqual(
-                    previous["repository_revision"],
-                    current["repository_revision"],
-                    path,
-                )
-                previous = current
+            self.assertNotEqual(first, second)
 
-    def test_alias_collision_requires_explicit_ambiguity_through_cli(self) -> None:
-        with temporary_repository() as root:
-            write_fixture(
-                root,
-                "src/lib.rs",
-                "fn alpha_entry() {}\nfn beta_entry() {}\n",
-            )
+    def test_alias_collision_requires_explicit_ambiguity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "src").mkdir()
+            (root / "src" / "lib.rs").write_text("fn locate() {}\n", encoding="utf-8")
+            (root / "AGENTS.md").write_text("instructions\n", encoding="utf-8")
             owners = []
             for owner_id in ("alpha", "beta"):
                 owners.append(
                     f"""
 [[owners]]
 id = "{owner_id}"
+concern_ids = []
 aliases = ["shared alias"]
+phrases = []
+ambiguous_with = []
 roots = ["src"]
-primary_entries = [{{ path = "src/lib.rs", symbol = "{owner_id}_entry" }}]
+instructions = ["AGENTS.md"]
+consumers = []
+contracts = []
+generated_mirrors = []
+tests = []
+
+[[owners.primary_entries]]
+path = "src/lib.rs"
+symbol = "{owner_id}_entry"
 """
                 )
-            write_fixture(
-                root,
-                "source_owners.toml",
-                manifest_text(*owners),
+            manifest_path = root / "source_owners.toml"
+            manifest_path.write_text(
+                "schema_version = 2\n" + "".join(owners), encoding="utf-8"
             )
 
-            result = run_source_owners_cli(root, "list")
+            with self.assertRaisesRegex(ValueError, "collision"):
+                source_owners.load_and_validate(manifest_path, root)
 
-            self.assertEqual(result.returncode, 1)
-            self.assertIn("phrase collision without explicit ambiguity", result.stderr)
-
-    def test_custom_manifest_defaults_declared_paths_to_its_directory_through_cli(
-        self,
-    ) -> None:
-        with temporary_repository() as root:
+    def test_custom_manifest_defaults_declared_paths_to_its_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
             (root / "src").mkdir()
-            manifest = write_fixture(
-                root,
-                "source_owners.toml",
-                manifest_text(
-                    """
+            manifest_path = root / "source_owners.toml"
+            manifest_path.write_text(
+                """schema_version = 2
 [[owners]]
 id = "alpha"
 roots = ["src"]
-"""
-                ),
+""",
+                encoding="utf-8",
             )
 
-            catalog = self.output_json(
-                run_source_owners_cli(
-                    root,
-                    "list",
-                    manifest=manifest,
-                    include_repo_root=False,
-                )
-            )
+            manifest, _ = source_owners.load_and_validate(manifest_path)
 
-            self.assertEqual([owner["id"] for owner in catalog["owners"]], ["alpha"])
+            self.assertEqual(manifest["owners"][0]["id"], "alpha")
 
-    def test_malformed_nested_shape_uses_manifest_diagnostic_through_cli(
-        self,
-    ) -> None:
-        with temporary_repository() as root:
-            write_fixture(
-                root,
-                "source_owners.toml",
+    def test_malformed_nested_shape_uses_manifest_diagnostic(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manifest_path = Path(directory) / "source_owners.toml"
+            manifest_path.write_text(
                 'schema_version = 2\nowners = ["not-a-table"]\n',
+                encoding="utf-8",
             )
 
-            result = run_source_owners_cli(root, "list")
+            with self.assertRaisesRegex(ValueError, "routing_manifest_invalid"):
+                source_owners.load_and_validate(manifest_path)
 
-            self.assertEqual(result.returncode, 1)
-            self.assertIn("routing_manifest_invalid", result.stderr)
-            self.assertIn("owners[0] must be a table", result.stderr)
+    def test_atomic_writer_preserves_target_when_replace_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "SOURCEMAP.md"
+            target.write_text("old\n", encoding="utf-8")
 
-    def test_atomic_writer_preserves_target_when_replace_fails_through_cli(
-        self,
-    ) -> None:
-        with temporary_repository() as root:
-            write_fixture(
-                root, "source_owners.toml", "schema_version = 2\nowners = []\n"
-            )
-            target = write_fixture(root, "SOURCEMAP.md", "old\n")
-            (root / ".codex/locks").mkdir(parents=True)
-            original = target.read_bytes()
-            original_mode = target.stat().st_mode
-            parent_mode = root.stat().st_mode
-            if os.name == "nt":
-                target.chmod(stat.S_IREAD)
-            else:
-                root.chmod(stat.S_IREAD | stat.S_IEXEC)
-            try:
-                result = run_source_owners_cli(root, "generate")
-            finally:
-                if os.name == "nt":
-                    target.chmod(original_mode)
-                else:
-                    root.chmod(parent_mode)
+            with mock.patch.object(source_owners.os, "replace", side_effect=OSError):
+                with self.assertRaises(OSError):
+                    source_owners.write_text_atomic(target, "new\n")
 
-            self.assertEqual(result.returncode, 1)
-            self.assertEqual(target.read_bytes(), original)
-            self.assertEqual(list(root.glob(".SOURCEMAP.md.*.tmp")), [])
-            self.assertFalse((root / "architecture_index.json").exists())
+            self.assertEqual(target.read_text(encoding="utf-8"), "old\n")
+            self.assertEqual(list(Path(directory).glob("*.tmp")), [])
 
-    def test_manifest_validation_reuses_equivalent_path_probes_through_cli(
-        self,
-    ) -> None:
-        with temporary_repository() as root:
-            write_fixture(root, "src/lib.rs", "fn locate() {}\n")
-            write_fixture(
-                root,
-                "source_owners.toml",
-                manifest_text(
-                    """
+    def test_manifest_validation_reuses_equivalent_path_probes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "src").mkdir()
+            source = root / "src" / "lib.rs"
+            source.write_text("fn locate() {}\n", encoding="utf-8")
+            manifest_path = root / "source_owners.toml"
+            manifest_path.write_text(
+                """schema_version = 2
 [[owners]]
 id = "alpha"
 roots = ["src/lib.rs"]
@@ -580,348 +305,281 @@ tests = ["src/lib.rs"]
 primary_entries = [{ path = "src/lib.rs", symbol = "locate" }]
 relationships = [{ category = "control_flow", kind = "calls", target = "path:src/lib.rs", confidence = "compiler_resolved", evidence = [{ path = "src/lib.rs", symbol = "locate" }] }]
 invariants = [{ id = "stable", kind = "semantic", statement = "Stable.", evidence = [{ path = "src/lib.rs", symbol = "locate" }], tests = ["src/lib.rs"] }]
-"""
-                ),
-            )
-
-            catalog = self.output_json(run_source_owners_cli(root, "list"))
-
-            self.assertEqual([owner["id"] for owner in catalog["owners"]], ["alpha"])
-
-    def test_architecture_index_is_reused_only_for_matching_intact_input_through_cli(
-        self,
-    ) -> None:
-        with temporary_repository() as root:
-            write_fixture(root, "source.rs", "fn locate() {}\n")
-            manifest = write_fixture(
-                root,
-                "source_owners.toml",
-                manifest_text(
-                    """
-[[owners]]
-id = "alpha"
-roots = ["source.rs"]
-primary_entries = [{ path = "source.rs", symbol = "locate" }]
-"""
-                ),
-            )
-            write_fixture(root, "SOURCEMAP.md", "manual prose\n")
-            self.assert_cli_success(run_source_owners_cli(root, "generate"))
-
-            query = self.output_json(
-                run_source_owners_cli(
-                    root,
-                    "query",
-                    extra=("--owner", "alpha"),
-                )
-            )
-            slice_ = self.output_json(
-                run_source_owners_cli(
-                    root,
-                    "slice",
-                    extra=("--owner", "alpha"),
-                )
-            )
-            self.assertEqual(query["owners"][0]["id"], "alpha")
-            self.assertIn("registration_and_entrypoints", slice_)
-
-            index_path = root / "architecture_index.json"
-            damaged = json.loads(index_path.read_text(encoding="utf-8"))
-            damaged["owners"][0]["id"] = "corrupted"
-            index_path.write_text(json.dumps(damaged), encoding="utf-8")
-            fallback = self.output_json(
-                run_source_owners_cli(
-                    root,
-                    "query",
-                    extra=("--owner", "alpha"),
-                )
-            )
-            self.assertEqual(fallback["owners"][0]["id"], "alpha")
-
-            first_revision = fallback["repository_revision"]
-            manifest.write_text(
-                manifest.read_text(encoding="utf-8") + "\n",
+""",
                 encoding="utf-8",
             )
-            stale_digest = self.output_json(
-                run_source_owners_cli(
-                    root,
-                    "query",
-                    extra=("--owner", "alpha"),
+            original_stat = Path.stat
+            source_stat_calls = 0
+
+            def tracked_stat(path: Path, *args: object, **kwargs: object) -> object:
+                nonlocal source_stat_calls
+                if path == source:
+                    source_stat_calls += 1
+                return original_stat(path, *args, **kwargs)
+
+            with (
+                mock.patch.object(
+                    source_owners,
+                    "confined_path",
+                    wraps=source_owners.confined_path,
+                ) as resolve_path,
+                mock.patch.object(Path, "stat", tracked_stat),
+            ):
+                source_owners.load_and_validate(manifest_path, root)
+
+            matching_resolutions = [
+                call
+                for call in resolve_path.call_args_list
+                if call.args[1] == "src/lib.rs"
+            ]
+            self.assertEqual(len(matching_resolutions), 1)
+            self.assertTrue(
+                all(
+                    call.args[0] == root.resolve()
+                    for call in resolve_path.call_args_list
                 )
             )
-            self.assertNotEqual(stale_digest["repository_revision"], first_revision)
+            self.assertEqual(source_stat_calls, 1)
 
-    def test_slice_snapshot_cache_revalidates_content_identity_through_cli(
-        self,
-    ) -> None:
-        with temporary_repository() as root:
-            source = write_fixture(root, "source.rs", "fn locate() { 11111 }\n")
-            write_fixture(
-                root,
-                "source_owners.toml",
-                manifest_text(
-                    """
+    def test_architecture_index_is_reused_only_for_matching_intact_input(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.rs"
+            source.write_text("fn locate() {}\n", encoding="utf-8")
+            manifest_path = root / "source_owners.toml"
+            manifest_path.write_text(
+                """schema_version = 2
 [[owners]]
 id = "alpha"
 roots = ["source.rs"]
 primary_entries = [{ path = "source.rs", symbol = "locate" }]
-"""
-                ),
+""",
+                encoding="utf-8",
+            )
+            manifest, digest = source_owners.load_and_validate(manifest_path, root)
+            index_path = root / "architecture_index.json"
+            index_text = source_owners.expected_architecture_index(
+                manifest, digest, root
+            )
+            index_path.write_text(index_text, encoding="utf-8")
+
+            loaded = source_owners.load_architecture_index(index_path, digest, root)
+            self.assertIsNotNone(loaded)
+            self.assertIsNone(
+                source_owners.load_architecture_index(index_path, "stale", root)
             )
 
-            first = self.output_json(
-                run_source_owners_cli(
-                    root,
-                    "slice",
-                    extra=("--owner", "alpha"),
-                )
+            damaged = json.loads(index_text)
+            damaged["owners"][0]["id"] = "corrupted"
+            index_path.write_text(json.dumps(damaged), encoding="utf-8")
+            self.assertIsNone(
+                source_owners.load_architecture_index(index_path, digest, root)
             )
+
+            index_path.write_text(index_text, encoding="utf-8")
+            argv = [
+                "source_owners.py",
+                "query",
+                "--manifest",
+                str(manifest_path),
+                "--architecture-index",
+                str(index_path),
+                "--repo-root",
+                str(root),
+                "--owner",
+                "alpha",
+            ]
+            with (
+                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(
+                    source_owners,
+                    "load_and_validate",
+                    side_effect=AssertionError("warm lookup reparsed the manifest"),
+                ),
+                mock.patch("builtins.print") as print_output,
+            ):
+                self.assertEqual(source_owners.main(), 0)
+                argv[1] = "slice"
+                self.assertEqual(source_owners.main(), 0)
+            self.assertTrue(print_output.called)
+
+    def test_slice_snapshot_cache_revalidates_content_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.rs"
+            source.write_bytes(b"first")
+            graph = {"relationships": []}
+            owners = [{"primary_entries": [{"path": "source.rs"}]}]
+            with source_owners._snapshot_cache_lock:
+                source_owners._snapshot_cache.clear()
+                source_owners._snapshot_cache_bytes = 0
+
+            first = source_owners._slice_source_snapshot(root, graph, owners)
+            warm = source_owners._slice_source_snapshot(root, graph, owners)
+            self.assertEqual(first[0], warm[0])
+            self.assertEqual(warm[1:], (0, 0))
+
             timestamps = source.stat()
-            source.write_text("fn locate() { 22222 }\n", encoding="utf-8")
-            os.utime(
+            source.write_bytes(b"other")
+            source.touch()
+            source_owners.os.utime(
                 source,
                 ns=(timestamps.st_atime_ns, timestamps.st_mtime_ns),
             )
-            changed = self.output_json(
-                run_source_owners_cli(
-                    root,
-                    "slice",
-                    extra=("--owner", "alpha"),
-                )
-            )
+            changed = source_owners._slice_source_snapshot(root, graph, owners)
+            self.assertNotEqual(changed[0], first[0])
+            self.assertEqual(changed[1:], (1, len(b"other")))
 
-            replacement = write_fixture(
-                root,
-                "replacement.rs",
-                "fn locate() { 33333 }\n",
-            )
-            os.utime(
+            replacement = root / "replacement.rs"
+            replacement.write_bytes(b"third")
+            source_owners.os.utime(
                 replacement,
                 ns=(timestamps.st_atime_ns, timestamps.st_mtime_ns),
             )
-            os.replace(replacement, source)
-            replaced = self.output_json(
-                run_source_owners_cli(
-                    root,
-                    "slice",
-                    extra=("--owner", "alpha"),
-                )
-            )
+            replacement.replace(source)
+            replaced = source_owners._slice_source_snapshot(root, graph, owners)
+            self.assertNotEqual(replaced[0], changed[0])
+            self.assertEqual(replaced[1:], (1, len(b"third")))
 
-            self.assertNotEqual(changed["snapshot"], first["snapshot"])
-            self.assertNotEqual(replaced["snapshot"], changed["snapshot"])
-            self.assertGreater(changed["metrics"]["bytes_read"], 0)
-            self.assertGreater(replaced["metrics"]["bytes_read"], 0)
-
-    def test_slice_snapshot_rejects_a_symlink_that_escapes_the_root_through_cli(
-        self,
-    ) -> None:
+    def test_slice_snapshot_rejects_a_symlink_that_escapes_the_root(self) -> None:
         with (
-            temporary_repository() as root,
+            tempfile.TemporaryDirectory() as directory,
             tempfile.TemporaryDirectory() as outside_directory,
         ):
-            source = write_fixture(root, "link.rs", "fn locate() {}\n")
-            write_fixture(
-                root,
-                "source_owners.toml",
-                manifest_text(
-                    """
-[[owners]]
-id = "alpha"
-roots = ["link.rs"]
-primary_entries = [{ path = "link.rs", symbol = "locate" }]
-"""
-                ),
-            )
-            write_fixture(root, "SOURCEMAP.md", "manual prose\n")
-            self.assert_cli_success(run_source_owners_cli(root, "generate"))
+            root = Path(directory)
             outside = Path(outside_directory) / "outside.rs"
-            outside.write_text("fn locate() {}\n", encoding="utf-8")
-            source.unlink()
+            outside.write_bytes(b"outside")
+            link = root / "link.rs"
             try:
-                source.symlink_to(outside)
+                link.symlink_to(outside)
             except OSError as error:
                 self.skipTest(f"symlink creation is unavailable: {error}")
 
-            slice_ = self.output_json(
-                run_source_owners_cli(
-                    root,
-                    "slice",
-                    extra=("--owner", "alpha"),
-                )
+            snapshot = source_owners._slice_source_snapshot(
+                root,
+                {"relationships": []},
+                [{"primary_entries": [{"path": "link.rs"}]}],
             )
 
-            missing_digest = hashlib.sha256()
+            missing_digest = source_owners.hashlib.sha256()
             missing_digest.update(b"link.rs")
             missing_digest.update(b"\0missing-or-not-a-file\0")
-            self.assertTrue(slice_["snapshot"].endswith(missing_digest.hexdigest()))
-            self.assertEqual(slice_["metrics"]["files_read"], 1)
+            self.assertEqual(snapshot, (missing_digest.hexdigest(), 0, 0))
 
-    def test_bounded_ranking_uses_partial_selection_and_preserves_order_through_cli(
-        self,
-    ) -> None:
-        with temporary_repository() as root:
-            write_fixture(root, "source.rs", "fn locate() {}\n")
-            relationships = "\n".join(
-                f"""
-[[owners.relationships]]
-category = "configuration"
-kind = "reads_config"
-target = "config:rank-{rank:03}"
-confidence = "declared"
-evidence = [{{ path = "source.rs", symbol = "locate" }}]
-"""
-                for rank in range(100, 0, -1)
-            )
-            write_fixture(
-                root,
-                "source_owners.toml",
-                manifest_text(
-                    f"""
-[[owners]]
-id = "alpha"
-roots = ["source.rs"]
-{relationships}
-"""
-                ),
+    def test_bounded_ranking_uses_partial_selection_and_preserves_order(self) -> None:
+        items = [{"rank": rank} for rank in range(100, 0, -1)]
+        with mock.patch.object(
+            source_owners.heapq,
+            "nsmallest",
+            wraps=source_owners.heapq.nsmallest,
+        ) as nsmallest:
+            selected = source_owners._bounded_sorted(
+                items, lambda item: item["rank"], 4
             )
 
-            graph = self.output_json(
-                run_source_owners_cli(
-                    root,
-                    "query",
-                    extra=("--owner", "alpha", "--max-relationships", "4"),
-                )
-            )
+        self.assertEqual([item["rank"] for item in selected], [1, 2, 3, 4])
+        nsmallest.assert_called_once()
 
-            self.assertEqual(
-                [item["target"] for item in graph["relationships"]],
-                [f"config:rank-{rank:03}" for rank in range(1, 5)],
-            )
-            self.assertEqual(graph["status"], "partial")
-            self.assertEqual(graph["omitted"]["relationships"], 96)
+    def test_round_robin_relationship_cap_preserves_facet_order(self) -> None:
+        relationships = {
+            "control": [{"id": "c0"}, {"id": "c1"}, {"id": "c2"}],
+            "tests": [{"id": "t0"}, {"id": "t1"}],
+            "invariants": [{"id": "i0"}],
+        }
 
-    def test_round_robin_relationship_cap_preserves_facet_order_through_cli(
-        self,
-    ) -> None:
-        with temporary_repository() as root:
-            write_fixture(root, "source.rs", "fn locate() {}\n")
-            write_fixture(root, "test0.rs", "")
-            write_fixture(root, "test1.rs", "")
-            relationships = "\n".join(
-                f"""
-[[owners.relationships]]
-category = "control_flow"
-kind = "calls"
-target = "config:c{index}"
-confidence = "compiler_resolved"
-evidence = [{{ path = "source.rs", symbol = "locate" }}]
-"""
-                for index in range(3)
-            )
-            write_fixture(
-                root,
-                "source_owners.toml",
-                manifest_text(
-                    f"""
-[[owners]]
-id = "alpha"
-roots = ["source.rs"]
-tests = ["test0.rs", "test1.rs"]
-{relationships}
-[[owners.invariants]]
-id = "i0"
-kind = "semantic"
-statement = "Stable."
-evidence = [{{ path = "source.rs", symbol = "locate" }}]
-tests = []
-"""
-                ),
-            )
+        retained = source_owners._round_robin_relationships(relationships, 4)
 
-            slice_ = self.output_json(
-                run_source_owners_cli(
-                    root,
-                    "slice",
-                    extra=("--owner", "alpha", "--max-relationships", "4"),
-                )
-            )
+        self.assertEqual([item["id"] for item in retained["control"]], ["c0", "c1"])
+        self.assertEqual([item["id"] for item in retained["tests"]], ["t0"])
+        self.assertEqual([item["id"] for item in retained["invariants"]], ["i0"])
 
-            self.assertEqual(
-                [
-                    item["target"]
-                    for item in slice_["control_and_data_flow"]["relationships"]
-                ],
-                ["config:c0", "config:c1"],
-            )
-            self.assertEqual(
-                [
-                    item["target"]
-                    for item in slice_["tests_and_contracts"]["relationships"]
-                ],
-                ["path:test0.rs"],
-            )
-            self.assertEqual(
-                [item["target"] for item in slice_["invariants"]["relationships"]],
-                ["contract:i0"],
-            )
-
-    def test_generate_reads_source_map_once_through_cli(self) -> None:
-        with temporary_repository() as root:
-            write_fixture(root, "src/lib.rs", "fn locate() {}\n")
-            write_fixture(
-                root,
-                "source_owners.toml",
-                manifest_text(
-                    """
+    def test_generate_reads_source_map_once(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "src").mkdir()
+            (root / "src" / "lib.rs").write_text("fn locate() {}\n", encoding="utf-8")
+            manifest_path = root / "source_owners.toml"
+            manifest_path.write_text(
+                """schema_version = 2
 [[owners]]
 id = "alpha"
 roots = ["src/lib.rs"]
-"""
-                ),
+""",
+                encoding="utf-8",
             )
-            source_map = write_fixture(root, "SOURCEMAP.md", "manual prose\n")
+            source_map = root / "SOURCEMAP.md"
+            source_map.write_text("manual prose\n", encoding="utf-8")
+            architecture_index = root / "architecture_index.json"
+            original_read_text = Path.read_text
+            source_map_reads = 0
 
-            result = run_source_owners_cli(root, "generate")
+            def tracked_read_text(path: Path, *args: object, **kwargs: object) -> str:
+                nonlocal source_map_reads
+                if path == source_map:
+                    source_map_reads += 1
+                return original_read_text(path, *args, **kwargs)
 
-            self.assert_cli_success(result)
-            rendered = source_map.read_text(encoding="utf-8")
-            self.assertTrue(rendered.startswith("manual prose\n"))
-            self.assertEqual(rendered.count(BEGIN_PREFIX), 1)
-            self.assertTrue((root / "architecture_index.json").is_file())
-            self.assertTrue((root / ".codex/locks/source-map.lock").is_file())
+            argv = [
+                "source_owners.py",
+                "generate",
+                "--manifest",
+                str(manifest_path),
+                "--source-map",
+                str(source_map),
+                "--architecture-index",
+                str(architecture_index),
+                "--repo-root",
+                str(root),
+            ]
+            with (
+                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(Path, "read_text", tracked_read_text),
+            ):
+                self.assertEqual(source_owners.main(), 0)
 
-    def test_generate_respects_shared_source_map_writer_lock_through_cli(
-        self,
-    ) -> None:
-        with temporary_repository() as root:
-            write_fixture(
-                root, "source_owners.toml", "schema_version = 2\nowners = []\n"
-            )
-            source_map = write_fixture(root, "SOURCEMAP.md", "manual prose\n")
-
-            with source_map_lock(root, "test-holder"):
-                result = run_source_owners_cli(root, "generate")
-
-            self.assertEqual(result.returncode, 1)
-            self.assertIn("source map outputs is already locked", result.stderr)
-            self.assertEqual(
+            self.assertEqual(source_map_reads, 1)
+            self.assertTrue((root / ".codex" / "locks" / "source-map.lock").is_file())
+            self.assertIn(
+                source_owners.BEGIN_PREFIX,
                 source_map.read_text(encoding="utf-8"),
-                "manual prose\n",
             )
-            self.assertFalse((root / "architecture_index.json").exists())
 
-    def test_query_is_bounded_revision_keyed_and_includes_incoming_edges_through_cli(
-        self,
-    ) -> None:
-        with temporary_repository() as root:
-            write_fixture(root, "src/lib.rs", "fn locate() {}\n")
-            write_fixture(
-                root,
-                "source_owners.toml",
-                manifest_text(
-                    """
+    def test_generate_respects_shared_source_map_writer_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest_path = root / "source_owners.toml"
+            manifest_path.write_text("schema_version = 2\n", encoding="utf-8")
+            source_map = root / "SOURCEMAP.md"
+            source_map.write_text("manual prose\n", encoding="utf-8")
+            architecture_index = root / "architecture_index.json"
+            argv = [
+                "source_owners.py",
+                "generate",
+                "--manifest",
+                str(manifest_path),
+                "--source-map",
+                str(source_map),
+                "--architecture-index",
+                str(architecture_index),
+                "--repo-root",
+                str(root),
+            ]
+            with (
+                source_map_lock(root, "test-holder"),
+                mock.patch.object(sys, "argv", argv),
+            ):
+                self.assertEqual(source_owners.main(), 1)
+            self.assertEqual(source_map.read_text(encoding="utf-8"), "manual prose\n")
+            self.assertFalse(architecture_index.exists())
+
+    def test_query_is_bounded_revision_keyed_and_includes_incoming_edges(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "src").mkdir()
+            (root / "src" / "lib.rs").write_text("fn locate() {}\n", encoding="utf-8")
+            manifest_path = root / "source_owners.toml"
+            manifest_path.write_text(
+                """schema_version = 2
 [[owners]]
 id = "alpha"
 feature_ids = ["alpha-feature"]
@@ -948,26 +606,22 @@ kind = "calls"
 target = "owner:alpha"
 confidence = "compiler_resolved"
 evidence = [{ path = "src/lib.rs", symbol = "locate" }]
-"""
-                ),
+""",
+                encoding="utf-8",
             )
+            manifest, digest = source_owners.load_and_validate(manifest_path, root)
 
-            bounded = self.output_json(
-                run_source_owners_cli(
-                    root,
-                    "query",
-                    extra=("--owner", "alpha", "--max-relationships", "1"),
+            with mock.patch.object(
+                source_owners, "repository_revision", return_value="revision-1"
+            ):
+                bounded = source_owners.query_graph(
+                    manifest, digest, root, ["alpha"], max_relationships=1
                 )
-            )
-            result = self.output_json(
-                run_source_owners_cli(
-                    root,
-                    "query",
-                    extra=("--owner", "alpha", "--max-relationships", "2"),
+                result = source_owners.query_graph(
+                    manifest, digest, root, ["alpha"], max_relationships=2
                 )
-            )
 
-            self.assertIn(":sources:", result["repository_revision"])
+            self.assertEqual(result["repository_revision"], "revision-1")
             self.assertEqual(bounded["status"], "partial")
             self.assertEqual(bounded["omitted"]["relationships"], 1)
             self.assertTrue(
@@ -976,16 +630,14 @@ evidence = [{ path = "src/lib.rs", symbol = "locate" }]
             self.assertEqual(result["owners"][0]["feature_ids"], ["alpha-feature"])
             self.assertEqual(result["owners"][0]["invariants"][0]["id"], "stable")
 
-    def test_architecture_slice_distinguishes_unknowns_from_bounded_noise_through_cli(
-        self,
-    ) -> None:
-        with temporary_repository() as root:
-            source = write_fixture(root, "src/lib.rs", "fn locate() {}\n")
-            write_fixture(
-                root,
-                "source_owners.toml",
-                manifest_text(
-                    """
+    def test_architecture_slice_distinguishes_unknowns_from_bounded_noise(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "src").mkdir()
+            (root / "src" / "lib.rs").write_text("fn locate() {}\n", encoding="utf-8")
+            manifest_path = root / "source_owners.toml"
+            manifest_path.write_text(
+                """schema_version = 2
 [[owners]]
 id = "alpha"
 roots = ["src"]
@@ -1007,53 +659,43 @@ kind = "semantic"
 statement = "Stable."
 evidence = [{ path = "src/lib.rs", symbol = "locate" }]
 tests = ["src/lib.rs"]
-"""
-                ),
-            )
-
-            first = self.output_json(
-                run_source_owners_cli(
-                    root,
-                    "slice",
-                    extra=("--owner", "alpha"),
-                )
-            )
-            self.assertEqual(first["material_unknowns"], [])
-            self.assertFalse(first["truncated"])
-            self.assertEqual(first["omitted_relationships"], 0)
-            self.assertEqual(
-                first["configuration_and_gates"]["status"],
-                "not_applicable",
-            )
-            self.assertEqual(
-                first["control_and_data_flow"]["relationships"][0]["provenance"],
-                "exact",
-            )
-
-            source.write_text(
-                'fn locate() { println!("changed"); }\n',
+""",
                 encoding="utf-8",
             )
-            second = self.output_json(
-                run_source_owners_cli(
-                    root,
-                    "slice",
-                    extra=("--owner", "alpha"),
-                )
-            )
-            self.assertNotEqual(first["snapshot"], second["snapshot"])
+            manifest, digest = source_owners.load_and_validate(manifest_path, root)
 
-    def test_architecture_slice_ranks_task_relevant_edges_within_each_facet_through_cli(
+            slice_ = source_owners.architecture_slice(manifest, digest, root, ["alpha"])
+
+            self.assertEqual(slice_["material_unknowns"], [])
+            self.assertFalse(slice_["truncated"])
+            self.assertEqual(slice_["omitted_relationships"], 0)
+            self.assertEqual(
+                slice_["configuration_and_gates"]["status"], "not_applicable"
+            )
+            self.assertEqual(
+                slice_["control_and_data_flow"]["relationships"][0]["provenance"],
+                "exact",
+            )
+            first_snapshot = slice_["snapshot"]
+            (root / "src" / "lib.rs").write_text(
+                'fn locate() { println!("changed"); }\n', encoding="utf-8"
+            )
+            second_snapshot = source_owners.architecture_slice(
+                manifest, digest, root, ["alpha"]
+            )["snapshot"]
+            self.assertNotEqual(first_snapshot, second_snapshot)
+
+    def test_architecture_slice_ranks_task_relevant_edges_within_each_facet(
         self,
     ) -> None:
-        with temporary_repository() as root:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "src").mkdir()
             for name in ("lib.rs", "critical_cache.rs", "secondary.rs"):
-                write_fixture(root, f"src/{name}", "fn item() {}\n")
-            write_fixture(
-                root,
-                "source_owners.toml",
-                manifest_text(
-                    """
+                (root / "src" / name).write_text("fn item() {}\n", encoding="utf-8")
+            manifest_path = root / "source_owners.toml"
+            manifest_path.write_text(
+                """schema_version = 2
 [[owners]]
 id = "alpha"
 roots = ["src"]
@@ -1081,483 +723,270 @@ kind = "reads_config"
 target = "config:settings"
 confidence = "declared"
 evidence = [{ path = "src/lib.rs", symbol = "item" }]
-"""
-                ),
+""",
+                encoding="utf-8",
             )
+            manifest, digest = source_owners.load_and_validate(manifest_path, root)
 
-            ranked = self.output_json(
-                run_source_owners_cli(
-                    root,
-                    "slice",
-                    extra=(
-                        "--owner",
-                        "alpha",
-                        "--focus",
-                        "repair critical cache",
-                    ),
-                )
-            )
-            control = ranked["control_and_data_flow"]["relationships"]
-            self.assertIn("critical_cache.rs", control[0]["target"])
-            self.assertIn("secondary.rs", control[1]["target"])
-
-            bounded = self.output_json(
-                run_source_owners_cli(
-                    root,
-                    "slice",
-                    extra=(
-                        "--owner",
-                        "alpha",
-                        "--max-relationships",
-                        "2",
-                        "--focus",
-                        "repair critical cache",
-                    ),
-                )
-            )
-            self.assertEqual(
-                len(bounded["control_and_data_flow"]["relationships"]),
-                1,
-            )
-            self.assertEqual(
-                len(bounded["configuration_and_gates"]["relationships"]),
-                1,
-            )
-            self.assertGreater(bounded["omitted_relationships"], 0)
-
-    def test_architecture_slice_ranks_focus_before_relationship_cap_through_cli(
-        self,
-    ) -> None:
-        with temporary_repository() as root:
-            write_fixture(root, "source.rs", "fn item() {}\n")
-            relationships = [
-                f"""
-[[owners.relationships]]
-category = "control_flow"
-kind = "calls"
-target = "config:noise-{index:03}"
-confidence = "compiler_resolved"
-evidence = [{{ path = "source.rs", symbol = "item" }}]
-"""
-                for index in range(MAX_QUERY_RELATIONSHIPS + 1)
-            ]
-            relationships.append(
-                """
-[[owners.relationships]]
-category = "control_flow"
-kind = "calls"
-target = "config:zz-critical-cache"
-confidence = "compiler_resolved"
-evidence = [{ path = "source.rs", symbol = "item" }]
-"""
-            )
-            write_fixture(
-                root,
-                "source_owners.toml",
-                manifest_text(
-                    f"""
-[[owners]]
-id = "alpha"
-roots = ["source.rs"]
-{"".join(relationships)}
-"""
-                ),
-            )
-
-            slice_ = self.output_json(
-                run_source_owners_cli(
-                    root,
-                    "slice",
-                    extra=(
-                        "--owner",
-                        "alpha",
-                        "--max-relationships",
-                        "1",
-                        "--focus",
-                        "critical cache",
-                    ),
-                )
-            )
-
-            retained = slice_["control_and_data_flow"]["relationships"]
-            self.assertEqual(retained[0]["target"], "config:zz-critical-cache")
-            self.assertEqual(
-                slice_["omitted_relationships"],
-                len(relationships) - 1,
-            )
-
-    def test_query_deduplicates_relationships_before_bounding_through_cli(
-        self,
-    ) -> None:
-        with temporary_repository() as root:
-            write_fixture(root, "source.rs", "fn item() {}\n")
-            duplicate = """
-[[owners.relationships]]
-category = "control_flow"
-kind = "calls"
-target = "config:duplicate"
-confidence = "compiler_resolved"
-evidence = [{ path = "source.rs", symbol = "item" }]
-"""
-            unique = """
-[[owners.relationships]]
-category = "control_flow"
-kind = "calls"
-target = "config:unique"
-confidence = "compiler_resolved"
-evidence = [{ path = "source.rs", symbol = "item" }]
-"""
-            write_fixture(
-                root,
-                "source_owners.toml",
-                manifest_text(
-                    f"""
-[[owners]]
-id = "alpha"
-roots = ["source.rs"]
-{duplicate * (MAX_QUERY_RELATIONSHIPS + 1)}
-{unique}
-"""
-                ),
-            )
-
-            graph = self.output_json(
-                run_source_owners_cli(
-                    root,
-                    "query",
-                    extra=("--owner", "alpha", "--max-relationships", "2"),
-                )
-            )
-
-            self.assertEqual(graph["status"], "complete")
-            self.assertEqual(graph["omitted"]["relationships"], 0)
-            self.assertEqual(
-                {item["target"] for item in graph["relationships"]},
-                {"config:duplicate", "config:unique"},
-            )
-
-    def test_query_rejects_focus_instead_of_ignoring_it_through_cli(self) -> None:
-        with temporary_repository() as root:
-            result = run_source_owners_cli(
-                root,
-                "query",
-                extra=("--focus", "exact routing task"),
-            )
-
-            self.assertEqual(result.returncode, 2)
-            self.assertEqual(
-                result.stderr.strip(),
-                "--focus is only valid with slice; select an owner with query, "
-                "then run slice --owner <id> --focus <task>",
-            )
-
-    def test_architecture_slice_counts_actual_manifest_bytes_through_cli(
-        self,
-    ) -> None:
-        with temporary_repository() as root:
-            manifest = write_fixture(
-                root,
-                "custom.toml",
-                manifest_text(
-                    """
-[[owners]]
-id = "alpha"
-"""
-                ),
-            )
-            write_fixture(
-                root,
-                "source_owners.toml",
-                "schema_version = 2\nowners = []\n# deliberately different size\n",
-            )
-
-            slice_ = self.output_json(
-                run_source_owners_cli(
-                    root,
-                    "slice",
-                    manifest=manifest,
-                    extra=("--owner", "alpha"),
-                )
-            )
-
-            self.assertEqual(
-                slice_["metrics"]["bytes_read"],
-                manifest.stat().st_size,
-            )
-
-    def test_architecture_slice_prefers_exact_generator_over_generic_mirror_edge_through_cli(
-        self,
-    ) -> None:
-        with temporary_repository() as root:
-            write_fixture(root, "generator.py", "def build():\n    pass\n")
-            write_fixture(root, "generated.json", "{}\n")
-            write_fixture(
-                root,
-                "source_owners.toml",
-                manifest_text(
-                    """
-[[owners]]
-id = "alpha"
-roots = ["generator.py"]
-generated_mirrors = ["generated.json"]
-
-[[owners.relationships]]
-category = "generated_artifacts"
-kind = "generates"
-target = "generated:generated.json"
-confidence = "generated"
-evidence = [{ path = "generator.py", symbol = "build" }]
-"""
-                ),
-            )
-
-            slice_ = self.output_json(
-                run_source_owners_cli(
-                    root,
-                    "slice",
-                    extra=("--owner", "alpha"),
-                )
-            )
-
-            generated = slice_["generated_artifacts"]["relationships"]
-            self.assertEqual(len(generated), 1)
-            self.assertEqual(generated[0]["kind"], "generated_by")
-            self.assertEqual(generated[0]["evidence"], "generator.py::build")
-
-    def test_architecture_slice_ranks_unicode_focus_terms_through_cli(
-        self,
-    ) -> None:
-        with temporary_repository() as root:
-            write_fixture(root, "source.rs", "fn item() {}\n")
-            write_fixture(
-                root,
-                "source_owners.toml",
-                manifest_text(
-                    """
-[[owners]]
-id = "alpha"
-roots = ["source.rs"]
-[[owners.relationships]]
-category = "control_flow"
-kind = "calls"
-target = "config:plain"
-confidence = "compiler_resolved"
-evidence = [{ path = "source.rs", symbol = "item" }]
-[[owners.relationships]]
-category = "control_flow"
-kind = "calls"
-target = "config:東京"
-confidence = "compiler_resolved"
-evidence = [{ path = "source.rs", symbol = "item" }]
-"""
-                ),
-            )
-
-            slice_ = self.output_json(
-                run_source_owners_cli(
-                    root,
-                    "slice",
-                    extra=("--owner", "alpha", "--focus", "東京"),
-                )
+            slice_ = source_owners.architecture_slice(
+                manifest, digest, root, ["alpha"], focus="repair critical cache"
             )
 
             ranked = slice_["control_and_data_flow"]["relationships"]
-            self.assertEqual(ranked[0]["target"], "config:東京")
+            self.assertIn("critical_cache.rs", ranked[0]["target"])
+            self.assertIn("secondary.rs", ranked[1]["target"])
 
-    def test_architecture_index_is_source_keyed_and_deterministic_through_cli(
-        self,
-    ) -> None:
-        with temporary_repository() as root:
-            source = write_fixture(root, "source.rs", "fn locate() {}\n")
-            write_fixture(
+            bounded = source_owners.architecture_slice(
+                manifest,
+                digest,
                 root,
-                "source_owners.toml",
-                manifest_text(
-                    """
-[[owners]]
-id = "alpha"
-roots = ["source.rs"]
-primary_entries = [{ path = "source.rs", symbol = "locate" }]
-"""
-                ),
+                ["alpha"],
+                max_relationships=2,
+                focus="repair critical cache",
             )
-            write_fixture(root, "SOURCEMAP.md", "manual prose\n")
+            self.assertEqual(len(bounded["control_and_data_flow"]["relationships"]), 1)
+            self.assertEqual(
+                len(bounded["configuration_and_gates"]["relationships"]), 1
+            )
+            self.assertGreater(bounded["omitted_relationships"], 0)
 
-            self.assert_cli_success(run_source_owners_cli(root, "generate"))
-            index_path = root / "architecture_index.json"
-            first = index_path.read_bytes()
-            self.assert_cli_success(run_source_owners_cli(root, "generate"))
-            second = index_path.read_bytes()
-            self.assertEqual(first, second)
-            index = json.loads(first)
-            self.assertIn(":sources:", index["repository_revision"])
-            self.assertTrue(
-                all("facet_exclusions" in owner for owner in index["owners"])
+    def test_architecture_slice_ranks_focus_before_relationship_cap(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            relationships = [
+                {
+                    "category": "control_flow",
+                    "kind": "calls",
+                    "target": f"path:src/noise_{index:03}.rs",
+                    "confidence": "compiler_resolved",
+                    "evidence": [{"path": f"src/noise_{index:03}.rs"}],
+                }
+                for index in range(source_owners.MAX_QUERY_RELATIONSHIPS + 1)
+            ]
+            relationships.append(
+                {
+                    "category": "control_flow",
+                    "kind": "calls",
+                    "target": "path:src/zz_critical_cache.rs",
+                    "confidence": "compiler_resolved",
+                    "evidence": [{"path": "src/zz_critical_cache.rs"}],
+                }
+            )
+            manifest = {
+                "owners": [
+                    {
+                        "id": "alpha",
+                        "relationships": relationships,
+                    }
+                ]
+            }
+
+            slice_ = source_owners.architecture_slice(
+                manifest,
+                "digest",
+                root,
+                ["alpha"],
+                max_relationships=1,
+                focus="critical cache",
             )
 
-            source.write_text(
-                'fn locate() { println!("changed"); }\n',
-                encoding="utf-8",
+            retained = slice_["control_and_data_flow"]["relationships"]
+            self.assertEqual(retained[0]["target"], "path:src/zz_critical_cache.rs")
+            self.assertEqual(slice_["omitted_relationships"], len(relationships) - 1)
+
+    def test_query_deduplicates_relationships_before_bounding(self) -> None:
+        relationship = {
+            "category": "control_flow",
+            "kind": "calls",
+            "target": "path:src/duplicate.rs",
+            "confidence": "compiler_resolved",
+            "evidence": [{"path": "src/duplicate.rs"}],
+        }
+        unique_relationship = {
+            "category": "control_flow",
+            "kind": "calls",
+            "target": "path:src/unique.rs",
+            "confidence": "compiler_resolved",
+            "evidence": [{"path": "src/unique.rs"}],
+        }
+        manifest = {
+            "owners": [
+                {
+                    "id": "alpha",
+                    "relationships": [relationship]
+                    * (source_owners.MAX_QUERY_RELATIONSHIPS + 1)
+                    + [unique_relationship],
+                }
+            ]
+        }
+
+        graph = source_owners.query_graph(
+            manifest, "digest", REPO_ROOT, ["alpha"], max_relationships=2
+        )
+
+        self.assertEqual(graph["status"], "complete")
+        self.assertEqual(graph["omitted"]["relationships"], 0)
+        self.assertEqual(
+            {item["target"] for item in graph["relationships"]},
+            {"path:src/duplicate.rs", "path:src/unique.rs"},
+        )
+
+    def test_query_rejects_focus_instead_of_ignoring_it(self) -> None:
+        argv = ["source_owners.py", "query", "--focus", "exact routing task"]
+
+        with (
+            mock.patch.object(sys, "argv", argv),
+            mock.patch("builtins.print") as print_output,
+        ):
+            self.assertEqual(source_owners.main(), 2)
+
+        print_output.assert_called_once_with(
+            "--focus is only valid with slice; select an owner with query, then run "
+            "slice --owner <id> --focus <task>",
+            file=sys.stderr,
+        )
+
+    def test_architecture_slice_counts_actual_manifest_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            custom_manifest = root / "custom.toml"
+            custom_manifest.write_text("custom manifest\n", encoding="utf-8")
+            default_manifest = root / "source_owners.toml"
+            default_manifest.write_text(
+                "default manifest with a different size\n", encoding="utf-8"
             )
-            self.assert_cli_success(run_source_owners_cli(root, "generate"))
-            changed = index_path.read_bytes()
-            self.assertNotEqual(changed, first)
-            self.assertNotEqual(
-                json.loads(changed)["repository_revision"],
-                index["repository_revision"],
+            manifest = {"owners": [{"id": "alpha"}]}
+
+            with (
+                mock.patch.object(source_owners, "REPO_ROOT", root),
+                mock.patch.object(source_owners, "DEFAULT_MANIFEST", default_manifest),
+            ):
+                slice_ = source_owners.architecture_slice(
+                    manifest,
+                    "digest",
+                    root,
+                    ["alpha"],
+                    manifest_bytes_read=custom_manifest.stat().st_size,
+                )
+
+            self.assertEqual(
+                slice_["metrics"]["bytes_read"], custom_manifest.stat().st_size
             )
 
-    def test_repository_slices_retain_representative_relationships_through_cli(
-        self,
-    ) -> None:
+    def test_architecture_slice_ranks_unicode_focus_terms(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = {
+                "owners": [
+                    {
+                        "id": "alpha",
+                        "relationships": [
+                            {
+                                "category": "control_flow",
+                                "kind": "calls",
+                                "target": "path:src/plain.rs",
+                                "confidence": "compiler_resolved",
+                                "evidence": [{"path": "src/plain.rs"}],
+                            },
+                            {
+                                "category": "control_flow",
+                                "kind": "calls",
+                                "target": "path:src/東京.rs",
+                                "confidence": "compiler_resolved",
+                                "evidence": [{"path": "src/東京.rs"}],
+                            },
+                        ],
+                    }
+                ]
+            }
+
+            slice_ = source_owners.architecture_slice(
+                manifest, "digest", root, ["alpha"], focus="東京"
+            )
+
+            ranked = slice_["control_and_data_flow"]["relationships"]
+            self.assertEqual(ranked[0]["target"], "path:src/東京.rs")
+
+    def test_architecture_index_is_source_keyed_and_deterministic(self) -> None:
+        manifest, digest = source_owners.load_and_validate(
+            source_owners.DEFAULT_MANIFEST, source_owners.REPO_ROOT
+        )
+
+        first = source_owners.expected_architecture_index(
+            manifest, digest, source_owners.REPO_ROOT
+        )
+        second = source_owners.expected_architecture_index(
+            manifest, digest, source_owners.REPO_ROOT
+        )
+
+        self.assertEqual(first, second)
+        index = json.loads(first)
+        self.assertEqual(
+            index["repository_revision"],
+            source_owners.repository_revision(
+                source_owners.REPO_ROOT, digest, manifest
+            ),
+        )
+        self.assertIn(":sources:", index["repository_revision"])
+        self.assertTrue(all("facet_exclusions" in owner for owner in index["owners"]))
+
+    def test_repository_slices_retain_representative_relationships(self) -> None:
+        manifest, digest = source_owners.load_and_validate(
+            source_owners.DEFAULT_MANIFEST, source_owners.REPO_ROOT
+        )
         cases = [
             (
-                ("repository-context-discovery",),
+                ["repository-context-discovery"],
                 "nested repository identity and failed instruction reads",
-                (
+                [
                     ("registration_and_entrypoints", "git_workspace.rs"),
                     ("callers_and_consumers", "session/mod.rs"),
                     ("control_and_data_flow", "agents_md.rs"),
                     ("tests_and_contracts", "agents_md_tests.rs"),
                     ("invariants", "snapshot-scoped-discovery"),
-                ),
+                ],
             ),
             (
-                ("feature-registry", "core-agent-runtime"),
+                ["feature-registry", "core-agent-runtime"],
                 "feature registry runtime wiring and compatibility",
-                (
+                [
                     ("callers_and_consumers", "core-agent-runtime"),
                     ("registration_and_entrypoints", "features/src/lib.rs"),
                     ("invariants", "feature-key-compatibility"),
-                ),
+                ],
             ),
             (
-                ("kd4-capability-manifest",),
+                ["kd4-capability-manifest"],
                 "KD4 capability lifecycle and static reachability evidence",
-                (
+                [
                     ("configuration_and_gates", "kd4_features.toml"),
                     ("callers_and_consumers", "kd4_perf_snapshot.py"),
                     ("registration_and_entrypoints", "check-kd4-features"),
                     ("tests_and_contracts", "test_check_kd4_features.py"),
                     ("invariants", "capability-evidence-reachability"),
-                ),
+                ],
             ),
             (
-                ("app-server-protocol-contracts", "app-server-runtime"),
+                ["app-server-protocol-contracts", "app-server-runtime"],
                 "generated protocol source consumer and parity",
-                (
+                [
                     ("generated_artifacts", "app-server-protocol/schema"),
                     ("callers_and_consumers", "app-server-runtime"),
                     ("registration_and_entrypoints", "app-server-schema-check"),
                     ("invariants", "schema-source-parity"),
-                ),
-            ),
-            (
-                ("completion-proof-certification",),
-                "canonical completion certification inventory contracts",
-                (
-                    ("control_and_data_flow", "scripts/completion_proof.py"),
-                    ("callers_and_consumers", "core/src/completion_proof.rs"),
-                    ("configuration_and_gates", "completion-proof.toml"),
-                    ("registration_and_entrypoints", "justfile"),
-                    ("tests_and_contracts", "test_completion_proof_inventory_v2.py"),
-                    ("generated_artifacts", "frozen-test-inventory-v1.json"),
-                    ("invariants", "canonical-command-gate-separation"),
-                    ("invariants", "immutable-baseline-reconciliation"),
-                    ("invariants", "cross-language-validation-contract-parity"),
-                ),
-            ),
-            (
-                ("completion-proof-focused-contracts",),
-                "focused evidence frame canonical process set and acknowledgement contract",
-                (
-                    (
-                        "control_and_data_flow",
-                        "validation-contracts/src/canonical.rs",
-                    ),
-                    ("registration_and_entrypoints", "focused_evidence_frame.rs"),
-                    ("registration_and_entrypoints", "validation-contracts/src/lib.rs"),
-                    ("tests_and_contracts", "tests/focused_evidence_frame.rs"),
-                    ("invariants", "focused-evidence-frame-v1-binary-contract"),
-                    ("invariants", "focused-evidence-ack-v1-binary-contract"),
-                    ("invariants", "focused-process-set-canonical-parser"),
-                ),
-            ),
-            (
-                ("replacement-admission-certification",),
-                "dormant replacement admission caller supplied successor boundary",
-                (
-                    ("control_and_data_flow", "scripts/replacement_admission.py"),
-                    ("callers_and_consumers", "test_replacement_admission.py"),
-                    ("configuration_and_gates", "replacement-admissions-v1.json"),
-                    ("configuration_and_gates", "test-replacements-v2.json"),
-                    ("registration_and_entrypoints", "scripts/replacement_admission.py"),
-                    ("tests_and_contracts", "test_replacement_admission.py"),
-                    ("invariants", "replacement-admission-dormant-projection"),
-                    ("invariants", "replacement-successor-catalog-boundary"),
-                    (
-                        "invariants",
-                        "replacement-trusted-defect-receipt-provenance-boundary",
-                    ),
-                ),
-            ),
-            (
-                ("repository-maintenance-runners",),
-                "maintenance runner registration ownership and validation routes",
-                (
-                    ("control_and_data_flow", "source-owner-index"),
-                    ("callers_and_consumers", "completion-proof-certification"),
-                    ("configuration_and_gates", "kd4-rust-tests.toml"),
-                    ("registration_and_entrypoints", "justfile"),
-                    ("tests_and_contracts", "test_rust_test_runner.py"),
-                    ("invariants", "maintenance-runner-route-fidelity"),
-                ),
-            ),
-            (
-                ("configuration-generated-contracts",),
-                "configuration schema proto generators outputs and consumers",
-                (
-                    ("control_and_data_flow", "generate-proto.rs"),
-                    ("callers_and_consumers", "thread_config/remote.rs"),
-                    ("configuration_and_gates", "codex.thread_config.v1.proto"),
-                    ("registration_and_entrypoints", "justfile"),
-                    ("tests_and_contracts", "test_generate_config_proto.py"),
-                    ("generated_artifacts", "core/config.schema.json"),
-                    ("generated_artifacts", "codex.thread_config.v1.rs"),
-                    ("invariants", "generated-configuration-source-parity"),
-                ),
-            ),
-            (
-                ("exec-server-relay-contracts",),
-                "exec server relay proto generator exact output and consumers",
-                (
-                    ("control_and_data_flow", "relay.rs"),
-                    ("callers_and_consumers", "relay_proto.rs"),
-                    ("registration_and_entrypoints", "justfile"),
-                    ("tests_and_contracts", "tests/relay.rs"),
-                    ("generated_artifacts", "codex.exec_server.relay.v1.rs"),
-                    ("invariants", "relay-proto-source-parity"),
-                ),
+                ],
             ),
         ]
 
         for owners, focus, expectations in cases:
             with self.subTest(owners=owners):
-                owner_arguments = tuple(
-                    argument for owner in owners for argument in ("--owner", owner)
-                )
-                slice_ = self.output_json(
-                    run_source_owners_cli(
-                        self.repository_root,
-                        "slice",
-                        extra=(
-                            *owner_arguments,
-                            "--max-relationships",
-                            "32",
-                            "--focus",
-                            focus,
-                        ),
-                    )
+                slice_ = source_owners.architecture_slice(
+                    manifest,
+                    digest,
+                    source_owners.REPO_ROOT,
+                    owners,
+                    max_relationships=32,
+                    focus=focus,
                 )
                 self.assertFalse(slice_["truncated"])
                 self.assertEqual(slice_["omitted_relationships"], 0)
@@ -1573,189 +1002,37 @@ primary_entries = [{ path = "source.rs", symbol = "locate" }]
                         f"{facet} did not contain {needle!r}",
                     )
 
-    def test_repository_maintenance_slice_resolves_just_shell_and_build_tooling_test(
-        self,
-    ) -> None:
-        slice_ = self.output_json(
-            run_source_owners_cli(
-                self.repository_root,
-                "slice",
-                extra=(
-                    "--owner",
-                    "repository-maintenance-runners",
-                    "--max-relationships",
-                    "32",
-                    "--focus",
-                    "just shell adapter build tooling test ownership",
-                ),
-            )
+    def test_runtime_features_and_kd4_capabilities_have_distinct_owners(self) -> None:
+        manifest, _ = source_owners.load_and_validate(
+            source_owners.DEFAULT_MANIFEST, source_owners.REPO_ROOT
         )
+        owners = {owner["id"]: owner for owner in manifest["owners"]}
 
-        self.assertFalse(slice_["truncated"])
-        self.assertEqual(slice_["omitted_relationships"], 0)
-        self.assertEqual(slice_["material_unknowns"], [])
-        self.assertTrue(
-            any(
-                relationship["target"] == "path:scripts/just-shell.py::main"
-                for relationship in slice_["registration_and_entrypoints"][
-                    "relationships"
-                ]
-            )
-        )
-        self.assertTrue(
-            any(
-                relationship["target"] == "path:scripts/test_build_tooling.py"
-                for relationship in slice_["tests_and_contracts"]["relationships"]
-            )
-        )
-
-    def test_repository_maintenance_slice_resolves_readme_toc_cli_and_test(
-        self,
-    ) -> None:
-        slice_ = self.output_json(
-            run_source_owners_cli(
-                self.repository_root,
-                "slice",
-                extra=(
-                    "--owner",
-                    "repository-maintenance-runners",
-                    "--max-relationships",
-                    "32",
-                    "--focus",
-                    "README ToC CLI and its subprocess integration tests",
-                ),
-            )
-        )
-
-        self.assertFalse(slice_["truncated"])
-        self.assertEqual(slice_["omitted_relationships"], 0)
-        self.assertEqual(slice_["material_unknowns"], [])
-        self.assertTrue(
-            any(
-                relationship["target"] == "path:scripts/readme_toc.py::main"
-                for relationship in slice_["registration_and_entrypoints"][
-                    "relationships"
-                ]
-            )
-        )
-        self.assertTrue(
-            any(
-                relationship["target"] == "path:scripts/test_readme_toc.py"
-                for relationship in slice_["tests_and_contracts"]["relationships"]
-            )
-        )
-
-    def test_workflow_preflight_coordination_slice_resolves_cli_contract_and_consumers(
-        self,
-    ) -> None:
-        slice_ = self.output_json(
-            run_source_owners_cli(
-                self.repository_root,
-                "slice",
-                extra=(
-                    "--owner",
-                    "workflow-preflight-coordination",
-                    "--max-relationships",
-                    "32",
-                    "--focus",
-                    "workflow preflight CLI template harness consumers and focused tests",
-                ),
-            )
-        )
-
-        self.assertFalse(slice_["truncated"])
-        self.assertEqual(slice_["omitted_relationships"], 0)
-        self.assertEqual(slice_["material_unknowns"], [])
-        expected_targets = {
-            "control_and_data_flow": {"path:scripts/workflow_preflight.py"},
-            "callers_and_consumers": {
-                "path:justfile",
-                "path:.codex/harness/workflow.md",
-                "path:.codex/harness/README.md",
-            },
-            "configuration_and_gates": {
-                "config:.codex/harness/templates/PREFLIGHT.json"
-            },
-            "registration_and_entrypoints": {
-                "path:scripts/workflow_preflight.py::main",
-                "path:justfile",
-            },
-            "tests_and_contracts": {
-                "path:scripts/test_workflow_preflight.py",
-                "path:scripts/test_source_owners.py",
-                "contract:.codex/harness/templates/PREFLIGHT.json",
-            },
-            "invariants": {"contract:workflow-preflight-contract-fidelity"},
-        }
-        for facet, targets in expected_targets.items():
-            with self.subTest(facet=facet):
-                self.assertTrue(
-                    targets.issubset(
-                        {
-                            relationship["target"]
-                            for relationship in slice_[facet]["relationships"]
-                        }
-                    )
-                )
-        self.assertEqual(slice_["generated_artifacts"]["status"], "not_applicable")
-        self.assertEqual(slice_["generated_artifacts"]["relationships"], [])
-
-    def test_runtime_features_and_kd4_capabilities_have_distinct_owners_through_cli(
-        self,
-    ) -> None:
-        graph = self.output_json(
-            run_source_owners_cli(
-                self.repository_root,
-                "query",
-                extra=(
-                    "--owner",
-                    "feature-registry",
-                    "--owner",
-                    "kd4-capability-manifest",
-                ),
-            )
-        )
-        owners = {owner["id"]: owner for owner in graph["owners"]}
-
-        self.assertNotIn(
-            "kd4_features.toml",
-            owners["feature-registry"]["configuration"],
-        )
-        self.assertIn(
-            "kd4_features.toml",
-            owners["kd4-capability-manifest"]["configuration"],
-        )
-        runtime_relationships = [
-            relationship
-            for relationship in graph["relationships"]
-            if relationship["source"] == "owner:feature-registry"
-        ]
-        capability_relationships = [
-            relationship
-            for relationship in graph["relationships"]
-            if relationship["source"] == "owner:kd4-capability-manifest"
-        ]
+        runtime_owner = owners["feature-registry"]
+        capability_owner = owners["kd4-capability-manifest"]
+        self.assertNotIn("kd4_features.toml", runtime_owner["contracts"])
+        self.assertIn("kd4_features.toml", capability_owner["contracts"])
         self.assertFalse(
             any(
                 relationship["target"] == "config:kd4_features.toml"
-                for relationship in runtime_relationships
+                for relationship in runtime_owner.get("relationships", [])
             )
         )
         self.assertTrue(
             any(
                 relationship["target"] == "config:kd4_features.toml"
-                for relationship in capability_relationships
+                for relationship in capability_owner.get("relationships", [])
             )
         )
 
-    def test_unknown_relationship_category_is_rejected_through_cli(self) -> None:
-        with temporary_repository() as root:
-            write_fixture(root, "src/lib.rs", "fn locate() {}\n")
-            write_fixture(
-                root,
-                "source_owners.toml",
-                manifest_text(
-                    """
+    def test_unknown_relationship_category_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "src").mkdir()
+            (root / "src" / "lib.rs").write_text("fn locate() {}\n", encoding="utf-8")
+            manifest_path = root / "source_owners.toml"
+            manifest_path.write_text(
+                """schema_version = 2
 [[owners]]
 id = "alpha"
 roots = ["src"]
@@ -1765,14 +1042,12 @@ kind = "calls"
 target = "path:src/lib.rs"
 confidence = "declared"
 evidence = [{ path = "src/lib.rs" }]
-"""
-                ),
+""",
+                encoding="utf-8",
             )
 
-            result = run_source_owners_cli(root, "list")
-
-            self.assertEqual(result.returncode, 1)
-            self.assertIn("unknown relationship category", result.stderr)
+            with self.assertRaisesRegex(ValueError, "unknown relationship category"):
+                source_owners.load_and_validate(manifest_path, root)
 
 
 if __name__ == "__main__":

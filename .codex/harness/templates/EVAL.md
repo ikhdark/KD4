@@ -1,51 +1,20 @@
 # Eval
 
-## Metadata
+## Outcome
 
-- Eval id:
-- Task:
-- Owner:
-- Type: capability | regression | release-critical | manual-review
-- Baseline:
-- Date:
+<behavior to prove and baseline to compare, if relevant>
 
-## Success Criteria
+## Checks
 
-- [ ] <criterion>
+Prefer repeatable tests. Use manual or model judgment when the result cannot be
+checked deterministically, and explain the criteria used.
 
-## Grader
+| Capability or regression | Command or method | Expected            | Result                |
+| ------------------------ | ----------------- | ------------------- | --------------------- |
+| <behavior>               | <check>           | <success criterion> | <pending or evidence> |
 
-Choose the strongest practical grader:
+## Result
 
-- Command grader: deterministic command or test.
-- Rule grader: regex, schema, or file-structure assertion.
-- Manual grader: human judgment for ambiguous UX, security, or product calls.
-- Model grader: only for open-ended outputs where deterministic checks are not
-  enough.
-
-## Capability Checks
-
-| Check | Method | Expected | Result |
-| --- | --- | --- | --- |
-| <check> | <command/rule/manual/model> | <expected> | <pending> |
-
-## Regression Checks
-
-| Check | Baseline | Result |
-| --- | --- | --- |
-| <check> | <baseline> | <pending> |
-
-## Run Log
-
-| Attempt | Revision or fingerprint | Evidence | Provenance | Covered contract | Result |
-| --- | --- | --- | --- | --- | --- |
-| 1 | <revision> | <command or artifact> | <provenance kind> | <exact scope> | <pending> |
-
-## Summary
-
-- Required checks passed:
-- Required checks failed:
-- Skipped checks and reasons:
-- Repeated-trial result (only when identical independent trials were run):
-- Status: ready | needs-work | blocked
-- Remaining risk:
+- Tested revision or relevant workspace state:
+- Failed or skipped checks and reasons:
+- Remaining uncertainty or next action:

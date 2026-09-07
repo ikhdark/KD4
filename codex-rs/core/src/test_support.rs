@@ -4,7 +4,6 @@
 //! We prefer this to using a crate feature to avoid building multiple
 //! permutations of the crate.
 
-use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::LazyLock;
@@ -24,8 +23,6 @@ use codex_extension_api::LoadedUserInstructions;
 use codex_extension_api::UserInstructionsProvider;
 use codex_http_client::HttpClientFactory;
 use codex_http_client::OutboundProxyPolicy;
-use codex_keyring_store::DefaultKeyringStore;
-use codex_keyring_store::KeyringStore;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_model_provider::create_model_provider;
@@ -49,93 +46,6 @@ static TEST_MODEL_PRESETS: LazyLock<Vec<ModelPreset>> = LazyLock::new(|| {
     ModelPreset::mark_default_by_picker_visibility(&mut presets);
     presets
 });
-
-/// Opaque snapshot of the exact physical credential used by the production trust store.
-///
-/// The snapshot intentionally exposes neither the derived credential identity nor its value. It
-/// exists only so real-process tests can prove exact before/after equality without enumerating or
-/// deleting credentials.
-#[derive(Clone, Eq, PartialEq)]
-pub struct CompletionProofPhysicalCredentialSnapshot {
-    credential: Option<String>,
-}
-
-impl std::fmt::Debug for CompletionProofPhysicalCredentialSnapshot {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("CompletionProofPhysicalCredentialSnapshot(<redacted>)")
-    }
-}
-
-pub fn completion_proof_physical_credential_snapshot(
-    codex_home: &Path,
-    cwd: &Path,
-) -> Result<CompletionProofPhysicalCredentialSnapshot, String> {
-    let (service, account) =
-        crate::completion_proof::completion_proof_trust_anchor_identity_for_tests(codex_home, cwd);
-    DefaultKeyringStore
-        .load(service, &account)
-        .map(|credential| CompletionProofPhysicalCredentialSnapshot { credential })
-        .map_err(|error| error.to_string())
-}
-
-pub fn completion_proof_state_lock_path(codex_home: &Path, cwd: &Path) -> PathBuf {
-    crate::completion_proof::completion_proof_state_lock_path_for_tests(codex_home, cwd)
-}
-
-/// Owns only the new physical credential of a disposable test home/repository.
-/// Keep this guard until every fixture session (including resumed sessions) ends.
-/// Existing credentials and credentials outside direct temporary fixtures are
-/// never owned. This leaves the real secure-storage path in use during the test.
-pub struct TemporaryCompletionProofCredential {
-    #[cfg(windows)]
-    account: Option<String>,
-}
-
-pub fn temporary_completion_proof_credential(
-    codex_home: &Path,
-    cwd: &Path,
-) -> Result<TemporaryCompletionProofCredential, String> {
-    #[cfg(windows)]
-    {
-        let temporary = dunce::canonicalize(std::env::temp_dir()).map_err(|e| e.to_string())?;
-        for path in [codex_home, cwd] {
-            let path = dunce::canonicalize(path).map_err(|e| e.to_string())?;
-            if path.parent() != Some(temporary.as_path())
-                || !path
-                    .file_name()
-                    .is_some_and(|name| name.to_string_lossy().starts_with(".tmp"))
-            {
-                return Err("credential cleanup requires disposable temporary fixtures".to_string());
-            }
-        }
-        let (service, account) =
-            crate::completion_proof::completion_proof_trust_anchor_identity_for_tests(
-                codex_home, cwd,
-            );
-        let existing = DefaultKeyringStore
-            .load(service, &account)
-            .map_err(|e| e.to_string())?;
-        return Ok(TemporaryCompletionProofCredential {
-            account: existing.is_none().then_some(account),
-        });
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = (codex_home, cwd);
-        Ok(TemporaryCompletionProofCredential {})
-    }
-}
-
-impl Drop for TemporaryCompletionProofCredential {
-    fn drop(&mut self) {
-        #[cfg(windows)]
-        if let Some(account) = &self.account
-            && let Err(error) = DefaultKeyringStore.delete("Codex Completion Proof", account)
-        {
-            tracing::warn!(%error, "could not release the completed temporary fixture credential");
-        }
-    }
-}
 
 /// Test-only provider that supplies no user instructions.
 #[derive(Debug, Default)]

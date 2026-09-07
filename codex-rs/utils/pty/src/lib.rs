@@ -5,7 +5,6 @@ pub mod process_group;
 pub mod pty;
 #[cfg(all(test, windows))]
 mod tests;
-mod windows_child_creation;
 
 #[cfg(windows)]
 mod win;
@@ -23,13 +22,6 @@ pub use managed_process::ManagedRootReclaimHook;
 pub use managed_process::WINDOWS_CREATE_SUSPENDED;
 #[cfg(windows)]
 pub use managed_process::WINDOWS_PROCESS_OPERATION_TIMEOUT;
-#[cfg(windows)]
-pub use managed_process::WindowsJobControl;
-#[cfg(windows)]
-pub use managed_process::WindowsManagedChild;
-#[cfg(windows)]
-#[doc(hidden)]
-pub use managed_process::WindowsSuspendedSpawnFault;
 pub use managed_process::install_managed_root_admission_reclaimer;
 #[cfg(windows)]
 pub use managed_process::run_windows_process_operation;
@@ -60,8 +52,6 @@ pub type SpawnedPty = SpawnedProcess;
 pub use pty::conpty_supported;
 /// Spawn a process attached to a PTY for interactive use.
 pub use pty::spawn_process as spawn_pty_process;
-pub use windows_child_creation::WindowsChildCreationScope;
-pub use windows_child_creation::with_windows_child_creation;
 
 #[cfg(windows)]
 pub use win::JobObject;

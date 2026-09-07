@@ -1,44 +1,23 @@
 # Handoff
 
-Use this before compaction, task switching, or stopping in the middle of a
-multi-step harnessed task.
+Use only when existing notes are insufficient to resume the task.
 
-## Objective
+## Objective and Current State
 
-<what the user wanted>
+<what the user wants, what is complete, and relevant changed files; link the plan>
 
-## Current State
+## Decisions and Failed Approaches
 
-<what changed or what was learned>
+- <what the next person needs to know, and why>
 
-## Evidence
+## Validation
 
-| Claim | Provenance | Source | Freshness | Covered Contract | Status |
-| --- | --- | --- | --- | --- | --- |
-| <claim> | <provenance kind> | <command, file, or observation> | <revision, timestamp, or dependency> | <exact scope> | <current or stale> |
+- <command and result, or link to existing evidence; note anything now outdated>
 
-## Failed Or Rejected Approaches
+## Remaining Work
 
-- <approach> failed or was rejected because <reason>
-
-## Decisions
-
-- <decision> because <reason>
-
-## Touched Files
-
-| File | State | Notes |
-| --- | --- | --- |
-| <path> | complete | <notes> |
+- <unfinished work, blocker, or unresolved question>
 
 ## Next Step
 
-<one concrete next action>
-
-## Open Questions
-
-- <question>
-
-## Material Unknowns
-
-- <unknown that must not be treated as an assumption>
+<one concrete action>

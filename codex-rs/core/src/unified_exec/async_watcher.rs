@@ -16,7 +16,6 @@ pub(super) use super::head_tail_buffer::omitted_output_marker;
 use super::process::ProcessOutputChunk;
 use super::process::ProcessOutputSnapshot;
 use super::process::UnifiedExecProcess;
-use crate::completion_proof::UnifiedExecCompletionProof;
 use crate::exec::EXEC_OUTPUT_DELTA_CAP_NOTICE;
 use crate::exec::OutputDeltaDecision;
 use crate::exec::OutputDeltaLimiter;
@@ -306,7 +305,6 @@ async fn emit_process_terminal_event(
     duration: Duration,
     source: &ToolCallSource,
     tracker: Option<&SharedTurnDiffTracker>,
-    suppress_post_proof_mutation_observation: bool,
 ) {
     let process_output = Some(process.snapshot_completion_output().await);
     if let Some(message) = failure_message {
@@ -326,7 +324,6 @@ async fn emit_process_terminal_event(
             duration,
             source.clone(),
             tracker.cloned(),
-            suppress_post_proof_mutation_observation,
         )
         .await;
     } else {
@@ -346,7 +343,6 @@ async fn emit_process_terminal_event(
             duration,
             source.clone(),
             tracker.cloned(),
-            suppress_post_proof_mutation_observation,
         )
         .await;
     }
@@ -379,15 +375,10 @@ pub(crate) fn spawn_exit_watcher(
     known_delta: Option<PreparedKnownDelta>,
     known_delta_executor_started_at: Option<Instant>,
     tool_dispatch_timing: Option<Arc<ToolDispatchTiming>>,
-    workspace_operation: Option<crate::workspace_operation_gate::WorkspaceOperationLease>,
-    completion_proof: Option<UnifiedExecCompletionProof>,
 ) {
     let exit_token = process.cancellation_token();
     let output_drained = process.output_drained_token();
     tokio::spawn(async move {
-        let canonical_completion_proof = completion_proof
-            .as_ref()
-            .is_some_and(UnifiedExecCompletionProof::is_canonical);
         turn_ref.turn_timing_state.record_next_sample_block_reason(
             codex_protocol::protocol::NextSampleBlockReason::WaitingForProcessCleanup,
         );
@@ -482,7 +473,6 @@ pub(crate) fn spawn_exit_watcher(
                 duration,
                 &source,
                 tracker.as_ref(),
-                canonical_completion_proof,
             )
             .await;
             delivered_at = Some(Instant::now());
@@ -558,25 +548,10 @@ pub(crate) fn spawn_exit_watcher(
                 duration,
                 &source,
                 tracker.as_ref(),
-                canonical_completion_proof,
             )
             .await;
             delivered_at = Some(Instant::now());
         }
-        if let Some(tracker) = tracker.as_ref() {
-            let observed_mutation_revision = tracker.lock().await.current_mutation_revision();
-            session_ref
-                .services
-                .command_execution
-                .observe_repository_revision(&turn_ref.sub_id, observed_mutation_revision)
-                .await;
-        }
-        if let Some(completion_proof) = completion_proof.as_ref() {
-            completion_proof.finish_as_watcher(Some(exit_code)).await;
-        }
-        // Keep the workspace lease through terminal output/report finalization,
-        // repository observation, and proof resolution.
-        drop(workspace_operation);
         let finalization = session_ref
             .services
             .command_execution
@@ -593,6 +568,15 @@ pub(crate) fn spawn_exit_watcher(
                 process_id,
                 "completed command bookkeeping was already released after delivery"
             );
+        }
+
+        if let Some(tracker) = tracker.as_ref() {
+            let observed_mutation_revision = tracker.lock().await.current_mutation_revision();
+            session_ref
+                .services
+                .command_execution
+                .observe_repository_revision(&turn_ref.sub_id, observed_mutation_revision)
+                .await;
         }
         let delivered_at = delivered_at.unwrap_or_else(Instant::now);
         let lifecycle = tool_dispatch_timing
@@ -888,7 +872,6 @@ pub(crate) async fn emit_exec_end_for_unified_exec(
     duration: Duration,
     source: ToolCallSource,
     tracker: Option<SharedTurnDiffTracker>,
-    suppress_post_proof_mutation_observation: bool,
 ) {
     let (aggregated_output, stdout, stderr) = if let Some(output) = process_output {
         (
@@ -908,16 +891,13 @@ pub(crate) async fn emit_exec_end_for_unified_exec(
         duration,
         timed_out,
     };
-    let mut event_ctx = ToolEventCtx::new(
+    let event_ctx = ToolEventCtx::new(
         session_ref.as_ref(),
         turn_ref.as_ref(),
         &call_id,
         tracker.as_ref(),
     )
     .with_call_source(&source);
-    if suppress_post_proof_mutation_observation {
-        event_ctx = event_ctx.without_post_proof_mutation_observation();
-    }
     let emitter = ToolEmitter::unified_exec(
         &command,
         cwd,
@@ -954,7 +934,6 @@ pub(crate) async fn emit_failed_exec_end_for_unified_exec(
     duration: Duration,
     source: ToolCallSource,
     tracker: Option<SharedTurnDiffTracker>,
-    suppress_post_proof_mutation_observation: bool,
 ) {
     let (stdout, process_stderr, process_aggregated_output) = if let Some(output) = process_output {
         (
@@ -988,16 +967,13 @@ pub(crate) async fn emit_failed_exec_end_for_unified_exec(
         duration,
         timed_out,
     };
-    let mut event_ctx = ToolEventCtx::new(
+    let event_ctx = ToolEventCtx::new(
         session_ref.as_ref(),
         turn_ref.as_ref(),
         &call_id,
         tracker.as_ref(),
     )
     .with_call_source(&source);
-    if suppress_post_proof_mutation_observation {
-        event_ctx = event_ctx.without_post_proof_mutation_observation();
-    }
     let emitter = ToolEmitter::unified_exec(
         &command,
         cwd,

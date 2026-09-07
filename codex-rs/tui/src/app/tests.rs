@@ -34,9 +34,6 @@ use crate::legacy_core::config::ConfigBuilder;
 use crate::legacy_core::config::ConfigOverrides;
 use crate::legacy_core::config::PermissionProfileSnapshot;
 use crate::legacy_core::config::TerminalResizeReflowMaxRows;
-use app_test_support::BlockedCompletionProofFixture;
-use app_test_support::create_mock_responses_server_repeating_assistant;
-use app_test_support::write_mock_responses_config_toml;
 use codex_app_server_client::AppServerPath;
 use codex_app_server_protocol::AdditionalFileSystemPermissions;
 use codex_app_server_protocol::AdditionalNetworkPermissions;
@@ -5798,126 +5795,6 @@ async fn shutdown_first_exit_uses_app_server_shutdown_without_submitting_op() {
         op_rx.try_recv().is_err(),
         "shutdown should not submit Op::Shutdown"
     );
-}
-
-#[tokio::test]
-async fn completion_proof_block_reaches_real_tui_session_and_hides_success() -> Result<()> {
-    Box::pin(async {
-        let fixture =
-            BlockedCompletionProofFixture::new().map_err(|err| color_eyre::eyre::eyre!("{err}"))?;
-        let server = create_mock_responses_server_repeating_assistant("premature success").await;
-        let codex_home = tempdir()?;
-        write_mock_responses_config_toml(
-            codex_home.path(),
-            &server.uri(),
-            &BTreeMap::new(),
-            /*auto_compact_limit*/ 100_000,
-            /*requires_openai_auth*/ None,
-            "mock_provider",
-            "compact",
-        )?;
-
-        let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
-        let mut config = ConfigBuilder::default()
-            .codex_home(codex_home.path().to_path_buf())
-            .loader_overrides(LoaderOverrides::without_managed_config_for_tests())
-            .harness_overrides(ConfigOverrides {
-                cwd: Some(fixture.repo_path().to_path_buf()),
-                ..ConfigOverrides::default()
-            })
-            .build()
-            .await?;
-        config.sqlite_home = codex_home.path().join("sqlite");
-        app.config = config;
-
-        let mut app_server =
-            Box::pin(crate::start_embedded_app_server_for_picker(&app.config)).await?;
-        let started = app_server.start_thread(&app.config).await?;
-        let thread_id = started.session.thread_id;
-        app.enqueue_primary_thread_session(started.session, started.turns)
-            .await?;
-        while app_event_rx.try_recv().is_ok() {}
-
-        let op = app
-            .chat_widget
-            .submit_user_message_as_plain_user_turn(crate::chatwidget::UserMessage::from(
-                "finish without running certification",
-            ))
-            .expect("configured thread should submit a user turn");
-        let handled = app
-            .try_submit_active_thread_op_via_app_server(&mut app_server, thread_id, &op)
-            .await?;
-        assert!(
-            handled,
-            "TUI should submit the user turn through app-server"
-        );
-
-        time::timeout(Duration::from_secs(120), async {
-            loop {
-                let event = app_server
-                    .next_event()
-                    .await
-                    .expect("embedded app-server event stream ended before turn completion");
-                app.handle_app_server_event(&app_server, event).await;
-
-                let mut thread_events = Vec::new();
-                let active_thread_rx = app
-                    .active_thread_rx
-                    .as_mut()
-                    .expect("primary thread receiver should remain active");
-                while let Ok(event) = active_thread_rx.try_recv() {
-                    thread_events.push(event);
-                }
-                let blocked_turn_completed = thread_events.iter().any(|event| {
-                    matches!(
-                        event,
-                        ThreadBufferedEvent::Notification(
-                            ServerNotification::TurnCompleted(notification)
-                        ) if notification.turn.status == TurnStatus::Failed
-                    )
-                });
-                for event in thread_events {
-                    app.handle_thread_event_now(event);
-                }
-                if blocked_turn_completed {
-                    break;
-                }
-            }
-        })
-        .await
-        .expect("timed out waiting for completion-proof failure in TUI");
-        app_server.shutdown().await?;
-
-        let mut rendered_history = Vec::new();
-        while let Ok(event) = app_event_rx.try_recv() {
-            if let AppEvent::InsertHistoryCell(cell) = event {
-                rendered_history.push(lines_to_single_string(&cell.display_lines(/*width*/ 120)));
-            }
-        }
-        if let Some(lines) = app.chat_widget.active_cell_transcript_lines(/*width*/ 120) {
-            rendered_history.push(lines_to_single_string(&lines));
-        }
-        let rendered_history = rendered_history.join("\n");
-        assert!(
-            !rendered_history.contains("premature success"),
-            "TUI exposed the buffered assistant success: {rendered_history:?}"
-        );
-        assert!(
-            rendered_history.contains("CompletionProofGate blocked terminal success"),
-            "TUI did not render the completion-proof failure: {rendered_history:?}"
-        );
-        assert!(
-            !app.chat_widget.is_task_running_for_test(),
-            "TUI did not finalize the blocked turn"
-        );
-        assert!(
-            !fixture.canonical_runner_launched(),
-            "TUI must not launch canonical certification"
-        );
-
-        Ok(())
-    })
-    .await
 }
 
 #[tokio::test]

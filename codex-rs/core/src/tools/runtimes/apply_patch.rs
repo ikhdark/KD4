@@ -61,8 +61,6 @@ pub struct ApplyPatchRequest {
     pub exec_approval_requirement: ExecApprovalRequirement,
     pub additional_permissions: Option<AdditionalPermissionProfile>,
     pub permissions_preapproved: bool,
-    pub(crate) workspace_operation:
-        Option<crate::workspace_operation_gate::WorkspaceOperationLease>,
 }
 
 #[derive(Default)]
@@ -431,9 +429,15 @@ impl ToolRuntime<ApplyPatchRequest, ApplyPatchRuntimeOutput> for ApplyPatchRunti
         let sandbox = Self::file_system_sandbox_context_for_attempt(req, attempt);
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        if let Some(workspace_operation) = req.workspace_operation.as_ref() {
-            workspace_operation.acquire().await;
-        }
+        let _workspace_operation_permit = if let Ok(native_cwd) = req.action.cwd.to_abs_path() {
+            let workspace_root =
+                get_git_repo_root(&native_cwd).unwrap_or_else(|| native_cwd.to_path_buf());
+            Some(
+                crate::workspace_operation_gate::acquire_workspace_operation(&workspace_root).await,
+            )
+        } else {
+            None
+        };
         let result = codex_apply_patch::apply_patch(
             &req.action.patch,
             &req.action.cwd,

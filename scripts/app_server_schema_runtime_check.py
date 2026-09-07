@@ -187,28 +187,9 @@ def stable_schema_compatibility_issues(
                 issues.append(f"{child_path}:removed")
                 continue
             current_value = current[key]
-            if key in {"required", "enum"}:
+            if key in {"required", "enum", "oneOf", "anyOf", "allOf"}:
                 if _canonical_json(baseline_value) != _canonical_json(current_value):
                     issues.append(f"{child_path}:changed")
-                continue
-            if (
-                key in {"oneOf", "anyOf", "allOf"}
-                and isinstance(baseline_value, list)
-                and isinstance(current_value, list)
-            ):
-                if len(baseline_value) != len(current_value):
-                    issues.append(f"{child_path}:changed")
-                    continue
-                for index, (baseline_branch, current_branch) in enumerate(
-                    zip(baseline_value, current_value, strict=True)
-                ):
-                    issues.extend(
-                        stable_schema_compatibility_issues(
-                            baseline_branch,
-                            current_branch,
-                            f"{child_path}/{index}",
-                        )
-                    )
                 continue
             issues.extend(
                 stable_schema_compatibility_issues(

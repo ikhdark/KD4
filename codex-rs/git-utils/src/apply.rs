@@ -153,12 +153,11 @@ pub fn apply_git_patch(req: &ApplyGitRequest) -> io::Result<ApplyGitResult> {
 }
 
 fn resolve_git_root(cwd: &Path) -> io::Result<PathBuf> {
-    let mut command = std::process::Command::new("git");
-    command
+    let out = std::process::Command::new("git")
         .arg("rev-parse")
         .arg("--show-toplevel")
-        .current_dir(cwd);
-    let out = coordinated_command_output(&mut command)?;
+        .current_dir(cwd)
+        .output()?;
     let code = out.status.code().unwrap_or(-1);
     if code != 0 {
         return Err(io::Error::other(format!(
@@ -216,19 +215,7 @@ fn run_git_output_os(
     if let Some(env) = env {
         cmd.envs(env.iter().cloned());
     }
-    cmd.current_dir(cwd);
-    coordinated_command_output(&mut cmd)
-}
-
-fn coordinated_command_output(
-    command: &mut std::process::Command,
-) -> io::Result<std::process::Output> {
-    command
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    let child = codex_utils_pty::with_windows_child_creation(|_| command.spawn())?;
-    child.wait_with_output()
+    cmd.current_dir(cwd).output()
 }
 
 fn prepare_temporary_index(
@@ -474,7 +461,7 @@ fn tracked_paths_in_index(
     cmd.args(paths)
         .envs(env.iter().cloned())
         .current_dir(git_root);
-    let out = coordinated_command_output(&mut cmd)?;
+    let out = cmd.output()?;
     let code = out.status.code().unwrap_or(-1);
     if code != 0 {
         return Err(io::Error::other(format!(
@@ -491,11 +478,10 @@ fn tracked_paths_in_index(
 }
 
 fn resolve_index_path(git_root: &Path) -> io::Result<PathBuf> {
-    let mut command = std::process::Command::new("git");
-    command
+    let out = std::process::Command::new("git")
         .args(["rev-parse", "--git-path", "index"])
-        .current_dir(git_root);
-    let out = coordinated_command_output(&mut command)?;
+        .current_dir(git_root)
+        .output()?;
     let code = out.status.code().unwrap_or(-1);
     if code != 0 {
         return Err(io::Error::other(format!(
@@ -710,8 +696,10 @@ pub fn stage_paths(git_root: &Path, diff: &str) -> io::Result<()> {
     for p in &existing {
         cmd.arg(p);
     }
-    cmd.env("GIT_LITERAL_PATHSPECS", "1").current_dir(git_root);
-    let out = coordinated_command_output(&mut cmd)?;
+    let out = cmd
+        .env("GIT_LITERAL_PATHSPECS", "1")
+        .current_dir(git_root)
+        .output()?;
     let code = out.status.code().unwrap_or(-1);
     if code == 0 {
         Ok(())

@@ -1,8 +1,6 @@
 use std::collections::BTreeMap;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
 
 use codex_extension_api::ExtensionData;
 use codex_protocol::ResponseItemId;
@@ -121,21 +119,6 @@ pub(crate) fn raw_assistant_output_text_from_item(item: &ResponseItem) -> Option
 }
 
 pub(crate) async fn record_completed_response_item_with_finalized_facts(
-    sess: &Session,
-    turn_context: &TurnContext,
-    item: &ResponseItem,
-    finalized_facts: Option<&FinalizedTurnItemFacts>,
-) {
-    if turn_context
-        .try_buffer_completion_conversation_item(item, finalized_facts)
-        .await
-    {
-        return;
-    }
-    record_completed_response_item_immediately(sess, turn_context, item, finalized_facts).await;
-}
-
-pub(crate) async fn record_completed_response_item_immediately(
     sess: &Session,
     turn_context: &TurnContext,
     item: &ResponseItem,
@@ -380,36 +363,18 @@ impl OrderedResponseItemRecorder {
         let preceding_required = state.required_tail.clone();
         let preceding_auxiliary = state.auxiliary_tail.clone();
         let primary = item.clone();
-        let finalized_facts_for_required = finalized_facts.clone();
-        let primary_buffered = Arc::new(AtomicBool::new(false));
-        let primary_buffered_for_required = Arc::clone(&primary_buffered);
         let required_sess = Arc::clone(&sess);
         let required_turn_context = Arc::clone(&turn_context);
         let required_barrier = async move {
             if let Some(preceding) = preceding_required {
                 preceding.await;
             }
-            let buffered = required_turn_context
-                .try_buffer_completion_conversation_item(
-                    &item,
-                    finalized_facts_for_required.as_ref(),
-                )
+            let mut items = Vec::with_capacity(1 + following_items.len());
+            items.push(item);
+            items.extend(following_items);
+            required_sess
+                .record_conversation_items(&required_turn_context, &items)
                 .await;
-            primary_buffered_for_required.store(buffered, Ordering::Release);
-            if buffered {
-                if !following_items.is_empty() {
-                    required_sess
-                        .record_conversation_items(&required_turn_context, &following_items)
-                        .await;
-                }
-            } else {
-                let mut items = Vec::with_capacity(1 + following_items.len());
-                items.push(item);
-                items.extend(following_items);
-                required_sess
-                    .record_conversation_items(&required_turn_context, &items)
-                    .await;
-            }
         }
         .boxed()
         .shared();
@@ -419,9 +384,6 @@ impl OrderedResponseItemRecorder {
                 preceding.await;
             }
             required_for_auxiliary.await;
-            if primary_buffered.load(Ordering::Acquire) {
-                return;
-            }
             let defers_mailbox_delivery = finalized_facts.as_ref().map_or_else(
                 || {
                     completed_item_defers_mailbox_delivery_to_next_turn(
@@ -532,7 +494,7 @@ pub(crate) struct FinalizedTurnItem {
     pub(crate) facts: FinalizedTurnItemFacts,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub(crate) struct FinalizedTurnItemFacts {
     pub(crate) memory_citation: Option<MemoryCitation>,
     pub(crate) last_agent_message: Option<String>,

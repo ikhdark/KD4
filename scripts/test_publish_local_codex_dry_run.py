@@ -520,7 +520,7 @@ class PublishLocalCodexDryRunTest(PublishLocalCodexTestBase):
                 result.stdout,
             )
 
-    def test_dry_run_trusts_digest_bound_bundle_when_old_artifacts_match_target(
+    def test_dry_run_reports_stale_source_build_when_skip_build_would_noop(
         self,
     ) -> None:
         self.init_repo_fixture()
@@ -533,19 +533,10 @@ class PublishLocalCodexDryRunTest(PublishLocalCodexTestBase):
                 temp_path / "fake-codex.cmd",
                 timestamp=stale_timestamp,
             )
-            for source_helper in (
-                self.source_code_mode_host,
-                self.source_windows_sandbox_setup,
-                self.source_command_runner,
-            ):
-                os.utime(source_helper, (stale_timestamp, stale_timestamp))
             target = install_dir / "codex.exe"
             target.write_bytes(fake_codex.read_bytes())
             os.utime(target, (stale_timestamp, stale_timestamp))
-            self.install_matching_publish_helpers(
-                install_dir,
-                timestamp=stale_timestamp,
-            )
+            self.install_matching_publish_helpers(install_dir)
 
             result = self.run_script(
                 "-DryRun",
@@ -561,24 +552,18 @@ class PublishLocalCodexDryRunTest(PublishLocalCodexTestBase):
                 0,
                 f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
             )
-            self.assert_proof_value(
+            self.assertIn("sourceBuildStale: True", result.stdout)
+            self.assert_publish_readiness(result.stdout, "blocked: source build stale")
+            self.assertIn(
+                "sourceBuildStaleRemedy: Run just publish-local-codex-final, then restart Codex Desktop.",
                 result.stdout,
-                "sourceBuildFreshnessBasis",
-                "digest-bound source bundle manifest",
             )
-            self.assert_proof_value(result.stdout, "sourceBuildStale", "False")
-            self.assert_publish_readiness(result.stdout, "ready: target already current")
-            self.assert_proof_value(result.stdout, "binaryChanged", "false")
-            self.assert_proof_value(
-                result.stdout,
-                "replace",
-                "not run: target already current",
-            )
-            self.assert_proof_value(result.stdout, "restartRequired", "false")
-            self.assertEqual(target.read_bytes(), fake_codex.read_bytes())
-            self.assertFalse((install_dir.parent / "publisher-backups").exists())
+            self.assertIn("binaryChanged: false", result.stdout)
+            self.assertIn("replace: not run: source build stale", result.stdout)
+            self.assertIn("restartRequired: unknown until rebuild", result.stdout)
+            self.assertNotIn("replace: not run: target already current", result.stdout)
 
-    def test_dry_run_runtime_proof_reports_missing_target_without_running_doctor(
+    def test_runtime_proof_reports_doctor_skip_before_stale_source_failure(
         self,
     ) -> None:
         self.init_repo_fixture()
@@ -604,35 +589,18 @@ class PublishLocalCodexDryRunTest(PublishLocalCodexTestBase):
                 str(install_dir),
             )
 
-            self.assertEqual(
-                result.returncode,
-                0,
-                f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
-            )
-            self.assert_proof_value(result.stdout, "runtimeProof", "requested")
-            self.assert_proof_value(
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("runtimeProof: requested", result.stdout)
+            self.assertIn("sourceBuildStale: True", result.stdout)
+            self.assert_publish_readiness(result.stdout, "blocked: source build stale")
+            self.assertIn(
+                f'doctorCommand: "{install_dir / "codex.exe"}" doctor --json (not run: target missing)',
                 result.stdout,
-                "sourceBuildFreshnessBasis",
-                "digest-bound source bundle manifest",
             )
-            self.assert_proof_value(result.stdout, "sourceBuildStale", "False")
-            self.assert_publish_readiness(
-                result.stdout,
-                "needs publish: target older than source build",
-            )
-            self.assert_proof_value(
-                result.stdout,
-                "doctorCommand",
-                f'"{install_dir / "codex.exe"}" doctor --json (not run: target missing)',
-            )
-            self.assert_proof_value(
-                result.stdout,
-                "doctorStatus",
-                "skipped: target missing",
-            )
-            self.assertFalse((install_dir / "codex.exe").exists())
+            self.assertIn("doctorStatus: skipped: target missing", result.stdout)
+            self.assertIn("Dry-run source build is stale", result.stderr)
 
-    def test_apply_rejects_source_bundle_changed_after_manifest_creation(self) -> None:
+    def test_apply_blocks_skip_build_when_source_binary_is_stale(self) -> None:
         self.init_repo_fixture()
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
@@ -642,17 +610,6 @@ class PublishLocalCodexDryRunTest(PublishLocalCodexTestBase):
                 temp_path / "fake-codex.cmd",
                 timestamp=946684800,
             )
-            manifest = self.write_source_bundle_manifest(fake_codex)
-            original_stat = fake_codex.stat()
-            original_bytes = fake_codex.read_bytes()
-            changed_bytes = original_bytes.replace(b"test-commit", b"best-commit")
-            self.assertNotEqual(changed_bytes, original_bytes)
-            self.assertEqual(len(changed_bytes), len(original_bytes))
-            fake_codex.write_bytes(changed_bytes)
-            os.utime(
-                fake_codex,
-                ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
-            )
             target = install_dir / "codex.exe"
             target.write_bytes(b"previous-codex")
 
@@ -660,20 +617,20 @@ class PublishLocalCodexDryRunTest(PublishLocalCodexTestBase):
                 "-SkipBuild",
                 "-SourceExe",
                 str(fake_codex),
-                "-SourceBundleManifest",
-                str(manifest),
                 "-InstallDir",
                 str(install_dir),
             )
 
             self.assertNotEqual(result.returncode, 0)
             self.assertEqual(target.read_bytes(), b"previous-codex")
-            self.assertFalse((install_dir.parent / "publisher-backups").exists())
+            self.assertFalse((install_dir / "backups").exists())
+            self.assertIn("sourceBuildStale: True", result.stdout)
+            self.assertIn("replace: blocked: source build stale", result.stdout)
+            self.assertIn("restartRequired: unknown until rebuild", result.stdout)
             self.assertIn(
-                "Source bundle file digest mismatch",
-                result.stdout + result.stderr,
+                "SkipBuild cannot publish the newest Codex bundle",
+                result.stderr,
             )
-            self.assert_no_publish_temps(install_dir)
 
 
 if __name__ == "__main__":

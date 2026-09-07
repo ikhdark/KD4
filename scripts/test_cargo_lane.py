@@ -11,9 +11,14 @@ import time
 import unittest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from scripts import rust_build_status  # noqa: E402
+
+
 SCRIPT = REPO_ROOT / "scripts" / "cargo-lane.ps1"
 CLEANUP_SCRIPT = REPO_ROOT / "scripts" / "cargo-lane-trash-cleanup.ps1"
-PYTHON_LANE_SCRIPT = REPO_ROOT / "scripts" / "rust_build_status.py"
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 LANES_ROOT_MARKER = ".codex-cargo-lanes-root"
 LANES_ROOT_MARKER_CONTENT = "codex-kd cargo lanes root v1"
@@ -130,22 +135,20 @@ class CargoLaneTest(unittest.TestCase):
         if created.returncode != 0:
             self.skipTest(f"could not create test junction: {created.stderr}")
 
-    def test_rejects_command_mistaken_for_positional_lane_through_cli(self) -> None:
+    def test_rejects_command_mistaken_for_positional_lane(self) -> None:
         result = self.run_fake_cargo("cargo", "check")
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("looks like a command", result.stderr)
         self.assertIn("-Lane <name>", result.stderr)
 
-    def test_lane_option_rejects_another_option_as_its_value_through_cli(self) -> None:
+    def test_lane_option_rejects_another_option_as_its_value(self) -> None:
         result = self.run_script("-Lane", "-Fetch")
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("does not start with '-'", result.stderr)
 
-    def test_pure_dot_lane_names_are_rejected_before_root_mutation_through_cli(
-        self,
-    ) -> None:
+    def test_pure_dot_lane_names_are_rejected_before_root_mutation(self) -> None:
         before = sorted(path.name for path in self.lanes_root.iterdir())
         for lane in (".", "..", "..."):
             with self.subTest(lane=lane):
@@ -157,7 +160,7 @@ class CargoLaneTest(unittest.TestCase):
                     before,
                 )
 
-    def test_missing_python_does_not_block_lane_command_through_cli(self) -> None:
+    def test_missing_python_does_not_block_lane_command(self) -> None:
         lane = f"unit-no-python-{os.getpid()}"
         fake_bin = self.fake_cargo_bin()
         path_without_python = (
@@ -183,9 +186,7 @@ class CargoLaneTest(unittest.TestCase):
         self.assertIn("cargo-args:check --target-dir", result.stdout)
         self.assertIn("python executable was not found", result.stdout + result.stderr)
 
-    def test_lane_last_used_stamp_is_refreshed_after_command_finishes_through_cli(
-        self,
-    ) -> None:
+    def test_lane_last_used_stamp_is_refreshed_after_command_finishes(self) -> None:
         lane = f"unit-last-used-{os.getpid()}"
         stamp = self.lanes_root / lane / ".lane-last-used"
         stale_timestamp = time.time() - (30 * 24 * 60 * 60)
@@ -209,7 +210,7 @@ class CargoLaneTest(unittest.TestCase):
         self.assertEqual(result.returncode, 7)
         self.assertGreater(stamp.stat().st_mtime, stale_timestamp + 60)
 
-    def test_explicit_busy_lane_reports_effective_suffix_through_cli(self) -> None:
+    def test_explicit_busy_lane_reports_effective_suffix(self) -> None:
         lane = f"unit-explicit-busy-{os.getpid()}"
 
         result = self.run_fake_cargo(
@@ -230,67 +231,15 @@ class CargoLaneTest(unittest.TestCase):
         self.assertIn(f"'{lane}-2'", warning_output)
         self.assertIn(f"--target-dir {self.lane_path(f'{lane}-2')}", result.stdout)
 
-    def test_powershell_runner_honors_python_active_lane_lock_through_cli(
-        self,
-    ) -> None:
+    def test_powershell_runner_honors_python_active_lane_lock(self) -> None:
         lane = f"unit-python-lock-{os.getpid()}"
-        ready_path = self.temp_root / "python-lane.ready"
-        release_path = self.temp_root / "python-lane.release"
-        child_code = (
-            "from pathlib import Path; import sys, time; "
-            "ready, release = map(Path, sys.argv[1:3]); "
-            "ready.write_text('ready', encoding='utf-8'); "
-            "deadline = time.monotonic() + 30; "
-            "exec(\"while not release.exists():\\n"
-            "    if time.monotonic() >= deadline: raise TimeoutError('release')\\n"
-            "    time.sleep(0.05)\")"
-        )
-        python_lane = subprocess.Popen(
-            [
-                sys.executable,
-                str(PYTHON_LANE_SCRIPT),
-                "run-lane",
-                "--lane",
-                lane,
-                "--repo-root",
-                str(REPO_ROOT),
-                "--lanes-root",
-                str(self.lanes_root),
-                "--",
-                sys.executable,
-                "-c",
-                child_code,
-                str(ready_path),
-                str(release_path),
-            ],
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            creationflags=CREATE_NO_WINDOW,
-        )
-        deadline = time.monotonic() + 10
-        while not ready_path.exists() and python_lane.poll() is None:
-            if time.monotonic() >= deadline:
-                break
-            time.sleep(0.05)
-        if not ready_path.exists():
-            python_lane.terminate()
-            stdout, stderr = python_lane.communicate(timeout=5)
-            self.fail(
-                "Python lane CLI did not acquire its lock\n"
-                f"stdout:\n{stdout}\nstderr:\n{stderr}"
-            )
-        try:
+        with rust_build_status.reserve_cargo_lane(
+            repo_root=REPO_ROOT,
+            requested_lane=lane,
+            command=["cargo", "check"],
+            lane_root=self.lanes_root,
+        ):
             result = self.run_fake_cargo("-Lane", lane, "cargo", "check")
-        finally:
-            release_path.write_text("release", encoding="utf-8")
-            stdout, stderr = python_lane.communicate(timeout=10)
-
-        self.assertEqual(
-            python_lane.returncode,
-            0,
-            f"stdout:\n{stdout}\nstderr:\n{stderr}",
-        )
 
         self.assertEqual(
             result.returncode,
@@ -302,7 +251,7 @@ class CargoLaneTest(unittest.TestCase):
         self.assertIn(f"'{lane}-2'", output)
         self.assertIn(f"--target-dir {self.lane_path(f'{lane}-2')}", result.stdout)
 
-    def test_relative_lanes_root_follows_powershell_location_through_cli(self) -> None:
+    def test_relative_lanes_root_follows_powershell_location(self) -> None:
         relative_root = "relative-lanes"
         command = (
             f"Set-Location {ps_single_quote(self.temp_root)}; "
@@ -337,28 +286,32 @@ class CargoLaneTest(unittest.TestCase):
         self.assertTrue((self.temp_root / relative_root / "relative").is_dir())
         self.assertTrue((self.temp_root / relative_root / LANES_ROOT_MARKER).is_file())
 
-    def test_cleanup_relative_root_follows_powershell_location_through_cli(
-        self,
-    ) -> None:
+    def test_cleanup_relative_root_follows_powershell_location(self) -> None:
         relative_root = self.temp_root / "cleanup-lanes"
         self.mark_lanes_root(relative_root)
         trash = relative_root / "old.trash-20260728123456789"
         trash.mkdir(parents=True)
-        cleanup_command = (
+        command = (
             f"Set-Location {ps_single_quote(self.temp_root)}; "
             f"& {ps_single_quote(CLEANUP_SCRIPT)} -LanesRoot cleanup-lanes "
             "-MaxPasses 1 -RetryDelaySeconds 0"
         )
 
-        result = self.run_script(
-            "-Lane",
-            f"cleanup-relative-{os.getpid()}",
-            self.shell,
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            cleanup_command,
+        result = subprocess.run(
+            [
+                self.shell,
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                command,
+            ],
+            cwd=REPO_ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+            creationflags=CREATE_NO_WINDOW,
+            timeout=30,
         )
 
         self.assertEqual(
@@ -368,7 +321,7 @@ class CargoLaneTest(unittest.TestCase):
         )
         self.assertFalse(trash.exists())
 
-    def test_unmarked_custom_root_is_not_pruned_through_cli(self) -> None:
+    def test_unmarked_custom_root_is_not_pruned(self) -> None:
         unsafe_root = self.temp_root / "ordinary-root"
         ordinary_dir = unsafe_root / "family-photos"
         ordinary_dir.mkdir(parents=True)
@@ -397,26 +350,31 @@ class CargoLaneTest(unittest.TestCase):
             result.stdout + result.stderr,
         )
 
-    def test_cleanup_rejects_unmarked_root_through_cli(self) -> None:
+    def test_cleanup_rejects_unmarked_root(self) -> None:
         unsafe_root = self.temp_root / "ordinary-cleanup-root"
         trash = unsafe_root / "family.trash-20260728123456789"
         trash.mkdir(parents=True)
 
-        result = self.run_script(
-            "-Lane",
-            f"cleanup-unmarked-{os.getpid()}",
-            self.shell,
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-            str(CLEANUP_SCRIPT),
-            "-LanesRoot",
-            str(unsafe_root),
-            "-MaxPasses",
-            "1",
-            "-RetryDelaySeconds",
-            "0",
+        result = subprocess.run(
+            [
+                self.shell,
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(CLEANUP_SCRIPT),
+                "-LanesRoot",
+                str(unsafe_root),
+                "-MaxPasses",
+                "1",
+                "-RetryDelaySeconds",
+                "0",
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+            creationflags=CREATE_NO_WINDOW,
+            timeout=30,
         )
 
         self.assertEqual(
@@ -426,9 +384,7 @@ class CargoLaneTest(unittest.TestCase):
         )
         self.assertTrue(trash.exists())
 
-    def test_lane_runner_rejects_junction_root_before_mutation_through_cli(
-        self,
-    ) -> None:
+    def test_lane_runner_rejects_junction_root_before_mutation(self) -> None:
         external_root = self.temp_root / "external-lanes-root"
         self.mark_lanes_root(external_root)
         sentinel = external_root / "keep.txt"
@@ -450,7 +406,7 @@ class CargoLaneTest(unittest.TestCase):
         self.assertIn("must not be a reparse point or junction", result.stderr)
         self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep")
 
-    def test_cleanup_rejects_junction_root_through_cli(self) -> None:
+    def test_cleanup_rejects_junction_root(self) -> None:
         external_root = self.temp_root / "external-cleanup-root"
         self.mark_lanes_root(external_root)
         trash = external_root / "old.trash-20260728123456789"
@@ -458,21 +414,26 @@ class CargoLaneTest(unittest.TestCase):
         junction_root = self.temp_root / "junction-cleanup-root"
         self.make_junction(junction_root, external_root)
 
-        result = self.run_script(
-            "-Lane",
-            f"cleanup-junction-root-{os.getpid()}",
-            self.shell,
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-            str(CLEANUP_SCRIPT),
-            "-LanesRoot",
-            str(junction_root),
-            "-MaxPasses",
-            "1",
-            "-RetryDelaySeconds",
-            "0",
+        result = subprocess.run(
+            [
+                self.shell,
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(CLEANUP_SCRIPT),
+                "-LanesRoot",
+                str(junction_root),
+                "-MaxPasses",
+                "1",
+                "-RetryDelaySeconds",
+                "0",
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+            creationflags=CREATE_NO_WINDOW,
+            timeout=30,
         )
 
         self.assertEqual(
@@ -482,16 +443,13 @@ class CargoLaneTest(unittest.TestCase):
         )
         self.assertTrue(trash.exists())
 
-    def test_cleanup_preserves_trash_named_junction_and_external_target_through_cli(
-        self,
-    ) -> None:
-        cleanup_root = self.temp_root / "cleanup-target"
-        self.mark_lanes_root(cleanup_root)
+    def test_cleanup_preserves_trash_named_junction_and_external_target(self) -> None:
+        self.mark_lanes_root()
         external = self.temp_root / "external-sentinel"
         external.mkdir()
         sentinel = external / "keep.txt"
         sentinel.write_text("keep", encoding="utf-8")
-        junction = cleanup_root / "linked.trash-20260728123456789"
+        junction = self.lanes_root / "linked.trash-20260728123456789"
         created = subprocess.run(
             ["cmd.exe", "/d", "/c", "mklink", "/J", str(junction), str(external)],
             text=True,
@@ -503,21 +461,26 @@ class CargoLaneTest(unittest.TestCase):
         if created.returncode != 0:
             self.skipTest(f"could not create test junction: {created.stderr}")
 
-        result = self.run_script(
-            "-Lane",
-            f"cleanup-junction-{os.getpid()}",
-            self.shell,
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-            str(CLEANUP_SCRIPT),
-            "-LanesRoot",
-            str(cleanup_root),
-            "-MaxPasses",
-            "1",
-            "-RetryDelaySeconds",
-            "0",
+        result = subprocess.run(
+            [
+                self.shell,
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(CLEANUP_SCRIPT),
+                "-LanesRoot",
+                str(self.lanes_root),
+                "-MaxPasses",
+                "1",
+                "-RetryDelaySeconds",
+                "0",
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+            creationflags=CREATE_NO_WINDOW,
+            timeout=30,
         )
 
         self.assertEqual(
@@ -586,9 +549,7 @@ class CargoLaneTest(unittest.TestCase):
             process.kill()
         self.fail("timed out waiting for lock helper")
 
-    def test_sets_default_rust_min_stack_for_direct_lane_commands_through_cli(
-        self,
-    ) -> None:
+    def test_sets_default_rust_min_stack_for_direct_lane_commands(self) -> None:
         lane = f"unit-stack-{os.getpid()}"
 
         result = self.run_script(
@@ -609,9 +570,7 @@ class CargoLaneTest(unittest.TestCase):
         self.assertIn("8388608", lines)
         self.assertIn("target=", lines)
 
-    def test_no_command_guidance_routes_core_tests_through_named_lanes_through_cli(
-        self,
-    ) -> None:
+    def test_no_command_guidance_routes_core_tests_through_named_lanes(self) -> None:
         result = self.run_script("-Lane", f"unit-guidance-{os.getpid()}")
 
         self.assertEqual(
@@ -623,7 +582,7 @@ class CargoLaneTest(unittest.TestCase):
         self.assertNotIn("test-lane-package codex-core", result.stdout)
         self.assertNotIn("cargo nextest run -p codex-core", result.stdout)
 
-    def test_uses_scoop_llvm_lld_link_when_not_on_path_through_cli(self) -> None:
+    def test_uses_scoop_llvm_lld_link_when_not_on_path(self) -> None:
         lane = f"unit-linker-{os.getpid()}"
         user_profile = self.temp_root / "user"
         scoop_llvm_bin = user_profile / "scoop" / "apps" / "llvm" / "current" / "bin"
@@ -661,9 +620,7 @@ class CargoLaneTest(unittest.TestCase):
         self.assertIn(f"x64={lld_link}", result.stdout)
         self.assertIn(f"arm64={lld_link}", result.stdout)
 
-    def test_auto_lane_uses_package_name_for_stable_cache_affinity_through_cli(
-        self,
-    ) -> None:
+    def test_auto_lane_uses_package_name_for_stable_cache_affinity(self) -> None:
         package = f"unit-core-{os.getpid()}"
 
         result = self.run_fake_cargo(
@@ -682,7 +639,7 @@ class CargoLaneTest(unittest.TestCase):
         )
         self.assertIn(f"--target-dir {self.lane_path(package)}", result.stdout)
 
-    def test_mismatched_cargo_target_dir_is_rejected_through_cli(self) -> None:
+    def test_mismatched_cargo_target_dir_is_rejected(self) -> None:
         package = f"unit-explicit-target-{os.getpid()}"
         explicit_target = self.temp_root / "explicit-target"
 
@@ -700,7 +657,7 @@ class CargoLaneTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("does not match reserved lane target", result.stderr)
 
-    def test_matching_cargo_target_dir_is_not_duplicated_through_cli(self) -> None:
+    def test_matching_cargo_target_dir_is_not_duplicated(self) -> None:
         lane = f"unit-matching-target-{os.getpid()}"
         explicit_target = self.lanes_root / lane
 
@@ -721,9 +678,7 @@ class CargoLaneTest(unittest.TestCase):
         self.assertEqual(result.stdout.count("--target-dir"), 1)
         self.assertIn(f"--target-dir {explicit_target}", result.stdout)
 
-    def test_lowercase_c_is_not_treated_as_value_taking_uppercase_option_through_cli(
-        self,
-    ) -> None:
+    def test_lowercase_c_is_not_treated_as_value_taking_uppercase_option(self) -> None:
         lane = f"unit-lower-c-{os.getpid()}"
 
         result = self.run_fake_cargo(
@@ -741,7 +696,7 @@ class CargoLaneTest(unittest.TestCase):
         )
         self.assertIn(f"check --target-dir {self.lane_path(lane)}", result.stdout)
 
-    def test_mismatched_equals_cargo_target_dir_is_rejected_through_cli(self) -> None:
+    def test_mismatched_equals_cargo_target_dir_is_rejected(self) -> None:
         package = f"unit-explicit-equals-target-{os.getpid()}"
         explicit_target = "explicit-equals-target"
 
@@ -758,7 +713,7 @@ class CargoLaneTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("does not match reserved lane target", result.stderr)
 
-    def test_mismatched_nextest_target_dir_is_rejected_through_cli(self) -> None:
+    def test_mismatched_nextest_target_dir_is_rejected(self) -> None:
         package = f"unit-nextest-explicit-target-{os.getpid()}"
         explicit_target = self.temp_root / "nextest-target"
 
@@ -777,9 +732,7 @@ class CargoLaneTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("does not match reserved lane target", result.stderr)
 
-    def test_auto_lane_reuses_warm_idle_suffix_when_base_lane_is_active_through_cli(
-        self,
-    ) -> None:
+    def test_auto_lane_reuses_warm_idle_suffix_when_base_lane_is_active(self) -> None:
         package = f"unit-core-active-{os.getpid()}"
         warm_suffix = f"{package}-2"
         self.mark_lanes_root()
@@ -802,7 +755,7 @@ class CargoLaneTest(unittest.TestCase):
         )
         self.assertIn(f"--target-dir {self.lane_path(warm_suffix)}", result.stdout)
 
-    def test_auto_lane_mints_suffix_when_base_lane_is_active_through_cli(self) -> None:
+    def test_auto_lane_mints_suffix_when_base_lane_is_active(self) -> None:
         package = f"unit-core-mint-{os.getpid()}"
 
         result = self.run_fake_cargo(
@@ -822,7 +775,7 @@ class CargoLaneTest(unittest.TestCase):
         )
         self.assertIn(f"--target-dir {self.lane_path(f'{package}-2')}", result.stdout)
 
-    def test_auto_lane_skips_busy_cargo_lock_through_cli(self) -> None:
+    def test_auto_lane_skips_busy_cargo_lock(self) -> None:
         package = f"unit-core-lock-{os.getpid()}"
         lock_process = self.hold_lane_lock(package)
         try:
@@ -849,7 +802,7 @@ class CargoLaneTest(unittest.TestCase):
         )
         self.assertIn(f"--target-dir {self.lane_path(f'{package}-2')}", result.stdout)
 
-    def test_auto_lane_surfaces_read_only_lock_error_through_cli(self) -> None:
+    def test_auto_lane_surfaces_read_only_lock_error(self) -> None:
         package = f"unit-core-readonly-{os.getpid()}"
         lane = self.make_lane(package)
         lock_path = lane / ".cargo-lock"
@@ -870,7 +823,7 @@ class CargoLaneTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertNotIn(self.lane_path(f"{package}-2"), result.stdout)
 
-    def test_auto_lane_skips_busy_lane_reservation_lock_through_cli(self) -> None:
+    def test_auto_lane_skips_busy_lane_reservation_lock(self) -> None:
         package = f"unit-core-reserved-{os.getpid()}"
         lock_process = self.hold_lane_lock(package, lock_name=".lane-active.lock")
         try:
@@ -897,7 +850,7 @@ class CargoLaneTest(unittest.TestCase):
         )
         self.assertIn(f"--target-dir {self.lane_path(f'{package}-2')}", result.stdout)
 
-    def test_cargo_llvm_cov_gets_lane_target_dir_through_cli(self) -> None:
+    def test_cargo_llvm_cov_gets_lane_target_dir(self) -> None:
         package = f"unit-coverage-{os.getpid()}"
 
         result = self.run_fake_cargo(
@@ -916,7 +869,7 @@ class CargoLaneTest(unittest.TestCase):
         )
         self.assertIn(f"--target-dir {self.lane_path(package)}", result.stdout)
 
-    def test_cargo_watch_default_check_gets_lane_target_dir_through_cli(self) -> None:
+    def test_cargo_watch_default_check_gets_lane_target_dir(self) -> None:
         result = self.run_fake_cargo(
             "-Lane",
             "auto",
@@ -933,7 +886,7 @@ class CargoLaneTest(unittest.TestCase):
         self.assertIn("check --target-dir", result.stdout)
         self.assertIn(str(self.lanes_root), result.stdout)
 
-    def test_cargo_watch_exec_gets_lane_target_dir_through_cli(self) -> None:
+    def test_cargo_watch_exec_gets_lane_target_dir(self) -> None:
         package = f"unit-watch-exec-{os.getpid()}"
 
         result = self.run_fake_cargo(
@@ -953,7 +906,7 @@ class CargoLaneTest(unittest.TestCase):
         self.assertIn(f"check -p {package} --target-dir", result.stdout)
         self.assertIn(self.lane_path(package), result.stdout)
 
-    def test_cargo_watch_exec_equals_gets_lane_target_dir_through_cli(self) -> None:
+    def test_cargo_watch_exec_equals_gets_lane_target_dir(self) -> None:
         package = f"unit-watch-equals-{os.getpid()}"
 
         result = self.run_fake_cargo(
@@ -972,7 +925,7 @@ class CargoLaneTest(unittest.TestCase):
         self.assertIn(f"--exec=check -p {package} --target-dir", result.stdout)
         self.assertIn(self.lane_path(package), result.stdout)
 
-    def test_cargo_watch_exec_rejects_mismatched_target_dir_through_cli(self) -> None:
+    def test_cargo_watch_exec_rejects_mismatched_target_dir(self) -> None:
         lane = f"unit-watch-mismatch-{os.getpid()}"
         mismatched_target = self.temp_root / "watch-escape"
 
@@ -988,7 +941,7 @@ class CargoLaneTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("does not match reserved lane target", result.stderr)
 
-    def test_cargo_watch_exec_accepts_matching_target_dir_through_cli(self) -> None:
+    def test_cargo_watch_exec_accepts_matching_target_dir(self) -> None:
         lane = f"unit-watch-match-{os.getpid()}"
         matching_target = self.lanes_root / lane
 
@@ -1008,9 +961,7 @@ class CargoLaneTest(unittest.TestCase):
         )
         self.assertEqual(result.stdout.count("--target-dir"), 1)
 
-    def test_cargo_watch_exec_inserts_target_before_test_arguments_through_cli(
-        self,
-    ) -> None:
+    def test_cargo_watch_exec_inserts_target_before_test_arguments(self) -> None:
         result = self.run_fake_cargo(
             "-Lane",
             "auto",
@@ -1028,7 +979,7 @@ class CargoLaneTest(unittest.TestCase):
         self.assertIn("test --target-dir", result.stdout)
         self.assertIn(" -- --nocapture", result.stdout)
 
-    def test_cargo_watch_shell_command_is_rejected_through_cli(self) -> None:
+    def test_cargo_watch_shell_command_is_rejected(self) -> None:
         result = self.run_fake_cargo(
             "-Lane",
             "auto",
@@ -1041,7 +992,7 @@ class CargoLaneTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("--shell/-s is not allowed", result.stderr)
 
-    def test_timestamped_explicit_lane_is_preserved_literally_through_cli(self) -> None:
+    def test_timestamped_explicit_lane_is_preserved_literally(self) -> None:
         lane = f"unit-stable-{os.getpid()}-20260608183755"
 
         result = self.run_fake_cargo(
@@ -1058,9 +1009,7 @@ class CargoLaneTest(unittest.TestCase):
         )
         self.assertIn(f"--target-dir {self.lane_path(lane)}", result.stdout)
 
-    def test_isolated_cargo_home_preserves_user_config_and_adds_sccache_through_cli(
-        self,
-    ) -> None:
+    def test_isolated_cargo_home_preserves_user_config_and_adds_sccache(self) -> None:
         lane = f"unit-cargo-home-{os.getpid()}"
         user_profile = self.temp_root / "user"
         cargo_config = user_profile / ".cargo" / "config.toml"
@@ -1104,7 +1053,7 @@ class CargoLaneTest(unittest.TestCase):
         self.assertIn("80G", result.stdout)
         self.assertIn("incremental=0", result.stdout)
 
-    def test_sccache_lane_preserves_explicit_cargo_incremental_through_cli(self) -> None:
+    def test_sccache_lane_preserves_explicit_cargo_incremental(self) -> None:
         fake_bin = self.temp_root / "bin"
         fake_bin.mkdir()
         (fake_bin / "sccache.cmd").write_text("@echo off\r\n", encoding="utf-8")
@@ -1130,7 +1079,7 @@ class CargoLaneTest(unittest.TestCase):
         )
         self.assertIn("incremental=1", result.stdout)
 
-    def test_auto_lane_routes_release_builds_to_release_lane_through_cli(self) -> None:
+    def test_auto_lane_routes_release_builds_to_release_lane(self) -> None:
         for release_arg in ("--release", "-r", "--profile=release"):
             with self.subTest(release_arg=release_arg):
                 package = f"unit-release-{os.getpid()}-{release_arg.replace('-', 'x').replace('=', 'x')}"
@@ -1155,9 +1104,7 @@ class CargoLaneTest(unittest.TestCase):
                     f"--target-dir {self.lane_path(release_lane)}", result.stdout
                 )
 
-    def test_gc_prunes_old_idle_lanes_but_excludes_requested_lane_through_cli(
-        self,
-    ) -> None:
+    def test_gc_prunes_old_idle_lanes_but_excludes_requested_lane(self) -> None:
         requested = f"unit-keep-old-{os.getpid()}"
         victim = f"unit-victim-old-{os.getpid()}"
         requested_path = self.make_lane(requested, days_old=30)
@@ -1184,7 +1131,7 @@ class CargoLaneTest(unittest.TestCase):
         self.assertTrue(requested_path.exists())
         self.assertFalse(victim_path.exists())
 
-    def test_trash_cleanup_worker_removes_existing_trash_dirs_through_cli(self) -> None:
+    def test_trash_cleanup_worker_removes_existing_trash_dirs(self) -> None:
         self.mark_lanes_root()
         for index in range(2):
             trash = self.lanes_root / f"unit-trash-{index}.trash-20260612000000000"
@@ -1222,7 +1169,7 @@ class CargoLaneTest(unittest.TestCase):
         self.assertFalse(list(self.lanes_root.glob("*.trash-*")))
         self.assertFalse((self.lanes_root / ".cargo-lane-trash-cleanup.lock").exists())
 
-    def test_failed_gc_does_not_advance_stamp_through_cli(self) -> None:
+    def test_failed_gc_does_not_advance_stamp(self) -> None:
         fake_bin = self.fake_cargo_bin()
         (fake_bin / "python.cmd").write_text(
             "@echo off\r\nexit /b 7\r\n", encoding="utf-8"
@@ -1249,7 +1196,7 @@ class CargoLaneTest(unittest.TestCase):
         self.assertFalse((self.lanes_root / ".gc-stamp").exists())
         self.assertIn("leaving the GC stamp unchanged", result.stdout + result.stderr)
 
-    def test_gc_size_cap_evicts_oversized_idle_lane_through_cli(self) -> None:
+    def test_gc_size_cap_evicts_oversized_idle_lane(self) -> None:
         oversized = f"unit-size-large-{os.getpid()}"
         small = f"unit-size-small-{os.getpid()}"
         oversized_path = self.make_lane(oversized, size=20, days_old=3)
@@ -1277,7 +1224,7 @@ class CargoLaneTest(unittest.TestCase):
         self.assertFalse(oversized_path.exists())
         self.assertTrue(small_path.exists())
 
-    def test_gc_global_cap_evicts_oldest_idle_lane_through_cli(self) -> None:
+    def test_gc_global_cap_evicts_oldest_idle_lane(self) -> None:
         oldest_path = self.make_lane(
             f"unit-lru-oldest-{os.getpid()}", size=2 * 1024 * 1024
         )
@@ -1312,7 +1259,7 @@ class CargoLaneTest(unittest.TestCase):
         self.assertFalse(oldest_path.exists())
         self.assertTrue(newest_path.exists())
 
-    def test_gc_defaults_lane_and_target_aggregate_caps_through_cli(self) -> None:
+    def test_gc_defaults_lane_and_target_aggregate_caps(self) -> None:
         fake_bin = self.fake_cargo_bin()
         args_log = self.temp_root / "gc-args.txt"
         (fake_bin / "python.cmd").write_text(
@@ -1349,7 +1296,7 @@ class CargoLaneTest(unittest.TestCase):
             args_log.read_text(encoding="utf-8"),
         )
 
-    def test_post_build_gc_bypasses_fresh_hourly_stamp_through_cli(self) -> None:
+    def test_post_build_gc_bypasses_fresh_hourly_stamp(self) -> None:
         fake_bin = self.fake_cargo_bin()
         args_log = self.temp_root / "post-build-gc-args.txt"
         (fake_bin / "python.cmd").write_text(
@@ -1388,7 +1335,7 @@ class CargoLaneTest(unittest.TestCase):
         self.assertEqual(len(invocations), 1)
         self.assertIn("--max-total-target-bytes 268435456000", invocations[0])
 
-    def test_gc_excludes_active_lanes_from_age_pruning_through_cli(self) -> None:
+    def test_gc_excludes_active_lanes_from_age_pruning(self) -> None:
         active = f"unit-active-old-{os.getpid()}"
         active_path = self.make_lane(active, days_old=30)
 
@@ -1413,7 +1360,7 @@ class CargoLaneTest(unittest.TestCase):
         )
         self.assertTrue(active_path.exists())
 
-    def test_gc_invalid_env_knobs_fall_back_to_defaults_through_cli(self) -> None:
+    def test_gc_invalid_env_knobs_fall_back_to_defaults(self) -> None:
         result = self.run_script(
             "-Lane",
             f"unit-env-{os.getpid()}",

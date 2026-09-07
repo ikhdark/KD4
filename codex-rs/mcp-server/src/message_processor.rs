@@ -597,13 +597,11 @@ impl MessageProcessor {
         // Create a stable string form early for logging and submission id.
         let request_id_string = request_id.to_string();
 
-        // Cancellation is terminal for this request from the MCP client's
-        // perspective. Remove the registration before any fallible lookup or
-        // interrupt submission so every exit leaves the map clean.
+        // Obtain the thread id while holding the first lock, then release.
         let thread_id = {
-            let mut map_guard = self.running_requests_id_to_codex_uuid.lock().await;
-            match map_guard.remove(&request_id) {
-                Some(id) => id,
+            let map_guard = self.running_requests_id_to_codex_uuid.lock().await;
+            match map_guard.get(&request_id) {
+                Some(id) => *id,
                 None => {
                     tracing::warn!("Session not found for request_id: {request_id_string}");
                     return;
@@ -634,6 +632,11 @@ impl MessageProcessor {
             tracing::error!("Failed to submit interrupt to Codex: {e}");
             return;
         }
+        // unregister the id so we don't keep it in the map
+        self.running_requests_id_to_codex_uuid
+            .lock()
+            .await
+            .remove(&request_id);
     }
 
     fn handle_progress_notification(&self, _params: rmcp::model::ProgressNotificationParam) {
@@ -653,14 +656,9 @@ impl MessageProcessor {
 mod tests {
     use std::sync::Weak;
 
-    use codex_core::config::ConfigBuilder;
     use codex_exec_server::EnvironmentManager;
     use codex_login::CodexAuth;
     use pretty_assertions::assert_eq;
-    use rmcp::model::CancelledNotification;
-    use rmcp::model::CancelledNotificationParam;
-    use rmcp::model::JsonRpcVersion2_0;
-    use tempfile::TempDir;
 
     use super::*;
 
@@ -701,56 +699,5 @@ mod tests {
         tool_tasks.shutdown().await;
 
         assert_eq!(resource_rx.recv().await, None);
-    }
-
-    #[tokio::test]
-    async fn cancelled_notification_unregisters_request_when_thread_lookup_fails()
-    -> anyhow::Result<()> {
-        let codex_home = TempDir::new()?;
-        let config = Arc::new(
-            ConfigBuilder::default()
-                .codex_home(codex_home.path().to_path_buf())
-                .build()
-                .await?,
-        );
-        let (outgoing_tx, _outgoing_rx) = tokio::sync::mpsc::channel(1);
-        let mut processor = MessageProcessor::new(
-            OutgoingMessageSender::new(outgoing_tx),
-            Arg0DispatchPaths::default(),
-            config,
-            Arc::new(EnvironmentManager::default_for_tests()),
-            None,
-            "test-installation".to_string(),
-        )
-        .await;
-        let request_id = RequestId::Number(17);
-        processor
-            .running_requests_id_to_codex_uuid
-            .lock()
-            .await
-            .insert(request_id.clone(), ThreadId::new());
-
-        processor
-            .process_notification(JsonRpcNotification {
-                jsonrpc: JsonRpcVersion2_0,
-                notification: ClientNotification::CancelledNotification(
-                    CancelledNotification::new(CancelledNotificationParam {
-                        request_id,
-                        reason: Some("test cancellation".to_string()),
-                    }),
-                ),
-            })
-            .await;
-
-        assert!(
-            processor
-                .running_requests_id_to_codex_uuid
-                .lock()
-                .await
-                .is_empty(),
-            "failed cancellation lookup must not leave a registered request"
-        );
-        processor.shutdown().await;
-        Ok(())
     }
 }

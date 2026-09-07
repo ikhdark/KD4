@@ -749,8 +749,6 @@ fn exec_server_params_use_path_uri_and_env_policy_overlay_contract() {
         network_sandbox_policy,
         windows_sandbox_filesystem_overrides: None,
         windows_sandbox_additional_read_roots: Vec::new(),
-        prepared_canonical_windows_sandbox_launch: None,
-        canonical_windows_sandbox_launch_identity: None,
         arg0: None,
         exec_server_sandbox: None,
         exec_server_enforce_managed_network: true,
@@ -916,11 +914,6 @@ async fn failed_initial_end_for_unstored_process_uses_fallback_output() {
         prefix_rule: None,
         validation_launch: None,
         known_delta: None,
-        workspace_operation: None,
-        completion_proof: None,
-        canonical_proof_repository_root: None,
-        canonical_proof_report_write_root: None,
-        prepared_canonical_windows_sandbox_launch: None,
     };
 
     let transcript = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::default()));

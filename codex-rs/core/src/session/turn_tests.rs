@@ -1822,11 +1822,24 @@ fn server_end_turn_false_completes_on_first_unchanged_signal() {
 }
 
 #[test]
-fn verified_turn_contract_after_agent_abort_discards_completed_output_metadata() {
-    let result = after_agent_abort_result(true);
+fn verified_turn_contract_after_agent_abort_preserves_completed_output_metadata() {
+    let surfaced_result = SurfacedToolResult {
+        adapter: "code_mode_cell".to_string(),
+        value: serde_json::json!({"answer": 42}),
+        canonical_message: Some("completed answer".to_string()),
+    };
 
-    assert!(result.last_agent_message.is_none());
-    assert!(result.surfaced_result.is_none());
+    let result = after_agent_abort_result(
+        Some("completed answer".to_string()),
+        Some(surfaced_result.clone()),
+        true,
+    );
+
+    assert_eq!(
+        result.last_agent_message.as_deref(),
+        Some("completed answer")
+    );
+    assert_eq!(result.surfaced_result, Some(surfaced_result));
     assert!(result.required_tool_terminal.is_none());
     assert!(result.defer_pending_input);
 }
@@ -4226,9 +4239,6 @@ async fn stop_hook_continuation_reaches_the_final_response_impl(
     direct_runtime: bool,
 ) -> Result<()> {
     core_test_support::skip_if_no_network!(Ok(()));
-    let isolated_workspace = tempfile::tempdir()?;
-    let isolated_cwd =
-        codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(isolated_workspace.path())?;
     let server = responses::start_mock_server().await;
     let response_log = responses::mount_sse_sequence(
         &server,
@@ -4266,11 +4276,6 @@ async fn stop_hook_continuation_reaches_the_final_response_impl(
             write_one_shot_stop_hook(home).expect("write stop-hook fixture");
         })
         .with_config(move |config| {
-            config.cwd = isolated_cwd.clone();
-            config.workspace_roots = vec![isolated_cwd.clone()];
-            config
-                .permissions
-                .set_workspace_roots(vec![isolated_cwd.clone()]);
             trust_discovered_hooks(config);
             if direct_runtime {
                 let _ = config.features.enable(Feature::DirectRuntime);
@@ -4281,8 +4286,7 @@ async fn stop_hook_continuation_reaches_the_final_response_impl(
     test.codex
         .submit(Op::UserInput {
             items: vec![UserInput::Text {
-                text: "completion-proof: allow completion without current proof\nanswer, then continue after the stop hook"
-                    .to_string(),
+                text: "answer, then continue after the stop hook".to_string(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,

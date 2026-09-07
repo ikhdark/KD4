@@ -536,8 +536,6 @@ pub(crate) async fn execute_exec_request(
         network_sandbox_policy,
         windows_sandbox_filesystem_overrides,
         windows_sandbox_additional_read_roots,
-        prepared_canonical_windows_sandbox_launch,
-        canonical_windows_sandbox_launch_identity,
         network_environment_id,
         arg0,
         exec_server_sandbox: _,
@@ -582,8 +580,6 @@ pub(crate) async fn execute_exec_request(
         &windows_sandbox_workspace_roots,
         windows_sandbox_filesystem_overrides.as_ref(),
         &windows_sandbox_additional_read_roots,
-        prepared_canonical_windows_sandbox_launch,
-        canonical_windows_sandbox_launch_identity,
     )
     .await;
     let duration = start.elapsed();
@@ -603,10 +599,6 @@ async fn get_raw_output_result(
     windows_sandbox_workspace_roots: &[AbsolutePathBuf],
     windows_sandbox_filesystem_overrides: Option<&WindowsSandboxFilesystemOverrides>,
     windows_sandbox_additional_read_roots: &[AbsolutePathBuf],
-    prepared_canonical_windows_sandbox_launch: Option<
-        codex_windows_sandbox::PreparedCanonicalWindowsSandboxLaunch,
-    >,
-    canonical_windows_sandbox_launch_identity: Option<String>,
 ) -> Result<RawExecToolCallOutput> {
     if sandbox == SandboxType::WindowsRestrictedToken {
         return exec_windows_sandbox(
@@ -617,8 +609,6 @@ async fn get_raw_output_result(
             windows_sandbox_workspace_roots,
             windows_sandbox_filesystem_overrides,
             windows_sandbox_additional_read_roots,
-            prepared_canonical_windows_sandbox_launch,
-            canonical_windows_sandbox_launch_identity,
         )
         .await;
     }
@@ -697,10 +687,6 @@ async fn exec_windows_sandbox(
     windows_sandbox_workspace_roots: &[AbsolutePathBuf],
     windows_sandbox_filesystem_overrides: Option<&WindowsSandboxFilesystemOverrides>,
     windows_sandbox_additional_read_roots: &[AbsolutePathBuf],
-    prepared_canonical_windows_sandbox_launch: Option<
-        codex_windows_sandbox::PreparedCanonicalWindowsSandboxLaunch,
-    >,
-    canonical_windows_sandbox_launch_identity: Option<String>,
 ) -> Result<RawExecToolCallOutput> {
     use codex_windows_sandbox::CaptureOutputSink;
     use codex_windows_sandbox::CaptureOutputStream;
@@ -751,18 +737,6 @@ async fn exec_windows_sandbox(
     let sandbox_level = windows_sandbox_level;
     let proxy_enforced = network.is_some();
     let use_elevated = windows_sandbox_uses_elevated_backend(sandbox_level, proxy_enforced);
-    if prepared_canonical_windows_sandbox_launch.is_some()
-        != canonical_windows_sandbox_launch_identity.is_some()
-    {
-        return Err(CodexErr::InvalidRequest(
-            "prepared canonical Windows launch state is incomplete".to_string(),
-        ));
-    }
-    if prepared_canonical_windows_sandbox_launch.is_some() && !use_elevated {
-        return Err(CodexErr::InvalidRequest(
-            "prepared canonical Windows launch requires the elevated sandbox backend".to_string(),
-        ));
-    }
     let additional_deny_write_paths = windows_sandbox_filesystem_overrides
         .map(|overrides| overrides.additional_deny_write_paths.clone())
         .unwrap_or_default();
@@ -831,8 +805,6 @@ async fn exec_windows_sandbox(
                     deny_write_paths_override: &additional_deny_write_paths,
                     output_sink: output_sink.clone(),
                     retained_bytes_cap,
-                    prepared_canonical_windows_sandbox_launch,
-                    canonical_launch_identity: canonical_windows_sandbox_launch_identity.as_deref(),
                 },
             )
         } else {

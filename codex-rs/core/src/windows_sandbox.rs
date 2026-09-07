@@ -9,8 +9,6 @@ use codex_login::default_client::originator;
 use codex_otel::sanitize_metric_tag_value;
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::models::PermissionProfile;
-use codex_sandboxing::SandboxType;
-use codex_sandboxing::resolve_windows_elevated_filesystem_overrides;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -146,86 +144,6 @@ pub fn run_elevated_setup(
     )
 }
 
-/// Prepare the same Windows logon identity and filesystem grants used by an
-/// elevated runtime launch, without starting the requested process.
-///
-/// Canonical completion proof calls this during a guarded platform-preparation
-/// interval. Windows ACL setup can emit filesystem notifications even when
-/// repository bytes do not change; the caller then uses one exact watcher
-/// handoff to begin the measured certification interval without a gap.
-pub(crate) fn prepare_canonical_completion_proof_sandbox(
-    attempt_id: &str,
-    launch_identity: &str,
-    permission_profile: &PermissionProfile,
-    workspace_roots: &[AbsolutePathBuf],
-    command_cwd: &Path,
-    env_map: &HashMap<String, String>,
-    codex_home: &Path,
-) -> anyhow::Result<codex_windows_sandbox::PreparedCanonicalWindowsSandboxLaunch> {
-    // Mirror the pure permission normalization performed by the real shell
-    // sandbox transform. The prepared capability must bind to the profile the
-    // elevated launcher will actually receive, rather than the equivalent
-    // higher-level profile that entered the tool handler.
-    let permission_profile = codex_sandboxing::policy_transforms::effective_permission_profile(
-        permission_profile,
-        /*additional_permissions*/ None,
-    );
-    let sandbox_policy_cwd = AbsolutePathBuf::from_absolute_path(command_cwd.to_path_buf())?;
-    let overrides = resolve_windows_elevated_filesystem_overrides(
-        SandboxType::WindowsRestrictedToken,
-        &permission_profile,
-        &sandbox_policy_cwd,
-        /*use_windows_elevated_backend*/ true,
-    )
-    .map_err(anyhow::Error::msg)?;
-    let permissions = codex_windows_sandbox::ResolvedWindowsSandboxPermissions::try_from_permission_profile_for_workspace_roots(
-        &permission_profile,
-        workspace_roots,
-    )?;
-    let deny_read_paths = overrides
-        .as_ref()
-        .map(|overrides| {
-            overrides
-                .additional_deny_read_paths
-                .iter()
-                .map(AbsolutePathBuf::to_path_buf)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    let deny_write_paths = overrides
-        .as_ref()
-        .map(|overrides| {
-            overrides
-                .additional_deny_write_paths
-                .iter()
-                .map(AbsolutePathBuf::to_path_buf)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    codex_windows_sandbox::prepare_canonical_windows_sandbox_launch(
-        attempt_id,
-        launch_identity,
-        &permissions,
-        command_cwd,
-        env_map,
-        codex_home,
-        overrides
-            .as_ref()
-            .and_then(|overrides| overrides.read_roots_override.as_deref()),
-        &[],
-        overrides
-            .as_ref()
-            .is_some_and(|overrides| overrides.read_roots_include_platform_defaults),
-        overrides
-            .as_ref()
-            .and_then(|overrides| overrides.write_roots_override.as_deref()),
-        &deny_read_paths,
-        &deny_write_paths,
-        /*proxy_enforced*/ false,
-        codex_windows_sandbox::WindowsSandboxProxySettingsMode::Reconcile,
-    )
-}
-
 pub fn run_elevated_provisioning_setup(codex_home: &Path, real_user: &str) -> anyhow::Result<()> {
     codex_windows_sandbox::run_elevated_provisioning_setup(codex_home, real_user)
 }
@@ -238,7 +156,7 @@ pub fn run_legacy_setup_preflight(
     codex_home: &Path,
 ) -> anyhow::Result<()> {
     codex_windows_sandbox::run_windows_sandbox_legacy_preflight(
-        &permission_profile,
+        permission_profile,
         workspace_roots,
         codex_home,
         command_cwd,

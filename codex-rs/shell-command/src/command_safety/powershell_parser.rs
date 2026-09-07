@@ -1,6 +1,5 @@
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use codex_utils_pty::with_windows_child_creation;
 use serde::Deserialize;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -314,8 +313,7 @@ impl PowershellParserProcess {
                 "trusted PowerShell parser host has no parent directory",
             )
         })?;
-        let mut command = Command::new(&trusted_executable);
-        command
+        let child = Command::new(&trusted_executable)
             .args([
                 "-NoLogo",
                 "-NoProfile",
@@ -327,8 +325,8 @@ impl PowershellParserProcess {
             .current_dir(trusted_working_directory)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-        let child = with_windows_child_creation(|_| command.spawn())?;
+            .stderr(Stdio::null())
+            .spawn()?;
         let mut child = Some(child);
         let stdin_result = child
             .as_mut()

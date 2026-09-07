@@ -19,7 +19,6 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_absolute_path::canonicalize_preserving_symlinks;
 use codex_utils_path_uri::PathUri;
 use codex_utils_pty::configure_windows_command_args;
-use codex_utils_pty::with_windows_child_creation;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
@@ -319,7 +318,7 @@ fn spawn_command(
     command.stdout(std::process::Stdio::piped());
     command.stderr(std::process::Stdio::piped());
     command.kill_on_drop(true);
-    with_windows_child_creation(|_| command.spawn()).map_err(io_error)
+    command.spawn().map_err(io_error)
 }
 
 fn io_error(err: std::io::Error) -> JSONRPCErrorError {

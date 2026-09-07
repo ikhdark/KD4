@@ -22,7 +22,6 @@ use crate::tools::runtimes::ShellCommandPreparation;
 use crate::tools::runtimes::exec_env_for_sandbox_permissions;
 use crate::tools::runtimes::prepare_shell_command;
 use crate::tools::runtimes::shell_snapshot_additional_read_roots;
-use crate::tools::runtimes::strip_managed_proxy_env;
 use crate::tools::sandboxing::Approvable;
 use crate::tools::sandboxing::ApprovalAction;
 use crate::tools::sandboxing::ApprovalCtx;
@@ -42,17 +41,13 @@ use crate::unified_exec::SpawnLifecycle;
 use crate::unified_exec::SpawnLifecycleHandle;
 use crate::unified_exec::UnifiedExecProcess;
 use crate::unified_exec::UnifiedExecProcessManager;
-use codex_network_proxy::ALLOW_LOCAL_BINDING_ENV_KEY;
 use codex_network_proxy::ManagedNetworkSandboxContext;
 use codex_network_proxy::NetworkProxy;
-use codex_network_proxy::PROXY_ENV_KEYS;
-use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::error::CodexErr;
 use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::request_permissions::UriAdditionalPermissionProfile;
 use codex_sandboxing::SandboxCommand;
-use codex_sandboxing::SandboxType;
 use codex_sandboxing::SandboxablePreference;
 use codex_utils_path_uri::PathUri;
 use futures::future::BoxFuture;
@@ -115,7 +110,6 @@ pub struct UnifiedExecRequest {
     pub approved_powershell_direct_argv: Option<Vec<String>>,
     pub raw_output_artifact: RawOutputArtifact,
     pub shell_type: ShellType,
-    pub shell_wrapper_is_owned: bool,
     pub hook_command: String,
     pub process_id: u32,
     pub cwd: PathUri,
@@ -133,19 +127,6 @@ pub struct UnifiedExecRequest {
     pub exec_approval_requirement: ExecApprovalRequirement,
     pub validation_launch: Option<crate::validation_admission::ValidationLaunchPlan>,
     pub(crate) known_delta_hit: Option<KnownDeltaHit>,
-    pub(crate) workspace_operation:
-        Option<crate::workspace_operation_gate::WorkspaceOperationLease>,
-    pub(crate) completion_proof: Option<crate::completion_proof::UnifiedExecCompletionProof>,
-    pub(crate) canonical_proof_repository_root: Option<std::path::PathBuf>,
-    pub(crate) canonical_proof_report_write_root: Option<std::path::PathBuf>,
-    pub(crate) prepared_canonical_windows_sandbox_launch:
-        Option<codex_windows_sandbox::PreparedCanonicalWindowsSandboxLaunch>,
-}
-
-impl UnifiedExecRequest {
-    fn sandbox_shell_type(&self) -> Option<&ShellType> {
-        self.shell_wrapper_is_owned.then_some(&self.shell_type)
-    }
 }
 
 #[derive(Debug)]
@@ -243,23 +224,6 @@ fn build_unified_exec_sandbox_command(
         managed_network,
         additional_permissions,
     })
-}
-
-fn strip_completion_proof_proxy_env(env: &mut HashMap<String, String>) {
-    strip_managed_proxy_env(env);
-    env.retain(|key, _| {
-        !PROXY_ENV_KEYS
-            .iter()
-            .any(|proxy_key| key.eq_ignore_ascii_case(proxy_key))
-    });
-}
-
-fn strip_completion_proof_private_env(env: &mut HashMap<String, String>) {
-    env.retain(|name, _| {
-        !name
-            .to_ascii_uppercase()
-            .starts_with("CODEX_COMPLETION_PROOF_")
-    });
 }
 
 impl<'a> UnifiedExecRuntime<'a> {
@@ -403,7 +367,7 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecLaunch> for UnifiedExecRunti
         req: &UnifiedExecRequest,
         ctx: &ToolCtx,
     ) -> Option<NetworkApprovalSpec> {
-        if req.known_delta_hit.is_some() || req.canonical_proof_report_write_root.is_some() {
+        if req.known_delta_hit.is_some() {
             return None;
         }
         let file_system_sandbox_policy = ctx.turn.file_system_sandbox_policy();
@@ -442,80 +406,8 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecLaunch> for UnifiedExecRunti
         attempt: &SandboxAttempt<'_>,
         ctx: &ToolCtx,
     ) -> Result<UnifiedExecLaunch, ToolError> {
-        let canonical_permissions = match (
-            req.canonical_proof_repository_root.as_deref(),
-            req.canonical_proof_report_write_root.as_deref(),
-        ) {
-            (Some(repository_root), Some(report_write_root)) => Some(
-                crate::tools::runtimes::shell::canonical_completion_proof_permissions(
-                    repository_root,
-                    report_write_root,
-                )
-                .map_err(ToolError::Rejected)?,
-            ),
-            (None, None) => None,
-            _ => {
-                return Err(ToolError::Rejected(
-                    "canonical completion-proof confinement received incomplete private launch metadata"
-                        .to_string(),
-                ));
-            }
-        };
-        let canonical_confinement = canonical_permissions.is_some();
-        let lifecycle_is_canonical = req
-            .completion_proof
-            .as_ref()
-            .is_some_and(crate::completion_proof::UnifiedExecCompletionProof::is_canonical);
-        if canonical_confinement != lifecycle_is_canonical {
-            return Err(ToolError::Rejected(
-                "canonical completion-proof confinement did not match its activated attempt"
-                    .to_string(),
-            ));
-        }
-        if canonical_confinement
-            && cfg!(windows)
-            && req.prepared_canonical_windows_sandbox_launch.is_none()
-        {
-            return Err(ToolError::Rejected(
-                "canonical completion-proof confinement received missing prepared Windows launch state"
-                    .to_string(),
-            ));
-        }
-        if !canonical_confinement && req.prepared_canonical_windows_sandbox_launch.is_some() {
-            return Err(ToolError::Rejected(
-                "non-canonical launch received unexpected prepared Windows launch state"
-                    .to_string(),
-            ));
-        }
-        if canonical_confinement && !cfg!(windows) {
-            return Err(ToolError::Rejected(
-                "canonical completion-proof network confinement is unavailable on this host"
-                    .to_string(),
-            ));
-        }
-        let canonical_attempt = canonical_permissions
-            .as_ref()
-            .map(|permissions| SandboxAttempt {
-                codex_home: attempt.codex_home,
-                sandbox: SandboxType::WindowsRestrictedToken,
-                sandbox_requested: true,
-                permissions,
-                exec_server_permissions: permissions,
-                enforce_managed_network: false,
-                sandbox_cwd: attempt.sandbox_cwd,
-                workspace_roots: attempt.workspace_roots,
-                windows_sandbox_level: WindowsSandboxLevel::Elevated,
-                windows_sandbox_private_desktop: attempt.windows_sandbox_private_desktop,
-                network_denial_cancellation_token: None,
-                network_proxy: None,
-            });
-        let attempt = canonical_attempt.as_ref().unwrap_or(attempt);
-
-        if !canonical_confinement && let Some(hit) = req.known_delta_hit.as_ref() {
+        if let Some(hit) = req.known_delta_hit.as_ref() {
             return Ok(UnifiedExecLaunch::KnownDelta(hit.clone()));
-        }
-        if let Some(workspace_operation) = req.workspace_operation.as_ref() {
-            workspace_operation.acquire().await;
         }
         let native_cwd = req.cwd.to_abs_path().ok();
         let mutation = crate::turn_diff_tracker::command_mutation(
@@ -524,17 +416,13 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecLaunch> for UnifiedExecRunti
                 .as_ref()
                 .map(codex_utils_absolute_path::AbsolutePathBuf::as_path),
         );
-        let mut mutation_event_ctx = crate::tools::events::ToolEventCtx::new(
-            ctx.session.as_ref(),
-            ctx.turn.as_ref(),
-            &ctx.call_id,
-            None,
-        );
-        if canonical_confinement {
-            mutation_event_ctx = mutation_event_ctx.without_post_proof_mutation_observation();
-        }
         crate::tools::events::begin_exec_mutation_evidence(
-            mutation_event_ctx,
+            crate::tools::events::ToolEventCtx::new(
+                ctx.session.as_ref(),
+                ctx.turn.as_ref(),
+                &ctx.call_id,
+                None,
+            ),
             native_cwd.as_ref(),
             &mutation,
         )
@@ -548,40 +436,17 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecLaunch> for UnifiedExecRunti
             .shell
             .as_ref()
             .unwrap_or(session_shell.as_ref());
-        let shell_snapshot_location = if canonical_confinement {
-            None
-        } else {
-            req.turn_environment.shell_snapshot(&req.cwd).await
-        };
+        let shell_snapshot_location = req.turn_environment.shell_snapshot(&req.cwd).await;
         let (file_system_sandbox_policy, _) = attempt.permissions.to_runtime_permissions();
-        let launch_sandbox_permissions = if canonical_confinement {
-            SandboxPermissions::UseDefault
-        } else {
-            sandbox_permissions_preserving_denied_reads(
-                req.sandbox_permissions,
-                &file_system_sandbox_policy,
-            )
-        };
-        let managed_network = if canonical_confinement {
-            None
-        } else {
-            attempt.network_proxy(managed_network_for_sandbox_permissions(
-                req.network.as_ref(),
-                launch_sandbox_permissions,
-            ))
-        };
-        let mut env = exec_env_for_sandbox_permissions(&req.env, launch_sandbox_permissions);
-        let mut explicit_env_overrides = req.explicit_env_overrides.clone();
-        if req.completion_proof.is_some() {
-            strip_completion_proof_private_env(&mut env);
-            strip_completion_proof_private_env(&mut explicit_env_overrides);
-        }
-        if canonical_confinement {
-            strip_completion_proof_proxy_env(&mut env);
-            strip_completion_proof_proxy_env(&mut explicit_env_overrides);
-            env.insert(ALLOW_LOCAL_BINDING_ENV_KEY.to_string(), "1".to_string());
-            explicit_env_overrides.insert(ALLOW_LOCAL_BINDING_ENV_KEY.to_string(), "1".to_string());
-        }
+        let launch_sandbox_permissions = sandbox_permissions_preserving_denied_reads(
+            req.sandbox_permissions,
+            &file_system_sandbox_policy,
+        );
+        let managed_network = attempt.network_proxy(managed_network_for_sandbox_permissions(
+            req.network.as_ref(),
+            launch_sandbox_permissions,
+        ));
+        let env = exec_env_for_sandbox_permissions(&req.env, launch_sandbox_permissions);
         let (mut env, managed_network_context) = match managed_network {
             Some(network) => {
                 let prepared = network
@@ -604,10 +469,10 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecLaunch> for UnifiedExecRunti
             command_for_approval: &req.command_for_approval,
             shell,
             shell_snapshot: shell_snapshot_location.as_deref(),
-            explicit_env_overrides: &explicit_env_overrides,
+            explicit_env_overrides: &req.explicit_env_overrides,
             env: &mut env,
             shell_type: &req.shell_type,
-            sandbox_shell_type: req.sandbox_shell_type(),
+            sandbox_shell_type: Some(&req.shell_type),
             sandbox: attempt.sandbox,
             windows_sandbox_level: attempt.windows_sandbox_level,
             enforce_managed_network: attempt.enforce_managed_network,
@@ -625,11 +490,7 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecLaunch> for UnifiedExecRunti
             &req.cwd,
             &env,
             managed_network_context,
-            if canonical_confinement {
-                None
-            } else {
-                req.additional_permissions.clone()
-            },
+            req.additional_permissions.clone(),
         )
         .map_err(|error| match error {
             ToolError::Rejected(_) => {
@@ -648,11 +509,7 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecLaunch> for UnifiedExecRunti
                 command,
                 additional_read_roots,
                 options,
-                if canonical_confinement {
-                    None
-                } else {
-                    req.additional_permissions_uri.as_ref()
-                },
+                req.additional_permissions_uri.as_ref(),
                 attempt,
                 managed_network,
                 /*environment_id*/ Some(&req.turn_environment.environment_id),
@@ -662,9 +519,6 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecLaunch> for UnifiedExecRunti
                 Some(req.raw_output_artifact.clone()),
                 req.turn_environment.environment.as_ref(),
                 &self.pending_spawns,
-                req.completion_proof.as_ref(),
-                req.prepared_canonical_windows_sandbox_launch.clone(),
-                canonical_confinement.then(|| req.hook_command.as_str()),
             )
             .await
             .map(UnifiedExecLaunch::Process)
@@ -819,7 +673,6 @@ mod tests {
                 bytes: 0,
             },
             shell_type: ShellType::Sh,
-            shell_wrapper_is_owned: true,
             hook_command: "pwd".to_string(),
             process_id: 1000,
             cwd: cwd.into(),
@@ -840,11 +693,6 @@ mod tests {
             },
             validation_launch: None,
             known_delta_hit: None,
-            workspace_operation: None,
-            completion_proof: None,
-            canonical_proof_repository_root: None,
-            canonical_proof_report_write_root: None,
-            prepared_canonical_windows_sandbox_launch: None,
         };
 
         assert_eq!(
@@ -933,7 +781,6 @@ mod tests {
                 bytes: 0,
             },
             shell_type: ShellType::Zsh,
-            shell_wrapper_is_owned: true,
             hook_command: "echo hi".to_string(),
             process_id: 1000,
             cwd: cwd.clone().into(),
@@ -951,29 +798,6 @@ mod tests {
             exec_approval_requirement,
             validation_launch: None,
             known_delta_hit: None,
-            workspace_operation: None,
-            completion_proof: None,
-            canonical_proof_repository_root: None,
-            canonical_proof_report_write_root: None,
-            prepared_canonical_windows_sandbox_launch: None,
         }
-    }
-
-    #[tokio::test]
-    async fn sandbox_shell_type_tracks_owned_shell_wrapper() {
-        let mut request = test_request(
-            SandboxPermissions::UseDefault,
-            ExecApprovalRequirement::Skip {
-                bypass_sandbox: false,
-                proposed_execpolicy_amendment: None,
-            },
-        );
-        request.shell_type = ShellType::PowerShell;
-        request.shell_wrapper_is_owned = false;
-
-        assert_eq!(request.sandbox_shell_type(), None);
-
-        request.shell_wrapper_is_owned = true;
-        assert_eq!(request.sandbox_shell_type(), Some(&ShellType::PowerShell));
     }
 }

@@ -146,24 +146,6 @@ pub(crate) fn retry_runner_spawn_once<T>(
     }
 }
 
-/// Uses already-prepared canonical credentials exactly once when refresh is
-/// disabled. This keeps login failure inside the launch attempt and prevents
-/// ACL-changing credential setup after the canonical watcher handoff.
-pub(crate) fn spawn_runner_with_optional_credential_refresh<T>(
-    sandbox_creds: SandboxCreds,
-    command: &[String],
-    allow_credential_refresh: bool,
-    spawn: impl FnMut(SandboxCreds) -> Result<T>,
-    refresh: impl FnOnce() -> Result<SandboxCreds>,
-) -> Result<T> {
-    if allow_credential_refresh {
-        retry_runner_spawn_once(sandbox_creds, command, spawn, refresh)
-    } else {
-        let mut spawn = spawn;
-        spawn(sandbox_creds)
-    }
-}
-
 impl RunnerTransport {
     pub(crate) fn send_spawn_request(&mut self, request: SpawnRequest) -> Result<()> {
         let spawn_request = FramedMessage {

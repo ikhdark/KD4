@@ -498,7 +498,8 @@ fn collect_manifest_entries(root: &Path, paths: &[String]) -> StoreResult<Manife
 }
 
 fn repository_head_entry(root: &Path) -> WorkspaceManifestEntry {
-    let content_hash = repository_overlay_output(root, &["rev-parse", "--verify", "HEAD"])
+    let content_hash = repository_overlay_command(root, &["rev-parse", "--verify", "HEAD"])
+        .output()
         .ok()
         .filter(|output| output.status.success())
         .and_then(|output| {
@@ -636,18 +637,7 @@ fn git_relative_path_identity(raw_path: &[u8]) -> StoreResult<String> {
 }
 
 fn spawn_repository_overlay_command(root: &Path, args: &[&str]) -> std::io::Result<Child> {
-    let mut command = repository_overlay_command(root, args);
-    codex_utils_pty::with_windows_child_creation(|_| command.spawn())
-}
-
-fn repository_overlay_output(root: &Path, args: &[&str]) -> std::io::Result<std::process::Output> {
-    let mut command = repository_overlay_command(root, args);
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let child = codex_utils_pty::with_windows_child_creation(|_| command.spawn())?;
-    child.wait_with_output()
+    repository_overlay_command(root, args).spawn()
 }
 
 fn repository_overlay_command(root: &Path, args: &[&str]) -> Command {
@@ -1183,7 +1173,7 @@ mod overlay_observation_tests {
                 .arg("--ignored")
                 .env(HELPER_DIR, &helper_dir)
                 .env(HELPER_ROLE, role)
-                .stdout(Stdio::null())
+                .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()
         })

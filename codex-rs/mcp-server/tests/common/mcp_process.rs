@@ -123,12 +123,6 @@ impl McpProcess {
         self.process.wait().await
     }
 
-    /// Forcefully terminates the real MCP child and waits until it has been reaped.
-    pub async fn hard_kill_and_wait(&mut self) -> std::io::Result<ExitStatus> {
-        self.process.start_kill()?;
-        self.process.wait().await
-    }
-
     /// Performs the initialization handshake with the MCP server.
     pub async fn initialize(&mut self) -> anyhow::Result<()> {
         let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
@@ -308,22 +302,10 @@ impl McpProcess {
         &mut self,
         request_id: RequestId,
     ) -> anyhow::Result<JsonRpcResponse<serde_json::Value>> {
-        let (response, _) = self
-            .read_stream_until_response_message_with_observed_payloads(request_id)
-            .await?;
-        Ok(response)
-    }
-
-    pub async fn read_stream_until_response_message_with_observed_payloads(
-        &mut self,
-        request_id: RequestId,
-    ) -> anyhow::Result<(JsonRpcResponse<serde_json::Value>, Vec<String>)> {
         eprintln!("in read_stream_until_response_message({request_id:?})");
 
-        let mut observed_payloads = Vec::new();
         loop {
             let message = self.read_jsonrpc_message().await?;
-            observed_payloads.push(serde_json::to_string(&message)?);
             match message {
                 JsonRpcMessage::Notification(_) => {
                     eprintln!("notification: {message:?}");
@@ -336,7 +318,7 @@ impl McpProcess {
                 }
                 JsonRpcMessage::Response(jsonrpc_response) => {
                     if jsonrpc_response.id == request_id {
-                        return Ok((jsonrpc_response, observed_payloads));
+                        return Ok(jsonrpc_response);
                     }
                 }
             }

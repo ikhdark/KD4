@@ -5,10 +5,6 @@ use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
-#[cfg(windows)]
-use std::time::SystemTime;
-#[cfg(windows)]
-use std::time::UNIX_EPOCH;
 
 use codex_code_mode::CellId;
 use codex_code_mode::CodeModeNestedToolCall;
@@ -250,111 +246,6 @@ async fn next_callback_event(
         .await
         .expect("callback event timeout")
         .expect("callback event stream closed")
-}
-
-#[cfg(windows)]
-async fn read_process_id(path: &std::path::Path, description: &str) -> u32 {
-    tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            if let Ok(contents) = std::fs::read_to_string(path)
-                && let Ok(process_id) = contents.trim().parse()
-            {
-                return process_id;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap_or_else(|_| panic!("{description} did not publish its process id"))
-}
-
-#[cfg(windows)]
-async fn powershell_process_check(process_id: u32, wait_for_exit: bool) -> bool {
-    let action = if wait_for_exit {
-        "if ($null -eq $process) { exit 0 }; if ($process.WaitForExit(10000)) { exit 0 }; exit 1"
-    } else {
-        "if ($null -eq $process) { exit 1 }; exit 0"
-    };
-    tokio::process::Command::new("powershell.exe")
-        .args([
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            &format!(
-                "$process = Get-Process -Id {process_id} -ErrorAction SilentlyContinue; {action}"
-            ),
-        ])
-        .status()
-        .await
-        .expect("run PowerShell process check")
-        .success()
-}
-
-#[cfg(windows)]
-#[tokio::test]
-async fn windows_process_owned_host_drop_terminates_immediate_descendant() {
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time after Unix epoch")
-        .as_nanos();
-    let temp_dir = std::env::temp_dir().join(format!(
-        "codex-code-mode-process-tree-{}-{nonce}",
-        std::process::id()
-    ));
-    std::fs::create_dir(&temp_dir).expect("create process-tree test directory");
-    let root_pid_file = temp_dir.join("root.pid");
-    let descendant_pid_file = temp_dir.join("descendant.pid");
-    let wrapper = temp_dir.join("host-wrapper.cmd");
-    let powershell_root_pid_file = root_pid_file.display().to_string().replace('\'', "''");
-    let powershell_pid_file = descendant_pid_file
-        .display()
-        .to_string()
-        .replace('\'', "''");
-    let host_program = codex_utils_cargo_bin::cargo_bin("codex-code-mode-host")
-        .expect("host binary")
-        .display()
-        .to_string();
-    std::fs::write(
-        &wrapper,
-        format!(
-            "@echo off\r\nstart \"\" /b powershell.exe -NoLogo -NoProfile -NonInteractive -Command \"$self = Get-CimInstance Win32_Process -Filter ('ProcessId = ' + $PID); [IO.File]::WriteAllText('{powershell_root_pid_file}', [string]$self.ParentProcessId); [IO.File]::WriteAllText('{powershell_pid_file}', [string]$PID); Start-Sleep -Seconds 300\" 1>NUL 2>NUL <NUL\r\n\"{host_program}\"\r\n"
-        ),
-    )
-    .expect("write code-mode host wrapper");
-
-    let provider = ProcessOwnedCodeModeSessionProvider::with_host_program(wrapper);
-    let session = provider
-        .create_session(Arc::new(RecordingDelegate::default()))
-        .await
-        .expect("create remote session through process-tree wrapper");
-    let root_process_id = read_process_id(&root_pid_file, "wrapper root").await;
-    let descendant_process_id = read_process_id(&descendant_pid_file, "immediate descendant").await;
-    assert_ne!(
-        root_process_id, descendant_process_id,
-        "wrapper root and immediate descendant must be separate processes"
-    );
-    assert!(
-        powershell_process_check(root_process_id, false).await,
-        "wrapper root {root_process_id} was not alive before session drop"
-    );
-    assert!(
-        powershell_process_check(descendant_process_id, false).await,
-        "immediate descendant {descendant_process_id} was not alive before session drop"
-    );
-
-    drop(session);
-    drop(provider);
-
-    assert!(
-        powershell_process_check(root_process_id, true).await,
-        "wrapper root {root_process_id} survived final session drop"
-    );
-    assert!(
-        powershell_process_check(descendant_process_id, true).await,
-        "immediate descendant {descendant_process_id} survived final session drop"
-    );
-    std::fs::remove_dir_all(temp_dir).expect("remove process-tree test directory");
 }
 
 #[tokio::test]

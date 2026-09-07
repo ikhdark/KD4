@@ -6,20 +6,17 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from scripts.build_tooling_test_support import (
-    REPO_ROOT,
-    powershell,
-    ps_single_quote,
-    pwsh_only,
-)
+from scripts.build_tooling_test_support import REPO_ROOT
+from scripts.build_tooling_test_support import powershell
+from scripts.build_tooling_test_support import ps_single_quote
+from scripts.build_tooling_test_support import pwsh_only
+
 
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
 class BuildToolingPerformanceTest(unittest.TestCase):
-    def test_perf_env_no_sccache_leaves_incremental_and_uses_lane_through_script_process(
-        self,
-    ) -> None:
+    def test_perf_env_no_sccache_leaves_incremental_and_uses_lane(self) -> None:
         shell = pwsh_only()
         if shell is None:
             self.skipTest("pwsh is not available")
@@ -68,9 +65,7 @@ class BuildToolingPerformanceTest(unittest.TestCase):
         self.assertIn("cargoTargetDir=", result.stdout)
         self.assertIn("perf-nextest-nosccache", result.stdout)
 
-    def test_perf_env_rejects_explicit_target_outside_reserved_lane_through_script_process(
-        self,
-    ) -> None:
+    def test_perf_env_rejects_explicit_target_outside_reserved_lane(self) -> None:
         shell = pwsh_only()
         if shell is None:
             self.skipTest("pwsh is not available")
@@ -81,7 +76,15 @@ class BuildToolingPerformanceTest(unittest.TestCase):
             fake_bin = temp_root / "bin"
             fake_bin.mkdir()
             (fake_bin / "cargo.cmd").write_text(
-                "@echo off\r\nif defined CARGO_TARGET_DIR (echo targetenv=%CARGO_TARGET_DIR%) else echo targetenv=\r\necho cargo-args:%*\r\nexit /b 0\r\n",
+                "\r\n".join(
+                    [
+                        "@echo off",
+                        "if defined CARGO_TARGET_DIR (echo targetenv=%CARGO_TARGET_DIR%) else echo targetenv=",
+                        "echo cargo-args:%*",
+                        "exit /b 0",
+                        "",
+                    ]
+                ),
                 encoding="utf-8",
             )
             explicit_target = temp_root / "explicit-target"
@@ -121,7 +124,7 @@ class BuildToolingPerformanceTest(unittest.TestCase):
         self.assertNotIn("targetenv=", result.stdout)
         self.assertNotIn("stale-target-env", result.stdout)
 
-    def test_perf_env_rejects_dot_path_lane_names_through_script_process(self) -> None:
+    def test_perf_env_rejects_dot_path_lane_names(self) -> None:
         shell = pwsh_only()
         if shell is None:
             self.skipTest("pwsh is not available")
@@ -156,9 +159,7 @@ class BuildToolingPerformanceTest(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("Cargo target lane", result.stderr)
 
-    def test_perf_env_keeps_same_length_cargo_watch_rewrite_through_script_process(
-        self,
-    ) -> None:
+    def test_perf_env_keeps_same_length_cargo_watch_rewrite(self) -> None:
         shell = pwsh_only()
         if shell is None:
             self.skipTest("pwsh is not available")
@@ -169,7 +170,15 @@ class BuildToolingPerformanceTest(unittest.TestCase):
             fake_bin = temp_root / "bin"
             fake_bin.mkdir()
             (fake_bin / "cargo.cmd").write_text(
-                "@echo off\r\nif defined CARGO_TARGET_DIR (echo targetenv=%CARGO_TARGET_DIR%) else echo targetenv=\r\necho cargo-args:%*\r\nexit /b 0\r\n",
+                "\r\n".join(
+                    [
+                        "@echo off",
+                        "if defined CARGO_TARGET_DIR (echo targetenv=%CARGO_TARGET_DIR%) else echo targetenv=",
+                        "echo cargo-args:%*",
+                        "exit /b 0",
+                        "",
+                    ]
+                ),
                 encoding="utf-8",
             )
             env = os.environ.copy()
@@ -211,7 +220,7 @@ class BuildToolingPerformanceTest(unittest.TestCase):
         self.assertIn("--target-dir", result.stdout)
         self.assertIn(" -- --nocapture", result.stdout)
 
-    def test_perf_env_non_native_success_ignores_stale_last_exit_code_through_script_process(
+    def test_perf_env_non_native_success_does_not_use_stale_last_exit_code(
         self,
     ) -> None:
         shell = pwsh_only()
@@ -246,9 +255,7 @@ class BuildToolingPerformanceTest(unittest.TestCase):
             f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
         )
 
-    def test_perf_env_non_native_failure_returns_nonzero_through_script_process(
-        self,
-    ) -> None:
+    def test_perf_env_non_native_failure_returns_nonzero(self) -> None:
         shell = pwsh_only()
         if shell is None:
             self.skipTest("pwsh is not available")
@@ -281,7 +288,7 @@ class BuildToolingPerformanceTest(unittest.TestCase):
             f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
         )
 
-    def test_perf_env_restores_empty_environment_variable_through_script_process(
+    def test_perf_env_restore_helper_preserves_empty_environment_variable(
         self,
     ) -> None:
         shell = pwsh_only()
@@ -289,17 +296,23 @@ class BuildToolingPerformanceTest(unittest.TestCase):
             self.skipTest("pwsh is not available")
         script = REPO_ROOT / "scripts" / "invoke-rust-perf-env.ps1"
         command = (
+            "$tokens = $null; $errors = $null; "
+            f"$ast = [System.Management.Automation.Language.Parser]::ParseFile("
+            f"{ps_single_quote(script)}, [ref]$tokens, [ref]$errors); "
+            "$function = $ast.Find({ param($node) "
+            "$node -is [System.Management.Automation.Language.FunctionDefinitionAst] "
+            "-and $node.Name -eq 'Restore-ProcessEnvironmentVariable' }, $true); "
+            "Invoke-Expression $function.Extent.Text; "
             "[Environment]::SetEnvironmentVariable("
-            "'SCCACHE_BASEDIR', '', [EnvironmentVariableTarget]::Process); "
-            f"& {ps_single_quote(script)} -NoSccache "
-            f"-WorkingDirectory {ps_single_quote(REPO_ROOT)} "
-            f"-ProgramArgs @({ps_single_quote(shell)}, '-NoProfile', "
-            "'-Command', 'exit 0'); "
-            "$scriptExit = $LASTEXITCODE; "
-            "if ($scriptExit -ne 0) { exit $scriptExit }; "
-            "if (-not (Test-Path Env:SCCACHE_BASEDIR) -or "
-            "$env:SCCACHE_BASEDIR -ne '') { exit 23 }; "
-            "Write-Output 'restoredEmpty=True'"
+            "'KD4_EMPTY_RESTORE_TEST', '', [EnvironmentVariableTarget]::Process); "
+            "$old = [Environment]::GetEnvironmentVariable("
+            "'KD4_EMPTY_RESTORE_TEST', 'Process'); "
+            "$had = Test-Path Env:KD4_EMPTY_RESTORE_TEST; "
+            "Remove-Item Env:KD4_EMPTY_RESTORE_TEST; "
+            "Restore-ProcessEnvironmentVariable "
+            "-Name 'KD4_EMPTY_RESTORE_TEST' -Value $old -WasSet $had; "
+            "if (-not (Test-Path Env:KD4_EMPTY_RESTORE_TEST) -or "
+            "$env:KD4_EMPTY_RESTORE_TEST -ne '') { exit 1 }"
         )
 
         result = subprocess.run(
@@ -317,9 +330,8 @@ class BuildToolingPerformanceTest(unittest.TestCase):
             0,
             f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
         )
-        self.assertIn("restoredEmpty=True", result.stdout)
 
-    def test_sccache_stats_restarts_stale_server_through_script_process(self) -> None:
+    def test_common_rust_env_restarts_stale_sccache_server_cache_size(self) -> None:
         shell = powershell()
         if shell is None:
             self.skipTest("PowerShell is not available")
@@ -335,7 +347,23 @@ class BuildToolingPerformanceTest(unittest.TestCase):
                 encoding="utf-8",
             )
             (fake_bin / "sccache.cmd").write_text(
-                '@echo off\r\n>>"%FAKE_SCCACHE_CALLS%" echo(%*\r\nif "%1"=="--show-stats" (\r\n  type "%FAKE_SCCACHE_STATS%"\r\n  exit /b 0\r\n)\r\nif "%1"=="--stop-server" exit /b 0\r\nif "%1"=="--start-server" (\r\n  >"%FAKE_SCCACHE_STATS%" echo Max cache size                       80 GiB\r\n  exit /b 0\r\n)\r\nexit /b 0\r\n',
+                "\r\n".join(
+                    [
+                        "@echo off",
+                        '>>"%FAKE_SCCACHE_CALLS%" echo(%*',
+                        'if "%1"=="--show-stats" (',
+                        '  type "%FAKE_SCCACHE_STATS%"',
+                        "  exit /b 0",
+                        ")",
+                        'if "%1"=="--stop-server" exit /b 0',
+                        'if "%1"=="--start-server" (',
+                        '  >"%FAKE_SCCACHE_STATS%" echo Max cache size                       80 GiB',
+                        "  exit /b 0",
+                        ")",
+                        "exit /b 0",
+                        "",
+                    ]
+                ),
                 encoding="utf-8",
             )
 
@@ -344,7 +372,7 @@ class BuildToolingPerformanceTest(unittest.TestCase):
             env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
             env["FAKE_SCCACHE_CALLS"] = str(calls)
             env["FAKE_SCCACHE_STATS"] = str(stats)
-            script = REPO_ROOT / "scripts" / "sccache-perf.ps1"
+            script = REPO_ROOT / "scripts" / "common-rust-env.ps1"
 
             result = subprocess.run(
                 [
@@ -352,9 +380,17 @@ class BuildToolingPerformanceTest(unittest.TestCase):
                     "-NoProfile",
                     "-ExecutionPolicy",
                     "Bypass",
-                    "-File",
-                    str(script),
-                    "stats",
+                    "-Command",
+                    (
+                        # Mirror the production session: cargo-lane.ps1
+                        # dot-sources this helper under StrictMode Latest
+                        # with $ErrorActionPreference = "Stop".
+                        "Set-StrictMode -Version Latest; "
+                        "$ErrorActionPreference = 'Stop'; "
+                        f". {ps_single_quote(script)}; "
+                        f"Ensure-CodexRustSccacheServer -RepoRoot {ps_single_quote(REPO_ROOT)}; "
+                        'Write-Output "cacheSize=$env:SCCACHE_CACHE_SIZE"'
+                    ),
                 ],
                 text=True,
                 encoding="utf-8",
@@ -370,157 +406,111 @@ class BuildToolingPerformanceTest(unittest.TestCase):
                 0,
                 f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
             )
-            call_lines = calls.read_text(encoding="utf-8").splitlines()
-            self.assertEqual(
-                call_lines,
-                [
-                    "--show-stats",
-                    "--stop-server",
-                    "--start-server",
-                    "--show-stats",
-                    "--show-stats",
-                ],
-            )
+            self.assertIn("cacheSize=80G", result.stdout)
+            call_text = calls.read_text(encoding="utf-8")
+            self.assertIn("--show-stats", call_text)
+            self.assertIn("--stop-server", call_text)
+            self.assertIn("--start-server", call_text)
             self.assertIn("80 GiB", stats.read_text(encoding="utf-8"))
 
-    def test_sccache_stats_honors_cache_size_override_through_script_process(
-        self,
-    ) -> None:
+    def test_common_rust_env_cache_size_honors_override(self) -> None:
         shell = powershell()
         if shell is None:
             self.skipTest("PowerShell is not available")
-        script = REPO_ROOT / "scripts" / "sccache-perf.ps1"
-
-        with tempfile.TemporaryDirectory() as tempdir:
-            temp_root = Path(tempdir)
-            fake_bin = temp_root / "bin"
-            fake_bin.mkdir()
-            observations = temp_root / "sccache-env.txt"
-            (fake_bin / "sccache.cmd").write_text(
-                '@echo off\r\n>>"%FAKE_SCCACHE_ENV%" echo cacheSize=%SCCACHE_CACHE_SIZE%\r\nexit /b 0\r\n',
-                encoding="utf-8",
-            )
-
-            for override, expected in ((" 100G ", "100G"), ("   ", "80G")):
-                with self.subTest(override=override):
-                    observations.unlink(missing_ok=True)
-                    env = os.environ.copy()
-                    env["CODEX_SCCACHE_CACHE_SIZE"] = override
-                    env["FAKE_SCCACHE_ENV"] = str(observations)
-                    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
-                    result = subprocess.run(
-                        [
-                            shell,
-                            "-NoProfile",
-                            "-ExecutionPolicy",
-                            "Bypass",
-                            "-File",
-                            str(script),
-                            "stats",
-                        ],
-                        text=True,
-                        encoding="utf-8",
-                        errors="replace",
-                        capture_output=True,
-                        check=False,
-                        env=env,
-                        creationflags=CREATE_NO_WINDOW,
-                    )
-
-                    self.assertEqual(
-                        result.returncode,
-                        0,
-                        f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
-                    )
-                    observed = observations.read_text(encoding="utf-8").splitlines()
-                    self.assertGreaterEqual(len(observed), 2)
-                    self.assertEqual(set(observed), {f"cacheSize={expected}"})
-
-    def test_sccache_stats_compares_cache_sizes_by_bytes_through_script_process(
-        self,
-    ) -> None:
-        shell = powershell()
-        if shell is None:
-            self.skipTest("PowerShell is not available")
-        script = REPO_ROOT / "scripts" / "sccache-perf.ps1"
-        cases = (
-            ("80GB", "80 GiB", False),
-            ("80g", "80 GiB", False),
-            ("500M", "500 MiB", False),
-            ("1T", "1 TiB", False),
-            ("1024G", "1 TiB", False),
-            ("80G", "10 GiB", True),
-            ("vendor-format", "80 GiB", False),
+        script = REPO_ROOT / "scripts" / "common-rust-env.ps1"
+        command = (
+            "Set-StrictMode -Version Latest; "
+            "$ErrorActionPreference = 'Stop'; "
+            f". {ps_single_quote(script)}; "
+            'Write-Output "cacheSize=$(Get-CodexRustSccacheCacheSize)"'
         )
 
-        with tempfile.TemporaryDirectory() as tempdir:
-            temp_root = Path(tempdir)
-            fake_bin = temp_root / "bin"
-            fake_bin.mkdir()
-            calls = temp_root / "sccache-calls.txt"
-            stats = temp_root / "sccache-stats.txt"
-            (fake_bin / "sccache.cmd").write_text(
-                '@echo off\r\n>>"%FAKE_SCCACHE_CALLS%" echo(%*\r\nif "%1"=="--show-stats" (\r\n  type "%FAKE_SCCACHE_STATS%"\r\n  exit /b 0\r\n)\r\nif "%1"=="--stop-server" exit /b 0\r\nif "%1"=="--start-server" (\r\n  >"%FAKE_SCCACHE_STATS%" echo Max cache size                       80 GiB\r\n  exit /b 0\r\n)\r\nexit /b 0\r\n',
-                encoding="utf-8",
-            )
+        for override, expected in (
+            (" 100G ", "cacheSize=100G"),
+            ("   ", "cacheSize=80G"),
+        ):
+            with self.subTest(override=override):
+                env = os.environ.copy()
+                env["CODEX_SCCACHE_CACHE_SIZE"] = override
+                result = subprocess.run(
+                    [
+                        shell,
+                        "-NoProfile",
+                        "-ExecutionPolicy",
+                        "Bypass",
+                        "-Command",
+                        command,
+                    ],
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    capture_output=True,
+                    check=False,
+                    env=env,
+                    creationflags=CREATE_NO_WINDOW,
+                )
 
-            for expected_size, actual_size, should_restart in cases:
-                with self.subTest(
-                    expected_size=expected_size,
-                    actual_size=actual_size,
-                ):
-                    calls.unlink(missing_ok=True)
-                    stats.write_text(
-                        f"Max cache size                       {actual_size}\r\n",
-                        encoding="utf-8",
-                    )
-                    env = os.environ.copy()
-                    env["CODEX_SCCACHE_CACHE_SIZE"] = expected_size
-                    env["FAKE_SCCACHE_CALLS"] = str(calls)
-                    env["FAKE_SCCACHE_STATS"] = str(stats)
-                    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
-                    result = subprocess.run(
-                        [
-                            shell,
-                            "-NoProfile",
-                            "-ExecutionPolicy",
-                            "Bypass",
-                            "-File",
-                            str(script),
-                            "stats",
-                        ],
-                        text=True,
-                        encoding="utf-8",
-                        errors="replace",
-                        capture_output=True,
-                        check=False,
-                        env=env,
-                        creationflags=CREATE_NO_WINDOW,
-                    )
+                self.assertEqual(
+                    result.returncode,
+                    0,
+                    f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+                )
+                self.assertIn(expected, result.stdout)
 
-                    self.assertEqual(
-                        result.returncode,
-                        0,
-                        f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
-                    )
-                    observed = calls.read_text(encoding="utf-8").splitlines()
-                    if should_restart:
-                        self.assertEqual(
-                            observed,
-                            [
-                                "--show-stats",
-                                "--stop-server",
-                                "--start-server",
-                                "--show-stats",
-                                "--show-stats",
-                            ],
-                        )
-                    else:
-                        self.assertEqual(observed, ["--show-stats", "--show-stats"])
+    def test_common_rust_env_compares_cache_sizes_by_bytes(self) -> None:
+        shell = powershell()
+        if shell is None:
+            self.skipTest("PowerShell is not available")
+        script = REPO_ROOT / "scripts" / "common-rust-env.ps1"
+        command = (
+            "Set-StrictMode -Version Latest; "
+            "$ErrorActionPreference = 'Stop'; "
+            f". {ps_single_quote(script)}; "
+            "$cases = @("
+            "@('80GB', '80 GiB', $true), "
+            "@('80g', '80 GiB', $true), "
+            "@('500M', '500 MiB', $true), "
+            "@('1T', '1 TiB', $true), "
+            "@('1024G', '1 TiB', $true), "
+            "@('80G', '10 GiB', $false), "
+            "@('vendor-format', '80 GiB', $true)"
+            "); "
+            "foreach ($case in $cases) { "
+            "$env:CODEX_SCCACHE_CACHE_SIZE = $case[0]; "
+            "$actual = Test-CodexRustSccacheStatsCacheSize "
+            "-Stats @('Max cache size                       ' + $case[1]); "
+            "Write-Output ($actual -eq $case[2]) "
+            "}"
+        )
 
-    def test_sccache_restart_ignores_stop_failure_and_checks_start_through_script_process(
-        self,
-    ) -> None:
+        result = subprocess.run(
+            [
+                shell,
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                command,
+            ],
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+            check=False,
+            creationflags=CREATE_NO_WINDOW,
+        )
+
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+        self.assertEqual(
+            [line.strip() for line in result.stdout.splitlines() if line.strip()],
+            ["True"] * 7,
+        )
+
+    def test_sccache_perf_restart_ignores_stop_failure_and_checks_start(self) -> None:
         shell = powershell()
         if shell is None:
             self.skipTest("PowerShell is not available")
@@ -531,7 +521,20 @@ class BuildToolingPerformanceTest(unittest.TestCase):
             fake_bin.mkdir()
             calls = temp_root / "sccache-calls.txt"
             (fake_bin / "sccache.cmd").write_text(
-                '@echo off\r\n>>"%FAKE_SCCACHE_CALLS%" echo(%*\r\nif "%1"=="--stop-server" exit /b 7\r\nif "%1"=="--start-server" exit /b 0\r\nif "%1"=="--show-stats" (\r\n  echo Max cache size                       80 GiB\r\n  exit /b 0\r\n)\r\nexit /b 0\r\n',
+                "\r\n".join(
+                    [
+                        "@echo off",
+                        '>>"%FAKE_SCCACHE_CALLS%" echo(%*',
+                        'if "%1"=="--stop-server" exit /b 7',
+                        'if "%1"=="--start-server" exit /b 0',
+                        'if "%1"=="--show-stats" (',
+                        "  echo Max cache size                       80 GiB",
+                        "  exit /b 0",
+                        ")",
+                        "exit /b 0",
+                        "",
+                    ]
+                ),
                 encoding="utf-8",
             )
             env = os.environ.copy()
@@ -572,9 +575,7 @@ class BuildToolingPerformanceTest(unittest.TestCase):
             ["--stop-server", "--start-server", "--show-stats"],
         )
 
-    def test_sccache_reset_reports_zero_stats_failure_through_script_process(
-        self,
-    ) -> None:
+    def test_sccache_perf_reset_fails_when_zero_stats_fails(self) -> None:
         shell = powershell()
         if shell is None:
             self.skipTest("PowerShell is not available")
@@ -585,7 +586,19 @@ class BuildToolingPerformanceTest(unittest.TestCase):
             fake_bin.mkdir()
             calls = temp_root / "sccache-calls.txt"
             (fake_bin / "sccache.cmd").write_text(
-                '@echo off\r\n>>"%FAKE_SCCACHE_CALLS%" echo(%*\r\nif "%1"=="--show-stats" (\r\n  echo Max cache size                       80 GiB\r\n  exit /b 0\r\n)\r\nif "%1"=="--zero-stats" exit /b 9\r\nexit /b 0\r\n',
+                "\r\n".join(
+                    [
+                        "@echo off",
+                        '>>"%FAKE_SCCACHE_CALLS%" echo(%*',
+                        'if "%1"=="--show-stats" (',
+                        "  echo Max cache size                       80 GiB",
+                        "  exit /b 0",
+                        ")",
+                        'if "%1"=="--zero-stats" exit /b 9',
+                        "exit /b 0",
+                        "",
+                    ]
+                ),
                 encoding="utf-8",
             )
             env = os.environ.copy()
@@ -622,9 +635,7 @@ class BuildToolingPerformanceTest(unittest.TestCase):
             ["--show-stats", "--zero-stats"],
         )
 
-    def test_sccache_reset_reports_command_removed_after_lookup_through_script_process(
-        self,
-    ) -> None:
+    def test_sccache_perf_reports_command_removed_after_lookup(self) -> None:
         shell = powershell()
         if shell is None:
             self.skipTest("PowerShell is not available")
@@ -635,7 +646,19 @@ class BuildToolingPerformanceTest(unittest.TestCase):
             fake_bin.mkdir()
             calls = temp_root / "sccache-calls.txt"
             (fake_bin / "sccache.cmd").write_text(
-                '@echo off\r\n>>"%FAKE_SCCACHE_CALLS%" echo(%*\r\nif "%1"=="--show-stats" (\r\n  echo Max cache size                       80 GiB\r\n  del "%~f0"\r\n  exit /b 0\r\n)\r\nexit /b 0\r\n',
+                "\r\n".join(
+                    [
+                        "@echo off",
+                        '>>"%FAKE_SCCACHE_CALLS%" echo(%*',
+                        'if "%1"=="--show-stats" (',
+                        "  echo Max cache size                       80 GiB",
+                        '  del "%~f0"',
+                        "  exit /b 0",
+                        ")",
+                        "exit /b 0",
+                        "",
+                    ]
+                ),
                 encoding="utf-8",
             )
             env = os.environ.copy()
@@ -665,112 +688,25 @@ class BuildToolingPerformanceTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("sccache --zero-stats failed to launch", result.stderr)
 
-    def test_just_cli_reaches_bench_and_validation_fast_paths(self) -> None:
-        with tempfile.TemporaryDirectory() as tempdir:
-            temp_root = Path(tempdir)
-            fake_bin = temp_root / "bin"
-            fake_bin.mkdir()
-            calls = temp_root / "cargo-calls.txt"
-            (fake_bin / "cargo.cmd").write_text(
-                '@echo off\r\n>>"%FAKE_CARGO_CALLS%" echo(%*\r\nexit /b 0\r\n',
-                encoding="utf-8",
-            )
-            env = os.environ.copy()
-            env["FAKE_CARGO_CALLS"] = str(calls)
-            env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    def test_justfile_bench_and_validation_fast_paths_are_explicit(self) -> None:
+        justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
 
-            invocations = (
-                ["bench", "fixture-package", "fixture-bench", "--sample-size", "1"],
-                ["bench-workspace", "--sample-size", "1"],
-                ["build-for-release", "--locked"],
-                ["app-server-runtime-check"],
-                ["app-server-command-exec-check"],
-                ["app-server-process-exec-check"],
-                ["app-server-thread-status-check"],
-                ["app-server-schema-protocol-check"],
-            )
-            for invocation in invocations:
-                with self.subTest(invocation=invocation):
-                    result = subprocess.run(
-                        ["just", *invocation],
-                        cwd=REPO_ROOT,
-                        env=env,
-                        text=True,
-                        encoding="utf-8",
-                        errors="replace",
-                        capture_output=True,
-                        check=False,
-                        creationflags=CREATE_NO_WINDOW,
-                    )
-                    self.assertEqual(
-                        result.returncode,
-                        0,
-                        f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
-                    )
+        self.assertIn("bench package bench_name *args:", justfile)
+        self.assertIn("bench-workspace *args:", justfile)
+        self.assertIn("build-for-release *args:", justfile)
+        self.assertIn("target-optimize-dry-run *args:", justfile)
+        self.assertIn("app-server-runtime-check:", justfile)
+        self.assertIn("app-server-command-exec-check:", justfile)
+        self.assertIn("app-server-process-exec-check:", justfile)
+        self.assertIn("app-server-thread-status-check:", justfile)
+        self.assertIn("app-server-schema-protocol-check:", justfile)
+        self.assertIn("app-server-schema-check:", justfile)
+        self.assertIn('app-server-schema-regenerate owner experimental="":', justfile)
+        self.assertIn("cargo nextest run -p codex-app-server-protocol -E", justfile)
 
-            routed = calls.read_text(encoding="utf-8")
-            self.assertIn(
-                "bench -p fixture-package --bench fixture-bench --sample-size 1",
-                routed,
-            )
-            self.assertIn("bench --workspace --bench * --sample-size 1", routed)
-            self.assertIn("build --release --locked", routed)
-            self.assertIn("check -p codex-app-server", routed)
-            self.assertIn("nextest run -p codex-app-server-protocol -E", routed)
-
-        for invocation, expected in (
-            (
-                ["target-optimize-dry-run"],
-                'scripts/rust_build_status.py" optimize --dry-run',
-            ),
-            (
-                ["app-server-schema-check"],
-                'scripts/app_server_schema_runtime_check.py" --mode check',
-            ),
-            (
-                ["app-server-schema-regenerate", "fixture-owner"],
-                (
-                    'scripts/app_server_schema_runtime_check.py" --mode force '
-                    '--owner "fixture-owner"'
-                ),
-            ),
-        ):
-            with self.subTest(dry_run=invocation):
-                result = subprocess.run(
-                    ["just", "--dry-run", *invocation],
-                    cwd=REPO_ROOT,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    capture_output=True,
-                    check=False,
-                    creationflags=CREATE_NO_WINDOW,
-                )
-                self.assertEqual(
-                    result.returncode,
-                    0,
-                    f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
-                )
-                self.assertIn(expected, result.stdout + result.stderr)
-
-    def test_repository_policy_layout_is_reachable_through_source_map_validation(
+    def test_agents_root_only_instruction_layout_and_budget_are_explicit(
         self,
     ) -> None:
-        validation = subprocess.run(
-            ["just", "source-map-check"],
-            cwd=REPO_ROOT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            capture_output=True,
-            check=False,
-            creationflags=CREATE_NO_WINDOW,
-        )
-        self.assertEqual(
-            validation.returncode,
-            0,
-            f"stdout:\n{validation.stdout}\nstderr:\n{validation.stderr}",
-        )
         expected_agent_files = ["AGENTS.md"]
         discovered_agent_files = subprocess.run(
             [

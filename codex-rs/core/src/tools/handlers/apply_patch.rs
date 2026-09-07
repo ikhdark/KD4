@@ -40,7 +40,6 @@ use crate::tools::registry::ToolExecutor;
 use crate::tools::runtimes::apply_patch::ApplyPatchRequest;
 use crate::tools::runtimes::apply_patch::ApplyPatchRuntime;
 use crate::tools::sandboxing::ToolCtx;
-use codex_agent_task_store::AttemptState;
 use codex_apply_patch::ApplyPatchAction;
 use codex_apply_patch::ApplyPatchFileChange;
 use codex_apply_patch::Hunk;
@@ -54,7 +53,6 @@ use codex_protocol::models::FileSystemPermissions;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::FileChange;
-use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::PatchApplyUpdatedEvent;
 use codex_sandboxing::policy_transforms::effective_file_system_sandbox_policy;
 use codex_sandboxing::policy_transforms::merge_uri_permission_profiles;
@@ -65,41 +63,6 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 
 const APPLY_PATCH_ARGUMENT_DIFF_BUFFER_INTERVAL: Duration = Duration::from_millis(500);
-
-async fn require_current_typed_patch_authority(
-    session: &Session,
-    turn: &TurnContext,
-) -> Result<(), FunctionCallError> {
-    if turn.multi_agent_version != MultiAgentVersion::V2
-        || turn.session_source.get_agent_path().is_none()
-    {
-        return Ok(());
-    }
-    let binding = turn.typed_agent_task_binding().ok_or_else(|| {
-        FunctionCallError::DeniedToModel(
-            "apply_patch: this typed child turn has no immutable task authority".to_string(),
-        )
-    })?;
-    let authorization = session
-        .services
-        .agent_control
-        .task_coordinator()
-        .get_agent_task_authorization(binding.assignment_id)
-        .await
-        .map_err(|error| {
-            FunctionCallError::RespondToModel(format!(
-                "apply_patch: typed assignment state is unavailable: {error}"
-            ))
-        })?;
-    if authorization.current_attempt.attempt_id != binding.attempt_id
-        || authorization.current_attempt.state != AttemptState::Active
-    {
-        return Err(FunctionCallError::DeniedToModel(
-            "apply_patch: the immutable typed assignment attempt is no longer active".to_string(),
-        ));
-    }
-    Ok(())
-}
 
 pub(crate) struct ApplyPatchInterceptionError {
     error: FunctionCallError,
@@ -501,7 +464,6 @@ impl ApplyPatchHandler {
             ..
         } = invocation;
         let turn = Arc::clone(&step_context.turn);
-        require_current_typed_patch_authority(session.as_ref(), turn.as_ref()).await?;
 
         let ToolPayload::Custom { input: patch_input } = payload else {
             return Err(FunctionCallError::RespondToModel(
@@ -543,14 +505,15 @@ impl ApplyPatchHandler {
         .await
         {
             codex_apply_patch::MaybeApplyPatchVerified::Body(changes) => {
-                let workspace_operation =
+                let _workspace_operation_permit =
                     if let Ok(native_cwd) = turn_environment.cwd().to_abs_path() {
                         let workspace_root = get_git_repo_root(&native_cwd)
                             .unwrap_or_else(|| native_cwd.to_path_buf());
                         Some(
-                            crate::workspace_operation_gate::WorkspaceOperationLease::new(
-                                workspace_root,
-                            ),
+                            crate::workspace_operation_gate::acquire_workspace_operation(
+                                &workspace_root,
+                            )
+                            .await,
                         )
                     } else {
                         None
@@ -572,6 +535,7 @@ impl ApplyPatchHandler {
                 let invocation =
                     apply_patch::apply_patch(turn.as_ref(), &file_system_sandbox_policy, changes)
                         .await;
+                drop(_workspace_operation_permit);
                 match invocation {
                     InternalApplyPatchInvocation::Output(item) => {
                         let content = item?;
@@ -602,7 +566,6 @@ impl ApplyPatchHandler {
                                 .additional_permissions,
                             permissions_preapproved: effective_additional_permissions
                                 .permissions_preapproved,
-                            workspace_operation,
                         };
 
                         let mut orchestrator = ToolOrchestrator::new();
@@ -742,13 +705,13 @@ pub(crate) async fn intercept_apply_patch(
     .await
     {
         codex_apply_patch::MaybeApplyPatchVerified::Body(changes) => {
-            require_current_typed_patch_authority(session.as_ref(), turn.as_ref())
-                .await
-                .map_err(ApplyPatchInterceptionError::from)?;
-            let workspace_operation = if let Ok(native_cwd) = cwd.to_abs_path() {
+            let _workspace_operation_permit = if let Ok(native_cwd) = cwd.to_abs_path() {
                 let workspace_root =
                     get_git_repo_root(&native_cwd).unwrap_or_else(|| native_cwd.to_path_buf());
-                Some(crate::workspace_operation_gate::WorkspaceOperationLease::new(workspace_root))
+                Some(
+                    crate::workspace_operation_gate::acquire_workspace_operation(&workspace_root)
+                        .await,
+                )
             } else {
                 None
             };
@@ -768,6 +731,7 @@ pub(crate) async fn intercept_apply_patch(
                 })?;
             let invocation =
                 apply_patch::apply_patch(turn.as_ref(), &file_system_sandbox_policy, changes).await;
+            drop(_workspace_operation_permit);
             match invocation {
                 InternalApplyPatchInvocation::Output(item) => {
                     let content = item?;
@@ -798,7 +762,6 @@ pub(crate) async fn intercept_apply_patch(
                             .additional_permissions,
                         permissions_preapproved: effective_additional_permissions
                             .permissions_preapproved,
-                        workspace_operation,
                     };
 
                     let mut orchestrator = ToolOrchestrator::new();

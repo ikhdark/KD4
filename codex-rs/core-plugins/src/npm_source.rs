@@ -6,7 +6,6 @@ use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
-use std::process::Stdio;
 use tempfile::TempDir;
 
 const NPM_PLUGIN_SOURCE_STAGING_DIR: &str = "plugins/.marketplace-plugin-source-staging";
@@ -100,16 +99,8 @@ fn pack_npm_package(
     }
     command.arg("--").arg(package_spec);
 
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    #[cfg(windows)]
-    let child = codex_utils_pty::with_windows_child_creation(|_| command.spawn());
-    #[cfg(not(windows))]
-    let child = command.spawn();
-    let output = child
-        .and_then(|child| child.wait_with_output())
+    let output = command
+        .output()
         .map_err(|err| format!("failed to run npm pack: {err}"))?;
     if output.status.success() {
         return Ok(());

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Synchronize or read-only validate SOURCEMAP.md repository inventories."""
+"""Synchronize and validate SOURCEMAP.md repository inventories."""
 
 from __future__ import annotations
 
@@ -266,35 +266,6 @@ def render_tracked_path_snapshot(source_paths: set[str], *, newline: str) -> str
     )
 
 
-def tracked_path_snapshot_block(
-    markdown: str,
-) -> tuple[re.Pattern[str], list[re.Match[str]]]:
-    block_re = re.compile(
-        rf"{re.escape(TRACKED_PATH_SNAPSHOT_BEGIN)}.*?"
-        rf"{re.escape(TRACKED_PATH_SNAPSHOT_END)}",
-        flags=re.DOTALL,
-    )
-    return block_re, list(block_re.finditer(markdown))
-
-
-def require_current_tracked_path_snapshot(
-    source_map: Path,
-    *,
-    source_paths: set[str],
-) -> None:
-    raw_markdown = source_map.read_bytes().decode("utf-8")
-    newline = "\r\n" if "\r\n" in raw_markdown else "\n"
-    _block_re, matches = tracked_path_snapshot_block(raw_markdown)
-    if len(matches) > 1:
-        raise ValueError("duplicate tracked path snapshot blocks")
-    expected = render_tracked_path_snapshot(source_paths, newline=newline)
-    if not matches or matches[0].group(0) != expected:
-        raise ValueError(
-            "tracked path snapshot is stale; run just source-map-check to "
-            "synchronize it"
-        )
-
-
 def sync_tracked_path_snapshot(
     source_map: Path,
     *,
@@ -310,7 +281,12 @@ def sync_tracked_path_snapshot(
         else repository_tracked_source_paths(root)
     )
     snapshot = render_tracked_path_snapshot(sources, newline=newline)
-    block_re, matches = tracked_path_snapshot_block(raw_markdown)
+    block_re = re.compile(
+        rf"{re.escape(TRACKED_PATH_SNAPSHOT_BEGIN)}.*?"
+        rf"{re.escape(TRACKED_PATH_SNAPSHOT_END)}",
+        flags=re.DOTALL,
+    )
+    matches = list(block_re.finditer(raw_markdown))
     if len(matches) > 1:
         raise ValueError("duplicate tracked path snapshot blocks")
     if matches:
@@ -472,8 +448,8 @@ def check_source_map(
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Synchronize or read-only validate SOURCEMAP.md's tracked path "
-            "snapshot, structure, and material repository inventories."
+            "Synchronize SOURCEMAP.md's tracked path snapshot, then check its "
+            "structure and material repository inventories."
         )
     )
     parser.add_argument(
@@ -487,14 +463,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         type=Path,
         help="Repository root used to resolve declared inventory paths.",
     )
-    parser.add_argument(
-        "--check-only",
-        action="store_true",
-        help=(
-            "Fail when the tracked-path snapshot is stale without rewriting "
-            "SOURCEMAP.md or acquiring the generated-output writer lock."
-        ),
-    )
     args = parser.parse_args(argv)
     root = (
         args.repo_root
@@ -502,18 +470,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         else args.source_map.resolve().parent
     )
     try:
-        if args.check_only:
-            source_paths, tracked_source_paths = repository_source_inventory(root)
-            require_current_tracked_path_snapshot(
-                args.source_map,
-                source_paths=tracked_source_paths,
-            )
-            return check_source_map(
-                args.source_map,
-                repo_root=root,
-                source_paths=source_paths,
-                tracked_source_paths=tracked_source_paths,
-            )
         with source_map_lock(root, f"source-map-check:{os.getpid()}"):
             source_paths, tracked_source_paths = repository_source_inventory(root)
             sync_tracked_path_snapshot(

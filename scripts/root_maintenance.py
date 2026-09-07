@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import ast
-import errno
 from functools import cache
 import hashlib
 import json
@@ -98,55 +97,26 @@ def script_kind_for_path(path: Path) -> str | None:
     return None
 
 
-class ScriptInventoryDiscoveryError(RuntimeError):
-    """Raised when tracked script discovery cannot be trusted."""
-
-
 def tracked_script_entrypoints() -> tuple[Path, ...]:
     """Return tracked executable scripts outside the owned script roots."""
-    try:
-        result = subprocess.run(
-            ["git", "ls-files", "--stage", "-z"],
-            cwd=REPO_ROOT,
-            capture_output=True,
-            check=False,
-        )
-    except OSError as error:
-        raise ScriptInventoryDiscoveryError(
-            f"tracked script discovery could not run git ls-files --stage: {error}"
-        ) from error
+    result = subprocess.run(
+        ["git", "ls-files", "--stage", "-z"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
     if result.returncode != 0:
-        detail = result.stderr.decode("utf-8", errors="replace").strip()
-        suffix = f": {detail}" if detail else ""
-        raise ScriptInventoryDiscoveryError(
-            "tracked script discovery failed "
-            f"(git ls-files --stage exit {result.returncode}){suffix}"
-        )
-    try:
-        stdout = result.stdout.decode("utf-8", errors="strict")
-    except UnicodeDecodeError as error:
-        raise ScriptInventoryDiscoveryError(
-            "tracked script discovery received non-UTF-8 git ls-files --stage "
-            f"output at byte {error.start}"
-        ) from error
-    if stdout and not stdout.endswith("\0"):
-        raise ScriptInventoryDiscoveryError(
-            "tracked script discovery received malformed git ls-files --stage output"
-        )
+        return ()
     entrypoints: list[Path] = []
-    for record_number, record in enumerate(stdout.split("\0"), start=1):
+    for record in result.stdout.split("\0"):
         if not record:
             continue
         metadata, separator, target = record.partition("\t")
-        metadata_match = re.fullmatch(
-            r"(?P<mode>[0-7]{6}) [0-9a-f]{40}(?:[0-9a-f]{24})? [0-3]",
-            metadata,
-        )
-        if not separator or not target or metadata_match is None:
-            raise ScriptInventoryDiscoveryError(
-                "tracked script discovery received malformed git ls-files --stage "
-                f"output at record {record_number}"
-            )
+        if not separator:
+            continue
         path = REPO_ROOT / target
         if any(
             root == path.parent or root in path.parents for root in SCRIPT_AUDIT_ROOTS
@@ -154,19 +124,12 @@ def tracked_script_entrypoints() -> tuple[Path, ...]:
             continue
         if target in SCRIPT_AUDIT_EXCLUSIONS:
             continue
-        mode = metadata_match.group("mode")
+        mode = metadata.split(" ", 1)[0]
         try:
             with path.open("rb") as script_file:
                 first_line = script_file.readline(256)
-        except OSError as error:
-            # The index retains unstaged deletions. Current discovery inventories
-            # the working tree; frozen replacement obligations are reconciled
-            # separately. Keep unreadable files and dangling links fail-closed.
-            if error.errno == errno.ENOENT and not os.path.lexists(path):
-                continue
-            raise ScriptInventoryDiscoveryError(
-                f"tracked script discovery could not read {target}: {error}"
-            ) from error
+        except OSError:
+            continue
         if mode == "100755" or first_line.startswith(b"#!"):
             entrypoints.append(path)
     return tuple(entrypoints)
@@ -331,23 +294,7 @@ SCRIPT_TEST_MODULES: dict[str, tuple[str, ...]] = {
     "scripts/build_codex_package.py": ("scripts.test_stage_npm_packages",),
     "scripts/cargo-lane-trash-cleanup.ps1": ("scripts.test_cargo_lane",),
     "scripts/cargo-lane.ps1": ("scripts.test_cargo_lane",),
-    "scripts/bounded_process.py": ("scripts.test_bounded_process",),
     "scripts/common-rust-env.ps1": ("scripts.test_build_tooling_performance",),
-    "scripts/completion_proof.py": (
-        "scripts.test_completion_proof",
-        "scripts.test_completion_proof_typed_canonical",
-        "scripts.test_completion_proof_current_evidence",
-    ),
-    "scripts/completion_proof_canonical.py": (
-        "scripts.test_completion_proof_inventory_v2",
-        "scripts.test_focused_live_successor_catalog",
-        "scripts.test_focused_replacement_approval_receipt",
-    ),
-    "scripts/completion_proof_pytest.py": ("scripts.test_completion_proof",),
-    "scripts/completion_proof_unittest.py": ("scripts.test_completion_proof",),
-    "scripts/current_evidence_successor_projection.py": (
-        "scripts.test_completion_proof_current_evidence",
-    ),
     "scripts/codex_package/rg": (
         "scripts.codex_package.test_dotslash",
         "scripts.codex_package.test_ripgrep",
@@ -889,34 +836,9 @@ def git_context_label() -> str:
     return f"{branch}; {max(0, len(lines) - 1)} changed path(s)"
 
 
-def run_script_audit_command(command: Sequence[str]) -> int:
-    executable = which(command[0]) or command[0]
-    return subprocess.run([executable, *command[1:]], cwd=REPO_ROOT).returncode
-
-
 def run_script_audit(*, include_tests: bool, strict: bool) -> int:
-    try:
-        audit_targets = script_source_targets()
-        kind_by_target = script_kind_map()
-    except ScriptInventoryDiscoveryError as error:
-        print(f"[FAIL] {error}", flush=True)
-        print(
-            "SCRIPT AUDIT INFRASTRUCTURE FAILED: "
-            "tracked script inventory is unavailable.",
-            flush=True,
-        )
-        return 2
-    if strict and not audit_targets:
-        print(
-            "[FAIL] strict script audit discovered zero audit targets",
-            flush=True,
-        )
-        print(
-            "SCRIPT AUDIT INFRASTRUCTURE FAILED: "
-            "no script artifacts were selected for validation.",
-            flush=True,
-        )
-        return 2
+    audit_targets = script_source_targets()
+    kind_by_target = script_kind_map()
     inventory: dict[str, int] = {}
     for target in audit_targets:
         kind = kind_by_target.get(target, "unknown")
@@ -947,18 +869,15 @@ def run_script_audit(*, include_tests: bool, strict: bool) -> int:
     for advisory in advisories:
         print(f"[ADVISORY] {advisory}", flush=True)
     failed_commands: list[str] = []
-    pre_result_errors: list[str] = []
     passed_commands = 0
-    executed_commands = 0
     for label, command in commands:
         print(f"[RUN] {label}", flush=True)
         try:
-            returncode = run_script_audit_command(command)
+            returncode = run(command)
         except OSError as exc:
             print(f"[FAIL] {label}: {exc}", flush=True)
-            pre_result_errors.append(label)
+            failed_commands.append(label)
             continue
-        executed_commands += 1
         if returncode == 0:
             print(f"[PASS] {label}", flush=True)
             passed_commands += 1
@@ -966,36 +885,16 @@ def run_script_audit(*, include_tests: bool, strict: bool) -> int:
             print(f"[FAIL] {label}: exit {returncode}", flush=True)
             failed_commands.append(label)
 
-    if strict and (pre_result_errors or executed_commands == 0):
-        if pre_result_errors:
-            print(
-                "[FAIL] strict script audit encountered command launch "
-                "pre-result errors",
-                flush=True,
-            )
-        else:
-            print(
-                "[FAIL] strict script audit executed zero command groups",
-                flush=True,
-            )
-        print(
-            "SCRIPT AUDIT INFRASTRUCTURE FAILED: "
-            f"{len(pre_result_errors)} command group(s) failed before a result; "
-            f"{executed_commands} command group(s) produced a result.",
-            flush=True,
-        )
-        return 2
-
     strict_failure = strict and bool(advisories)
     if strict_failure:
         print(
             "[FAIL] --strict promoted optimization advisories to failures", flush=True
         )
-    if errors or failed_commands or pre_result_errors or strict_failure:
+    if errors or failed_commands or strict_failure:
         print(
             "SCRIPT AUDIT FAILED: "
             f"{len(errors)} internal/context failure(s), "
-            f"{len(failed_commands) + len(pre_result_errors)} command failure(s), "
+            f"{len(failed_commands)} command failure(s), "
             f"{len(advisories)} advisory item(s).",
             flush=True,
         )

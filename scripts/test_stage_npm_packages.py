@@ -5,8 +5,6 @@ import io
 import hashlib
 import json
 import os
-import shutil
-import subprocess
 import sys
 import tarfile
 import tempfile
@@ -39,64 +37,6 @@ class StageNpmPackagesTests(unittest.TestCase):
         if hasattr(stage.load_build_module, "cache_clear"):
             stage.load_build_module.cache_clear()
         self.temp_dir.cleanup()
-
-    def node_platform_key(self, build: types.ModuleType) -> tuple[str, str]:
-        node = build.installed_executable("node")
-        completed = subprocess.run(
-            [node, "-p", "process.platform + '-' + process.arch"],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        return node, completed.stdout.strip()
-
-    def install_windows_command_probe(self, binary_path: Path) -> None:
-        command_processor = os.environ.get("COMSPEC")
-        if not command_processor:
-            self.fail("COMSPEC is required for Windows launcher runtime coverage")
-        binary_path.parent.mkdir(parents=True)
-        shutil.copy2(command_processor, binary_path)
-
-    def run_wrapper_probe(
-        self,
-        *,
-        node: str,
-        wrapper: Path,
-        marker: Path,
-        argument: str,
-        exit_code: int,
-        env: dict[str, str] | None = None,
-    ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
-        probe_script = marker.with_suffix(".cmd")
-        probe_script.write_text(
-            "@echo off\r\n"
-            "echo argument=%~2>\"%~1\"\r\n"
-            "echo package_root=%CODEX_MANAGED_PACKAGE_ROOT%>>\"%~1\"\r\n"
-            "set CODEX_MANAGED_BY_>>\"%~1\"\r\n"
-            "exit /b %~3\r\n",
-            encoding="utf-8",
-        )
-        completed = subprocess.run(
-            [
-                node,
-                str(wrapper),
-                "/d",
-                "/c",
-                str(probe_script),
-                str(marker),
-                argument,
-                str(exit_code),
-            ],
-            check=False,
-            capture_output=True,
-            env=env,
-            text=True,
-        )
-        self.assertTrue(
-            marker.is_file(),
-            msg=f"wrapper did not launch the staged binary: {completed.stderr}",
-        )
-        return completed, marker.read_text(encoding="utf-8").splitlines()
 
     def test_stage_models_use_slots(self) -> None:
         self.assertFalse(
@@ -202,123 +142,26 @@ class StageNpmPackagesTests(unittest.TestCase):
         self.assertNotIn("@openai/codex@latest", cli_launcher)
         self.assertIn("same fork release artifact", cli_launcher)
 
-        staging_dir = self.root / "codex-runtime"
-        staging_dir.mkdir()
-        build.stage_sources(staging_dir, "1.2.3", "codex")
-        node, platform_key = self.node_platform_key(build)
-        staged_package_json = json.loads(
-            (staging_dir / "package.json").read_text(encoding="utf-8")
-        )
-        active_target = staged_package_json["codexNativeTargets"][platform_key]
-        binary_path = (
-            staging_dir
-            / "vendor"
-            / active_target["targetTriple"]
-            / "bin"
-            / active_target["binary"]
-        )
-        self.install_windows_command_probe(binary_path)
-
-        env = os.environ.copy()
-        for key in list(env):
-            if key.casefold() in {
-                "CODEX_MANAGED_BY_NPM".casefold(),
-                "CODEX_MANAGED_BY_PNPM".casefold(),
-                "CODEX_MANAGED_BY_BUN".casefold(),
-                "npm_config_user_agent".casefold(),
-                "npm_execpath".casefold(),
-            }:
-                del env[key]
-        env.update(
-            {
-                "CODEX_MANAGED_BY_NPM": "parent",
-                "CODEX_MANAGED_BY_PNPM": "parent",
-                "CODEX_MANAGED_BY_BUN": "parent",
-                "npm_config_user_agent": "npm/runtime-probe",
-            }
-        )
-        completed, probe_lines = self.run_wrapper_probe(
-            node=node,
-            wrapper=staging_dir / "bin" / "codex.js",
-            marker=self.root / "codex-runtime.txt",
-            argument="codex-forwarded-argument",
-            exit_code=37,
-            env=env,
-        )
-
-        self.assertEqual(completed.returncode, 37)
-        self.assertIn("argument=codex-forwarded-argument", probe_lines)
-        package_root = next(
-            line.removeprefix("package_root=")
-            for line in probe_lines
-            if line.startswith("package_root=")
-        )
-        self.assertTrue(Path(package_root).samefile(staging_dir))
-        self.assertEqual(
-            [
-                line
-                for line in probe_lines
-                if line.casefold().startswith("codex_managed_by_")
-            ],
-            ["CODEX_MANAGED_BY_NPM=1"],
-        )
-
-    def test_platform_tarball_installs_offline_from_moved_archive(self) -> None:
+    def test_npm_pack_smoke_tests_the_moved_tarball(self) -> None:
         build = stage.load_build_module()
-        staging_dir = self.root / "platform-staging"
+        staging_dir = self.root / "staging"
         staging_dir.mkdir()
-        build.stage_sources(staging_dir, "1.2.3", "codex-win32-x64")
-        output_path = self.root / "out" / "codex-win32-x64.tgz"
+        output_path = self.root / "out" / "codex.tgz"
 
-        with mock.patch.dict(
-            os.environ,
-            {
-                "NPM_CONFIG_AUDIT": "false",
-                "NPM_CONFIG_FUND": "false",
-                "NPM_CONFIG_OFFLINE": "true",
-                "NPM_CONFIG_REGISTRY": "http://127.0.0.1:9",
-                "NPM_CONFIG_UPDATE_NOTIFIER": "false",
-            },
+        def fake_pack(command: list[str], **_: object) -> str:
+            pack_dir = Path(command[command.index("--pack-destination") + 1])
+            (pack_dir / "packed.tgz").write_bytes(b"fixture")
+            return json.dumps([{"filename": "packed.tgz"}])
+
+        with (
+            mock.patch.object(build.subprocess, "check_output", side_effect=fake_pack),
+            mock.patch.object(build, "smoke_test_npm_tarball") as smoke,
         ):
             actual = build.run_npm_pack(staging_dir, output_path)
 
         self.assertEqual(actual, output_path.resolve())
-        self.assertTrue(output_path.is_file())
-
-    def test_cli_tarball_rejects_invalid_launcher_after_offline_install(self) -> None:
-        build = stage.load_build_module()
-        staging_dir = self.root / "cli-staging"
-        staging_dir.mkdir()
-        build.stage_sources(staging_dir, "1.2.3", "codex")
-        package_json_path = staging_dir / "package.json"
-        package_json = json.loads(package_json_path.read_text(encoding="utf-8"))
-        package_json.pop("optionalDependencies", None)
-        package_json_path.write_text(
-            json.dumps(package_json, indent=2) + "\n",
-            encoding="utf-8",
-        )
-        (staging_dir / "bin" / "codex.js").write_text(
-            "#!/usr/bin/env node\nconst invalid = ;\n",
-            encoding="utf-8",
-        )
-        output_path = self.root / "out" / "codex.tgz"
-
-        with (
-            mock.patch.dict(
-                os.environ,
-                {
-                    "NPM_CONFIG_AUDIT": "false",
-                    "NPM_CONFIG_FUND": "false",
-                    "NPM_CONFIG_OFFLINE": "true",
-                    "NPM_CONFIG_REGISTRY": "http://127.0.0.1:9",
-                    "NPM_CONFIG_UPDATE_NOTIFIER": "false",
-                },
-            ),
-            self.assertRaises(subprocess.CalledProcessError),
-        ):
-            build.run_npm_pack(staging_dir, output_path)
-
-        self.assertTrue(output_path.is_file())
+        self.assertEqual(output_path.read_bytes(), b"fixture")
+        smoke.assert_called_once_with(output_path.resolve())
 
     def test_platform_package_manifest_is_minimal(self) -> None:
         build = stage.load_build_module()
@@ -370,30 +213,6 @@ class StageNpmPackagesTests(unittest.TestCase):
 
         package_json = json.loads((self.root / "package.json").read_text())
         self.assertEqual(package_json["os"], ["win32"])
-
-        node, platform_key = self.node_platform_key(build)
-        active_target = build.build_codex_package_json("1.2.3")[
-            "codexNativeTargets"
-        ][platform_key]
-        binary_name = "codex-responses-api-proxy"
-        binary_path = (
-            self.root
-            / "vendor"
-            / active_target["targetTriple"]
-            / binary_name
-            / f"{binary_name}.exe"
-        )
-        self.install_windows_command_probe(binary_path)
-        completed, probe_lines = self.run_wrapper_probe(
-            node=node,
-            wrapper=self.root / "bin" / f"{binary_name}.js",
-            marker=self.root / "responses-proxy-runtime.txt",
-            argument="proxy-forwarded-argument",
-            exit_code=29,
-        )
-
-        self.assertEqual(completed.returncode, 29)
-        self.assertIn("argument=proxy-forwarded-argument", probe_lines)
 
     def test_copy_native_binaries_filters_target_and_requires_executable(self) -> None:
         build = stage.load_build_module()

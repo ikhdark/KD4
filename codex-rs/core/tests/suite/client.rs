@@ -198,22 +198,7 @@ async fn retired_kda_tool_is_not_advertised_and_calls_are_rejected() -> anyhow::
         ],
     )
     .await;
-    let credential = Arc::new(std::sync::Mutex::new(None));
-    let retained_credential = Arc::clone(&credential);
-    let test = test_codex()
-        .with_config(move |config| {
-            *retained_credential
-                .lock()
-                .expect("fixture credential scope") = Some(
-                codex_core::test_support::temporary_completion_proof_credential(
-                    &config.codex_home,
-                    config.cwd.as_path(),
-                )
-                .expect("own only a new disposable fixture credential"),
-            );
-        })
-        .build(&server)
-        .await?;
+    let test = test_codex().build(&server).await?;
 
     test.submit_turn("Check the available tools.").await?;
 
@@ -233,7 +218,6 @@ async fn retired_kda_tool_is_not_advertised_and_calls_are_rejected() -> anyhow::
         Some("unsupported call: kda")
     );
 
-    test.codex.shutdown_and_wait().await?;
     Ok(())
 }
 

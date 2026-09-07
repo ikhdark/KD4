@@ -22,14 +22,6 @@ use codex_code_mode_protocol::host::ProtocolVersion;
 use codex_code_mode_protocol::host::RequestId;
 use codex_code_mode_protocol::host::SupportedProtocolVersions;
 use codex_utils_pty::ManagedRootProcess;
-#[cfg(windows)]
-use codex_utils_pty::WINDOWS_CREATE_SUSPENDED;
-#[cfg(windows)]
-use codex_utils_pty::WINDOWS_PROCESS_OPERATION_TIMEOUT;
-#[cfg(windows)]
-use codex_utils_pty::run_windows_process_operation;
-#[cfg(windows)]
-use codex_utils_pty::with_windows_child_creation;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::BufReader;
 use tokio::process::Child;
@@ -80,67 +72,6 @@ struct ConnectionSupervisor {
     writer_task: JoinHandle<Result<(), String>>,
 }
 
-#[cfg(windows)]
-struct WindowsSpawnOperationChild {
-    child: Option<Child>,
-    managed: Arc<ManagedRootProcess>,
-}
-
-#[cfg(windows)]
-impl WindowsSpawnOperationChild {
-    fn new(child: Child, managed: Arc<ManagedRootProcess>) -> Self {
-        Self {
-            child: Some(child),
-            managed,
-        }
-    }
-
-    fn process_id(&self) -> std::io::Result<u32> {
-        self.child
-            .as_ref()
-            .and_then(Child::id)
-            .ok_or_else(|| std::io::Error::other("spawned code-mode host has no process id"))
-    }
-
-    fn attach_and_resume(&self, process_id: u32) -> std::io::Result<()> {
-        self.managed.attach_and_resume(process_id)
-    }
-
-    fn cleanup_error(mut self, primary: std::io::Error) -> std::io::Error {
-        let child = self
-            .child
-            .take()
-            .expect("Windows spawn operation still owns its child");
-        match terminate_reap_and_observe_empty_blocking(child, Arc::clone(&self.managed)) {
-            Ok(()) => primary,
-            Err(cleanup) => std::io::Error::other(format!(
-                "{primary}; contained child cleanup also failed: {cleanup}"
-            )),
-        }
-    }
-
-    fn into_child(mut self) -> Child {
-        self.child
-            .take()
-            .expect("Windows spawn operation still owns its child")
-    }
-}
-
-#[cfg(windows)]
-impl Drop for WindowsSpawnOperationChild {
-    fn drop(&mut self) {
-        let Some(child) = self.child.take() else {
-            return;
-        };
-        let managed = Arc::clone(&self.managed);
-        tokio::task::spawn_blocking(move || {
-            if let Err(err) = terminate_reap_and_observe_empty_blocking(child, managed) {
-                warn!("failed to clean up abandoned Windows code-mode host spawn: {err}");
-            }
-        });
-    }
-}
-
 impl CallerCancellation {
     fn new() -> Self {
         Self {
@@ -175,60 +106,24 @@ impl Connection {
                 .await
                 .map_err(|err| format!("failed to reserve code-mode host process: {err}"))?,
         );
-        command
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        #[cfg(windows)]
-        command.creation_flags(WINDOWS_CREATE_SUSPENDED);
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|err| {
+                format!(
+                    "failed to spawn code-mode host {}: {err}",
+                    host_program.display()
+                )
+            })?;
+        let process_id = child
+            .id()
+            .ok_or_else(|| "spawned code-mode host has no process id".to_string())?;
 
-        #[cfg(windows)]
-        let mut child = {
-            let spawn_managed = Arc::clone(&managed);
-            let operation_child =
-                run_windows_process_operation(WINDOWS_PROCESS_OPERATION_TIMEOUT, move || {
-                    let child = with_windows_child_creation(|_| command.spawn())?;
-                    let operation_child = WindowsSpawnOperationChild::new(child, spawn_managed);
-                    let process_id = match operation_child.process_id() {
-                        Ok(process_id) => process_id,
-                        Err(err) => return Err(operation_child.cleanup_error(err)),
-                    };
-                    if let Err(err) = operation_child.attach_and_resume(process_id) {
-                        return Err(operation_child.cleanup_error(std::io::Error::other(format!(
-                            "failed to contain code-mode host: {err}"
-                        ))));
-                    }
-                    Ok(operation_child)
-                })
-                .await
-                .map_err(|err| {
-                    format!(
-                        "failed to spawn code-mode host {}: {err}",
-                        host_program.display()
-                    )
-                })?;
-            operation_child.into_child()
-        };
-        #[cfg(not(windows))]
-        let mut child = command.spawn().map_err(|err| {
-            format!(
-                "failed to spawn code-mode host {}: {err}",
-                host_program.display()
-            )
-        })?;
-        #[cfg(not(windows))]
-        let process_id = match child.id() {
-            Some(process_id) => process_id,
-            None => {
-                terminate_reap_and_observe_empty(child, Arc::clone(&managed)).await;
-                return Err("spawned code-mode host has no process id".to_string());
-            }
-        };
-
-        #[cfg(not(windows))]
         if let Err(err) = managed.attach(process_id) {
-            terminate_reap_and_observe_empty(child, Arc::clone(&managed)).await;
+            kill_and_reap(&mut child, &managed).await;
             return Err(format!(
                 "failed to contain code-mode host {}: {err}",
                 host_program.display()
@@ -251,20 +146,14 @@ impl Connection {
             });
         }
 
-        let stdin = match child.stdin.take() {
-            Some(stdin) => stdin,
-            None => {
-                terminate_reap_and_observe_empty(child, Arc::clone(&managed)).await;
-                return Err("spawned code-mode host has no stdin".to_string());
-            }
-        };
-        let stdout = match child.stdout.take() {
-            Some(stdout) => stdout,
-            None => {
-                terminate_reap_and_observe_empty(child, Arc::clone(&managed)).await;
-                return Err("spawned code-mode host has no stdout".to_string());
-            }
-        };
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "spawned code-mode host has no stdin".to_string())?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "spawned code-mode host has no stdout".to_string())?;
         let mut reader = FramedReader::new(stdout);
         let mut writer = FramedWriter::new(stdin);
         let handshake = async {
@@ -301,12 +190,12 @@ impl Connection {
         let handshake_result = match tokio::time::timeout(HOST_HANDSHAKE_TIMEOUT, handshake).await {
             Ok(result) => result,
             Err(_) => {
-                terminate_reap_and_observe_empty(child, Arc::clone(&managed)).await;
+                kill_and_reap(&mut child, &managed).await;
                 return Err("timed out negotiating with the code-mode host".to_string());
             }
         };
         if let Err(err) = handshake_result {
-            terminate_reap_and_observe_empty(child, Arc::clone(&managed)).await;
+            kill_and_reap(&mut child, &managed).await;
             return Err(err);
         }
 
@@ -521,6 +410,7 @@ impl Drop for Connection {
 
 impl ConnectionSupervisor {
     async fn run(mut self) {
+        let mut child_exited = false;
         let reason = tokio::select! {
             biased;
             _ = self.cancellation.cancelled() => failure_message(&self.failure),
@@ -531,6 +421,7 @@ impl ConnectionSupervisor {
             result = &mut self.reader_task => task_failure("reader", result),
             result = &mut self.writer_task => task_failure("writer", result),
             result = self.child.wait() => {
+                child_exited = true;
                 match result {
                     Ok(status) => format!("code-mode host exited with status {status}"),
                     Err(err) => format!("failed waiting for code-mode host: {err}"),
@@ -540,7 +431,9 @@ impl ConnectionSupervisor {
         mark_connection_dead(&self.alive, &self.failure, reason.clone());
         let _ = self.event_tx.try_send(DriverEvent::Failed(reason));
         self.cancellation.cancel();
-        terminate_reap_and_observe_empty(self.child, self.managed).await;
+        if !child_exited {
+            kill_and_reap(&mut self.child, &self.managed).await;
+        }
     }
 }
 
@@ -577,96 +470,9 @@ fn failure_message(failure: &std::sync::Mutex<Option<String>>) -> String {
         .unwrap_or_else(|| "code-mode host connection closed".to_string())
 }
 
-#[cfg(windows)]
-async fn terminate_reap_and_observe_empty(child: Child, managed: Arc<ManagedRootProcess>) {
-    match tokio::task::spawn_blocking(move || {
-        terminate_reap_and_observe_empty_blocking(child, managed)
-    })
-    .await
-    {
-        Ok(Ok(())) => {}
-        Ok(Err(err)) => warn!("failed to fully tear down code-mode host process tree: {err}"),
-        Err(err) => warn!("code-mode host process-tree teardown task failed: {err}"),
-    }
-}
+async fn kill_and_reap(child: &mut Child, managed: &ManagedRootProcess) {
+    let _ = managed.terminate();
 
-#[cfg(not(windows))]
-async fn terminate_reap_and_observe_empty(mut child: Child, managed: Arc<ManagedRootProcess>) {
     let _ = child.start_kill();
     let _ = child.wait().await;
-    drop(managed);
-}
-
-#[cfg(windows)]
-fn terminate_reap_and_observe_empty_blocking(
-    mut child: Child,
-    managed: Arc<ManagedRootProcess>,
-) -> std::io::Result<()> {
-    let job_error = managed.terminate().err();
-    let root_error = child.start_kill().err();
-    let deadline = std::time::Instant::now() + WINDOWS_PROCESS_OPERATION_TIMEOUT;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            Ok(None) => {
-                return Err(retain_failed_windows_cleanup(
-                    &managed,
-                    std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "contained code-mode host did not exit after Job termination",
-                    ),
-                ));
-            }
-            Err(err) => return Err(retain_failed_windows_cleanup(&managed, err)),
-        }
-    }
-
-    if let (Some(job_error), Some(root_error)) = (job_error, root_error) {
-        return Err(retain_failed_windows_cleanup(
-            &managed,
-            std::io::Error::other(format!(
-                "failed to terminate Windows Job ({job_error}); root fallback also failed: {root_error}"
-            )),
-        ));
-    }
-    observe_windows_job_empty_blocking(managed, deadline)
-}
-
-#[cfg(windows)]
-fn observe_windows_job_empty_blocking(
-    managed: Arc<ManagedRootProcess>,
-    deadline: std::time::Instant,
-) -> std::io::Result<()> {
-    loop {
-        let active = managed
-            .active_process_count()
-            .map_err(|err| retain_failed_windows_cleanup(&managed, err))?;
-        if active == 0 {
-            return Ok(());
-        }
-        if std::time::Instant::now() >= deadline {
-            return Err(retain_failed_windows_cleanup(
-                &managed,
-                std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    format!(
-                        "code-mode host Job still contains {active} process(es) after termination"
-                    ),
-                ),
-            ));
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-}
-
-#[cfg(windows)]
-fn retain_failed_windows_cleanup(
-    managed: &Arc<ManagedRootProcess>,
-    error: std::io::Error,
-) -> std::io::Error {
-    std::mem::forget(Arc::clone(managed));
-    error
 }

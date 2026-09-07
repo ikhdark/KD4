@@ -389,7 +389,6 @@ struct CommandRepositoryState {
     observed_turn_mutation_revisions: HashMap<String, u64>,
     uncertain_command_baselines: HashMap<String, UncertainCommandBaseline>,
     typed_mutation_baselines: HashMap<String, PendingTypedMutationBaseline>,
-    post_proof_mutation_baselines: HashMap<String, PendingPostProofMutationBaseline>,
 }
 
 struct UncertainCommandBaseline {
@@ -406,16 +405,6 @@ pub(crate) struct TypedMutationBaseline {
 struct PendingTypedMutationBaseline {
     turn_id: String,
     baseline: TypedMutationBaseline,
-}
-
-pub(crate) struct PostProofMutationBaseline {
-    pub(crate) proof_observation: Option<crate::completion_proof::PostProofMutationObservation>,
-    pub(crate) source_observation: Option<crate::git_workspace::SourcePathChangeObservation>,
-}
-
-struct PendingPostProofMutationBaseline {
-    turn_id: String,
-    baseline: PostProofMutationBaseline,
 }
 
 #[derive(Default)]
@@ -589,39 +578,6 @@ impl CommandExecutionLedger {
             .await
             .repository
             .typed_mutation_baselines
-            .remove(call_id)
-            .map(|pending| pending.baseline)
-    }
-
-    pub(crate) async fn record_post_proof_mutation_baseline(
-        &self,
-        call_id: &str,
-        turn_id: &str,
-        baseline: PostProofMutationBaseline,
-    ) {
-        self.state
-            .lock()
-            .await
-            .repository
-            .post_proof_mutation_baselines
-            .insert(
-                call_id.to_string(),
-                PendingPostProofMutationBaseline {
-                    turn_id: turn_id.to_string(),
-                    baseline,
-                },
-            );
-    }
-
-    pub(crate) async fn take_post_proof_mutation_baseline(
-        &self,
-        call_id: &str,
-    ) -> Option<PostProofMutationBaseline> {
-        self.state
-            .lock()
-            .await
-            .repository
-            .post_proof_mutation_baselines
             .remove(call_id)
             .map(|pending| pending.baseline)
     }
@@ -1023,10 +979,6 @@ impl CommandExecutionLedger {
         state
             .repository
             .uncertain_command_baselines
-            .retain(|_, baseline| baseline.turn_id != turn_id);
-        state
-            .repository
-            .post_proof_mutation_baselines
             .retain(|_, baseline| baseline.turn_id != turn_id);
     }
 

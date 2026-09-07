@@ -9,6 +9,13 @@ use serde_json::json;
 use std::fs;
 use std::sync::Arc;
 
+const FIXTURE_PATHS: [&str; 5] = [
+    "tests/fixtures/json_schema_policy/slack.json",
+    "tests/fixtures/json_schema_policy/google_calendar.json",
+    "tests/fixtures/json_schema_policy/google_drive.json",
+    "tests/fixtures/json_schema_policy/notion.json",
+    "tests/fixtures/json_schema_policy/microsoft_outlook_email.json",
+];
 const OVERSIZED_NOTION_CREATE_PAGE_SCHEMA_PATH: &str =
     "tests/fixtures/json_schema_policy/oversized_notion_create_page_input_schema.json";
 
@@ -37,32 +44,82 @@ struct ExpectedValue {
     value: Value,
 }
 
-macro_rules! json_schema_policy_fixture_tests {
-    ($($test_name:ident => $fixture_path:literal),+ $(,)?) => {
-        $(
-            #[test]
-            fn $test_name() {
-                assert_fixture_converts_through_mcp_responses_boundary($fixture_path);
-            }
-        )+
-    };
-}
+#[test]
+fn json_schema_policy_fixtures_convert_to_responses_tools() {
+    for fixture in FIXTURE_PATHS.into_iter().map(load_fixture::<FixtureFile>) {
+        for fixture_tool in &fixture.tools {
+            let responses_tool = convert_fixture_tool(&fixture, fixture_tool);
+            let parameters = serde_json::to_value(&responses_tool.parameters)
+                .expect("responses parameters should serialize");
 
-json_schema_policy_fixture_tests! {
-    slack_schema_converts_through_mcp_responses_boundary =>
-        "tests/fixtures/json_schema_policy/slack.json",
-    google_calendar_schema_converts_through_mcp_responses_boundary =>
-        "tests/fixtures/json_schema_policy/google_calendar.json",
-    google_drive_schema_converts_through_mcp_responses_boundary =>
-        "tests/fixtures/json_schema_policy/google_drive.json",
-    notion_schema_converts_through_mcp_responses_boundary =>
-        "tests/fixtures/json_schema_policy/notion.json",
-    microsoft_outlook_email_schema_converts_through_mcp_responses_boundary =>
-        "tests/fixtures/json_schema_policy/microsoft_outlook_email.json",
+            let expected_fields = [
+                (
+                    "preserve the tool name",
+                    json!(fixture_tool.name),
+                    json!(responses_tool.name),
+                ),
+                (
+                    "preserve the tool description",
+                    json!(fixture_tool.description),
+                    json!(responses_tool.description),
+                ),
+                (
+                    "remain a strict:false tool",
+                    json!(false),
+                    json!(responses_tool.strict),
+                ),
+                (
+                    "produce object-shaped parameters",
+                    json!("object"),
+                    parameters.get("type").cloned().unwrap_or(Value::Null),
+                ),
+            ];
+
+            for (message, expected, actual) in expected_fields {
+                assert_eq!(actual, expected, "{} should {message}", fixture_tool.name);
+            }
+            assert!(
+                parameters.get("properties").is_some_and(Value::is_object),
+                "{} should produce a parameters.properties object",
+                fixture_tool.name
+            );
+
+            for expected in &fixture_tool.expected_preserved {
+                assert_eq!(
+                    parameters.pointer(&expected.pointer),
+                    Some(&expected.value),
+                    "{} should preserve {}",
+                    fixture_tool.name,
+                    expected.pointer
+                );
+            }
+
+            for pointer in &fixture_tool.expected_pruned {
+                assert!(
+                    parameters.pointer(pointer).is_none(),
+                    "{} should prune unreachable definition {pointer}",
+                    fixture_tool.name
+                );
+            }
+
+            for pointer in &fixture_tool.expected_dropped_fields {
+                assert!(
+                    fixture_tool.input_schema.pointer(pointer).is_some(),
+                    "{} fixture should contain expected dropped field {pointer}",
+                    fixture_tool.name
+                );
+                assert!(
+                    parameters.pointer(pointer).is_none(),
+                    "{} should drop field {pointer} after JsonSchema conversion",
+                    fixture_tool.name
+                );
+            }
+        }
+    }
 }
 
 #[test]
-fn oversized_notion_schema_compacts_through_mcp_responses_boundary() {
+fn json_schema_policy_oversized_golden_schema_triggers_compaction() {
     let fixture: FixtureFile = load_fixture(OVERSIZED_NOTION_CREATE_PAGE_SCHEMA_PATH);
     let fixture_tool = fixture
         .tools
@@ -80,23 +137,22 @@ fn oversized_notion_schema_compacts_through_mcp_responses_boundary() {
         "compaction should reduce schema size from {input_bytes} bytes"
     );
 
-    assert!(
-        parameters.pointer("/description").is_none(),
-        "oversized schema should drop its root description"
-    );
+    let absent_pointers = [
+        ("/description", "drop root description"),
+        ("/properties/parent/description", "drop nested descriptions"),
+    ];
+    for (pointer, message) in absent_pointers {
+        assert!(
+            parameters.pointer(pointer).is_none(),
+            "oversized schema should {message}"
+        );
+    }
 
     let expected_values = [
         (
-            "/properties/parent/$ref",
-            json!("#/$defs/parent"),
+            "/properties/parent",
+            json!({"$ref": "#/$defs/parent"}),
             "retain local parent validation",
-        ),
-        (
-            "/properties/parent/description",
-            json!(
-                "Request body field. Parent reference controlling whether the page is standalone or a row under a data source."
-            ),
-            "retain the user-facing parent description",
         ),
         (
             "/properties/children/items",
@@ -125,78 +181,6 @@ fn oversized_notion_schema_compacts_through_mcp_responses_boundary() {
         parameters.pointer("/$defs").is_some(),
         "oversized schema should retain reachable definitions"
     );
-}
-
-fn assert_fixture_converts_through_mcp_responses_boundary(path: &str) {
-    let fixture: FixtureFile = load_fixture(path);
-    for fixture_tool in &fixture.tools {
-        let responses_tool = convert_fixture_tool(&fixture, fixture_tool);
-        let parameters = serde_json::to_value(&responses_tool.parameters)
-            .expect("responses parameters should serialize");
-
-        let expected_fields = [
-            (
-                "preserve the tool name",
-                json!(fixture_tool.name),
-                json!(responses_tool.name),
-            ),
-            (
-                "preserve the tool description",
-                json!(fixture_tool.description),
-                json!(responses_tool.description),
-            ),
-            (
-                "remain a strict:false tool",
-                json!(false),
-                json!(responses_tool.strict),
-            ),
-            (
-                "produce object-shaped parameters",
-                json!("object"),
-                parameters.get("type").cloned().unwrap_or(Value::Null),
-            ),
-        ];
-
-        for (message, expected, actual) in expected_fields {
-            assert_eq!(actual, expected, "{} should {message}", fixture_tool.name);
-        }
-        assert!(
-            parameters.get("properties").is_some_and(Value::is_object),
-            "{} should produce a parameters.properties object",
-            fixture_tool.name
-        );
-
-        for expected in &fixture_tool.expected_preserved {
-            assert_eq!(
-                parameters.pointer(&expected.pointer),
-                Some(&expected.value),
-                "{} should preserve {}",
-                fixture_tool.name,
-                expected.pointer
-            );
-        }
-
-        for pointer in &fixture_tool.expected_pruned {
-            assert!(
-                parameters.pointer(pointer).is_none(),
-                "{} should prune unreachable definition {pointer}",
-                fixture_tool.name
-            );
-        }
-
-        for pointer in &fixture_tool.expected_dropped_fields {
-            assert!(
-                fixture_tool.input_schema.pointer(pointer).is_some(),
-                "{} fixture should contain expected dropped field {pointer}",
-                fixture_tool.name
-            );
-            assert!(
-                parameters.pointer(pointer).is_none(),
-                "{} should drop field {pointer} after JsonSchema conversion",
-                fixture_tool.name
-            );
-        }
-    }
 }
 
 fn load_fixture<T: DeserializeOwned>(path: &str) -> T {

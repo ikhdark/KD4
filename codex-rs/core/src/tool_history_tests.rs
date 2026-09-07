@@ -352,8 +352,6 @@ fn recovered_workspace_evidence_inherits_origin_revision() {
     let recovery_call_id = "recovery-call";
     let origin_output = text_output(origin_call_id, "old file contents".to_string());
     let captured = workspace_identity("captured");
-    let changed = workspace_identity("changed");
-    let recovery_output = text_output(recovery_call_id, "old file contents".to_string());
     let mut state = ToolHistoryState::default();
     state.register(candidate(origin_call_id, "old file contents".to_string()));
     state.register_workspace_evidence(
@@ -373,18 +371,11 @@ fn recovered_workspace_evidence_inherits_origin_revision() {
             call_id: recovery_call_id.to_string(),
             internal_chat_message_metadata_passthrough: None,
         },
-        recovery_output.clone(),
+        text_output(recovery_call_id, "old file contents".to_string()),
     ]);
-    state.register_workspace_evidence(
-        WorkspaceEvidenceObservation::from_response_item(
-            Some(changed.clone()),
-            &recovery_output,
-            BTreeSet::new(),
-        )
-        .expect("fresh recovery workspace observation"),
-    );
 
-    let projection = state.project_with_workspace_identity(canonical, Some(&changed));
+    let projection =
+        state.project_with_workspace_identity(canonical, Some(&workspace_identity("changed")));
     let (_, output) = textual_output_identity(&projection.items[1]).expect("stale recovery");
     assert!(output.contains("\"stale_workspace_evidence\":true"));
 }

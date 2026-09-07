@@ -41,7 +41,6 @@ use crate::AgentTaskBinding;
 use crate::AgentTaskBindingDraft;
 use crate::ArchitectureContractV1;
 use crate::Assignment;
-use crate::AssignmentAdmissionOrigin;
 use crate::AssignmentDraft;
 use crate::AssignmentId;
 use crate::Attempt;
@@ -50,7 +49,6 @@ use crate::AttemptId;
 use crate::AttemptState;
 use crate::AttributionConfidence;
 use crate::CONCURRENT_DRIFT_REASON;
-use crate::CapabilityProfile;
 use crate::CriterionStatus;
 use crate::DEFAULT_MUTATION_EVIDENCE_LIMIT;
 use crate::DEFAULT_SNAPSHOT_CHUNK_BYTES;
@@ -110,16 +108,6 @@ const DATABASE_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 const EXTERNAL_WAKE_RECHECK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 const DATABASE_FILENAME: &str = "agent_tasks.sqlite";
 const DATABASE_MAX_CONNECTIONS: u32 = 4;
-const TERMINAL_DELIVERY_SUCCEEDED_CALL_ID: &str =
-    "codex-internal:typed-child-terminal-delivery:succeeded";
-const TERMINAL_DELIVERY_FAILED_CALL_ID: &str =
-    "codex-internal:typed-child-terminal-delivery:failed";
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum TerminalDeliveryState {
-    Delivered,
-    Failed,
-}
 
 fn workspace_actor_lease_state(
     state: &str,
@@ -226,12 +214,6 @@ pub(crate) async fn with_test_snapshot_capture_pause<T>(
 enum ReceiptHandoffAction {
     Publish(IsolationHandoff),
     Integrate(Vec<AssignmentId>),
-}
-
-struct ReviewTargetReceiptGuard {
-    expected_reviewer_assignment: Assignment,
-    target_assignment_id: AssignmentId,
-    target_attempt_id: AttemptId,
 }
 
 #[derive(Clone)]
@@ -1220,92 +1202,6 @@ LIMIT 1
         Ok(observation)
     }
 
-    async fn record_typed_child_terminal_delivery_impl(
-        &self,
-        attempt_id: AttemptId,
-        delivered: bool,
-        summary: String,
-    ) -> StoreResult<bool> {
-        if summary.trim().is_empty() {
-            return Err(StoreError::InvalidAssignment(
-                "terminal delivery summary cannot be empty".to_string(),
-            ));
-        }
-        let mut transaction = self.pool.begin().await?;
-        lock_attempt_tx(&mut transaction, attempt_id).await?;
-        let attempt = load_attempt_tx(&mut transaction, attempt_id).await?;
-        let current = load_current_attempt_tx(&mut transaction, attempt.assignment_id).await?;
-        if current.attempt_id != attempt_id {
-            return Err(StoreError::AttemptNotActive(attempt_id));
-        }
-        let receipt_body = sqlx::query_scalar::<_, String>(
-            "SELECT body_json FROM receipts WHERE attempt_id = ? AND assignment_id = ?",
-        )
-        .bind(attempt_id.to_string())
-        .bind(attempt.assignment_id.to_string())
-        .fetch_optional(&mut *transaction)
-        .await?
-        .ok_or_else(|| {
-            StoreError::CorruptData(format!(
-                "typed-child terminal delivery requires a sealed receipt for attempt {attempt_id}"
-            ))
-        })?;
-        let receipt: AgentReceipt = decode(&receipt_body)?;
-        if attempt.sealed_at != Some(receipt.sealed_at) {
-            return Err(StoreError::CorruptData(format!(
-                "typed-child terminal delivery receipt does not match sealed attempt {attempt_id}"
-            )));
-        }
-
-        let prior =
-            terminal_delivery_state_tx(&mut transaction, attempt_id, receipt.sealed_at).await?;
-        let requested = if delivered {
-            TerminalDeliveryState::Delivered
-        } else {
-            TerminalDeliveryState::Failed
-        };
-        match (prior, requested) {
-            (Some(TerminalDeliveryState::Failed), TerminalDeliveryState::Delivered) => {
-                transaction.commit().await?;
-                return Ok(false);
-            }
-            (Some(existing), requested) if existing == requested => {
-                transaction.commit().await?;
-                return Ok(true);
-            }
-            _ => {}
-        }
-
-        let assignment = load_assignment_tx(&mut transaction, attempt.assignment_id).await?;
-        let observation = append_observation_tx(
-            &mut transaction,
-            &assignment,
-            attempt_id,
-            if delivered {
-                ObservationKind::Completed
-            } else {
-                ObservationKind::NeedsMain
-            },
-            summary,
-            Some(
-                if delivered {
-                    TERMINAL_DELIVERY_SUCCEEDED_CALL_ID
-                } else {
-                    TERMINAL_DELIVERY_FAILED_CALL_ID
-                }
-                .to_string(),
-            ),
-        )
-        .await?;
-        if observation.created_at <= receipt.sealed_at {
-            return Err(StoreError::CorruptData(format!(
-                "typed-child terminal delivery marker for attempt {attempt_id} was not recorded after receipt sealing"
-            )));
-        }
-        transaction.commit().await?;
-        Ok(true)
-    }
-
     async fn record_validation_call_impl(&self, mut call: ValidationCall) -> StoreResult<()> {
         if call.call_id.trim().is_empty() {
             return Err(StoreError::InvalidAssignment(
@@ -1537,10 +1433,10 @@ LIMIT 1
         root_session_id: &str,
     ) -> StoreResult<()> {
         let rows = sqlx::query(
-            "SELECT attempts.attempt_id, receipts.body_json AS receipt_body_json
-             FROM assignments
-             JOIN attempts USING (assignment_id)
-             LEFT JOIN receipts ON receipts.attempt_id = attempts.attempt_id
+            "SELECT receipts.body_json
+             FROM receipts
+             JOIN assignments USING (assignment_id)
+             JOIN attempts USING (attempt_id)
              WHERE assignments.root_session_id = ?
                AND NOT EXISTS (
                    SELECT 1 FROM attempts AS newer
@@ -1552,18 +1448,9 @@ LIMIT 1
         .fetch_all(&self.pool)
         .await?;
         for row in rows {
-            let attempt_id = row.get::<String, _>("attempt_id");
-            let Some(receipt_body) = row.get::<Option<String>, _>("receipt_body_json") else {
-                return Err(StoreError::CorruptData(format!(
-                    "current typed-task attempt {attempt_id} has no sealed receipt"
-                )));
-            };
-            let receipt: AgentReceipt = decode(&receipt_body)?;
+            let receipt: AgentReceipt = decode(&row.get::<String, _>("body_json"))?;
             if !receipt.status.is_success() {
-                return Err(StoreError::CorruptData(format!(
-                    "current typed-task attempt {attempt_id} has non-success receipt status {:?}",
-                    receipt.status
-                )));
+                continue;
             }
             for call_id in &receipt.validation_call_ids {
                 let call = self
@@ -1580,20 +1467,6 @@ LIMIT 1
                     });
                 }
             }
-            match terminal_delivery_state(&self.pool, receipt.attempt_id, receipt.sealed_at).await?
-            {
-                Some(TerminalDeliveryState::Delivered) => {}
-                Some(TerminalDeliveryState::Failed) => {
-                    return Err(StoreError::CorruptData(format!(
-                        "current typed-task attempt {attempt_id} has failed terminal delivery"
-                    )));
-                }
-                None => {
-                    return Err(StoreError::CorruptData(format!(
-                        "current typed-task attempt {attempt_id} has no durable terminal delivery"
-                    )));
-                }
-            }
         }
         Ok(())
     }
@@ -1603,7 +1476,6 @@ LIMIT 1
         attempt_id: AttemptId,
         mut draft: ReceiptDraft,
         review_reason: Option<String>,
-        review_target_guard: Option<ReviewTargetReceiptGuard>,
     ) -> StoreResult<AgentReceipt> {
         if draft.summary.trim().is_empty() {
             return Err(StoreError::InvalidAssignment(
@@ -1633,19 +1505,7 @@ LIMIT 1
         {
             return Err(StoreError::ReceiptAlreadySealed(attempt_id));
         }
-        let mut assignment = load_assignment_tx(&mut transaction, attempt.assignment_id).await?;
-        if let Some(guard) = review_target_guard.as_ref() {
-            // Task capsules are stored separately from immutable assignment rows. Compare the
-            // complete live assignment to the private admission snapshot before sealing.
-            hydrate_task_capsule(&self.coordination_root, &mut assignment)?;
-            validate_review_target_receipt_guard_tx(
-                &mut transaction,
-                attempt_id,
-                &assignment,
-                guard,
-            )
-            .await?;
-        }
+        let assignment = load_assignment_tx(&mut transaction, attempt.assignment_id).await?;
         validate_criterion_results(&assignment, attempt.amendment.as_ref(), &draft)?;
         let mut invalid_calls = Vec::new();
         let mut invalid_statuses = Vec::new();
@@ -3717,24 +3577,6 @@ impl LocalAgentTaskStore {
         })
     }
 
-    #[doc(hidden)]
-    pub fn record_typed_child_terminal_delivery(
-        &self,
-        attempt_id: AttemptId,
-        delivered: bool,
-        summary: String,
-    ) -> TaskStoreFuture<'_, bool> {
-        Box::pin(async move {
-            let result = self
-                .record_typed_child_terminal_delivery_impl(attempt_id, delivered, summary)
-                .await;
-            if result.is_ok() {
-                self.notify_wake_waiters();
-            }
-            result
-        })
-    }
-
     pub fn record_validation_call(&self, call: ValidationCall) -> TaskStoreFuture<'_, ()> {
         Box::pin(async move {
             let result = self.record_validation_call_impl(call).await;
@@ -3770,7 +3612,7 @@ impl LocalAgentTaskStore {
     ) -> TaskStoreFuture<'_, AgentReceipt> {
         Box::pin(async move {
             let result = self
-                .submit_agent_receipt_impl(attempt_id, receipt, None, None)
+                .submit_agent_receipt_impl(attempt_id, receipt, None)
                 .await;
             if result.is_ok() {
                 self.notify_wake_waiters();
@@ -3787,38 +3629,7 @@ impl LocalAgentTaskStore {
     ) -> TaskStoreFuture<'_, AgentReceipt> {
         Box::pin(async move {
             let result = self
-                .submit_agent_receipt_impl(attempt_id, receipt, Some(review_reason), None)
-                .await;
-            if result.is_ok() {
-                self.notify_wake_waiters();
-            }
-            result
-        })
-    }
-
-    /// Seals a review receipt only while its private fresh-spawn assignment snapshot and the
-    /// successful target attempt remain current in the same transaction.
-    pub fn submit_agent_receipt_for_review_target(
-        &self,
-        attempt_id: AttemptId,
-        receipt: ReceiptDraft,
-        review_reason: Option<String>,
-        expected_reviewer_assignment: Assignment,
-        target_assignment_id: AssignmentId,
-        target_attempt_id: AttemptId,
-    ) -> TaskStoreFuture<'_, AgentReceipt> {
-        Box::pin(async move {
-            let result = self
-                .submit_agent_receipt_impl(
-                    attempt_id,
-                    receipt,
-                    review_reason,
-                    Some(ReviewTargetReceiptGuard {
-                        expected_reviewer_assignment,
-                        target_assignment_id,
-                        target_attempt_id,
-                    }),
-                )
+                .submit_agent_receipt_impl(attempt_id, receipt, Some(review_reason))
                 .await;
             if result.is_ok() {
                 self.notify_wake_waiters();
@@ -4020,12 +3831,9 @@ impl LocalAgentTaskStore {
         root_session_id: String,
     ) -> TaskStoreFuture<'_, crate::QuiescenceStatus> {
         Box::pin(async move {
-            let status = crate::workspace::quiescence(&self.pool, &root_session_id).await?;
-            if status.quiescent {
-                self.require_root_receipt_evidence_current_impl(&root_session_id)
-                    .await?;
-            }
-            Ok(status)
+            self.require_root_receipt_evidence_current_impl(&root_session_id)
+                .await?;
+            crate::workspace::quiescence(&self.pool, &root_session_id).await
         })
     }
 
@@ -4701,102 +4509,6 @@ async fn load_current_attempt_tx(
         .ok_or(StoreError::AssignmentNotFound(assignment_id))?;
     let attempt_id = AttemptId::parse(row.get::<String, _>("attempt_id").as_str())?;
     attempt_from_row(attempt_id, &row)
-}
-
-async fn validate_review_target_receipt_guard_tx(
-    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    reviewer_attempt_id: AttemptId,
-    reviewer: &Assignment,
-    guard: &ReviewTargetReceiptGuard,
-) -> StoreResult<()> {
-    if reviewer != &guard.expected_reviewer_assignment {
-        return Err(StoreError::InvalidAssignment(
-            "persisted reviewer assignment does not match its fresh-spawn snapshot".to_string(),
-        ));
-    }
-    let relation_matches = reviewer.relation.as_ref().is_some_and(|relation| {
-        relation.kind == RelationKind::Review
-            && relation.target_assignment_ids.as_slice() == [guard.target_assignment_id]
-    });
-    if reviewer.admission_origin != AssignmentAdmissionOrigin::Typed
-        || reviewer.role != AgentRole::Reviewer
-        || reviewer.capability_profile != CapabilityProfile::ReadSearchDiff
-        || !reviewer.write_scope.is_empty()
-        || reviewer.dependencies.as_slice() != [guard.target_assignment_id]
-        || !relation_matches
-    {
-        return Err(StoreError::InvalidAssignment(
-            "review-target receipt requires the exact typed read-only Reviewer relation and dependency"
-                .to_string(),
-        ));
-    }
-    let reviewer_attempt = load_attempt_tx(transaction, reviewer_attempt_id).await?;
-    if reviewer_attempt.assignment_id != reviewer.assignment_id
-        || reviewer_attempt.amendment.is_some()
-    {
-        return Err(StoreError::CorruptData(format!(
-            "reviewer attempt {reviewer_attempt_id} does not belong to assignment {}",
-            reviewer.assignment_id
-        )));
-    }
-
-    lock_assignment_tx(transaction, guard.target_assignment_id).await?;
-    let target = load_assignment_tx(transaction, guard.target_assignment_id).await?;
-    if target.root_session_id != reviewer.root_session_id
-        || target.repository_id != reviewer.repository_id
-        || target.workspace_id != reviewer.workspace_id
-        || target.assignment_id == reviewer.assignment_id
-    {
-        return Err(StoreError::InvalidAssignment(
-            "reviewer and review target must share root-session and repository identity"
-                .to_string(),
-        ));
-    }
-    let current_target = load_current_attempt_tx(transaction, guard.target_assignment_id).await?;
-    if current_target.attempt_id != guard.target_attempt_id {
-        return Err(StoreError::AttemptNotActive(guard.target_attempt_id));
-    }
-    if current_target.state != AttemptState::Completed || current_target.sealed_at.is_none() {
-        return Err(StoreError::InvalidAssignment(format!(
-            "review target attempt {} is not completed and sealed",
-            guard.target_attempt_id
-        )));
-    }
-    let receipt_row = sqlx::query(
-        "SELECT assignment_id, status, body_json, sealed_at
-         FROM receipts
-         WHERE assignment_id = ? AND attempt_id = ?",
-    )
-    .bind(guard.target_assignment_id.to_string())
-    .bind(guard.target_attempt_id.to_string())
-    .fetch_optional(&mut **transaction)
-    .await?
-    .ok_or_else(|| {
-        StoreError::InvalidAssignment(format!(
-            "review target attempt {} has no sealed receipt",
-            guard.target_attempt_id
-        ))
-    })?;
-    let stored_assignment_id =
-        AssignmentId::parse(receipt_row.get::<String, _>("assignment_id").as_str())?;
-    let stored_status: AgentStatusClaim = decode(receipt_row.get::<String, _>("status").as_str())?;
-    let stored_sealed_at: chrono::DateTime<Utc> =
-        decode(receipt_row.get::<String, _>("sealed_at").as_str())?;
-    let receipt: AgentReceipt = decode(receipt_row.get::<String, _>("body_json").as_str())?;
-    if stored_assignment_id != guard.target_assignment_id
-        || receipt.assignment_id != guard.target_assignment_id
-        || receipt.attempt_id != guard.target_attempt_id
-        || !stored_status.is_success()
-        || receipt.status != stored_status
-        || receipt.sealed_at != stored_sealed_at
-        || current_target.sealed_at != Some(stored_sealed_at)
-    {
-        return Err(StoreError::CorruptData(format!(
-            "review target receipt identity, status, or seal does not match attempt {}",
-            guard.target_attempt_id
-        )));
-    }
-    Ok(())
 }
 
 async fn require_active_current_attempt_tx(
@@ -6558,66 +6270,6 @@ async fn verify_nonexistent_snapshot_marker(
             "snapshot marker verification task failed: {error}"
         )))
     })?
-}
-
-fn terminal_delivery_state_from_rows(
-    attempt_id: AttemptId,
-    sealed_at: chrono::DateTime<Utc>,
-    rows: Vec<sqlx::sqlite::SqliteRow>,
-) -> StoreResult<Option<TerminalDeliveryState>> {
-    let mut state = None;
-    for row in rows {
-        let observation: RuntimeObservation = decode(&row.get::<String, _>("body_json"))?;
-        if observation.created_at <= sealed_at {
-            continue;
-        }
-        let next = match observation.call_id.as_deref() {
-            Some(TERMINAL_DELIVERY_SUCCEEDED_CALL_ID) => TerminalDeliveryState::Delivered,
-            Some(TERMINAL_DELIVERY_FAILED_CALL_ID) => TerminalDeliveryState::Failed,
-            _ => continue,
-        };
-        match (state, next) {
-            (Some(TerminalDeliveryState::Failed), TerminalDeliveryState::Delivered) => {
-                return Err(StoreError::CorruptData(format!(
-                    "typed-child terminal delivery for attempt {attempt_id} transitioned from failed to delivered"
-                )));
-            }
-            (Some(TerminalDeliveryState::Delivered), TerminalDeliveryState::Failed) => {
-                state = Some(TerminalDeliveryState::Failed);
-            }
-            (None, next) => state = Some(next),
-            _ => {}
-        }
-    }
-    Ok(state)
-}
-
-async fn terminal_delivery_state(
-    pool: &SqlitePool,
-    attempt_id: AttemptId,
-    sealed_at: chrono::DateTime<Utc>,
-) -> StoreResult<Option<TerminalDeliveryState>> {
-    let rows = sqlx::query(
-        "SELECT body_json FROM observations WHERE attempt_id = ? ORDER BY wake_sequence",
-    )
-    .bind(attempt_id.to_string())
-    .fetch_all(pool)
-    .await?;
-    terminal_delivery_state_from_rows(attempt_id, sealed_at, rows)
-}
-
-async fn terminal_delivery_state_tx(
-    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    attempt_id: AttemptId,
-    sealed_at: chrono::DateTime<Utc>,
-) -> StoreResult<Option<TerminalDeliveryState>> {
-    let rows = sqlx::query(
-        "SELECT body_json FROM observations WHERE attempt_id = ? ORDER BY wake_sequence",
-    )
-    .bind(attempt_id.to_string())
-    .fetch_all(&mut **transaction)
-    .await?;
-    terminal_delivery_state_from_rows(attempt_id, sealed_at, rows)
 }
 
 async fn append_observation_tx(

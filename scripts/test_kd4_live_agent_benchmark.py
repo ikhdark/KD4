@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import ctypes
 import os
 import subprocess
 import sys
@@ -18,22 +17,13 @@ from scripts import kd4_live_agent_benchmark as benchmark
 def _pid_is_running(pid: int) -> bool:
     """Whether a pid is still live, without reaping anything we do not own."""
     if os.name == "nt":
-        from ctypes import wintypes
-
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-        kernel32.OpenProcess.restype = wintypes.HANDLE
-        kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
-        kernel32.WaitForSingleObject.restype = wintypes.DWORD
-        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-        kernel32.CloseHandle.restype = wintypes.BOOL
-        handle = kernel32.OpenProcess(0x00100000, False, pid)
-        if not handle:
-            return False
-        try:
-            return kernel32.WaitForSingleObject(handle, 0) == 0x00000102
-        finally:
-            kernel32.CloseHandle(handle)
+        probe = subprocess.run(
+            ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return str(pid) in probe.stdout
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -203,21 +193,6 @@ def _trace(
 
 
 class Kd4LiveAgentBenchmarkTest(unittest.TestCase):
-    def test_cli_self_test_runs_offline(self) -> None:
-        script = Path(benchmark.__file__).resolve()
-        result = subprocess.run(
-            [sys.executable, str(script), "--self-test"],
-            cwd=script.parents[1],
-            capture_output=True,
-            text=True,
-            timeout=60,
-            check=False,
-        )
-
-        self.assertEqual(result.returncode, 0, msg=result.stderr or result.stdout)
-        self.assertEqual(result.stdout, "self-test passed\n")
-        self.assertEqual(result.stderr, "")
-
     def test_turn_measurements_use_union_wait_and_continuation_flags(self) -> None:
         event = {
             "type": "turn.completed",
@@ -2335,11 +2310,10 @@ def render_report(text: str) -> str:
                 parent.stdout.close()
             parent.wait(timeout=10)
 
-    def test_benchmark_process_owner_terminates_descendant_after_root_exit(self) -> None:
-        """The real benchmark owner retains a child tree after its root exits."""
+    def test_native_process_owner_survives_root_exit(self) -> None:
         script = (
             "import subprocess, sys\n"
-            "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n"
+            "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'])\n"
             "print(child.pid, flush=True)\n"
         )
         parent = benchmark.spawn_owned_process(

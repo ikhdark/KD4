@@ -1,55 +1,24 @@
-# Orchestrator Template
+# Agent Coordination
 
-Use this template when multi-agent work is active. Follow the
-[`workflow.md` multi-agent procedure](../workflow.md#optional-multi-agent-mode)
-and resolve a copy of [`PREFLIGHT.json`](PREFLIGHT.json) before concurrent
+Use when explicitly requested multi-agent work needs saved coordination. Follow
+`.codex/harness/workflow.md`; resolve preflight manifests before concurrent
 writers or validation lanes start.
 
 ## Objective
 
-State the shared objective and final owner.
+- Shared outcome:
+- Coordinator responsible for integration and final validation:
 
-## Coordination Pattern
+## Assignments
 
-Choose one:
+| Agent   | Task and scope | Dependencies   | Expected output | Status    |
+| ------- | -------------- | -------------- | --------------- | --------- |
+| <agent> | <bounded task> | <needed input> | <result>        | <pending> |
 
-- Pipeline: one agent's output becomes the next agent's input.
-- Fanout/fanin: several agents inspect independent areas, then one owner
-  integrates.
-- Expert pool: agents investigate specialized surfaces such as tests, runtime,
-  docs, or build tooling.
-- Producer/reviewer: one agent proposes or implements, another checks.
-- Supervisor: one owner tracks work, constraints, and validation evidence.
+Link preflight manifests and receipts here when used; keep their fields there.
 
-## Durable Preflight
+## Integration and Validation
 
-- Root task ID:
-- Starting revision and workspace fingerprint:
-- Active preflight receipts checked:
-- Generated-output owner:
-- Validation owner:
-- Cargo lanes:
-- Shared/isolated strategy:
-
-## Agent Assignments
-
-| Agent | Assignment ID | Path/contract claims | Expected Output | Stop Condition |
-| --- | --- | --- | --- | --- |
-|  |  |  |  |  |
-
-## Shared Constraints
-
-- Follow the root and nearest scoped `AGENTS.md`.
-- Do not recurse into more agents unless explicitly approved.
-- Record path, named-contract, and Cargo target-lane overlap as advisories.
-- Use isolated worktrees when separation is useful; overlap remains advisory.
-- Each agent reports inspected scope, findings, and validation evidence.
-
-## Integration
-
-- Final owner:
-- Integration files:
-- Versioned isolated-worktree handoffs:
-- Required validation:
-- Quiescence check for linked assignments, validations, and gates:
-- Remaining risk:
+- <ordering or overlap to resolve>
+- <required checks and results, or links to existing evidence>
+- <remaining work>

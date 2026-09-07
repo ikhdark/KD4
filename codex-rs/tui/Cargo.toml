@@ -65,7 +65,6 @@ codex-utils-home-dir = { workspace = true }
 codex-utils-image = { workspace = true }
 codex-utils-oss = { workspace = true }
 codex-utils-path-uri = { workspace = true }
-codex-utils-pty = { workspace = true }
 codex-utils-sandbox-summary = { workspace = true }
 codex-utils-string = { workspace = true }
 color-eyre = { workspace = true }

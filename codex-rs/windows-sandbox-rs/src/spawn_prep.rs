@@ -15,7 +15,7 @@ use crate::env::ensure_non_interactive_pager;
 use crate::env::inherit_path_env;
 use crate::env::normalize_null_device_env;
 use crate::identity::SandboxCreds;
-use crate::identity::acquire_logon_sandbox_creds_for_launch;
+use crate::identity::require_logon_sandbox_creds_with_additional_read_roots;
 use crate::logging::log_start;
 use crate::path_normalization::canonical_path_key;
 use crate::path_normalization::canonicalize_path;
@@ -53,7 +53,6 @@ pub(crate) struct ElevatedSpawnContext {
     pub(crate) sandbox_base: PathBuf,
     pub(crate) logs_base_dir: Option<PathBuf>,
     pub(crate) sandbox_creds: SandboxCreds,
-    pub(crate) used_prepared_launch: bool,
     pub(crate) cap_sids: Vec<String>,
 }
 
@@ -394,8 +393,6 @@ pub(crate) fn prepare_elevated_spawn_context_for_permissions(
     deny_write_paths_override: &[PathBuf],
     proxy_enforced: bool,
     proxy_settings_mode: crate::WindowsSandboxProxySettingsMode,
-    prepared_canonical_windows_sandbox_launch: Option<crate::PreparedCanonicalWindowsSandboxLaunch>,
-    canonical_launch_identity: Option<&str>,
 ) -> Result<ElevatedSpawnContext> {
     normalize_null_device_env(env_map);
     ensure_non_interactive_pager(env_map);
@@ -436,9 +433,7 @@ pub(crate) fn prepare_elevated_spawn_context_for_permissions(
     } else {
         write_roots_override
     };
-    let acquired_creds = acquire_logon_sandbox_creds_for_launch(
-        prepared_canonical_windows_sandbox_launch,
-        canonical_launch_identity,
+    let sandbox_creds = require_logon_sandbox_creds_with_additional_read_roots(
         &permissions,
         cwd,
         env_map,
@@ -456,7 +451,6 @@ pub(crate) fn prepare_elevated_spawn_context_for_permissions(
         proxy_enforced,
         proxy_settings_mode,
     )?;
-    let sandbox_creds = acquired_creds.credentials;
     let caps = load_or_create_cap_sids(codex_home)?;
     let write_root_sids = if uses_write_capabilities {
         root_capability_sids(codex_home, cwd, effective_write_roots)?
@@ -478,7 +472,6 @@ pub(crate) fn prepare_elevated_spawn_context_for_permissions(
         sandbox_base,
         logs_base_dir,
         sandbox_creds,
-        used_prepared_launch: acquired_creds.used_prepared_launch,
         cap_sids,
     })
 }

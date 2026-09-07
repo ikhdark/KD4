@@ -33,7 +33,6 @@ mod agent_communication;
 mod attestation;
 mod codex_delegate;
 mod command_canonicalization;
-mod completion_proof;
 pub mod config;
 pub mod connectors;
 pub mod context;

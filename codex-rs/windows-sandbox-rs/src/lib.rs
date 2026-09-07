@@ -310,10 +310,6 @@ pub use hide_users::hide_newly_created_users;
 
 pub use identity::require_logon_sandbox_creds;
 
-pub use identity::PreparedCanonicalWindowsSandboxLaunch;
-
-pub use identity::prepare_canonical_windows_sandbox_launch;
-
 pub use identity::sandbox_setup_is_complete;
 
 pub use ipc_framed::ErrorPayload;
@@ -380,7 +376,6 @@ pub use resolved_permissions::WindowsSandboxTokenMode;
 
 pub use resolved_permissions::token_mode_for_permission_profile;
 
-pub use setup::CANONICAL_PROOF_USERNAME;
 pub use setup::SETUP_VERSION;
 
 pub use setup::SandboxSetupRequest;
@@ -444,16 +439,11 @@ pub use unified_exec::WindowsSandboxSessionRequest;
 
 pub use unified_exec::spawn_windows_sandbox_session_elevated_for_permission_profile;
 
-pub use unified_exec::spawn_windows_sandbox_session_elevated_with_prepared_canonical_launch;
-
 pub use unified_exec::spawn_windows_sandbox_session_for_level;
 
 pub use unified_exec::spawn_windows_sandbox_session_legacy;
 
-pub use wfp::install_canonical_proof_wfp_filters_for_account;
 pub use wfp::install_wfp_filters_for_account;
-
-pub use wfp_setup::install_canonical_proof_wfp_filters;
 
 pub use wfp_setup::install_wfp_filters;
 
@@ -521,7 +511,9 @@ mod windows_impl {
     use windows_sys::Win32::Foundation::ERROR_NO_DATA;
     use windows_sys::Win32::Foundation::GetLastError;
     use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Foundation::HANDLE_FLAG_INHERIT;
     use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Foundation::SetHandleInformation;
     use windows_sys::Win32::System::Pipes::CreatePipe;
     use windows_sys::Win32::System::Pipes::PIPE_NOWAIT;
     use windows_sys::Win32::System::Pipes::SetNamedPipeHandleState;
@@ -620,6 +612,15 @@ mod windows_impl {
             return Err(pipe_setup_error(&[in_r, in_w, out_r, out_w]));
         }
         let handles = [in_r, in_w, out_r, out_w, err_r, err_w];
+        if SetHandleInformation(in_r, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) == 0 {
+            return Err(pipe_setup_error(&handles));
+        }
+        if SetHandleInformation(out_w, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) == 0 {
+            return Err(pipe_setup_error(&handles));
+        }
+        if SetHandleInformation(err_w, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) == 0 {
+            return Err(pipe_setup_error(&handles));
+        }
         let pipe_mode = PIPE_NOWAIT;
         if SetNamedPipeHandleState(out_r, &pipe_mode, ptr::null(), ptr::null()) == 0 {
             return Err(pipe_setup_error(&handles));

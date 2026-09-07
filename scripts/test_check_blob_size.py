@@ -2,341 +2,256 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import os
-import subprocess
-import sys
+from pathlib import Path
 import tempfile
 import unittest
-from pathlib import Path
+from unittest import mock
+
+from scripts import check_blob_size
+from scripts.check_blob_size import ChangedBlob
 
 
 class CheckBlobSizeTest(unittest.TestCase):
-    def setUp(self) -> None:
-        self.temp = tempfile.TemporaryDirectory()
-        self.repo = Path(self.temp.name) / "repo"
-        subprocess.run(["git", "init", "-q", str(self.repo)], check=True)
-        self.git("config", "user.email", "test@example.com")
-        self.git("config", "user.name", "Test")
-        self.git("config", "core.autocrlf", "false")
-        self.git("commit", "--allow-empty", "-qm", "baseline")
-        self.base = self.git("rev-parse", "HEAD").stdout.strip()
-        self.script = Path(__file__).with_name("check_blob_size.py").resolve()
-        self.allowlist = Path(self.temp.name) / "allowlist.txt"
-        self.allowlist.write_text("", encoding="utf-8")
+    def test_run_git_is_anchored_at_repo_root(self) -> None:
+        with mock.patch.object(check_blob_size.subprocess, "run") as run:
+            run.return_value.stdout = "ok\n"
 
-    def tearDown(self) -> None:
-        self.temp.cleanup()
+            output = check_blob_size.run_git("status", "--short")
 
-    def git(
-        self,
-        *arguments: str,
-        input_text: str | None = None,
-    ) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            ["git", "-C", str(self.repo), *arguments],
-            check=True,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            input=input_text,
+        self.assertEqual(output, "ok\n")
+        run.assert_called_once()
+        self.assertEqual(run.call_args.kwargs["cwd"], check_blob_size.REPO_ROOT)
+
+    def test_collect_changed_blobs_batches_diff_and_cat_file(self) -> None:
+        calls: list[tuple[tuple[str, ...], str | None]] = []
+
+        def fake_git(*args: str, input_text: str | None = None) -> str:
+            calls.append((args, input_text))
+            if args[:2] == ("diff", "--numstat"):
+                return "10\t2\ttext.txt\0-\t-\timage.bin\0"
+            if args[:3] == (
+                "cat-file",
+                "-Z",
+                "--batch-check=%(objecttype) %(objectsize)",
+            ):
+                self.assertEqual(input_text, "HEAD:text.txt\0HEAD:image.bin\0")
+                return "blob 12\x00blob 600000\x00"
+            raise AssertionError(f"unexpected git call: {args}")
+
+        blobs = check_blob_size.collect_changed_blobs(
+            "BASE",
+            "HEAD",
+            {"image.bin"},
+            include_kind=True,
+            run_git_func=fake_git,
         )
 
-    def commit_files(
-        self, files: dict[str, str | bytes], message: str = "files"
-    ) -> str:
-        for relative, contents in files.items():
-            path = self.repo / relative
-            path.parent.mkdir(parents=True, exist_ok=True)
-            if isinstance(contents, bytes):
-                path.write_bytes(contents)
-            else:
-                path.write_text(contents, encoding="utf-8", newline="")
-        self.git("add", "-A")
-        self.git("commit", "-qm", message)
-        return self.git("rev-parse", "HEAD").stdout.strip()
-
-    def commit_tree_blobs(self, files: dict[str, bytes], message: str) -> str:
-        entries: list[bytes] = []
-        for path, contents in sorted(files.items()):
-            blob = (
-                subprocess.run(
-                    ["git", "-C", str(self.repo), "hash-object", "-w", "--stdin"],
-                    check=True,
-                    capture_output=True,
-                    input=contents,
-                )
-                .stdout.decode("ascii")
-                .strip()
-            )
-            entries.append(f"100644 blob {blob}\t{path}\0".encode())
-        tree = (
-            subprocess.run(
-                ["git", "-C", str(self.repo), "mktree", "-z"],
-                check=True,
-                capture_output=True,
-                input=b"".join(entries),
-            )
-            .stdout.decode("ascii")
-            .strip()
-        )
-        return subprocess.run(
+        self.assertEqual(
+            blobs,
             [
-                "git",
-                "-C",
-                str(self.repo),
-                "commit-tree",
-                tree,
-                "-p",
-                "HEAD",
-                "-m",
-                message,
+                ChangedBlob("text.txt", 12, False, False),
+                ChangedBlob("image.bin", 600000, True, True),
             ],
-            check=True,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-        ).stdout.strip()
+        )
+        self.assertEqual(len(calls), 2)
 
-    def run_cli(
-        self,
-        *,
-        base: str,
-        head: str,
-        max_bytes: int = 512000,
-        include_kind: bool = False,
-        stdin_paths: str | None = None,
-        paths_file: Path | None = None,
-        summary_path: Path | None = None,
-        use_temp_repository: bool = True,
-        cwd: Path | None = None,
-    ) -> subprocess.CompletedProcess[str]:
-        command = [
-            sys.executable,
-            str(self.script),
-            "--base",
-            base,
-            "--head",
-            head,
-            "--max-bytes",
-            str(max_bytes),
-            "--allowlist",
-            str(self.allowlist),
-        ]
-        if include_kind:
-            command.append("--include-kind")
-        if stdin_paths is not None:
-            command.append("--stdin-paths")
-        if paths_file is not None:
-            command.extend(["--paths-file", str(paths_file)])
+    def test_explicit_paths_skip_diff_when_kind_is_not_requested(self) -> None:
+        calls: list[tuple[tuple[str, ...], str | None]] = []
 
-        environment = os.environ.copy()
-        if use_temp_repository:
-            environment["GIT_DIR"] = str(self.repo / ".git")
-            environment["GIT_WORK_TREE"] = str(self.repo)
-        if summary_path is not None:
-            environment["GITHUB_STEP_SUMMARY"] = str(summary_path)
-        else:
-            environment.pop("GITHUB_STEP_SUMMARY", None)
-        return subprocess.run(
-            command,
-            cwd=cwd,
-            env=environment,
-            input=stdin_paths,
-            check=False,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
+        def fake_git(*args: str, input_text: str | None = None) -> str:
+            calls.append((args, input_text))
+            if args[:3] == (
+                "cat-file",
+                "-Z",
+                "--batch-check=%(objecttype) %(objectsize)",
+            ):
+                return "blob 1\x00blob 2\x00"
+            raise AssertionError(f"unexpected git call: {args}")
+
+        blobs = check_blob_size.collect_changed_blobs(
+            "BASE",
+            "HEAD",
+            set(),
+            paths=["a.txt", "b.txt"],
+            include_kind=False,
+            run_git_func=fake_git,
         )
 
-    def test_cli_anchors_git_at_repository_root_from_unrelated_cwd(self) -> None:
-        completed = self.run_cli(
-            base="HEAD",
-            head="HEAD",
-            use_temp_repository=False,
-            cwd=Path(self.temp.name),
+        self.assertEqual(
+            blobs,
+            [
+                ChangedBlob("a.txt", 1, False, False),
+                ChangedBlob("b.txt", 2, False, False),
+            ],
         )
+        self.assertEqual(len(calls), 1)
 
-        self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertIn("No changed files were detected", completed.stdout)
+    def test_explicit_paths_with_kind_preserve_paths_missing_from_diff(self) -> None:
+        def fake_git(*args: str, input_text: str | None = None) -> str:
+            if args[:2] == ("diff", "--numstat"):
+                self.assertNotIn("a.txt", args)
+                self.assertNotIn("b.bin", args)
+                return "-\t-\tb.bin\0"
+            if args[:3] == (
+                "cat-file",
+                "-Z",
+                "--batch-check=%(objecttype) %(objectsize)",
+            ):
+                self.assertEqual(input_text, "HEAD:a.txt\0HEAD:b.bin\0")
+                return "blob 1\x00blob 2\x00"
+            raise AssertionError(f"unexpected git call: {args}")
 
-    def test_cli_collects_real_diff_and_blob_sizes_in_one_run(self) -> None:
-        head = self.commit_files(
-            {"text.txt": "hello\n", "image.bin": b"\0" + b"x" * 599},
-        )
-        self.allowlist.write_text("image.bin\n", encoding="utf-8")
-
-        completed = self.run_cli(
-            base=self.base,
-            head=head,
-            max_bytes=100,
+        blobs = check_blob_size.collect_changed_blobs(
+            "BASE",
+            "HEAD",
+            set(),
+            paths=["a.txt", "b.bin"],
             include_kind=True,
+            run_git_func=fake_git,
         )
 
-        self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertIn("Checked 2 changed file(s)", completed.stdout)
-        self.assertIn("text.txt: 6 bytes (0.0 KiB) [non-binary, ok]", completed.stdout)
-        self.assertIn(
-            "image.bin: 600 bytes (0.6 KiB) [binary, allowlisted]", completed.stdout
+        self.assertEqual(
+            blobs,
+            [
+                ChangedBlob("a.txt", 1, False, False),
+                ChangedBlob("b.bin", 2, False, True),
+            ],
         )
 
-    def test_cli_explicit_paths_skip_diff_when_kind_is_not_requested(self) -> None:
-        head = self.commit_files({"a.txt": "a", "b.txt": "bb"})
+    def test_explicit_paths_with_kind_do_not_expand_git_command_line(self) -> None:
+        paths = [f"generated/path-{index:05d}.bin" for index in range(10_000)]
 
-        completed = self.run_cli(
-            base="not-a-real-revision",
-            head=head,
-            stdin_paths="a.txt\nb.txt\n",
-        )
+        def fake_git(*args: str, input_text: str | None = None) -> str:
+            self.assertLess(len(args), 10)
+            self.assertIsNone(input_text)
+            return ""
 
-        self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertIn("Checked 2 changed file(s)", completed.stdout)
-        self.assertIn("a.txt: 1 bytes", completed.stdout)
-        self.assertIn("b.txt: 2 bytes", completed.stdout)
-
-    def test_cli_explicit_kind_preserves_path_absent_from_diff(self) -> None:
-        first = self.commit_files({"a.txt": "a", "b.bin": b"\0old"}, "first")
-        head = self.commit_files({"b.bin": b"\0new-binary"}, "second")
-
-        completed = self.run_cli(
-            base=first,
-            head=head,
+        changed = check_blob_size.get_changed_paths(
+            "BASE",
+            "HEAD",
             include_kind=True,
-            stdin_paths="a.txt\nb.bin\n",
+            paths=paths,
+            run_git_func=fake_git,
         )
 
-        self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertIn("a.txt: 1 bytes (0.0 KiB) [non-binary, ok]", completed.stdout)
-        self.assertIn("b.bin: 11 bytes (0.0 KiB) [binary, ok]", completed.stdout)
+        self.assertEqual(len(changed), len(paths))
+        self.assertFalse(any(path.is_binary for path in changed))
 
-    def test_cli_handles_ten_thousand_paths_without_command_line_expansion(
-        self,
-    ) -> None:
-        head = self.commit_files({"a.txt": "a"})
-        paths_file = Path(self.temp.name) / "many-paths.bin"
-        paths_file.write_bytes(("a.txt\0" * 10_000).encode("utf-8"))
+    def test_parse_paths_accepts_newline_or_nul_delimiters(self) -> None:
+        self.assertEqual(check_blob_size.parse_paths("a\n\nb\n"), ["a", "b"])
+        self.assertEqual(check_blob_size.parse_paths("a\0\0b\0"), ["a", "b"])
 
-        completed = self.run_cli(
-            base=self.base,
-            head=head,
-            include_kind=True,
-            paths_file=paths_file,
+    def test_batch_blob_sizes_preserves_newlines_in_paths(self) -> None:
+        def fake_git(*args: str, input_text: str | None = None) -> str:
+            self.assertEqual(
+                args,
+                (
+                    "cat-file",
+                    "-Z",
+                    "--batch-check=%(objecttype) %(objectsize)",
+                ),
+            )
+            self.assertEqual(input_text, "HEAD:docs/a\nb.txt\0HEAD:c.txt\0")
+            return "blob 123\x00blob 456\x00"
+
+        sizes = check_blob_size.batch_blob_sizes(
+            "HEAD", ["docs/a\nb.txt", "c.txt"], run_git_func=fake_git
         )
 
-        self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertIn("Checked 10000 changed file(s)", completed.stdout)
-        self.assertEqual(completed.stdout.count("- a.txt:"), 10_000)
+        self.assertEqual(sizes, {"docs/a\nb.txt": 123, "c.txt": 456})
 
-    def test_cli_paths_file_accepts_newline_and_nul_delimiters(self) -> None:
-        head = self.commit_files({"a.txt": "a", "b.txt": "bb"})
-        newline_file = Path(self.temp.name) / "newline-paths.txt"
-        newline_file.write_text("a.txt\n\nb.txt\n", encoding="utf-8")
-        nul_file = Path(self.temp.name) / "nul-paths.bin"
-        nul_file.write_bytes(b"a.txt\0\0b.txt\0")
+    def test_batch_blob_sizes_reports_missing_path_cleanly(self) -> None:
+        def fake_git(*args: str, input_text: str | None = None) -> str:
+            return "HEAD:missing.txt missing\0"
 
-        for paths_file in (newline_file, nul_file):
-            with self.subTest(paths_file=paths_file.name):
-                completed = self.run_cli(
-                    base="not-a-real-revision",
-                    head=head,
-                    paths_file=paths_file,
+        with self.assertRaisesRegex(
+            check_blob_size.BlobLookupError,
+            "'missing.txt' does not exist as a blob at 'HEAD'",
+        ):
+            check_blob_size.batch_blob_sizes(
+                "HEAD", ["missing.txt"], run_git_func=fake_git
+            )
+
+    def test_batch_blob_sizes_rejects_non_blob_object(self) -> None:
+        def fake_git(*args: str, input_text: str | None = None) -> str:
+            return "commit 245\0"
+
+        with self.assertRaisesRegex(
+            check_blob_size.BlobLookupError,
+            "'vendor/submodule' is not a blob at 'HEAD'",
+        ):
+            check_blob_size.batch_blob_sizes(
+                "HEAD", ["vendor/submodule"], run_git_func=fake_git
+            )
+
+    def test_main_reports_blob_lookup_error_without_traceback(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            allowlist = Path(temp_dir) / "allowlist.txt"
+            allowlist.write_text("", encoding="utf-8")
+            stderr = io.StringIO()
+            with (
+                mock.patch.object(
+                    check_blob_size,
+                    "collect_changed_blobs",
+                    side_effect=check_blob_size.BlobLookupError(
+                        "'missing.txt' does not exist as a blob at 'HEAD'"
+                    ),
+                ),
+                contextlib.redirect_stderr(stderr),
+            ):
+                exit_code = check_blob_size.main(
+                    [
+                        "--base",
+                        "BASE",
+                        "--head",
+                        "HEAD",
+                        "--allowlist",
+                        str(allowlist),
+                    ]
                 )
-                self.assertEqual(completed.returncode, 0, completed.stderr)
-                self.assertIn("Checked 2 changed file(s)", completed.stdout)
-                self.assertIn("a.txt: 1 bytes", completed.stdout)
-                self.assertIn("b.txt: 2 bytes", completed.stdout)
 
-    def test_cli_preserves_newlines_in_paths_during_blob_lookup(self) -> None:
-        newline_path = "a\nb.txt"
-        head = self.commit_tree_blobs(
-            {newline_path: b"a" * 123, "c.txt": b"c" * 456},
-            "newline path",
-        )
-        paths_file = Path(self.temp.name) / "paths.bin"
-        paths_file.write_bytes(f"{newline_path}\0c.txt\0".encode())
+        self.assertEqual(exit_code, 2)
+        self.assertIn("missing.txt", stderr.getvalue())
+        self.assertNotIn("Traceback", stderr.getvalue())
 
-        completed = self.run_cli(
-            base="not-a-real-revision",
-            head=head,
-            paths_file=paths_file,
-        )
+    def test_allowlist_preserves_hash_in_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            allowlist = Path(temp_dir) / "allowlist.txt"
+            allowlist.write_text(
+                "# comment\nassets/icon#dark.png\nassets/large.bin # explanation\n",
+                encoding="utf-8",
+            )
 
-        self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertIn(f"{newline_path}: 123 bytes", completed.stdout)
-        self.assertIn("c.txt: 456 bytes", completed.stdout)
+            loaded = check_blob_size.load_allowlist(allowlist)
 
-    def test_cli_reports_missing_blob_without_traceback(self) -> None:
-        completed = self.run_cli(
-            base="not-a-real-revision",
-            head=self.base,
-            stdin_paths="missing.txt\n",
-        )
+        self.assertEqual(loaded, {"assets/icon#dark.png", "assets/large.bin"})
 
-        self.assertEqual(completed.returncode, 2)
-        self.assertIn("'missing.txt' does not exist as a blob", completed.stderr)
-        self.assertNotIn("Traceback", completed.stderr)
+    def test_step_summary_escapes_markdown_table_cells(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            summary_path = Path(temp_dir) / "summary.md"
+            old_summary = os.environ.get("GITHUB_STEP_SUMMARY")
+            os.environ["GITHUB_STEP_SUMMARY"] = str(summary_path)
+            try:
+                check_blob_size.write_step_summary(
+                    10,
+                    [ChangedBlob("docs/a|`b`.txt", 20, False, False)],
+                    [ChangedBlob("docs/a|`b`.txt", 20, False, False)],
+                    include_kind=False,
+                )
+            finally:
+                if old_summary is None:
+                    os.environ.pop("GITHUB_STEP_SUMMARY", None)
+                else:
+                    os.environ["GITHUB_STEP_SUMMARY"] = old_summary
 
-    def test_cli_rejects_non_blob_gitlink(self) -> None:
-        self.git(
-            "update-index",
-            "--add",
-            "--cacheinfo",
-            f"160000,{self.base},vendor/submodule",
-        )
-        self.git("commit", "-qm", "gitlink")
-        head = self.git("rev-parse", "HEAD").stdout.strip()
+            summary = summary_path.read_text(encoding="utf-8")
 
-        completed = self.run_cli(
-            base="not-a-real-revision",
-            head=head,
-            stdin_paths="vendor/submodule\n",
-        )
-
-        self.assertEqual(completed.returncode, 2)
-        self.assertIn("'vendor/submodule' is not a blob", completed.stderr)
-        self.assertNotIn("Traceback", completed.stderr)
-
-    def test_cli_allowlist_preserves_hash_in_paths_and_inline_comments(self) -> None:
-        head = self.commit_files(
-            {"assets/icon#dark.png": b"x" * 20, "assets/large.bin": b"y" * 30}
-        )
-        self.allowlist.write_text(
-            "# comment\nassets/icon#dark.png\nassets/large.bin # explanation\n",
-            encoding="utf-8",
-        )
-
-        completed = self.run_cli(
-            base="not-a-real-revision",
-            head=head,
-            max_bytes=10,
-            stdin_paths="assets/icon#dark.png\nassets/large.bin\n",
-        )
-
-        self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertIn(
-            "assets/icon#dark.png: 20 bytes (0.0 KiB) [allowlisted]", completed.stdout
-        )
-        self.assertIn(
-            "assets/large.bin: 30 bytes (0.0 KiB) [allowlisted]", completed.stdout
-        )
-
-    def test_cli_step_summary_escapes_markdown_table_cells(self) -> None:
-        unusual_path = "a|`b`.txt"
-        head = self.commit_tree_blobs({unusual_path: b"x" * 20}, "unusual path")
-        summary = Path(self.temp.name) / "summary.md"
-
-        completed = self.run_cli(
-            base="not-a-real-revision",
-            head=head,
-            max_bytes=10,
-            stdin_paths=f"{unusual_path}\n",
-            summary_path=summary,
-        )
-
-        self.assertEqual(completed.returncode, 1, completed.stderr)
-        contents = summary.read_text(encoding="utf-8")
-        self.assertIn("<code>a&#124;`b`.txt</code>", contents)
-        self.assertIn("| Path | Size | Status |", contents)
-        self.assertNotIn("| Kind |", contents)
+        self.assertIn("<code>docs/a&#124;`b`.txt</code>", summary)
+        self.assertIn("| Path | Size | Status |", summary)
+        self.assertNotIn("| Kind |", summary)
 
 
 if __name__ == "__main__":

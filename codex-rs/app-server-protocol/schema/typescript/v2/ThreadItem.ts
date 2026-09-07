@@ -38,23 +38,7 @@ cwd: LegacyAppPathString,
 /**
  * Identifier for the underlying PTY process (when available).
  */
-processId: string | null,
-/**
- * Model-visible exec call that owns a nested code-mode command.
- */
-parentCallId?: string,
-/**
- * Stable code-mode cell that issued the nested command.
- */
-parentCellId?: string,
-/**
- * Runtime invocation id within the owning code-mode cell.
- */
-runtimeToolCallId?: string,
-/**
- * Unique dispatch execution id used by timing and lifecycle records.
- */
-executionId?: string, source: CommandExecutionSource, status: CommandExecutionStatus,
+processId: string | null, source: CommandExecutionSource, status: CommandExecutionStatus,
 /**
  * A best-effort parsing of the command to understand the action(s) it will perform.
  * This returns a list of CommandAction objects because a single shell command may

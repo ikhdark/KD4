@@ -7,9 +7,10 @@ import html
 import os
 import subprocess
 import sys
-from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Sequence
+
 
 DEFAULT_MAX_BYTES = 500 * 1024
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -122,38 +123,34 @@ def batch_blob_sizes(
 ) -> dict[str, int]:
     if not paths:
         return {}
+    input_text = "".join(f"{commit}:{path}\0" for path in paths)
     output = run_git_func(
-        "ls-tree",
-        "-r",
-        "-z",
-        "--long",
-        "--full-tree",
-        commit,
+        "cat-file",
+        "-Z",
+        "--batch-check=%(objecttype) %(objectsize)",
+        input_text=input_text,
     )
-    entries_by_path: dict[str, tuple[str, str]] = {}
-    for record in output.split("\0"):
-        if not record:
-            continue
-        try:
-            metadata, path = record.split("\t", 1)
-        except ValueError as exc:
-            raise BlobLookupError(
-                f"git ls-tree returned an invalid record at {commit!r}: {record!r}"
-            ) from exc
-        fields = metadata.split()
-        if len(fields) != 4:
-            raise BlobLookupError(
-                f"git ls-tree returned invalid metadata at {commit!r}: {metadata!r}"
-            )
-        _mode, object_type, _object_id, size_text = fields
-        entries_by_path[path] = (object_type, size_text)
-
+    entries = output.split("\0")
+    if entries and entries[-1] == "":
+        entries.pop()
+    if len(entries) != len(paths):
+        raise BlobLookupError(
+            f"git cat-file returned {len(entries)} result(s) for {len(paths)} path(s)"
+        )
     sizes: dict[str, int] = {}
-    for path in paths:
-        entry = entries_by_path.get(path)
-        if entry is None:
-            raise BlobLookupError(f"{path!r} does not exist as a blob at {commit!r}")
-        object_type, size_text = entry
+    for path, entry in zip(paths, entries, strict=True):
+        if entry.endswith(" missing"):
+            raise BlobLookupError(
+                f"{path!r} does not exist as a blob at {commit!r} "
+                f"(git cat-file returned {entry!r})"
+            )
+        fields = entry.split(" ", 1)
+        if len(fields) != 2:
+            raise BlobLookupError(
+                f"{path!r} does not exist as a blob at {commit!r} "
+                f"(git cat-file returned {entry!r})"
+            )
+        object_type, size_text = fields
         if object_type != "blob":
             raise BlobLookupError(
                 f"{path!r} is not a blob at {commit!r} (object type is {object_type!r})"
@@ -163,7 +160,7 @@ def batch_blob_sizes(
         except ValueError as exc:
             raise BlobLookupError(
                 f"git cat-file returned an invalid size for {path!r} at {commit!r} "
-                f"(git ls-tree returned {size_text!r})"
+                f"(git cat-file returned {entry!r})"
             ) from exc
     return sizes
 

@@ -29,13 +29,11 @@ use winapi::shared::minwindef::DWORD;
 use winapi::um::processthreadsapi::*;
 use winapi::um::winnt::HANDLE;
 
-const PROC_THREAD_ATTRIBUTE_HANDLE_LIST: usize = 0x00020002;
 const PROC_THREAD_ATTRIBUTE_JOB_LIST: usize = 0x0002000D;
 const PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE: usize = 0x00020016;
 
 pub struct ProcThreadAttributeList {
     data: Vec<u8>,
-    handle_list: Vec<HANDLE>,
     job_list: Vec<HANDLE>,
 }
 
@@ -64,7 +62,6 @@ impl ProcThreadAttributeList {
         );
         Ok(Self {
             data,
-            handle_list: Vec::new(),
             job_list: Vec::new(),
         })
     }
@@ -95,15 +92,6 @@ impl ProcThreadAttributeList {
         // SAFETY: `value` points to `self.job_list`, which remains alive while
         // the attribute list can reference it, and `size` covers that slice.
         unsafe { self.update(PROC_THREAD_ATTRIBUTE_JOB_LIST, value, size) }
-    }
-
-    pub fn set_handle_list(&mut self, handles: Vec<HANDLE>) -> Result<(), Error> {
-        self.handle_list = handles;
-        let value = self.handle_list.as_mut_ptr().cast();
-        let size = std::mem::size_of_val(self.handle_list.as_slice());
-        // SAFETY: `value` points to `self.handle_list`, which remains alive
-        // while the attribute list can reference it, and `size` covers that slice.
-        unsafe { self.update(PROC_THREAD_ATTRIBUTE_HANDLE_LIST, value, size) }
     }
 
     unsafe fn update(

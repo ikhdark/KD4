@@ -51,7 +51,7 @@ contains = "kd4-sync-audit *args:"
 [[features.evidence]]
 kind = "test"
 path = "scripts/test_kd4_sync_audit.py"
-contains = "test_cli_requires_isolated_strategy_for_real_merge_conflict"
+contains = "test_conflicting_trial_merge_requires_isolated_strategy"
 
 [[features]]
 id = "kd4-perf-snapshot"
@@ -76,7 +76,7 @@ contains = "kd4-perf-snapshot *args:"
 [[features.evidence]]
 kind = "test"
 path = "scripts/test_kd4_perf_snapshot.py"
-contains = "test_cli_phase0_selects_required_baseline_categories"
+contains = "test_phase0_profile_covers_required_baseline_categories"
 
 [[features]]
 id = "extension-boundary-core"
@@ -133,12 +133,12 @@ owner = "codex-rs/core"
 summary = "Explicit legacy, script, argv, and internally encoded PowerShell command shapes."
 upstream_equivalent = "partial"
 config_keys = []
-runtime_verification = { kind = "contract_test", path = "codex-rs/core/src/tools/handlers/command_shape_tests.rs", symbol = "tagged_script_is_canonical_and_tagged_legacy_is_rejected", command = ["just", "core-test-fast", "core_lib", "-E", "test(tagged_script_is_canonical_and_tagged_legacy_is_rejected)"] }
+runtime_verification = { kind = "contract_test", path = "codex-rs/core/src/tools/handlers/command_shape_tests.rs", symbol = "tagged_script_and_legacy_shapes_are_explicit", command = ["just", "core-test-fast", "core_lib", "-E", "test(tagged_script_and_legacy_shapes_are_explicit)"] }
 
 [[features.evidence]]
 kind = "entrypoint"
 path = "codex-rs/core/src/tools/handlers/command_shape.rs"
-contains = "match kind.unwrap_or(CommandKind::Script)"
+contains = "CommandKind::Legacy | CommandKind::Script"
 
 [[features.evidence]]
 kind = "registration"
@@ -158,7 +158,7 @@ contains = "CommandInvocation::from_parts"
 [[features.evidence]]
 kind = "test"
 path = "codex-rs/core/src/tools/handlers/command_shape_tests.rs"
-contains = "untagged_command_preserves_legacy_compatibility"
+contains = "tagged_script_and_legacy_shapes_are_explicit"
 
 [[features]]
 id = "command-preflight"
@@ -184,7 +184,7 @@ contains = "preflight_invocation_with_equivalent_repair_async("
 [[features.evidence]]
 kind = "registration"
 path = "codex-rs/core/src/tools/handlers/unified_exec/exec_command.rs"
-contains = "preflight_invocation_for_runtime("
+contains = "preflight_invocation_with_equivalent_repair_async("
 
 [[features.evidence]]
 kind = "test"
@@ -287,7 +287,7 @@ contains = "create_raw_output_artifact("
 [[features.evidence]]
 kind = "registration"
 path = "codex-rs/core/src/unified_exec/process.rs"
-contains = "RawOutputArtifactWriter::open(Some(&task_state)).await"
+contains = "RawOutputArtifactWriter::open(raw_output_artifact.as_ref()).await"
 
 [[features.evidence]]
 kind = "test"

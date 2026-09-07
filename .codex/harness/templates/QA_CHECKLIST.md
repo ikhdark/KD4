@@ -1,58 +1,25 @@
 # QA Checklist
 
+Use for a broad or risky review. Remove checks that do not apply.
+
 ## Scope
 
-- Reviewed files:
-- Reviewed call paths:
-- Reviewed tests or validation routes:
+<reviewed change, files, and relevant runtime paths>
 
-## Correctness
+## Checks
 
-- [ ] User objective is satisfied
-- [ ] Behavior is wired through the intended runtime path
-- [ ] Stale or parallel code paths do not override the change
-- [ ] Edge cases from the inspected owner area are covered
+- [ ] The change satisfies the user's objective through the intended runtime path.
+- [ ] Relevant callers, configuration, contracts, and generated outputs agree.
+- [ ] Tests cover the changed behavior and important edge cases.
+- [ ] Validation results support the claims; failures and skipped checks are explained.
+- [ ] Desktop activation is verified if requested, or any required activation is reported.
 
-## Contracts
+## Findings and Evidence
 
-- [ ] Config schema ownership checked when config changed
-- [ ] App-server or protocol schema ownership checked when contracts changed
-- [ ] Generated artifacts updated only through owning workflow
-- [ ] Public CLI or API behavior called out when changed
+| Finding                      | Source or check result                | Action             |
+| ---------------------------- | ------------------------------------- | ------------------ |
+| <issue, ordered by severity> | <file, command, or existing evidence> | <fix or follow-up> |
 
-## Validation
+## Remaining Work
 
-- [ ] Focused checks ran
-- [ ] Check results support the final claim
-- [ ] Failures are explained and scoped
-
-## Implementation Completion Gate
-
-Apply the repository rules in root [`AGENTS.md`](../../../AGENTS.md), the status
-definitions in [`../workflow.md`](../workflow.md#completion-gate-status), and the
-finish phase in [`../workflow.md`](../workflow.md#phase-5-finish).
-
-- [ ] Intended runtime path identified:
-- [ ] Changed code is reached from that path:
-- [ ] No new or task-relevant placeholder/stub markers in changed code or the
-      intended runtime path, including `TODO`, `FIXME`, `todo!()`,
-      `unimplemented!()`, `stub`, `temporary`, `fake`, `mock-only`, and panic
-      placeholders
-- [ ] New public functions, types, config fields, commands, or workflow entries
-      are wired into expected callers
-- [ ] Nearest sufficient validation ran, or skip/not-applicable reason recorded
-- [ ] Evidence names its provenance, freshness, and exact covered contract
-- [ ] Completion gate status recorded: passed | partial | blocked
-- [ ] Final implementation answer includes completion gate status, validation
-      run, and remaining unverified risk
-
-## Desktop Visibility
-
-- [ ] Publish required:
-- [ ] Restart required:
-- [ ] Process path/hash checked:
-- [ ] Visible runtime evidence captured:
-
-## Findings
-
-- <finding>
+<unresolved findings or unverified behavior; write none when complete>

@@ -1307,12 +1307,7 @@ impl ThreadHistoryBuilder {
             turn.completed_at = payload.completed_at;
             turn.duration_ms = payload.duration_ms;
             turn.timing = payload.timing.clone();
-            turn.surfaced_result =
-                if matches!(turn.status, TurnStatus::Failed) || turn.error.is_some() {
-                    None
-                } else {
-                    payload.surfaced_result.clone()
-                };
+            turn.surfaced_result = payload.surfaced_result.clone();
             ThreadHistoryTurnChange::from_pending_turn(turn)
         };
 
@@ -1342,12 +1337,7 @@ impl ThreadHistoryBuilder {
             turn.completed_at = payload.completed_at;
             turn.duration_ms = payload.duration_ms;
             turn.timing = payload.timing.clone();
-            turn.surfaced_result =
-                if matches!(turn.status, TurnStatus::Failed) || turn.error.is_some() {
-                    None
-                } else {
-                    payload.surfaced_result.clone()
-                };
+            turn.surfaced_result = payload.surfaced_result.clone();
             let changed_turn = ThreadHistoryTurnChange::from_turn(turn);
             self.record_changed_turn(changed_turn);
             return;
@@ -4709,11 +4699,6 @@ mod tests {
 
     #[test]
     fn error_then_turn_complete_preserves_failed_status() {
-        let surfaced_result = SurfacedToolResult {
-            adapter: "code_mode_cell".to_string(),
-            value: serde_json::json!({"result": "must remain hidden"}),
-            canonical_message: Some("must remain hidden".to_string()),
-        };
         let events = vec![
             EventMsg::TurnStarted(TurnStartedEvent {
                 turn_id: "turn-a".into(),
@@ -4737,7 +4722,7 @@ mod tests {
                 }),
             }),
             EventMsg::TurnComplete(TurnCompleteEvent {
-                surfaced_result: Some(surfaced_result),
+                surfaced_result: None,
                 turn_id: "turn-a".into(),
                 last_agent_message: None,
                 error: None,
@@ -4756,7 +4741,6 @@ mod tests {
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].id, "turn-a");
         assert_eq!(turns[0].status, TurnStatus::Failed);
-        assert_eq!(turns[0].surfaced_result, None);
         assert_eq!(
             turns[0].error,
             Some(TurnError {

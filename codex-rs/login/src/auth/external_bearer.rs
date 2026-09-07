@@ -3,7 +3,6 @@ use super::manager::ExternalAuth;
 use super::manager::ExternalAuthFuture;
 use super::manager::ExternalAuthRefreshContext;
 use codex_protocol::config_types::ModelProviderAuthInfo;
-use codex_utils_pty::with_windows_child_creation;
 use std::fmt;
 use std::io;
 use std::path::Path;
@@ -111,24 +110,21 @@ async fn run_provider_auth_command(config: &ModelProviderAuthInfo) -> io::Result
         .stderr(Stdio::piped())
         .kill_on_drop(true);
 
-    let output = tokio::time::timeout(config.timeout(), async {
-        let child = with_windows_child_creation(|_| command.spawn())?;
-        child.wait_with_output().await
-    })
-    .await
-    .map_err(|_| {
-        io::Error::other(format!(
-            "provider auth command `{}` timed out after {} ms",
-            config.command,
-            config.timeout_ms.get()
-        ))
-    })?
-    .map_err(|err| {
-        io::Error::other(format!(
-            "provider auth command `{}` failed to start: {err}",
-            config.command
-        ))
-    })?;
+    let output = tokio::time::timeout(config.timeout(), command.output())
+        .await
+        .map_err(|_| {
+            io::Error::other(format!(
+                "provider auth command `{}` timed out after {} ms",
+                config.command,
+                config.timeout_ms.get()
+            ))
+        })?
+        .map_err(|err| {
+            io::Error::other(format!(
+                "provider auth command `{}` failed to start: {err}",
+                config.command
+            ))
+        })?;
 
     if !output.status.success() {
         let status = output.status;

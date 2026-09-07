@@ -3,13 +3,14 @@ approval_policy = "never"
 sandbox_mode = "danger-full-access"
 allow_login_shell = false
 
+
 [agents]
 max_depth = 1
 
 
 [features.multi_agent_v2]
 enabled = true
-max_concurrent_threads_per_session = 20
+max_concurrent_threads_per_session = 5
 
 [reasoning_phase_efforts]
 orient = "high"

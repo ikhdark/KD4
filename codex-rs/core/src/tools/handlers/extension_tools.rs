@@ -95,9 +95,6 @@ struct CoreTurnItemEmitter {
 
 async fn emit_legacy_events(session: &Session, turn: &TurnContext, legacy_events: Vec<EventMsg>) {
     for msg in legacy_events {
-        if turn.try_buffer_completion_output(&msg).await {
-            continue;
-        }
         session
             .send_event_raw(Event {
                 id: turn.sub_id.clone(),

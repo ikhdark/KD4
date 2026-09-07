@@ -25,7 +25,6 @@ use crate::compact::should_use_remote_compact_task;
 use crate::compact_model_fallback::record_model_fallback;
 use crate::compact_model_fallback::should_retry_with_current_model;
 use crate::compact_remote_v2::run_inline_remote_auto_compact_task as run_inline_remote_auto_compact_task_v2;
-use crate::completion_proof::CompletionProofGateDecision;
 use crate::connectors;
 use crate::context::ApprovalPromptContext;
 use crate::context::ContextualUserFragment;
@@ -581,10 +580,6 @@ pub(crate) async fn run_turn(
             ordinal: logical_generation_ordinal,
         };
         logical_generation_ordinal = logical_generation_ordinal.saturating_add(1);
-        // Hold assistant-authored output until this response is known to be
-        // ordinary progress or an accepted terminal completion. This does not
-        // hold tool, hook, warning, or validation events.
-        turn_context.begin_completion_output_buffer().await;
         let sampling_request_result: CodexResult<_> = async {
             super::time_reminder::maybe_record_current_time_reminder(
                 sess.as_ref(),
@@ -692,7 +687,6 @@ pub(crate) async fn run_turn(
                 } = sampling_request_output;
                 prefetched_workspace_identity = next_workspace_identity;
                 if let Some(required_tool_terminal) = required_tool_terminal {
-                    turn_context.discard_completion_output().await;
                     if required_tool_terminal.cause != RequiredToolTerminalCause::Blocked {
                         let error = CodexErrorInfo::Other;
                         sess.emit_turn_error_lifecycle(turn_context.as_ref(), error.clone())
@@ -733,14 +727,6 @@ pub(crate) async fn run_turn(
                     has_pending_input,
                 );
                 if budget_forced_terminal {
-                    if model_needs_follow_up {
-                        report_logical_generation_budget_exhausted(
-                            sess.as_ref(),
-                            turn_context.as_ref(),
-                            &mut generation_budget_error_reported,
-                        )
-                        .await;
-                    }
                     // The budget grants one final tool-free synthesis request.
                     // Queued input remains in the mailbox for the next turn;
                     // it must not reopen this exhausted sampling loop.
@@ -849,10 +835,6 @@ pub(crate) async fn run_turn(
                     needs_follow_up,
                     "post sampling token usage"
                 );
-                if needs_follow_up {
-                    sess.release_non_final_completion_output(turn_context.as_ref())
-                        .await;
-                }
                 if tracing::event_enabled!(
                     target: POST_SAMPLING_TOKEN_ESTIMATE_TARGET,
                     tracing::Level::TRACE,
@@ -948,7 +930,6 @@ pub(crate) async fn run_turn(
                         )
                         .await
                     {
-                        turn_context.discard_completion_output().await;
                         sess.record_response_item_and_emit_turn_item(
                             &turn_context,
                             hook_prompt_message,
@@ -962,40 +943,20 @@ pub(crate) async fn run_turn(
                     }
                     if completion_stop_report.should_stop {
                         if mutating_finalizer_aborted {
-                            turn_context.discard_completion_output().await;
-                            return Ok(after_agent_abort_result(defer_pending_input));
+                            return Ok(after_agent_abort_result(
+                                last_agent_message,
+                                surfaced_result,
+                                defer_pending_input,
+                            ));
                         }
-                        match completion_proof_terminal_disposition(
-                            sess.as_ref(),
-                            turn_context.as_ref(),
-                            &logical_generation_budget,
-                            &mut generation_budget_error_reported,
+                        emit_hook_stop_reason(
+                            &sess,
+                            &turn_context,
+                            "Stop",
+                            completion_stop_report.stop_reason.as_deref(),
                         )
-                        .await
-                        {
-                            CompletionProofTerminalDisposition::Accepted => {
-                                emit_hook_stop_reason(
-                                    &sess,
-                                    &turn_context,
-                                    "Stop",
-                                    completion_stop_report.stop_reason.as_deref(),
-                                )
-                                .await;
-                                break 'sampling_loop;
-                            }
-                            CompletionProofTerminalDisposition::Continue => {
-                                last_agent_message = None;
-                                surfaced_result = None;
-                                stop_hook_active = true;
-                                reasoning_governor.host_diagnose();
-                                clear_pending_generation_request(&mut pending_generation_request);
-                                pending_continuation_cause = Some(ContinuationCause::StopHook);
-                                continue 'sampling_loop;
-                            }
-                            CompletionProofTerminalDisposition::Blocked => {
-                                break 'sampling_loop;
-                            }
-                        }
+                        .await;
+                        break 'sampling_loop;
                     }
                     let after_agent_aborted = if matches!(
                         turn_context.config.after_agent_policy,
@@ -1013,15 +974,17 @@ pub(crate) async fn run_turn(
                         false
                     };
                     if mutating_finalizer_aborted || after_agent_aborted {
-                        turn_context.discard_completion_output().await;
-                        return Ok(after_agent_abort_result(defer_pending_input));
+                        return Ok(after_agent_abort_result(
+                            last_agent_message,
+                            surfaced_result,
+                            defer_pending_input,
+                        ));
                     }
                     match completion_pending_input_disposition(
                         &logical_generation_budget,
                         sess.input_queue.has_pending_input(&sess.active_turn).await,
                     ) {
                         CompletionPendingInputDisposition::Continue => {
-                            turn_context.discard_completion_output().await;
                             pending_continuation_cause = Some(ContinuationCause::PendingInput);
                             continue 'sampling_loop;
                         }
@@ -1030,25 +993,7 @@ pub(crate) async fn run_turn(
                         }
                         CompletionPendingInputDisposition::None => {}
                     }
-                    match completion_proof_terminal_disposition(
-                        sess.as_ref(),
-                        turn_context.as_ref(),
-                        &logical_generation_budget,
-                        &mut generation_budget_error_reported,
-                    )
-                    .await
-                    {
-                        CompletionProofTerminalDisposition::Accepted => break,
-                        CompletionProofTerminalDisposition::Continue => {
-                            last_agent_message = None;
-                            surfaced_result = None;
-                            reasoning_governor.host_diagnose();
-                            clear_pending_generation_request(&mut pending_generation_request);
-                            pending_continuation_cause = Some(ContinuationCause::StopHook);
-                            continue 'sampling_loop;
-                        }
-                        CompletionProofTerminalDisposition::Blocked => break,
-                    }
+                    break;
                 }
                 pending_continuation_cause = ordinary_continuation_cause(
                     tool_result_continuation,
@@ -1144,10 +1089,14 @@ fn rebase_generation_request_after_compaction(
     request
 }
 
-fn after_agent_abort_result(defer_pending_input: bool) -> TurnTaskResult {
+fn after_agent_abort_result(
+    last_agent_message: Option<String>,
+    surfaced_result: Option<SurfacedToolResult>,
+    defer_pending_input: bool,
+) -> TurnTaskResult {
     TurnTaskResult {
-        last_agent_message: None,
-        surfaced_result: None,
+        last_agent_message,
+        surfaced_result,
         required_tool_terminal: None,
         defer_pending_input,
     }
@@ -1302,7 +1251,6 @@ fn completion_pending_input_disposition(
 const LOGICAL_GENERATION_BUDGET_EXHAUSTED_MESSAGE: &str =
     "The turn reached its logical generation limit before all requested work completed.";
 const LOGICAL_GENERATION_BUDGET_FORCED_TERMINAL_DIRECTIVE: &str = "The logical generation limit has been reached. This is the final tool-free synthesis request. Do not call tools. Summarize completed work and truthfully report any remaining work, failed validation, or blocker.";
-const COMPLETION_PROOF_BLOCKED_DIRECTIVE_PREFIX: &str = "CompletionProofGate blocked successful terminal completion. The prior final-looking answer was withheld. Continue normal work and do not claim success until the gate accepts a current proof.";
 async fn record_forced_terminal_budget_boundary(sess: &Session, turn_context: &TurnContext) {
     let directive_item = ResponseItem::Message {
         id: None,
@@ -1416,58 +1364,6 @@ fn generation_needs_follow_up(
         has_pending_input
     } else {
         model_needs_follow_up || has_pending_input
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum CompletionProofTerminalDisposition {
-    Accepted,
-    Continue,
-    Blocked,
-}
-
-async fn completion_proof_terminal_disposition(
-    sess: &Session,
-    turn_context: &TurnContext,
-    budget: &LogicalGenerationBudget,
-    exhaustion_reported: &mut bool,
-) -> CompletionProofTerminalDisposition {
-    match sess
-        .services
-        .completion_proof
-        .check_gate_with_workspace(&sess.services.git_workspace)
-        .await
-    {
-        CompletionProofGateDecision::Accepted => CompletionProofTerminalDisposition::Accepted,
-        CompletionProofGateDecision::Blocked { message } => {
-            turn_context.discard_completion_output().await;
-            if regular_follow_up_admission(budget, *exhaustion_reported)
-                == RegularFollowUpAdmission::Exhausted
-            {
-                turn_context.mark_completion_proof_terminal_blocked();
-                turn_context
-                    .terminal_error
-                    .lock()
-                    .await
-                    .replace(ErrorEvent {
-                        message: format!("CompletionProofGate blocked terminal success: {message}"),
-                        codex_error_info: Some(CodexErrorInfo::Other),
-                    });
-                return CompletionProofTerminalDisposition::Blocked;
-            }
-            let directive = ResponseItem::Message {
-                id: None,
-                role: "developer".to_string(),
-                content: vec![ContentItem::InputText {
-                    text: format!("{COMPLETION_PROOF_BLOCKED_DIRECTIVE_PREFIX}\n\n{message}"),
-                }],
-                phase: None,
-                internal_chat_message_metadata_passthrough: None,
-            };
-            sess.record_conversation_items(turn_context, std::slice::from_ref(&directive))
-                .await;
-            CompletionProofTerminalDisposition::Continue
-        }
     }
 }
 

@@ -328,7 +328,7 @@ impl MemoryStartupContext {
             thread_id, thread, ..
         } = self
             .thread_manager
-            .start_evidence_contributor_thread_with_options(StartThreadOptions {
+            .start_thread_with_options(StartThreadOptions {
                 config,
                 allow_provider_model_fallback: false,
                 initial_history: InitialHistory::New,

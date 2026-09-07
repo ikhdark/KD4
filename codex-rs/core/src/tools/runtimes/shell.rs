@@ -23,7 +23,6 @@ use crate::tools::runtimes::build_sandbox_command;
 use crate::tools::runtimes::exec_env_for_sandbox_permissions;
 use crate::tools::runtimes::prepare_shell_command;
 use crate::tools::runtimes::shell_snapshot_additional_read_roots;
-use crate::tools::runtimes::strip_managed_proxy_env;
 use crate::tools::sandboxing::Approvable;
 use crate::tools::sandboxing::ApprovalAction;
 use crate::tools::sandboxing::ApprovalCtx;
@@ -37,23 +36,16 @@ use crate::tools::sandboxing::ToolRuntime;
 use crate::tools::sandboxing::managed_network_for_sandbox_permissions;
 use crate::tools::sandboxing::sandbox_permissions_preserving_denied_reads;
 use crate::tools::sandboxing::with_cached_approval;
-use codex_network_proxy::ALLOW_LOCAL_BINDING_ENV_KEY;
 use codex_network_proxy::NetworkProxy;
-use codex_network_proxy::PROXY_ENV_KEYS;
-use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::SandboxErr;
 use codex_protocol::exec_output::ExecToolCallOutput;
 use codex_protocol::models::AdditionalPermissionProfile;
-use codex_protocol::models::PermissionProfile;
-use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::ReviewDecision;
-use codex_sandboxing::SandboxType;
 use codex_sandboxing::SandboxablePreference;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use futures::future::BoxFuture;
 use std::collections::HashMap;
-use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -84,60 +76,12 @@ pub struct ShellRequest {
     pub exec_approval_requirement: ExecApprovalRequirement,
     pub(crate) known_delta: Option<PreparedKnownDelta>,
     pub(crate) validation_launch: Option<crate::validation_admission::ValidationLaunchPlan>,
-    pub(crate) workspace_operation:
-        Option<crate::workspace_operation_gate::WorkspaceOperationLease>,
-    /// Present only for the exact trusted whole-repository certification
-    /// command. The shell runtime uses these roots to force process-level
-    /// offline confinement while granting only the repository and the
-    /// runner's private per-attempt report directory.
-    pub(crate) canonical_proof_repository_root: Option<PathBuf>,
-    pub(crate) canonical_proof_report_write_root: Option<PathBuf>,
-    pub(crate) prepared_canonical_windows_sandbox_launch:
-        Option<codex_windows_sandbox::PreparedCanonicalWindowsSandboxLaunch>,
+    pub(crate) workspace_operation_root: Option<PathBuf>,
 }
 
 pub struct ShellRuntime {
     last_validation_attempt_output: Option<ExecToolCallOutput>,
     last_validation_attempt_started: bool,
-}
-
-pub(crate) fn canonical_completion_proof_permissions(
-    repository_root: &Path,
-    report_write_root: &Path,
-) -> Result<PermissionProfile, String> {
-    let repository_root = AbsolutePathBuf::try_from(repository_root.to_path_buf()).map_err(
-        |error| {
-            format!(
-                "canonical completion-proof confinement could not resolve its repository root: {error}"
-            )
-        },
-    )?;
-    let report_write_root = AbsolutePathBuf::try_from(report_write_root.to_path_buf()).map_err(
-        |error| {
-            format!(
-                "canonical completion-proof confinement could not resolve its private report directory: {error}"
-            )
-        },
-    )?;
-    Ok(PermissionProfile::workspace_write_with(
-        &[repository_root, report_write_root],
-        NetworkSandboxPolicy::Restricted,
-        /*exclude_tmpdir_env_var*/ false,
-        /*exclude_slash_tmp*/ false,
-    ))
-}
-
-fn strip_completion_proof_proxy_env(env: &mut HashMap<String, String>) {
-    strip_managed_proxy_env(env);
-    // Windows environment names are case-insensitive, but the inherited map
-    // can retain user-provided mixed-case spellings. Remove every proxy key by
-    // Windows semantics so an existing loopback proxy cannot bridge the
-    // otherwise loopback-only WFP boundary to a live service.
-    env.retain(|key, _| {
-        !PROXY_ENV_KEYS
-            .iter()
-            .any(|proxy_key| key.eq_ignore_ascii_case(proxy_key))
-    });
 }
 
 #[derive(serde::Serialize, Clone, Debug, Eq, PartialEq, Hash)]
@@ -336,12 +280,6 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
         req: &ShellRequest,
         ctx: &ToolCtx,
     ) -> Option<NetworkApprovalSpec> {
-        // Canonical certification is always offline-confined by the process
-        // sandbox. It must never enter managed-network approval or inherit a
-        // network exception from the ordinary turn permission profile.
-        if req.canonical_proof_report_write_root.is_some() {
-            return None;
-        }
         let file_system_sandbox_policy = ctx.turn.file_system_sandbox_policy();
         let sandbox_permissions = sandbox_permissions_preserving_denied_reads(
             req.sandbox_permissions,
@@ -378,70 +316,11 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
         attempt: &SandboxAttempt<'_>,
         ctx: &ToolCtx,
     ) -> Result<ExecToolCallOutput, ToolError> {
-        let canonical_permissions = match (
-            req.canonical_proof_repository_root.as_deref(),
-            req.canonical_proof_report_write_root.as_deref(),
-        ) {
-            (Some(repository_root), Some(report_write_root)) => Some(
-                canonical_completion_proof_permissions(repository_root, report_write_root)
-                    .map_err(ToolError::Rejected)?,
-            ),
-            (None, None) => None,
-            _ => {
-                return Err(ToolError::Rejected(
-                    "canonical completion-proof confinement received incomplete private launch metadata"
-                        .to_string(),
-                ));
-            }
-        };
-        let canonical_confinement = canonical_permissions.is_some();
-        if canonical_confinement
-            && cfg!(windows)
-            && req.prepared_canonical_windows_sandbox_launch.is_none()
-        {
-            return Err(ToolError::Rejected(
-                "canonical completion-proof confinement received missing prepared Windows launch state"
-                    .to_string(),
-            ));
-        }
-        if !canonical_confinement && req.prepared_canonical_windows_sandbox_launch.is_some() {
-            return Err(ToolError::Rejected(
-                "non-canonical launch received unexpected prepared Windows launch state"
-                    .to_string(),
-            ));
-        }
-        if canonical_confinement && !cfg!(windows) {
-            return Err(ToolError::Rejected(
-                "canonical completion-proof network confinement is unavailable on this host"
-                    .to_string(),
-            ));
-        }
-        let canonical_attempt = canonical_permissions
+        if let Some(hit_output) = req
+            .known_delta
             .as_ref()
-            .map(|permissions| SandboxAttempt {
-                codex_home: attempt.codex_home,
-                sandbox: SandboxType::WindowsRestrictedToken,
-                sandbox_requested: true,
-                permissions,
-                exec_server_permissions: permissions,
-                // Restricted network permissions select the Windows offline
-                // identity directly. No managed proxy is part of certification.
-                enforce_managed_network: false,
-                sandbox_cwd: attempt.sandbox_cwd,
-                workspace_roots: attempt.workspace_roots,
-                windows_sandbox_level: WindowsSandboxLevel::Elevated,
-                windows_sandbox_private_desktop: attempt.windows_sandbox_private_desktop,
-                network_denial_cancellation_token: None,
-                network_proxy: None,
-            });
-        let attempt = canonical_attempt.as_ref().unwrap_or(attempt);
-
-        if !canonical_confinement
-            && let Some(hit_output) = req
-                .known_delta
-                .as_ref()
-                .and_then(PreparedKnownDelta::hit)
-                .map(KnownDeltaHit::rendered_output)
+            .and_then(PreparedKnownDelta::hit)
+            .map(KnownDeltaHit::rendered_output)
         {
             return Ok(ExecToolCallOutput {
                 stdout: codex_protocol::exec_output::StreamOutput::new(hit_output.to_string()),
@@ -451,9 +330,12 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
                 ..Default::default()
             });
         }
-        if let Some(workspace_operation) = req.workspace_operation.as_ref() {
-            workspace_operation.acquire().await;
-        }
+        let _workspace_operation_permit = match req.workspace_operation_root.as_deref() {
+            Some(root) => {
+                Some(crate::workspace_operation_gate::acquire_workspace_operation(root).await)
+            }
+            None => None,
+        };
         let mutation = crate::turn_diff_tracker::command_mutation(
             &req.command_for_approval,
             Some(req.cwd.as_path()),
@@ -475,69 +357,24 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
             .shell
             .as_ref()
             .unwrap_or(session_shell.as_ref());
-        // Canonical certification must start from the explicit runtime
-        // environment below. Replaying an interactive shell snapshot could
-        // restore ambient proxy variables after they have been stripped and
-        // turn an allowed loopback endpoint into a bridge to a live service.
-        let shell_snapshot_location = if canonical_confinement {
-            None
-        } else {
-            req.turn_environment
-                .shell_snapshot(&codex_utils_path_uri::PathUri::from_abs_path(&req.cwd))
-                .await
-        };
+        let shell_snapshot_location = req
+            .turn_environment
+            .shell_snapshot(&codex_utils_path_uri::PathUri::from_abs_path(&req.cwd))
+            .await;
         let (file_system_sandbox_policy, _) = attempt.permissions.to_runtime_permissions();
-        let sandbox_permissions = if canonical_confinement {
-            SandboxPermissions::UseDefault
-        } else {
-            sandbox_permissions_preserving_denied_reads(
-                req.sandbox_permissions,
-                &file_system_sandbox_policy,
-            )
-        };
-        let managed_network = if canonical_confinement {
-            None
-        } else {
-            managed_network_for_sandbox_permissions(req.network.as_ref(), sandbox_permissions)
-        };
+        let sandbox_permissions = sandbox_permissions_preserving_denied_reads(
+            req.sandbox_permissions,
+            &file_system_sandbox_policy,
+        );
+        let managed_network =
+            managed_network_for_sandbox_permissions(req.network.as_ref(), sandbox_permissions);
         let mut env = exec_env_for_sandbox_permissions(&req.env, sandbox_permissions);
-        if canonical_confinement
-            && !env
-                .keys()
-                .any(|name| name.eq_ignore_ascii_case("CODEX_COMPLETION_PROOF_ATTEMPT_ID"))
-        {
-            return Err(ToolError::Rejected(
-                "canonical completion-proof confinement received no private attempt environment"
-                    .to_string(),
-            ));
-        }
-        let mut canonical_explicit_env_overrides = None;
-        if canonical_confinement {
-            strip_completion_proof_proxy_env(&mut env);
-            env.insert(ALLOW_LOCAL_BINDING_ENV_KEY.to_string(), "1".to_string());
-
-            let mut explicit_env_overrides = req.explicit_env_overrides.clone();
-            for (name, value) in &env {
-                if name
-                    .get(.."CODEX_COMPLETION_PROOF_".len())
-                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("CODEX_COMPLETION_PROOF_"))
-                {
-                    explicit_env_overrides.insert(name.clone(), value.clone());
-                }
-            }
-            strip_completion_proof_proxy_env(&mut explicit_env_overrides);
-            explicit_env_overrides.insert(ALLOW_LOCAL_BINDING_ENV_KEY.to_string(), "1".to_string());
-            canonical_explicit_env_overrides = Some(explicit_env_overrides);
-        }
-        let explicit_env_overrides = canonical_explicit_env_overrides
-            .as_ref()
-            .unwrap_or(&req.explicit_env_overrides);
         let command = prepare_shell_command(ShellCommandPreparation {
             command: &req.command,
             command_for_approval: &req.command_for_approval,
             shell,
             shell_snapshot: shell_snapshot_location.as_deref(),
-            explicit_env_overrides,
+            explicit_env_overrides: &req.explicit_env_overrides,
             env: &mut env,
             shell_type: &shell.shell_type,
             sandbox_shell_type: req.shell_type.as_ref(),
@@ -553,12 +390,8 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
             shell_snapshot_location.as_deref(),
             attempt.sandbox,
         );
-        let additional_permissions = if canonical_confinement {
-            None
-        } else {
-            req.additional_permissions.clone()
-        };
-        let command = build_sandbox_command(&command, &req.cwd, &env, additional_permissions)?;
+        let command =
+            build_sandbox_command(&command, &req.cwd, &env, req.additional_permissions.clone())?;
         let mut expiration: crate::exec::ExecExpiration = req.timeout_ms.into();
         expiration = expiration.with_cancellation(req.cancellation_token.clone());
         let stall_cancellation = req.stall_timeout_ms.map(|_| CancellationToken::new());
@@ -581,10 +414,6 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
             )
             .map_err(ToolError::Codex)?;
         env.windows_sandbox_additional_read_roots = additional_read_roots;
-        env.prepared_canonical_windows_sandbox_launch =
-            req.prepared_canonical_windows_sandbox_launch.clone();
-        env.canonical_windows_sandbox_launch_identity =
-            canonical_confinement.then(|| req.hook_command.clone());
         let authorization_guard = if let Some(launch) = req.validation_launch.as_ref() {
             let guard = Arc::clone(&ctx.turn.validation_authorization)
                 .read_owned()

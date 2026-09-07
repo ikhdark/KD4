@@ -168,13 +168,6 @@ impl TestAppServer {
         self.process.wait().await
     }
 
-    /// Forcefully terminates the real app-server child and waits until it has been reaped.
-    pub async fn hard_kill_and_wait(&mut self) -> std::io::Result<ExitStatus> {
-        drop(self.stdin.take());
-        self.process.start_kill()?;
-        self.process.wait().await
-    }
-
     pub fn close_stdin(&mut self) {
         drop(self.stdin.take());
     }

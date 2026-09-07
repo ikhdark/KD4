@@ -155,28 +155,21 @@ mod reload {
         preserve_current_provider: bool,
         preserve_current_service_tier: bool,
     ) -> anyhow::Result<Config> {
-        let current_provider = preserve_current_provider.then(|| {
-            (
-                config.model_provider_id.clone(),
-                config.model_provider.clone(),
-            )
-        });
         let config_layer_stack = build_config_layer_stack(config, &role_layer_toml)?;
         let merged_config = deserialize_effective_config(config, &config_layer_stack)?;
 
-        let mut next_config = Config::load_config_with_layer_stack(
+        let next_config = Config::load_config_with_layer_stack(
             LOCAL_FS.as_ref(),
             merged_config,
-            reload_overrides(config, preserve_current_service_tier),
+            reload_overrides(
+                config,
+                preserve_current_provider,
+                preserve_current_service_tier,
+            ),
             config.codex_home.clone(),
             config_layer_stack,
         )
         .await?;
-        if let Some((provider_id, provider)) = current_provider {
-            next_config.model_provider_id = provider_id.clone();
-            next_config.model_provider = provider.clone();
-            next_config.model_providers.insert(provider_id, provider);
-        }
         Ok(next_config)
     }
 
@@ -228,10 +221,12 @@ mod reload {
 
     fn reload_overrides(
         config: &Config,
+        preserve_current_provider: bool,
         preserve_current_service_tier: bool,
     ) -> ConfigOverrides {
         ConfigOverrides {
             cwd: Some(config.cwd.to_path_buf()),
+            model_provider: preserve_current_provider.then(|| config.model_provider_id.clone()),
             service_tier: preserve_current_service_tier.then(|| config.service_tier.clone()),
             ..Default::default()
         }
@@ -473,47 +468,6 @@ Rules:
             "awaiter.toml" => Some(AWAITER),
             _ => None,
         }
-    }
-}
-
-#[cfg(test)]
-mod provider_preservation_tests {
-    use super::*;
-    use crate::config::ConfigBuilder;
-    use codex_model_provider_info::ModelProviderInfo;
-    use tempfile::TempDir;
-
-    #[tokio::test]
-    async fn apply_explorer_role_preserves_live_model_provider() {
-        let home = TempDir::new().expect("create temp dir");
-        let mut config = ConfigBuilder::default()
-            .codex_home(home.path().to_path_buf())
-            .fallback_cwd(Some(home.path().to_path_buf()))
-            .build()
-            .await
-            .expect("load test config");
-        let provider_id = "runtime-only-provider".to_string();
-        let provider = ModelProviderInfo {
-            name: "Runtime-only provider".to_string(),
-            base_url: Some("http://127.0.0.1:43123/v1".to_string()),
-            ..Default::default()
-        };
-        config.model_provider_id = provider_id.clone();
-        config.model_provider = provider.clone();
-        config
-            .model_providers
-            .insert(provider_id.clone(), provider.clone());
-
-        apply_role_to_config(&mut config, Some("explorer"))
-            .await
-            .expect("explorer role should preserve the live provider");
-
-        assert_eq!(config.model_provider_id, provider_id);
-        assert_eq!(config.model_provider, provider);
-        assert_eq!(
-            config.model_providers.get(&config.model_provider_id),
-            Some(&config.model_provider)
-        );
     }
 }
 

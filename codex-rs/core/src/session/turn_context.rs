@@ -2,8 +2,6 @@ use super::*;
 use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::git_workspace::GitWorkspaceMetadataSource;
 use crate::shell_snapshot::ShellSnapshotFile;
-use crate::stream_events_utils::FinalizedTurnItemFacts;
-use codex_agent_task_store::AgentTaskBinding;
 use codex_core_skills::HostSkillsSnapshot;
 use codex_file_system::FileSystemSandboxContext;
 use codex_model_provider::SharedModelProvider;
@@ -159,37 +157,6 @@ struct PendingPostToolContexts {
     by_call_id: Mutex<HashMap<String, Vec<ResponseItem>>>,
 }
 
-#[derive(Debug, Default)]
-struct CompletionOutputBuffer {
-    state: Mutex<CompletionOutputBufferState>,
-}
-
-#[derive(Debug, Default)]
-struct CompletionOutputBufferState {
-    active: bool,
-    captured: Vec<BufferedCompletionOutput>,
-}
-
-#[derive(Debug, Default)]
-struct CompletionProofTerminalState {
-    blocked: AtomicBool,
-}
-
-#[derive(Clone, Debug)]
-struct TypedAgentTaskTurnBinding(AgentTaskBinding);
-
-#[derive(Clone, Debug)]
-pub(crate) enum BufferedCompletionOutput {
-    ConversationItem {
-        item: ResponseItem,
-        finalized_facts: Option<FinalizedTurnItemFacts>,
-    },
-    Event {
-        event: EventMsg,
-        persist: bool,
-    },
-}
-
 /// The context needed for a single turn of the thread.
 #[derive(Debug)]
 pub struct TurnContext {
@@ -276,136 +243,6 @@ fn same_turn_config_projection(left: &Config, right: &Config) -> bool {
 }
 
 impl TurnContext {
-    /// Return the exact typed-task authority captured when this turn was admitted. A correction
-    /// attempt may rebind the agent path while the turn is still running, so receipt and terminal
-    /// paths must use this immutable snapshot instead of resolving the mutable path binding.
-    pub(crate) fn typed_agent_task_binding(&self) -> Option<AgentTaskBinding> {
-        self.extension_data
-            .get::<TypedAgentTaskTurnBinding>()
-            .map(|binding| binding.0.clone())
-    }
-
-    /// Start holding assistant-authored output for the next model response.
-    ///
-    /// Tool, hook, warning, and validation events continue to flow normally. A
-    /// response that needs another model generation is released as ordinary
-    /// progress; a terminal-looking response remains private until the
-    /// completion-proof gate accepts it.
-    pub(crate) async fn begin_completion_output_buffer(&self) {
-        let buffer = self
-            .extension_data
-            .get_or_init(CompletionOutputBuffer::default);
-        let mut buffer = buffer.state.lock().await;
-        // Private assistant output retained from an earlier tool-follow-up
-        // generation stays in this same capture stream. Appending the next
-        // generation preserves the order in which all retained output arose.
-        buffer.active = true;
-    }
-
-    pub(crate) async fn try_buffer_completion_conversation_item(
-        &self,
-        item: &ResponseItem,
-        finalized_facts: Option<&FinalizedTurnItemFacts>,
-    ) -> bool {
-        if !matches!(item, ResponseItem::Message { role, .. } if role == "assistant") {
-            return false;
-        }
-        let Some(buffer) = self.extension_data.get::<CompletionOutputBuffer>() else {
-            return false;
-        };
-        let mut buffer = buffer.state.lock().await;
-        if !buffer.active {
-            return false;
-        }
-        buffer
-            .captured
-            .push(BufferedCompletionOutput::ConversationItem {
-                item: item.clone(),
-                finalized_facts: finalized_facts.cloned(),
-            });
-        true
-    }
-
-    pub(crate) async fn try_buffer_completion_output(&self, event: &EventMsg) -> bool {
-        self.try_buffer_completion_output_with_persistence(event, true)
-            .await
-    }
-
-    pub(crate) async fn try_buffer_completion_output_with_persistence(
-        &self,
-        event: &EventMsg,
-        persist: bool,
-    ) -> bool {
-        if !is_assistant_output_event(event) {
-            return false;
-        }
-        let Some(buffer) = self.extension_data.get::<CompletionOutputBuffer>() else {
-            return false;
-        };
-        let mut buffer = buffer.state.lock().await;
-        if !buffer.active {
-            return false;
-        }
-        buffer.captured.push(BufferedCompletionOutput::Event {
-            event: event.clone(),
-            persist,
-        });
-        true
-    }
-
-    pub(crate) async fn take_completion_output(&self) -> Vec<BufferedCompletionOutput> {
-        let Some(buffer) = self.extension_data.get::<CompletionOutputBuffer>() else {
-            return Vec::new();
-        };
-        let mut buffer = buffer.state.lock().await;
-        buffer.active = false;
-        std::mem::take(&mut buffer.captured)
-    }
-
-    /// Drain explicit commentary and plan progress while retaining every other
-    /// assistant message for the terminal completion-proof decision.
-    pub(crate) async fn take_non_final_completion_output(&self) -> Vec<BufferedCompletionOutput> {
-        let Some(buffer) = self.extension_data.get::<CompletionOutputBuffer>() else {
-            return Vec::new();
-        };
-        let mut buffer = buffer.state.lock().await;
-        buffer.active = false;
-
-        let captured = std::mem::take(&mut buffer.captured);
-        let commentary_item_ids = commentary_item_ids(&captured);
-        let mut released = Vec::new();
-        for output in captured {
-            if buffered_output_is_private_assistant(&output, &commentary_item_ids) {
-                buffer.captured.push(output);
-            } else {
-                released.push(output);
-            }
-        }
-        released
-    }
-
-    pub(crate) async fn discard_completion_output(&self) {
-        let Some(buffer) = self.extension_data.get::<CompletionOutputBuffer>() else {
-            return;
-        };
-        let mut buffer = buffer.state.lock().await;
-        buffer.active = false;
-        buffer.captured.clear();
-    }
-
-    pub(crate) fn mark_completion_proof_terminal_blocked(&self) {
-        self.extension_data
-            .get_or_init(CompletionProofTerminalState::default)
-            .blocked
-            .store(true, Ordering::Release);
-    }
-
-    pub(crate) fn completion_proof_terminal_blocked(&self) -> bool {
-        self.extension_data
-            .get::<CompletionProofTerminalState>()
-            .is_some_and(|state| state.blocked.load(Ordering::Acquire))
-    }
-
     pub(crate) async fn queue_post_tool_contexts(
         &self,
         call_id: &str,
@@ -862,136 +699,6 @@ impl TurnContext {
     }
 }
 
-fn is_assistant_output_event(event: &EventMsg) -> bool {
-    match event {
-        EventMsg::AgentMessage(_)
-        | EventMsg::AgentMessageContentDelta(_)
-        | EventMsg::PlanDelta(_) => true,
-        EventMsg::ItemStarted(event) => {
-            matches!(event.item, TurnItem::AgentMessage(_) | TurnItem::Plan(_))
-        }
-        EventMsg::ItemCompleted(event) => {
-            matches!(event.item, TurnItem::AgentMessage(_) | TurnItem::Plan(_))
-        }
-        EventMsg::RawResponseItem(event) => matches!(
-            &event.item,
-            ResponseItem::Message { role, .. } if role == "assistant"
-        ),
-        _ => false,
-    }
-}
-
-fn response_item_is_private_assistant_message(item: &ResponseItem) -> bool {
-    matches!(
-        item,
-        ResponseItem::Message {
-            role,
-            phase,
-            ..
-        } if role == "assistant"
-            && !matches!(phase, Some(codex_protocol::models::MessagePhase::Commentary))
-    )
-}
-
-fn turn_item_commentary_id(item: &TurnItem) -> Option<&str> {
-    let TurnItem::AgentMessage(message) = item else {
-        return None;
-    };
-    matches!(
-        message.phase,
-        Some(codex_protocol::models::MessagePhase::Commentary)
-    )
-    .then_some(message.id.as_str())
-}
-
-fn commentary_item_ids(outputs: &[BufferedCompletionOutput]) -> HashSet<String> {
-    let mut ids = HashSet::new();
-    for output in outputs {
-        match output {
-            BufferedCompletionOutput::ConversationItem { item, .. }
-            | BufferedCompletionOutput::Event {
-                event:
-                    EventMsg::RawResponseItem(codex_protocol::protocol::RawResponseItemEvent { item }),
-                ..
-            } => {
-                if let ResponseItem::Message {
-                    id: Some(id),
-                    role,
-                    phase: Some(codex_protocol::models::MessagePhase::Commentary),
-                    ..
-                } = item
-                    && role == "assistant"
-                {
-                    ids.insert(id.to_string());
-                }
-            }
-            BufferedCompletionOutput::Event {
-                event: EventMsg::ItemStarted(event),
-                ..
-            } => {
-                if let Some(id) = turn_item_commentary_id(&event.item) {
-                    ids.insert(id.to_string());
-                }
-            }
-            BufferedCompletionOutput::Event {
-                event: EventMsg::ItemCompleted(event),
-                ..
-            } => {
-                if let Some(id) = turn_item_commentary_id(&event.item) {
-                    ids.insert(id.to_string());
-                }
-            }
-            BufferedCompletionOutput::Event { .. } => {}
-        }
-    }
-    ids
-}
-
-fn buffered_output_is_private_assistant(
-    output: &BufferedCompletionOutput,
-    commentary_item_ids: &HashSet<String>,
-) -> bool {
-    match output {
-        BufferedCompletionOutput::ConversationItem { item, .. } => {
-            response_item_is_private_assistant_message(item)
-        }
-        BufferedCompletionOutput::Event { event, .. } => {
-            event_is_private_assistant_output(event, commentary_item_ids)
-        }
-    }
-}
-
-fn event_is_private_assistant_output(
-    event: &EventMsg,
-    commentary_item_ids: &HashSet<String>,
-) -> bool {
-    match event {
-        EventMsg::AgentMessage(event) => !matches!(
-            event.phase,
-            Some(codex_protocol::models::MessagePhase::Commentary)
-        ),
-        EventMsg::AgentMessageContentDelta(event) => !commentary_item_ids.contains(&event.item_id),
-        EventMsg::ItemStarted(event) => matches!(
-            &event.item,
-            TurnItem::AgentMessage(message)
-                if !matches!(
-                    message.phase,
-                    Some(codex_protocol::models::MessagePhase::Commentary)
-                )
-        ),
-        EventMsg::ItemCompleted(event) => matches!(
-            &event.item,
-            TurnItem::AgentMessage(message)
-                if !matches!(
-                    message.phase,
-                    Some(codex_protocol::models::MessagePhase::Commentary)
-                )
-        ),
-        EventMsg::RawResponseItem(event) => response_item_is_private_assistant_message(&event.item),
-        _ => false,
-    }
-}
-
 fn local_time_context() -> (String, String) {
     match iana_time_zone::get_timezone() {
         Ok(timezone) => (Local::now().format("%Y-%m-%d").to_string(), timezone),
@@ -1324,11 +1031,6 @@ impl Session {
         final_output_json_schema: Option<Option<Value>>,
         multi_agent_runtime: TurnMultiAgentRuntime,
     ) -> Arc<TurnContext> {
-        let typed_agent_task_binding = self
-            .services
-            .agent_control
-            .task_coordinator()
-            .binding_for_source(&session_configuration.session_source);
         let turn_environments = self.services.turn_environments.snapshot().await;
         let git_metadata_source = self
             .services
@@ -1457,11 +1159,6 @@ impl Session {
             sub_id,
             skills_snapshot,
         );
-        if let Some(binding) = typed_agent_task_binding {
-            turn_context
-                .extension_data
-                .insert(TypedAgentTaskTurnBinding(binding));
-        }
         if let Some(final_schema) = final_output_json_schema {
             turn_context.final_output_json_schema = final_schema;
         }

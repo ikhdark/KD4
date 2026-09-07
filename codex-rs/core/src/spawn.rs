@@ -4,7 +4,6 @@ use codex_utils_pty::WINDOWS_CREATE_SUSPENDED;
 use codex_utils_pty::WINDOWS_PROCESS_OPERATION_TIMEOUT;
 use codex_utils_pty::configure_windows_command_args;
 use codex_utils_pty::run_windows_process_operation;
-use codex_utils_pty::with_windows_child_creation;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -110,10 +109,7 @@ pub(crate) async fn spawn_child_async(request: SpawnChildRequest<'_>) -> std::io
     }
 
     cmd.kill_on_drop(true);
-    run_windows_process_operation(WINDOWS_PROCESS_OPERATION_TIMEOUT, move || {
-        with_windows_child_creation(|_| cmd.spawn())
-    })
-    .await
+    run_windows_process_operation(WINDOWS_PROCESS_OPERATION_TIMEOUT, move || cmd.spawn()).await
 }
 
 fn apply_network_sandbox_policy_to_env(

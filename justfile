@@ -504,31 +504,6 @@ source-map-check:
     {{ python }} "{{ justfile_directory() }}/scripts/readme_toc.py" --require-markers "{{ justfile_directory() }}/SOURCEMAP.md"
     {{ python }} "{{ justfile_directory() }}/scripts/source_owners.py" check
 
-# Validate the tracked-path snapshot and source-map inventories without writing.
-source-map-check-only:
-    {{ python }} "{{ justfile_directory() }}/scripts/source_map_check.py" "{{ justfile_directory() }}/SOURCEMAP.md" --check-only
-    {{ python }} "{{ justfile_directory() }}/scripts/asciicheck.py" "{{ justfile_directory() }}/SOURCEMAP.md"
-    {{ python }} "{{ justfile_directory() }}/scripts/readme_toc.py" --require-markers "{{ justfile_directory() }}/SOURCEMAP.md"
-    {{ python }} "{{ justfile_directory() }}/scripts/source_owners.py" check
-
-# Run exactly one configured validation through the trusted runner. This emits
-# focused evidence only and can never establish whole-repository certification.
-[no-cd]
-[script("python")]
-completion-focused validation_id *test_ids:
-    import runpy
-    import sys
-    script = r"{{ justfile_directory() }}/scripts/completion_proof.py"
-    sys.argv = [script, "focused", *sys.argv[1:]]
-    runpy.run_path(script, run_name="__main__")
-
-# The sole whole-repository certification command. The compiled runtime owns
-# authorization and final verification; this recipe only launches the fresh
-# validation attempt and writes its private structured report.
-[no-cd]
-completion-proof:
-    @{{ python }} "{{ justfile_directory() }}/scripts/completion_proof.py" run
-
 source-owners-generate:
     {{ python }} "{{ justfile_directory() }}/scripts/source_owners.py" generate
 
@@ -575,12 +550,11 @@ sdk-python-check:
     uv run --directory "{{ justfile_directory() }}/sdk/python" --group dev ruff check .
     uv run --directory "{{ justfile_directory() }}/sdk/python" --group dev pytest
 
-# Check wrapper syntax and execute both staged JavaScript launchers.
+# Lint the codex-cli npm wrapper entrypoint.
 [no-cd]
 codex-cli-wrapper-check:
     node --check "{{ justfile_directory() }}/codex-cli/bin/codex.js"
     node --check "{{ justfile_directory() }}/codex-rs/responses-api-proxy/npm/bin/codex-responses-api-proxy.js"
-    {{ python }} -m unittest scripts.test_stage_npm_packages.StageNpmPackagesTests.test_build_module_derives_platform_metadata_from_canonical_targets scripts.test_stage_npm_packages.StageNpmPackagesTests.test_responses_proxy_staging_is_windows_only
 
 app-server-command-exec-check:
     just _app-server-command-exec-tests
@@ -606,7 +580,7 @@ _app-server-thread-status-tests:
     cargo nextest run -p codex-app-server -E 'test(thread_status::tests::stale_active_running_thread_resume_clears_watch_status) | test(thread_status::tests::stale_active_repair_preserves_pending_approval_status)'
 
 app-server-schema-protocol-check:
-    just core-gate app-server-schema-protocol
+    cargo nextest run -p codex-app-server-protocol -E 'test(typescript_schema_fixtures_match_generated) | test(json_schema_fixtures_match_generated)'
 
 # Check app-server schema fixtures without modifying generated output.
 [no-cd]

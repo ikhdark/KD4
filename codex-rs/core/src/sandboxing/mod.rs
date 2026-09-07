@@ -66,9 +66,6 @@ pub struct ExecRequest {
     /// Runtime-owned files needed only to start a Windows sandboxed command.
     /// These do not expand the command's declared permission profile.
     pub(crate) windows_sandbox_additional_read_roots: Vec<AbsolutePathBuf>,
-    pub(crate) prepared_canonical_windows_sandbox_launch:
-        Option<codex_windows_sandbox::PreparedCanonicalWindowsSandboxLaunch>,
-    pub(crate) canonical_windows_sandbox_launch_identity: Option<String>,
     pub arg0: Option<String>,
     pub(crate) exec_server_sandbox: Option<FileSystemSandboxContext>,
     pub(crate) exec_server_enforce_managed_network: bool,
@@ -117,8 +114,6 @@ impl ExecRequest {
             network_sandbox_policy,
             windows_sandbox_filesystem_overrides: None,
             windows_sandbox_additional_read_roots: Vec::new(),
-            prepared_canonical_windows_sandbox_launch: None,
-            canonical_windows_sandbox_launch_identity: None,
             arg0,
             exec_server_sandbox: None,
             exec_server_enforce_managed_network: false,
@@ -177,8 +172,6 @@ impl ExecRequest {
             network_sandbox_policy,
             windows_sandbox_filesystem_overrides: None,
             windows_sandbox_additional_read_roots: Vec::new(),
-            prepared_canonical_windows_sandbox_launch: None,
-            canonical_windows_sandbox_launch_identity: None,
             arg0,
             exec_server_sandbox: None,
             exec_server_enforce_managed_network: false,

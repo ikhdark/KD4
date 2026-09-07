@@ -74,14 +74,4 @@ tokenUsage?: TurnTimingProviderTokenUsage,
  * Aggregate-only full logical prompt accounting. No prompt text,
  * repository paths, tool arguments, or hashes are persisted here.
  */
-requestTokenCategories: TurnTimingRequestTokenCategories | null,
-/**
- * Whether this logical request exactly matched the preceding stable
- * prompt prefix under the same prompt-cache identity.
- */
-fixedPrefixReuseEligible?: boolean,
-/**
- * Stable SHA-256 fingerprint of the prompt cache key sent to the provider.
- * The raw key is intentionally not persisted in timing diagnostics.
- */
-promptCacheKeyFingerprint?: string, dispatchMs: number | null, firstModelOutputMs: number | null, firstActionableOutputMs: number | null, completedMs: number | null, };
+requestTokenCategories: TurnTimingRequestTokenCategories | null, dispatchMs: number | null, firstModelOutputMs: number | null, firstActionableOutputMs: number | null, completedMs: number | null, };

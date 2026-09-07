@@ -6,8 +6,6 @@ use std::collections::HashSet;
 use std::fmt::Debug;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::LazyLock;
-use std::sync::Mutex as StdMutex;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -47,7 +45,6 @@ use crate::image_preparation::prepare_response_items;
 use crate::image_preparation::response_items_need_preparation;
 use crate::parse_turn_item;
 use crate::session::step_context::StepContext;
-use crate::session::turn_context::BufferedCompletionOutput;
 use crate::session::turn_context::TurnEnvironment;
 use crate::session_prefix::format_inter_agent_completion_message;
 use crate::skills::SkillRenderSideEffects;
@@ -412,7 +409,6 @@ pub enum SteerInputError {
     ExpectedTurnMismatch { expected: String, actual: String },
     ActiveTurnNotSteerable { turn_kind: NonSteerableTurnKind },
     EmptyInput,
-    CompletionProofInstructionRejected { message: String },
     PendingInputLimitExceeded { max_items: usize, max_bytes: usize },
 }
 
@@ -442,10 +438,6 @@ impl SteerInputError {
             Self::EmptyInput => ErrorEvent {
                 message: "input must not be empty".to_string(),
                 codex_error_info: Some(CodexErrorInfo::BadRequest),
-            },
-            Self::CompletionProofInstructionRejected { message } => ErrorEvent {
-                message: message.clone(),
-                codex_error_info: Some(CodexErrorInfo::InternalServerError),
             },
             Self::PendingInputLimitExceeded {
                 max_items,
@@ -639,7 +631,6 @@ pub(crate) struct CodexSpawnArgs {
     pub(crate) attestation_provider: Option<Arc<dyn AttestationProvider>>,
     pub(crate) external_time_provider: Option<Arc<dyn TimeProvider>>,
     pub(crate) inherited_multi_agent_version: Option<MultiAgentVersion>,
-    pub(crate) completion_proof_authority: crate::completion_proof::CompletionProofSessionAuthority,
 }
 
 pub(crate) fn resolve_multi_agent_version(
@@ -668,128 +659,6 @@ const CYBER_SAFETY_URL: &str = "https://developers.openai.com/codex/concepts/cyb
 
 fn event_channel() -> (async_channel::Sender<Event>, async_channel::Receiver<Event>) {
     async_channel::bounded(EVENT_CHANNEL_CAPACITY)
-}
-
-type TypedChildCompletionAdmissionKey = (ThreadId, String);
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum TypedChildCompletionAdmissionClaim {
-    Ordinary,
-    Active,
-    Cancelled,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum TypedChildCompletionAdmissionPhase {
-    Pending,
-    Admitting,
-    Cancelled,
-}
-
-struct TypedChildCompletionAdmission {
-    phase: TypedChildCompletionAdmissionPhase,
-    response: Option<oneshot::Sender<bool>>,
-}
-
-static TYPED_CHILD_COMPLETION_ADMISSIONS: LazyLock<
-    StdMutex<HashMap<TypedChildCompletionAdmissionKey, TypedChildCompletionAdmission>>,
-> = LazyLock::new(|| StdMutex::new(HashMap::new()));
-
-struct TypedChildCompletionAdmissionRegistration {
-    key: TypedChildCompletionAdmissionKey,
-    remove_on_drop: bool,
-}
-
-impl TypedChildCompletionAdmissionRegistration {
-    fn cancel_if_pending(&mut self) -> bool {
-        let mut admissions = typed_child_completion_admissions();
-        let Some(admission) = admissions.get_mut(&self.key) else {
-            return false;
-        };
-        if admission.phase != TypedChildCompletionAdmissionPhase::Pending {
-            return false;
-        }
-        admission.phase = TypedChildCompletionAdmissionPhase::Cancelled;
-        admission.response.take();
-        self.remove_on_drop = false;
-        true
-    }
-}
-
-impl Drop for TypedChildCompletionAdmissionRegistration {
-    fn drop(&mut self) {
-        if self.remove_on_drop {
-            typed_child_completion_admissions().remove(&self.key);
-        }
-    }
-}
-
-fn typed_child_completion_admissions() -> std::sync::MutexGuard<
-    'static,
-    HashMap<TypedChildCompletionAdmissionKey, TypedChildCompletionAdmission>,
-> {
-    TYPED_CHILD_COMPLETION_ADMISSIONS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-/// Claims a private typed-child acknowledgement before its communication is admitted. A timed-out
-/// private submission leaves a cancellation tombstone so the delayed FIFO item is discarded;
-/// public submissions have no registration and retain ordinary behavior.
-pub(crate) fn claim_typed_child_completion_admission(
-    thread_id: ThreadId,
-    submission_id: &str,
-) -> TypedChildCompletionAdmissionClaim {
-    let key = (thread_id, submission_id.to_string());
-    let mut admissions = typed_child_completion_admissions();
-    let Some(admission) = admissions.get_mut(&key) else {
-        return TypedChildCompletionAdmissionClaim::Ordinary;
-    };
-    match admission.phase {
-        TypedChildCompletionAdmissionPhase::Pending => {
-            admission.phase = TypedChildCompletionAdmissionPhase::Admitting;
-            TypedChildCompletionAdmissionClaim::Active
-        }
-        TypedChildCompletionAdmissionPhase::Admitting => TypedChildCompletionAdmissionClaim::Active,
-        TypedChildCompletionAdmissionPhase::Cancelled => {
-            admissions.remove(&key);
-            TypedChildCompletionAdmissionClaim::Cancelled
-        }
-    }
-}
-
-/// Resolves a private typed-child delivery acknowledgement after the normal submission loop has
-/// made the real mailbox admission decision. Public operations cannot register a waiter, so an
-/// arbitrary communication payload cannot opt into this acknowledgement path.
-pub(crate) fn resolve_typed_child_completion_admission(
-    thread_id: ThreadId,
-    submission_id: &str,
-    accepted: bool,
-) {
-    let key = (thread_id, submission_id.to_string());
-    if let Some(mut admission) = typed_child_completion_admissions().remove(&key)
-        && let Some(response) = admission.response.take()
-    {
-        let _ = response.send(accepted);
-    }
-}
-
-/// Fails every outstanding acknowledgement owned by a terminated parent loop and removes any
-/// cancellation tombstones that loop can no longer consume.
-pub(crate) fn clear_typed_child_completion_admissions(thread_id: ThreadId) {
-    let mut admissions = typed_child_completion_admissions();
-    let keys = admissions
-        .keys()
-        .filter(|(candidate_thread_id, _)| *candidate_thread_id == thread_id)
-        .cloned()
-        .collect::<Vec<_>>();
-    for key in keys {
-        if let Some(mut admission) = admissions.remove(&key)
-            && let Some(response) = admission.response.take()
-        {
-            let _ = response.send(false);
-        }
-    }
 }
 
 impl Codex {
@@ -855,7 +724,6 @@ impl Codex {
             attestation_provider,
             external_time_provider,
             inherited_multi_agent_version,
-            completion_proof_authority,
         } = args;
         let (tx_sub, rx_sub) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
         let (tx_event, rx_event) = event_channel();
@@ -1026,7 +894,6 @@ impl Codex {
             attestation_provider,
             external_time_provider,
             multi_agent_version,
-            completion_proof_authority,
         ))
         .await
         .map_err(|e| {
@@ -1097,87 +964,6 @@ impl Codex {
             .await
             .map_err(|_| CodexErr::InternalAgentDied)?;
         Ok(())
-    }
-
-    /// Submit a typed-child completion through the ordinary FIFO and wait until the handler has
-    /// accepted or rejected it at the parent mailbox. This capability is crate-private and the
-    /// acknowledgement registration is never represented in the public protocol payload.
-    pub(crate) async fn submit_typed_child_completion_with_admission(
-        &self,
-        communication: InterAgentCommunication,
-    ) -> CodexResult<String> {
-        if communication.trigger_turn {
-            return Err(CodexErr::InvalidRequest(
-                "typed child completion cannot trigger a parent turn".to_string(),
-            ));
-        }
-
-        let submission_id = new_submission_id();
-        let key = (self.session.thread_id, submission_id.clone());
-        let (admission_tx, mut admission_rx) = oneshot::channel();
-        {
-            let mut admissions = typed_child_completion_admissions();
-            if admissions.contains_key(&key) {
-                return Err(CodexErr::InternalAgentDied);
-            }
-            admissions.insert(
-                key.clone(),
-                TypedChildCompletionAdmission {
-                    phase: TypedChildCompletionAdmissionPhase::Pending,
-                    response: Some(admission_tx),
-                },
-            );
-        }
-        let mut registration = TypedChildCompletionAdmissionRegistration {
-            key,
-            remove_on_drop: true,
-        };
-        let submission = Submission {
-            id: submission_id.clone(),
-            op: Op::InterAgentCommunication { communication },
-            client_user_message_id: None,
-            trace: current_span_w3c_trace_context(),
-        };
-        let session_loop_termination = self.session_loop_termination.clone();
-        let send_result = tokio::select! {
-            biased;
-            result = self.tx_sub.send(submission) => result,
-            _ = session_loop_termination.clone() => {
-                drop(registration);
-                return Err(CodexErr::InternalAgentDied);
-            }
-        };
-        if send_result.is_err() {
-            drop(registration);
-            return Err(CodexErr::InternalAgentDied);
-        }
-
-        let admission_deadline = tokio::time::sleep(Duration::from_secs(10));
-        tokio::pin!(admission_deadline);
-        let accepted = tokio::select! {
-            biased;
-            result = &mut admission_rx => result.unwrap_or(false),
-            _ = session_loop_termination.clone() => false,
-            _ = &mut admission_deadline => {
-                if registration.cancel_if_pending() {
-                    false
-                } else {
-                    tokio::select! {
-                        biased;
-                        result = &mut admission_rx => result.unwrap_or(false),
-                        _ = session_loop_termination => false,
-                    }
-                }
-            }
-        };
-        drop(registration);
-        if accepted {
-            Ok(submission_id)
-        } else {
-            Err(CodexErr::InvalidRequest(
-                "parent mailbox rejected typed child completion".to_string(),
-            ))
-        }
     }
 
     /// Persist a thread-level memory mode update for the active session.
@@ -1439,12 +1225,17 @@ fn push_rendered_prompt_fragment(
 }
 
 struct PreparedEventDispatch {
+    terminal_source: Option<EventMsg>,
     legacy_events: Vec<EventMsg>,
 }
 
 impl PreparedEventDispatch {
     fn new(source: &EventMsg, show_raw_agent_reasoning: bool) -> Self {
+        let terminal_source =
+            matches!(source, EventMsg::TurnComplete(_) | EventMsg::TurnAborted(_))
+                .then(|| source.clone());
         Self {
+            terminal_source,
             legacy_events: source.as_legacy_events(show_raw_agent_reasoning),
         }
     }
@@ -2455,67 +2246,6 @@ impl Session {
 
     /// Persist the event to rollout and send it to clients.
     pub(crate) async fn send_event(&self, turn_context: &TurnContext, msg: EventMsg) {
-        if turn_context.try_buffer_completion_output(&msg).await {
-            return;
-        }
-        self.send_event_unbuffered(turn_context, msg).await;
-    }
-
-    async fn send_event_unbuffered(&self, turn_context: &TurnContext, mut msg: EventMsg) {
-        let typed_child_terminal = turn_context.multi_agent_version == MultiAgentVersion::V2
-            && matches!(msg, EventMsg::TurnComplete(_) | EventMsg::TurnAborted(_))
-            && matches!(
-                &turn_context.session_source,
-                SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
-                    agent_path: Some(_),
-                    ..
-                })
-            );
-        if typed_child_terminal {
-            // Receipt sealing, durable reload, and parent delivery are part of the child terminal
-            // transaction. Serialize them with root certification and never publish child success
-            // first.
-            let _workspace_operation = self
-                .services
-                .completion_proof
-                .acquire_workspace_operation()
-                .await;
-            let delivered_status = self
-                .maybe_notify_parent_of_terminal_turn(turn_context, &msg)
-                .await;
-            if matches!(
-                delivered_status,
-                Some(AgentStatus::Completed(_) | AgentStatus::CompletedWithSurface { .. })
-            ) {
-                self.release_completion_output(turn_context).await;
-            } else {
-                turn_context.discard_completion_output().await;
-                if let EventMsg::TurnComplete(terminal) = &mut msg {
-                    terminal.last_agent_message = None;
-                    terminal.surfaced_result = None;
-                    if terminal.error.is_none() {
-                        let message = match delivered_status {
-                            Some(AgentStatus::Errored(message)) => message,
-                            Some(status) => format!(
-                                "typed child completion was rejected by its durable status: {status:?}"
-                            ),
-                            None => "typed child completion could not seal and deliver its durable evidence receipt"
-                                .to_string(),
-                        };
-                        let error = ErrorEvent {
-                            message,
-                            codex_error_info: Some(CodexErrorInfo::Other),
-                        };
-                        terminal.error = Some(error.clone());
-                        turn_context.terminal_error.lock().await.replace(error);
-                    }
-                }
-            }
-        }
-        self.dispatch_event_unbuffered(turn_context, msg).await;
-    }
-
-    async fn dispatch_event_unbuffered(&self, turn_context: &TurnContext, msg: EventMsg) {
         let post_dispatch = PreparedEventDispatch::new(&msg, self.show_raw_agent_reasoning());
         if let EventMsg::Error(error) = &msg
             && error.affects_turn_status()
@@ -2541,71 +2271,18 @@ impl Session {
             .await;
     }
 
-    pub(crate) async fn release_completion_output(&self, turn_context: &TurnContext) {
-        let output = turn_context.take_completion_output().await;
-        self.release_buffered_completion_output(turn_context, output)
-            .await;
-    }
-
-    pub(crate) async fn release_non_final_completion_output(&self, turn_context: &TurnContext) {
-        let output = turn_context.take_non_final_completion_output().await;
-        self.release_buffered_completion_output(turn_context, output)
-            .await;
-    }
-
-    async fn release_buffered_completion_output(
-        &self,
-        turn_context: &TurnContext,
-        output: Vec<BufferedCompletionOutput>,
-    ) {
-        for buffered in output {
-            match buffered {
-                BufferedCompletionOutput::ConversationItem {
-                    item,
-                    finalized_facts,
-                } => {
-                    crate::stream_events_utils::record_completed_response_item_immediately(
-                        self,
-                        turn_context,
-                        &item,
-                        finalized_facts.as_ref(),
-                    )
-                    .await;
-                }
-                BufferedCompletionOutput::Event { event, persist } => {
-                    if persist {
-                        self.dispatch_event_unbuffered(turn_context, event).await;
-                    } else {
-                        self.send_nonpersistent_event_unbuffered(turn_context, event)
-                            .await;
-                    }
-                }
-            }
-        }
-    }
-
-    async fn send_nonpersistent_event_unbuffered(&self, turn_context: &TurnContext, msg: EventMsg) {
-        self.services
-            .rollout_thread_trace
-            .record_codex_turn_event(&turn_context.sub_id, &msg);
-        self.services
-            .rollout_thread_trace
-            .record_tool_call_event(turn_context.sub_id.as_str(), &msg);
-        self.send_event_raw_with_persistence(
-            Event {
-                id: turn_context.sub_id.clone(),
-                msg,
-            },
-            /*persist*/ false,
-        )
-        .await;
-    }
-
     async fn finish_prepared_event_dispatch(
         &self,
         turn_context: &TurnContext,
         post_dispatch: PreparedEventDispatch,
     ) -> bool {
+        let parent_notification_completed = match post_dispatch.terminal_source.as_ref() {
+            Some(terminal_source) => {
+                self.maybe_notify_parent_of_terminal_turn(turn_context, terminal_source)
+                    .await
+            }
+            None => true,
+        };
         for legacy in post_dispatch.legacy_events {
             self.services
                 .rollout_thread_trace
@@ -2616,7 +2293,7 @@ impl Session {
             };
             self.send_event_raw(legacy_event).await;
         }
-        true
+        parent_notification_completed
     }
 
     /// Forwards terminal turn events from spawned MultiAgentV2 children to their direct parent.
@@ -2624,13 +2301,13 @@ impl Session {
         &self,
         turn_context: &TurnContext,
         msg: &EventMsg,
-    ) -> Option<AgentStatus> {
+    ) -> bool {
         if turn_context.multi_agent_version != MultiAgentVersion::V2 {
-            return agent_status_from_event(msg);
+            return true;
         }
 
         if !matches!(msg, EventMsg::TurnComplete(_) | EventMsg::TurnAborted(_)) {
-            return agent_status_from_event(msg);
+            return true;
         }
 
         let SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
@@ -2639,7 +2316,7 @@ impl Session {
             ..
         }) = &turn_context.session_source
         else {
-            return agent_status_from_event(msg);
+            return true;
         };
 
         let mut status = match turn_context.terminal_error.lock().await.clone() {
@@ -2650,35 +2327,22 @@ impl Session {
             }
             None => {
                 let Some(status) = agent_status_from_event(msg) else {
-                    return None;
+                    return true;
                 };
                 status
             }
         };
         if !is_final(&status) {
-            return Some(status);
+            return true;
         }
 
         let task_coordinator = self.services.agent_control.task_coordinator();
-        let Some(binding) = turn_context.typed_agent_task_binding() else {
-            warn!(
-                agent_path = %child_agent_path,
-                "typed child turn has no immutable durable task binding at terminal publication"
-            );
-            return None;
-        };
-        if binding.agent_path != child_agent_path.as_str() {
-            warn!(
-                agent_path = %child_agent_path,
-                bound_agent_path = %binding.agent_path,
-                "typed child turn binding does not match its session path"
-            );
-            return None;
-        }
-        let assignment_id = binding.assignment_id;
+        let assignment_id = task_coordinator
+            .binding_for_agent_path(child_agent_path)
+            .map(|binding| binding.assignment_id);
         if let Err(error) = task_coordinator
             .seal_missing_receipt(
-                &binding,
+                child_agent_path,
                 format!(
                     "typed agent {child_agent_path} finished with status {status:?} without submitting a receipt"
                 ),
@@ -2690,117 +2354,37 @@ impl Session {
                 %error,
                 "failed to seal missing typed-agent receipt"
             );
-            return None;
+            return false;
         }
-        let task = match task_coordinator.get_agent_task(assignment_id, None).await {
-            Ok(task) => task,
-            Err(error) => {
-                warn!(
-                    %assignment_id,
-                    %error,
-                    "failed to load durable typed-agent outcome for parent notification"
-                );
-                return None;
-            }
-        };
-        if task.current_attempt.attempt_id != binding.attempt_id {
-            warn!(
-                %assignment_id,
-                bound_attempt_id = %binding.attempt_id,
-                current_attempt_id = %task.current_attempt.attempt_id,
-                "refusing to publish stale typed-child completion against a successor attempt"
-            );
-            return None;
-        }
-        let Some(durable_status) = agent_status_from_task(&task) else {
-            warn!(
-                %assignment_id,
-                attempt_id = %binding.attempt_id,
-                "typed child has no projectable durable receipt status"
-            );
-            return None;
-        };
-        let live_succeeded = matches!(
-            status,
-            AgentStatus::Completed(_) | AgentStatus::CompletedWithSurface { .. }
-        );
-        let durable_succeeded = matches!(
-            durable_status,
-            AgentStatus::Completed(_) | AgentStatus::CompletedWithSurface { .. }
-        );
-        status = match (live_succeeded, durable_succeeded) {
-            (true, _) => durable_status,
-            (false, true) => status,
-            (false, false) => durable_status,
-        };
-        self.agent_status.send_replace(status.clone());
-        task_coordinator
-            .maybe_emit_terminal_metrics(assignment_id, &turn_context.session_telemetry)
-            .await;
-
-        let parent_delivered = self
-            .forward_child_completion_to_parent(
-                turn_context,
-                *parent_thread_id,
-                child_agent_path,
-                status.clone(),
-            )
-            .await;
-        let terminal_succeeded = matches!(
-            status,
-            AgentStatus::Completed(_) | AgentStatus::CompletedWithSurface { .. }
-        );
-        let durable_delivery_succeeded = parent_delivered && terminal_succeeded;
-        let delivery_summary = if durable_delivery_succeeded {
-            format!(
-                "typed child {child_agent_path} terminal result was admitted to parent {parent_thread_id}"
-            )
-        } else if !terminal_succeeded {
-            format!(
-                "typed child {child_agent_path} terminal result failed before successful completion: {status:?}"
-            )
-        } else {
-            format!(
-                "typed child {child_agent_path} terminal result was rejected by parent {parent_thread_id}"
-            )
-        };
-        match task_coordinator
-            .record_typed_child_terminal_delivery(
-                &binding,
-                durable_delivery_succeeded,
-                delivery_summary,
-            )
-            .await
-        {
-            Ok(true) => {
-                if let Err(error) = self
-                    .services
-                    .agent_control
-                    .close_persisted_thread_spawn_edge(self.thread_id)
-                    .await
-                {
+        if let Some(assignment_id) = assignment_id {
+            match task_coordinator.get_agent_task(assignment_id, None).await {
+                Ok(task) => {
+                    if let Some(durable_status) = agent_status_from_task(&task) {
+                        status = durable_status;
+                        self.agent_status.send_replace(status.clone());
+                    }
+                }
+                Err(error) => {
                     warn!(
                         %assignment_id,
-                        attempt_id = %binding.attempt_id,
-                        child_thread_id = %self.thread_id,
                         %error,
-                        "failed to close typed-child persisted thread-spawn edge"
+                        "failed to load durable typed-agent outcome for parent notification"
                     );
-                    return None;
+                    return false;
                 }
-                parent_delivered.then_some(status)
             }
-            Ok(false) => None,
-            Err(error) => {
-                warn!(
-                    %assignment_id,
-                    attempt_id = %binding.attempt_id,
-                    %error,
-                    "failed to persist typed-child terminal delivery outcome"
-                );
-                None
-            }
+            task_coordinator
+                .maybe_emit_terminal_metrics(assignment_id, &turn_context.session_telemetry)
+                .await;
         }
+
+        self.forward_child_completion_to_parent(
+            turn_context,
+            *parent_thread_id,
+            child_agent_path,
+            status,
+        )
+        .await
     }
 
     /// Sends the standard completion envelope from a spawned MultiAgentV2 child to its parent.
@@ -2816,7 +2400,7 @@ impl Session {
             .rsplit_once('/')
             .and_then(|(parent, _)| codex_protocol::AgentPath::try_from(parent).ok())
         else {
-            return false;
+            return true;
         };
 
         let Some(message) = format_inter_agent_completion_message(
@@ -2824,7 +2408,7 @@ impl Session {
             child_agent_path.clone(),
             &status,
         ) else {
-            return false;
+            return true;
         };
         // `communication` owns the message. Keep a second copy only when the
         // recorder will actually need it after parent delivery succeeds.
@@ -2845,7 +2429,7 @@ impl Session {
         if let Err(err) = self
             .services
             .agent_control
-            .send_typed_child_completion_with_admission(parent_thread_id, communication, context)
+            .send_inter_agent_communication(parent_thread_id, communication, context)
             .await
         {
             debug!("failed to notify parent thread {parent_thread_id}: {err}");
@@ -4444,12 +4028,6 @@ impl Session {
         }
         for item in items {
             let msg = EventMsg::RawResponseItem(RawResponseItemEvent { item: item.clone() });
-            if turn_context
-                .try_buffer_completion_output_with_persistence(&msg, false)
-                .await
-            {
-                continue;
-            }
             self.services
                 .rollout_thread_trace
                 .record_codex_turn_event(&turn_context.sub_id, &msg);
@@ -5632,19 +5210,17 @@ impl Session {
                         .await;
                 }
             }
-            if let Some(binding) = turn_context.typed_agent_task_binding() {
-                self.services
-                    .agent_control
-                    .task_coordinator()
-                    .record_task_usage_for_binding(
-                        &binding,
-                        token_usage.total_tokens.max(0) as u64,
-                        1,
-                    );
-            }
+            self.services
+                .agent_control
+                .task_coordinator()
+                .record_task_usage_for_source(
+                    &turn_context.session_source,
+                    token_usage.total_tokens.max(0) as u64,
+                    1,
+                );
         }
         let coordinator = self.services.agent_control.task_coordinator();
-        if let Some(binding) = turn_context.typed_agent_task_binding() {
+        if let Some(binding) = coordinator.binding_for_source(&turn_context.session_source) {
             match coordinator.heartbeat_typed_actor_binding(&binding).await {
                 Ok(true) => {}
                 Ok(false) => warn!(
@@ -5802,36 +5378,6 @@ impl Session {
         // disk transaction immediately before every initial model request.
     }
 
-    /// Authenticates completion-proof policy only from text accepted at a real root-session
-    /// current-user boundary. Added context, persisted files, model output, tools, and subagent
-    /// messages never call this path.
-    pub(crate) async fn observe_current_user_completion_proof_instruction(
-        &self,
-        input: &[UserInput],
-    ) -> Result<(), String> {
-        if !self.services.completion_proof.is_terminal_owner() {
-            return Ok(());
-        }
-
-        let text = input
-            .iter()
-            .filter_map(|item| match item {
-                UserInput::Text { text, .. } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        if text.is_empty() {
-            return Ok(());
-        }
-
-        self.services
-            .completion_proof
-            .observe_current_user_completion_proof_instruction(&text, &new_submission_id())
-            .await
-            .map(|_| ())
-    }
-
     pub(crate) async fn notify_stream_error(
         &self,
         turn_context: &TurnContext,
@@ -5902,15 +5448,6 @@ impl Session {
         if input.is_empty() {
             return Err(SteerInputError::EmptyInput);
         }
-        self.observe_current_user_completion_proof_instruction(&input)
-            .await
-            .map_err(
-                |message| SteerInputError::CompletionProofInstructionRejected {
-                    message: format!(
-                        "failed to record the current-user completion-proof instruction: {message}"
-                    ),
-                },
-            )?;
         active_turn_context
             .update_validation_authorization(&input)
             .await;

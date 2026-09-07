@@ -51,8 +51,6 @@ use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::MultiAgentVersion;
-use codex_protocol::protocol::SessionSource;
-use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnAbortedEvent;
@@ -1241,21 +1239,17 @@ impl Session {
                 });
         }
 
-        let (
-            mut last_agent_message,
-            mut surfaced_result,
-            required_tool_terminal,
-            defer_pending_input,
-        ) = match &finalization.outcome {
-            TurnTerminalOutcome::Completed { result } => (
-                result.last_agent_message.clone(),
-                result.surfaced_result.clone(),
-                result.required_tool_terminal.clone(),
-                result.defer_pending_input,
-            ),
-            _ => (None, None, None, false),
-        };
-        let existing_error = match &finalization.outcome {
+        let (last_agent_message, surfaced_result, required_tool_terminal, defer_pending_input) =
+            match &finalization.outcome {
+                TurnTerminalOutcome::Completed { result } => (
+                    result.last_agent_message.clone(),
+                    result.surfaced_result.clone(),
+                    result.required_tool_terminal.clone(),
+                    result.defer_pending_input,
+                ),
+                _ => (None, None, None, false),
+            };
+        let error = match &finalization.outcome {
             TurnTerminalOutcome::ReturnedError(CodexErr::TurnAborted) => None,
             TurnTerminalOutcome::ReturnedError(err) => Some(err.to_error_event(None)),
             TurnTerminalOutcome::WorkerJoinFailed(_) => Some(ErrorEvent {
@@ -1263,98 +1257,8 @@ impl Session {
                 codex_error_info: Some(CodexErrorInfo::InternalServerError),
             }),
             _ => turn_context.terminal_error.lock().await.clone(),
-        }
-        .or_else(|| {
-            required_tool_terminal.as_ref().map(|terminal| ErrorEvent {
-                message: terminal.message.clone(),
-                codex_error_info: Some(CodexErrorInfo::Other),
-            })
-        });
-        let mut terminal_workspace_operation = None;
-        let mut terminal_tree_closing = None;
-        let completion_gate_error = if abort_reason.is_none()
-            && matches!(&finalization.outcome, TurnTerminalOutcome::Completed { .. })
-            && existing_error.is_none()
-        {
-            if self.services.completion_proof.is_terminal_owner() {
-                terminal_workspace_operation = Some(
-                    self.services
-                        .completion_proof
-                        .acquire_workspace_operation()
-                        .await,
-                );
-                let readiness = match self
-                    .services
-                    .agent_control
-                    .begin_terminal_publication(self.thread_id)
-                    .await
-                {
-                    Ok(closing_guard) => {
-                        terminal_tree_closing = Some(closing_guard);
-                        self.services
-                            .agent_control
-                            .task_coordinator()
-                            .prepare_root_terminal_completion(&turn_context.session_telemetry)
-                            .await
-                            .map_err(|error| error.to_string())
-                    }
-                    Err(error) => Err(error.to_string()),
-                };
-                let decision = match readiness {
-                    Ok(()) => {
-                        self.services
-                            .completion_proof
-                            .check_gate_with_workspace(&self.services.git_workspace)
-                            .await
-                    }
-                    Err(message) => {
-                        crate::completion_proof::CompletionProofGateDecision::Blocked { message }
-                    }
-                };
-                match decision {
-                    crate::completion_proof::CompletionProofGateDecision::Accepted => {
-                        self.release_completion_output(turn_context.as_ref()).await;
-                        None
-                    }
-                    crate::completion_proof::CompletionProofGateDecision::Blocked { message } => {
-                        turn_context.discard_completion_output().await;
-                        turn_context.mark_completion_proof_terminal_blocked();
-                        last_agent_message = None;
-                        surfaced_result = None;
-                        Some(ErrorEvent {
-                            message: format!(
-                                "CompletionProofGate blocked terminal success: {message}"
-                            ),
-                            codex_error_info: Some(CodexErrorInfo::Other),
-                        })
-                    }
-                }
-            } else {
-                let typed_v2_child = turn_context.multi_agent_version == MultiAgentVersion::V2
-                    && matches!(
-                        &turn_context.session_source,
-                        SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
-                            agent_path: Some(_),
-                            ..
-                        })
-                    );
-                if !typed_v2_child {
-                    self.release_completion_output(turn_context.as_ref()).await;
-                }
-                None
-            }
-        } else {
-            turn_context.discard_completion_output().await;
-            last_agent_message = None;
-            surfaced_result = None;
-            None
         };
-        let completion_gate_blocked =
-            completion_gate_error.is_some() || turn_context.completion_proof_terminal_blocked();
-        let error = completion_gate_error.or(existing_error);
-        let last_agent_message = if completion_gate_blocked {
-            None
-        } else if last_agent_message.is_none()
+        let last_agent_message = if last_agent_message.is_none()
             && surfaced_result.is_none()
             && turn_context.final_output_json_schema.is_none()
         {
@@ -1416,8 +1320,6 @@ impl Session {
         if let Err(err) = self.flush_rollout().await {
             warn!("failed to flush rollout after emitting terminal turn event: {err}");
         }
-        drop(terminal_tree_closing);
-        drop(terminal_workspace_operation);
 
         if cleared_active_turn {
             self.emit_thread_idle_lifecycle_if_idle().await;
@@ -1450,7 +1352,6 @@ impl Session {
         turn_context
             .turn_metadata_state
             .cancel_git_enrichment_task();
-        turn_context.discard_completion_output().await;
         turn_context.turn_timing_state.begin_finalization();
         let timing_snapshot = turn_context.turn_timing_state.complete_snapshot();
         let timing = timing_snapshot.protocol_timing();

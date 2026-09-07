@@ -204,10 +204,8 @@ async fn spawn_process_with_stdin_mode(
         // ensures that a child returned after this future times out is terminated when the
         // detached spawn result is discarded.
         command.kill_on_drop(true);
-        run_windows_process_operation(WINDOWS_PROCESS_OPERATION_TIMEOUT, move || {
-            crate::with_windows_child_creation(|_| command.spawn())
-        })
-        .await?
+        run_windows_process_operation(WINDOWS_PROCESS_OPERATION_TIMEOUT, move || command.spawn())
+            .await?
     };
     #[cfg(not(windows))]
     let mut child = command.spawn()?;
