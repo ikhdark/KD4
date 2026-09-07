@@ -686,7 +686,17 @@ impl ExecCommandHandler {
             } else if let Some(attempt) = session
                 .services
                 .completion_proof
-                .prepare_focused_attempt(&hook_command, permission_cwd)
+                .prepare_focused_attempt(
+                    &hook_command,
+                    permission_cwd,
+                    match &command_invocation {
+                        crate::tools::handlers::command_shape::CommandInvocation::Argv {
+                            program,
+                            args,
+                        } => Some((program.as_str(), args.as_slice())),
+                        _ => None,
+                    },
+                )
                 .await
                 .map_err(FunctionCallError::RespondToModel)?
             {

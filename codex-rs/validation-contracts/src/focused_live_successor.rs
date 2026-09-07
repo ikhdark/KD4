@@ -903,11 +903,23 @@ impl FocusedLiveSuccessorCatalogV1 {
 
         for (test_id, successor) in &successors {
             let entry = resolved_entries[test_id];
-            let current = current_inventory.get(test_id).ok_or_else(|| {
-                ContractError::InvalidContract(format!(
-                    "successor {test_id} is absent from current inventory"
-                ))
-            })?;
+            let current = current_inventory
+                .get(test_id)
+                .or_else(|| {
+                    // Historical unittest mappings may retain their native label.
+                    // Bind it to the exact collected canonical inventory identity.
+                    current_inventory
+                        .get(format!("python-unittest::{test_id}").as_str())
+                        .filter(|row| {
+                            matches!(row.framework, FocusedInventoryFrameworkV1::PythonUnittest)
+                                && row.native_id == *test_id
+                        })
+                })
+                .ok_or_else(|| {
+                    ContractError::InvalidContract(format!(
+                        "successor {test_id} is absent from current inventory"
+                    ))
+                })?;
             match (&entry.executable_identity, entry.test_route_id) {
                 (
                     ExecutableIdentityV1::Test {

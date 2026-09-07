@@ -231,7 +231,7 @@
         "format_id": { "const": "kd4.focused-replacement-approval-receipt.v1" },
         "schema_version": { "const": 1 },
         "attempt_id": { "$ref": "#/$defs/nonemptyString" },
-        "focused_validation_id": { "const": "inventory.frozen-reconciliation" },
+        "focused_validation_id": { "enum": ["inventory.frozen-reconciliation", "inventory.transition-readiness"] },
         "receipt_sha256": { "$ref": "#/$defs/sha256" }
       }
     },

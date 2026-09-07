@@ -47,6 +47,7 @@ impl FocusedReplacementApprovalReceiptV1 {
     pub const FORMAT_ID: &'static str = "kd4.focused-replacement-approval-receipt.v1";
     pub const HASH_DOMAIN: &'static str = "kd4.focused-replacement-approval-receipt.v1";
     pub const FOCUSED_VALIDATION_ID: &'static str = "inventory.frozen-reconciliation";
+    pub const TRANSITION_VALIDATION_ID: &'static str = "inventory.transition-readiness";
     pub const CLASSIFICATION: &'static str = "confirmed-pass";
 
     pub fn parse_canonical(bytes: &[u8]) -> Result<Self, ContractError> {
@@ -61,7 +62,10 @@ impl FocusedReplacementApprovalReceiptV1 {
         canonical_jcs_of(self)?;
         if self.format_id != Self::FORMAT_ID
             || self.schema_version != 1
-            || self.focused_validation_id != Self::FOCUSED_VALIDATION_ID
+            || !matches!(
+                self.focused_validation_id.as_str(),
+                Self::FOCUSED_VALIDATION_ID | Self::TRANSITION_VALIDATION_ID
+            )
             || self.classification != Self::CLASSIFICATION
             || self.mutation_epoch > 9_007_199_254_740_991
         {

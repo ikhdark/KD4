@@ -103,6 +103,65 @@ const REQUIRED_FAILURE_TOOL_NAME: &str = "completion_proof_required_failure";
 const MAX_REGULAR_LOGICAL_GENERATIONS: usize = 32;
 const TOTAL_GENERATIONS_WITH_FORCED_TERMINAL: usize = MAX_REGULAR_LOGICAL_GENERATIONS + 1;
 
+#[test]
+fn inventory_v2_activation_rejects_public_approval_and_untrusted_policy() -> Result<()> {
+    run_session_path_test(
+        "inventory_v2_activation_rejects_public_approval_and_untrusted_policy",
+        inventory_v2_activation_rejects_public_approval_and_untrusted_policy_impl,
+    )
+}
+
+async fn inventory_v2_activation_rejects_public_approval_and_untrusted_policy_impl() -> Result<()> {
+    let fixture = CompletionProofFixture::new()?;
+    let config = fixture
+        .repo_path
+        .join(".codex/validation/completion-proof.toml");
+    let before = fs::read(&config)?;
+    let harness = fixture.harness_with_raw_response_items().await?;
+    mount_sse_sequence(
+        harness.server(),
+        vec![
+            sse(vec![
+                ev_response_created("forged-activation"),
+                ev_function_call(
+                    "public-activation",
+                    "activate_inventory_v2",
+                    r#"{"approved":true,"receipt":"self-authored"}"#,
+                ),
+                ev_completed("forged-activation"),
+            ]),
+            sse(vec![
+                ev_response_created("untrusted-activation"),
+                ev_function_call("untrusted-activation", "activate_inventory_v2", "{}"),
+                ev_completed("untrusted-activation"),
+            ]),
+            required_failure_call_response("stop-activation"),
+        ],
+    )
+    .await;
+    let events =
+        submit_and_collect(harness.test(), "exercise the activation authority boundary").await?;
+    assert!(
+        function_call_output(&events, "public-activation")
+            .context("missing public approval rejection")?
+            .contains("accepts no caller-authored")
+    );
+    assert!(
+        function_call_output(&events, "untrusted-activation")
+            .context("missing policy rejection")?
+            .contains("requires the compiled KD4 authority")
+    );
+    assert_eq!(fs::read(config)?, before);
+    assert!(
+        !fixture
+            .repo_path
+            .join(".codex/validation/inventory-generations")
+            .exists()
+    );
+    assert!(!fixture.marker_path.exists());
+    Ok(())
+}
+
 const QUALITY_TEST_ID: &str = "__main__.PriceContract.test_discount";
 const QUALITY_TEST_BODY: &str = r#"    def test_discount(self):
         result = subprocess.run([sys.executable, '-B', 'src/product.py', '100'], capture_output=True, text=True, check=True)
@@ -128,10 +187,21 @@ fn test_discount() {
 
 fn install_rust_quality_test(fixture: &CompletionProofFixture) -> Result<()> {
     fs::remove_file(fixture.repo_path.join("src/test_behavior.py"))?;
-    fs::write(
-        fixture.repo_path.join("src/test_behavior.rs"),
-        QUALITY_RUST_TEST_BODY,
-    )?;
+    let neighbor = r#"#[cfg(test)]
+mod stable_neighbor {
+    fn invalid_price_is_rejected() -> bool {
+        !std::process::Command::new("python")
+            .args(["-B", "src/product.py", "invalid"])
+            .output().unwrap().status.success()
+    }
+    #[test]
+    fn unchanged_crlf_neighbor() {
+        assert!(invalid_price_is_rejected());
+    }
+}
+"#;
+    let current = format!("{QUALITY_RUST_TEST_BODY}\n{neighbor}");
+    fs::write(fixture.repo_path.join("src/test_behavior.rs"), &current)?;
     let path = fixture.repo_path.join("focused.py");
     let mut script = fs::read_to_string(&path)?;
     let needle = "launch_target_identity = start_identity(sys.executable)";
@@ -161,6 +231,45 @@ launch_target_identity = start_identity(sys.executable if VALIDATION_ID == 'fixt
         &fixture.repo_path,
         &["commit", "--quiet", "--amend", "--no-edit"],
     )?;
+    install_mixed_eol_quality_baseline(
+        fixture,
+        "src/test_behavior.rs",
+        &current.replace(
+            "assert_eq!(actual.trim(), \"95\")",
+            "assert_eq!(actual.trim(), \"100\")",
+        ),
+        &current,
+    )?;
+    Ok(())
+}
+
+fn install_mixed_eol_quality_baseline(
+    fixture: &CompletionProofFixture,
+    relative: &str,
+    baseline: &str,
+    current: &str,
+) -> Result<()> {
+    assert_ne!(
+        baseline, current,
+        "fixture needs a substantive assertion change"
+    );
+    run_git(&fixture.repo_path, &["config", "core.autocrlf", "false"])?;
+    let baseline = baseline.replace("\r\n", "\n").replace('\n', "\r\n");
+    let path = fixture.repo_path.join(relative);
+    fs::write(&path, &baseline)?;
+    run_git(&fixture.repo_path, &["add", relative])?;
+    run_git(
+        &fixture.repo_path,
+        &["commit", "--quiet", "--amend", "--no-edit"],
+    )?;
+    let stored = Command::new("git")
+        .args(["show", &format!("HEAD:{relative}")])
+        .current_dir(&fixture.repo_path)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .output()?;
+    anyhow::ensure!(stored.status.success(), "read mixed-EOL fixture baseline");
+    assert_eq!(stored.stdout, baseline.as_bytes());
+    fs::write(path, current)?;
     Ok(())
 }
 
@@ -236,7 +345,7 @@ fn install_quality_behavior_fixture(
     )?;
     fs::write(
         fixture.repo_path.join("fix_price.py"),
-        "from pathlib import Path\nPath('src/product.py').write_text('import sys\\nprint(int(sys.argv[1]) - 5)\\n')\n",
+        "from pathlib import Path\nPath('src/product.py').write_bytes(b'import sys\\nprint(int(sys.argv[1]) - 5)\\n')\n",
     )?;
     run_git(
         &fixture.repo_path,
@@ -330,6 +439,63 @@ enum QualityScenario {
     ChangedAssertions,
     OmittedTest,
     ForgedAttempt,
+    PinnedProduct,
+    PartialBatch,
+    Retired,
+    RetirementWithoutAuthority,
+    OmittedRetirement,
+    AlteredRetirement,
+    RetirementWithoutReplacement,
+}
+
+impl QualityScenario {
+    fn reviews_retirement(self) -> bool {
+        matches!(
+            self,
+            Self::Retired
+                | Self::RetirementWithoutAuthority
+                | Self::OmittedRetirement
+                | Self::AlteredRetirement
+                | Self::RetirementWithoutReplacement
+        )
+    }
+}
+
+const QUALITY_RETIREMENT_REQUEST: &str = "Retire the old identity-price behavior and its tests; the price CLI must subtract five instead.";
+const QUALITY_RETIRED_BODY: &str = "    def test_legacy_identity(self):\n        result = subprocess.run([sys.executable, '-B', 'src/product.py', '100'], capture_output=True, text=True, check=True)\n        self.assertEqual(result.stdout.strip(), '100')\n";
+
+#[test]
+fn test_quality_retired_tests_require_authorized_behavior_replacement() -> Result<()> {
+    run_session_path_test(
+        "test_quality_retired_tests_require_authorized_behavior_replacement",
+        || async {
+            let mut errors = Vec::new();
+            for scenario in [
+                QualityScenario::Retired,
+                QualityScenario::RetirementWithoutAuthority,
+                QualityScenario::OmittedRetirement,
+                QualityScenario::AlteredRetirement,
+                QualityScenario::RetirementWithoutReplacement,
+            ] {
+                if let Err(error) = run_quality_scenario(scenario).await {
+                    errors.push(format!("{scenario:?}: {error:#}"));
+                }
+            }
+            anyhow::ensure!(errors.is_empty(), "{}", errors.join("\n"));
+            Ok(())
+        },
+    )
+}
+
+#[test]
+fn test_quality_reviews_pinned_product_and_keeps_unreviewed_batch_blocked() -> Result<()> {
+    run_session_path_test(
+        "test_quality_reviews_pinned_product_and_keeps_unreviewed_batch_blocked",
+        || async {
+            run_quality_scenario(QualityScenario::PinnedProduct).await?;
+            run_quality_scenario(QualityScenario::PartialBatch).await
+        },
+    )
 }
 
 #[test]
@@ -385,6 +551,28 @@ fn quality_review_result(
             .as_str()
             .is_some_and(|s| s.contains("independently review test QUALITY"))
     );
+    let format = &body["text"]["format"];
+    assert_eq!(
+        format["type"], "json_schema",
+        "the real reviewer request must constrain its result"
+    );
+    assert_eq!(format["strict"], true);
+    let declaration_schema =
+        &format["schema"]["properties"]["retirements"]["items"]["properties"]["declaration"];
+    assert_eq!(
+        declaration_schema["type"], "object",
+        "a retirement signature string is not a declaration"
+    );
+    assert_eq!(declaration_schema["additionalProperties"], false);
+    for field in ["name", "body", "context"] {
+        assert_eq!(declaration_schema["properties"][field]["type"], "string");
+        assert!(
+            declaration_schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!(field))
+        );
+    }
     let packet = body["input"]
         .as_array()
         .expect("review input")
@@ -405,15 +593,126 @@ fn quality_review_result(
         "failed"
     );
     assert_eq!(
-        packet["passing_executions"][FIXTURE_VALIDATION_ID]["report"]["outcomes"][0]["outcome"],
+        packet["passing_executions"]
+            .as_object()
+            .expect("retained passing executions")
+            .values()
+            .find(|execution| execution["report"]["id"] == FIXTURE_VALIDATION_ID)
+            .expect("a prior actual pass must remain visible, even when revoked")["report"]["outcomes"]
+            [0]["outcome"],
         "passed"
     );
-    let review = json!({"approved":true,"explanation":"The actual CLI returns 100 in the broken run and 95 after the product correction. The same assertion checks the explicit user's 95 contract.",
-                        "evaluated_test_paths":[test_path],"input_paths":[test_path,"src/product.py"],"obligations":[{
+    if matches!(
+        scenario,
+        QualityScenario::Accepted | QualityScenario::RustAccepted
+    ) {
+        let required = packet["required_test_declarations"][test_path]
+            .as_array()
+            .expect("current test declarations");
+        assert_eq!(
+            required.len(),
+            1,
+            "unchanged CRLF neighbors are not new obligations"
+        );
+        assert_eq!(required[0]["name"], "test_discount");
+        assert_eq!(
+            required[0]["body"], test_body,
+            "review still receives the exact current body"
+        );
+        let comparison = packet["comparison_index"]
+            .as_array()
+            .expect("runtime comparison navigation")
+            .iter()
+            .find(|entry| entry["test_id"] == test_id)
+            .expect("current test comparison");
+        assert!(
+            comparison["current_passing_attempt_ids"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|id| {
+                    packet["passing_executions"]
+                        .as_object()
+                        .unwrap()
+                        .values()
+                        .any(|pass| &pass["attempt_id"] == id)
+                })
+        );
+        assert!(
+            comparison["unchanged_failing_attempt_ids"]
+                .as_array()
+                .unwrap()
+                .contains(&packet["failing_executions"][FIXTURE_VALIDATION_ID]["attempt_id"])
+        );
+    }
+    if scenario == QualityScenario::ChangedAssertions {
+        assert!(
+            packet["comparison_index"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|entry| entry["test_id"] == test_id)
+                .all(|entry| entry["unchanged_failing_attempt_ids"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()),
+            "a failed different assertion must not be suggested as an unchanged comparison"
+        );
+    }
+    let mut review = json!({"approved":true,"explanation":"The actual CLI returns 100 in the broken run and 95 after the product correction. The same assertion checks the explicit user's 95 contract.",
+                        "evaluated_test_paths":[test_path],"input_paths":[test_path,"src/product.py"],"retirements":[],"obligations":[{
                             "validation_id":FIXTURE_VALIDATION_ID,"test_id":test_id,"test_path":test_path,"test_body":test_body,
                             "oracle_source":"Current user request: input 100 must output 95","expected_behavior":"subtract five from the CLI input","runtime_path":"python src/product.py 100 subprocess stdout",
                             "defect_explanation":"The product returned its input without applying the five-unit discount; the unchanged assertion failed on 100 and passed on 95.",
                             "failed_attempt_id":if scenario == QualityScenario::ForgedAttempt { json!("author-invented-attempt") } else { packet["failing_executions"][FIXTURE_VALIDATION_ID]["attempt_id"].clone() },"product_paths":["src/product.py"]}]});
+    if scenario.reviews_retirement() {
+        let retired = packet["retired_test_declarations"]
+            .as_object()
+            .expect("runtime-derived retired declarations");
+        assert_eq!(
+            retired.len(),
+            2,
+            "both rename and deleted file stay obligations"
+        );
+        let mut retirements = Vec::new();
+        for (path, declarations) in retired {
+            assert!(matches!(
+                path.as_str(),
+                "src/test_behavior.py" | "src/retired_test.py"
+            ));
+            let declarations = declarations.as_array().expect("retired tests");
+            assert_eq!(declarations.len(), 1);
+            let declaration = &declarations[0];
+            assert_eq!(declaration["name"], "test_legacy_identity");
+            assert_eq!(declaration["body"], QUALITY_RETIRED_BODY);
+            retirements.push(json!({
+                "test_path":path,"declaration":declaration,
+                "authorization_quote":QUALITY_RETIREMENT_REQUEST,
+                "explanation":"The user retired identity pricing. The unchanged subprocess assertion now requires the five-unit discount and detects the old identity behavior.",
+                "replacement_validation_id":FIXTURE_VALIDATION_ID,"replacement_test_id":test_id
+            }));
+        }
+        match scenario {
+            QualityScenario::RetirementWithoutAuthority => {
+                retirements[0]["authorization_quote"] =
+                    json!("Invented permission to delete every test");
+            }
+            QualityScenario::OmittedRetirement => {
+                retirements.pop();
+            }
+            QualityScenario::AlteredRetirement => {
+                retirements[0]["declaration"]["body"] =
+                    json!("    def test_legacy_identity(self): pass\n");
+            }
+            QualityScenario::RetirementWithoutReplacement => {
+                retirements[0]["replacement_test_id"] = json!("unexecuted.replacement");
+            }
+            _ => {}
+        }
+        review["evaluated_test_paths"] = json!([test_path, "src/retired_test.py"]);
+        review["input_paths"] = json!([test_path, "src/product.py", "src/retired_test.py"]);
+        review["retirements"] = json!(retirements);
+    }
     review
 }
 
@@ -425,15 +724,740 @@ fn test_quality_rechecks_unchanged_test_after_later_regression() -> Result<()> {
     )
 }
 
+fn quality_fixture_yielded_process(request: &wiremock::Request) -> Option<u32> {
+    let body: serde_json::Value = serde_json::from_slice(&request.body).ok()?;
+    // Older results stay in the request history. Only the latest result can
+    // describe the command that this model response must finish collecting.
+    let result = body["input"]
+        .as_array()?
+        .iter()
+        .rev()
+        .find(|item| item["type"] == "function_call_output")?;
+    let tail = result["output"]
+        .as_str()?
+        .strip_prefix("Process running with session ID ")?;
+    tail.split(|c: char| !c.is_ascii_digit())
+        .next()?
+        .parse()
+        .ok()
+}
+
+#[test]
+fn test_quality_accepts_batched_corrections_and_rejects_uncovered_versions() -> Result<()> {
+    run_session_path_test(
+        "test_quality_accepts_batched_corrections_and_rejects_uncovered_versions",
+        || async {
+            use futures::FutureExt;
+            let mut errors = Vec::new();
+            for (review_other, mismatched_before) in [(true, false), (false, false), (true, true)] {
+                let result = std::panic::AssertUnwindSafe(run_quality_batch_scenario(
+                    review_other,
+                    mismatched_before,
+                    false,
+                ))
+                .catch_unwind()
+                .await;
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => errors.push(format!(
+                        "review_other={review_other}, mismatched_before={mismatched_before}: {error:#}"
+                    )),
+                    Err(_) => errors.push(format!(
+                        "review_other={review_other}, mismatched_before={mismatched_before}: assertion failed"
+                    )),
+                }
+            }
+            anyhow::ensure!(errors.is_empty(), "{}", errors.join("\n"));
+            Ok(())
+        },
+    )
+}
+
+#[test]
+fn test_quality_reaches_review_with_hash_bound_oversized_workspace_diff() -> Result<()> {
+    run_session_path_test(
+        "test_quality_reaches_review_with_hash_bound_oversized_workspace_diff",
+        || async { run_quality_batch_scenario(true, false, true).await },
+    )
+}
+
+async fn run_quality_batch_scenario(
+    review_other: bool,
+    mismatched_before: bool,
+    oversized_diff: bool,
+) -> Result<()> {
+    use base64::Engine;
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+    let fixture = CompletionProofFixture::new()?;
+    install_quality_behavior_fixture(&fixture, false)?;
+    if oversized_diff {
+        let path = fixture.repo_path.join("src/test_behavior.py");
+        let source = fs::read_to_string(&path)?;
+        fs::write(
+            path,
+            format!(
+                "import sys\nsys.stderr.write('DIAGNOSTIC-BEGIN\\n' + 'padding\\n' * 1600 + 'DIAGNOSTIC-END\\n')\n{source}"
+            ),
+        )?;
+    }
+    let other_path = "src/other/test_product.py";
+    let other_source = fs::read_to_string(fixture.repo_path.join(other_path))?;
+    fs::write(
+        fixture.repo_path.join(other_path),
+        other_source.replace("'updated'", "'baseline'"),
+    )?;
+    fs::write(
+        fixture.repo_path.join("fix_both.py"),
+        "import runpy\nrunpy.run_path('fix_price.py')\nrunpy.run_path('change_other.py')\n",
+    )?;
+    fs::write(
+        fixture.repo_path.join("change_intermediate.py"),
+        "from pathlib import Path\nPath('src/other/product.py').write_text(\"print('intermediate')\\n\")\n",
+    )?;
+    let generated_path = "src/generated/catalog.json";
+    let review_input_paths = (0..129)
+        .map(|index| format!("src/generated/review-input-{index}.json"))
+        .collect::<Vec<_>>();
+    if oversized_diff {
+        fs::create_dir_all(fixture.repo_path.join("src/generated"))?;
+        fs::write(
+            fixture.repo_path.join(generated_path),
+            "{\"begin\":\"BASELINE-BEGIN\",\"data\":\"\",\"end\":\"BASELINE-END\"}\n",
+        )?;
+        run_git(&fixture.repo_path, &["add", generated_path])?;
+    }
+    run_git(
+        &fixture.repo_path,
+        &["add", other_path, "fix_both.py", "change_intermediate.py"],
+    )?;
+    run_git(
+        &fixture.repo_path,
+        &["commit", "--quiet", "--amend", "--no-edit"],
+    )?;
+    fs::write(fixture.repo_path.join(other_path), &other_source)?;
+    if oversized_diff {
+        // Escaping makes the serialized diff exceed the review's wire limit.
+        // The source itself remains small enough for ordinary input capture.
+        let generated = serde_json::json!({
+            "begin": "OVERSIZED-DIFF-BEGIN",
+            "data": "\"".repeat(700 * 1024),
+            "end": "OVERSIZED-DIFF-END",
+        })
+        .to_string()
+            + "\n";
+        assert!(generated.len() < 2 * 1024 * 1024);
+        assert!(serde_json::to_string(&generated)?.len() > 2 * 1024 * 1024);
+        let parsed: serde_json::Value = serde_json::from_str(&generated)?;
+        assert_eq!(parsed["begin"], "OVERSIZED-DIFF-BEGIN");
+        assert_eq!(parsed["end"], "OVERSIZED-DIFF-END");
+        fs::write(fixture.repo_path.join(generated_path), generated)?;
+        // A real review can reference more artifacts than the inactive-output
+        // retention count. Capture distinct inputs through the ordinary runner
+        // before asking the child to read its earliest diff/source artifacts.
+        for (index, path) in review_input_paths.iter().enumerate() {
+            fs::write(
+                fixture.repo_path.join(path),
+                format!("{{\"input\":{index}}}\n"),
+            )?;
+        }
+        // Introduce the faulty discount after the baseline commit so the real
+        // execution captures this changed product's historical source. The
+        // unchanged assertion must reject zero and accept the later five.
+        fs::write(
+            fixture.repo_path.join("src/product.py"),
+            "import sys\nprint(int(sys.argv[1]) - 0)\n",
+        )?;
+    }
+    let price_source = fs::read(fixture.repo_path.join("src/test_behavior.py"))?;
+    let historical_product_source = fs::read(fixture.repo_path.join("src/product.py"))?;
+    let corrected_product_source = b"import sys\nprint(int(sys.argv[1]) - 5)\n".to_vec();
+    assert_ne!(historical_product_source, corrected_product_source);
+    let harness = fixture.harness_with_raw_response_items().await?;
+    let reviews = Arc::new(AtomicUsize::new(0));
+    let observed_reviews = Arc::clone(&reviews);
+    let review_repo = fixture.repo_path.clone();
+    let expected_historical_product_source = historical_product_source.clone();
+    let expected_corrected_product_source = corrected_product_source.clone();
+    let boundary_errors = Arc::new(Mutex::new(Vec::<String>::new()));
+    let review_errors = Arc::clone(&boundary_errors);
+    let schema_errors = Arc::clone(&boundary_errors);
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path_regex(".*/responses"))
+        .and(|request: &wiremock::Request| {
+            serde_json::from_slice::<serde_json::Value>(&request.body)
+                .ok()
+                .is_some_and(|body| {
+                    body["instructions"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("independently review test QUALITY"))
+                })
+        })
+        .respond_with(move |request: &wiremock::Request| {
+            let review_step = observed_reviews.fetch_add(1, Ordering::SeqCst);
+            let mut review = quality_review_result(
+                request,
+                QualityScenario::Accepted,
+                "src/test_behavior.py",
+                QUALITY_TEST_BODY,
+                QUALITY_TEST_ID,
+            );
+            if review_other {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                let packet = body["input"]
+                    .as_array().unwrap().iter()
+                    .flat_map(|item| item["content"].as_array().into_iter().flatten())
+                    .filter_map(|item| item["text"].as_str())
+                    .filter_map(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+                    .find(|value| value.get("changed_test_paths").is_some()).unwrap();
+                if oversized_diff {
+                    let reference = &packet["workspace_diff"];
+                    // The reviewer must read the bytes through its own tool
+                    // capability, not through a Command run by this mock server.
+                    let inspected = (|| -> Result<()> {
+                        anyhow::ensure!(reference["kind"] == "tool-output-reference-v1", "oversized diff has no reviewer-readable artifact");
+                        anyhow::ensure!(reference["repository_root"].as_str() == Some(review_repo.to_string_lossy().as_ref()), "diff repository changed");
+                        anyhow::ensure!(reference["workspace_fingerprint"].as_str().is_some_and(|value| value.len() == 64), "missing workspace binding");
+                        let bytes = reference["byte_length"].as_u64().context("missing diff length")?;
+                        anyhow::ensure!(bytes > 4096, "fixture did not produce an oversized diff");
+                        if review_step == 0 {
+                            anyhow::ensure!(packet["source_blobs"].as_object().context("source blobs")?.len() > 128, "fixture did not cross inactive artifact retention");
+                            return Ok(());
+                        }
+                        let output = body["input"].as_array().context("review inputs")?.iter()
+                            .find(|item| item["type"] == "function_call_output" && item["call_id"] == "review-read-diff")
+                            .context("reviewer's actual read result was not returned")?;
+                        let encoded = match &output["output"] {
+                            serde_json::Value::String(text) => text.clone(),
+                            serde_json::Value::Array(items) => items.iter().filter_map(|item| item["text"].as_str()).collect::<Vec<_>>().join("\n"),
+                            _ => anyhow::bail!("review read did not return text"),
+                        };
+                        let read: serde_json::Value = serde_json::from_str(&encoded)
+                            .with_context(|| format!("reviewer's diff artifact read failed: {encoded}"))?;
+                        anyhow::ensure!(read["artifact_id"] == reference["artifact_id"] && read["canonical_sha256"] == reference["sha256"] && read["canonical_bytes"] == reference["byte_length"], "review read did not verify the exact diff bytes");
+                        anyhow::ensure!(read["complete"] == true && (read.get("unavailable_ranges").is_none() || read["unavailable_ranges"] == json!([])), "review diff read was incomplete");
+                        let mut excerpts = Vec::new();
+                        for selected in read["results"].as_array().context("review read selections")? {
+                            anyhow::ensure!(selected["status"] == "ok" && selected["complete"] == true, "review selection failed");
+                            if let Some(text) = selected["text"].as_str() {
+                                excerpts.extend_from_slice(text.as_bytes());
+                            } else {
+                                excerpts.extend(base64::engine::general_purpose::STANDARD.decode(selected["data_base64"].as_str().context("exact diff bytes")?)?);
+                            }
+                        }
+                        let excerpts = String::from_utf8(excerpts)?;
+                        anyhow::ensure!(excerpts.contains("OVERSIZED-DIFF-BEGIN") && excerpts.contains("OVERSIZED-DIFF-END"), "reviewer could not read both ends of the actual diff");
+                        if review_step >= 2 {
+                            let source = packet["source_blobs"].as_object().context("source blobs")?.values()
+                                .find(|source| source["repository_path"] == "src/test_behavior.py")
+                                .context("current test source reference")?;
+                            let output = body["input"].as_array().context("review inputs")?.iter()
+                                .find(|item| item["type"] == "function_call_output" && item["call_id"] == "review-read-source")
+                                .context("reviewer's source read result was not returned")?;
+                            let encoded = match &output["output"] {
+                                serde_json::Value::String(text) => text.clone(),
+                                serde_json::Value::Array(items) => items.iter().filter_map(|item| item["text"].as_str()).collect::<Vec<_>>().join("\n"),
+                                _ => anyhow::bail!("source read did not return text"),
+                            };
+                            let read: serde_json::Value = serde_json::from_str(&encoded)?;
+                            anyhow::ensure!(read["artifact_id"] == source["artifact_id"] && read["canonical_sha256"] == source["sha256"] && read["canonical_bytes"] == source["byte_length"] && read["complete"] == true, "review source read did not verify exact bytes");
+                            anyhow::ensure!(read["results"][0]["text"].as_str().is_some_and(|text| text.contains(QUALITY_TEST_BODY)), "reviewer could not inspect the unchanged assertion body");
+                        }
+                        if review_step >= 3 {
+                            let source_ref = packet["failing_executions"][FIXTURE_VALIDATION_ID]
+                                ["inputs"]["sources"]["src/product.py"]["source_ref"]
+                                .as_str()
+                                .context("historical product source reference")?;
+                            let source = &packet["source_blobs"][source_ref];
+                            anyhow::ensure!(source["snapshot_path"] == "src/product.py", "historical source lost its snapshot path");
+                            anyhow::ensure!(source.get("repository_path").is_none() && source.get("text").is_none() && source.get("base_source").is_none() && source.get("unified_diff").is_none(), "historical source was not represented only by its reviewer-readable snapshot artifact");
+                            let output = body["input"].as_array().context("review inputs")?.iter()
+                                .find(|item| item["type"] == "function_call_output" && item["call_id"] == "review-read-historical-source")
+                                .context("reviewer's historical source read result was not returned")?;
+                            let encoded = match &output["output"] {
+                                serde_json::Value::String(text) => text.clone(),
+                                serde_json::Value::Array(items) => items.iter().filter_map(|item| item["text"].as_str()).collect::<Vec<_>>().join("\n"),
+                                _ => anyhow::bail!("historical source read did not return text"),
+                            };
+                            let read: serde_json::Value = serde_json::from_str(&encoded)?;
+                            anyhow::ensure!(read["artifact_id"] == source["artifact_id"] && read["canonical_sha256"] == source["sha256"] && read["canonical_bytes"] == source["byte_length"], "historical source read did not verify the exact artifact identity");
+                            anyhow::ensure!(read["complete"] == true && (read.get("unavailable_ranges").is_none() || read["unavailable_ranges"] == json!([])), "historical source read was incomplete");
+                            let selected = &read["results"][0];
+                            anyhow::ensure!(selected["status"] == "ok" && selected["complete"] == true, "historical source selection failed");
+                            let historical_bytes = if let Some(text) = selected["text"].as_str() {
+                                text.as_bytes().to_vec()
+                            } else {
+                                base64::engine::general_purpose::STANDARD.decode(selected["data_base64"].as_str().context("exact historical source bytes")?)?
+                            };
+                            anyhow::ensure!(historical_bytes.len() as u64 == source["byte_length"].as_u64().context("historical source length")?, "historical source byte length changed");
+                            anyhow::ensure!(format!("{:x}", Sha256::digest(&historical_bytes)) == source["sha256"].as_str().context("historical source digest")?, "historical source bytes did not match their digest");
+                            anyhow::ensure!(historical_bytes == expected_historical_product_source, "reviewer did not receive the failed product version");
+                            let current_product_source = fs::read(review_repo.join("src/product.py"))?;
+                            anyhow::ensure!(current_product_source == expected_corrected_product_source, "fixture did not retain the corrected current product version");
+                            anyhow::ensure!(historical_bytes != current_product_source, "historical source artifact was replaced by current product bytes");
+                        }
+                        if review_step >= 4 {
+                            let diagnostic_ref = packet["failing_executions"][FIXTURE_VALIDATION_ID]
+                                ["report"]["diagnostic"]["diagnostic_ref"].as_str().context("complete diagnostic reference")?;
+                            let diagnostic = &packet["diagnostic_blobs"][diagnostic_ref];
+                            let output = body["input"].as_array().context("review inputs")?.iter()
+                                .find(|item| item["type"] == "function_call_output" && item["call_id"] == "review-read-diagnostic")
+                                .context("reviewer's diagnostic read was not returned")?;
+                            let encoded = match &output["output"] {
+                                serde_json::Value::String(text) => text.clone(),
+                                serde_json::Value::Array(items) => items.iter().filter_map(|item| item["text"].as_str()).collect::<Vec<_>>().join("\n"),
+                                _ => anyhow::bail!("diagnostic read did not return text"),
+                            };
+                            let read: serde_json::Value = serde_json::from_str(&encoded)?;
+                            anyhow::ensure!(read["artifact_id"] == diagnostic["artifact_id"] && read["canonical_sha256"] == diagnostic["sha256"] && read["canonical_bytes"] == diagnostic["byte_length"] && read["complete"] == true, "diagnostic read did not verify complete canonical identity");
+                            let mut excerpts = Vec::new();
+                            for selected in read["results"].as_array().context("diagnostic selections")? {
+                                anyhow::ensure!(selected["status"] == "ok" && selected["complete"] == true, "diagnostic selection was incomplete");
+                                if let Some(text) = selected["text"].as_str() {
+                                    excerpts.extend_from_slice(text.as_bytes());
+                                } else {
+                                    excerpts.extend(base64::engine::general_purpose::STANDARD.decode(selected["data_base64"].as_str().context("diagnostic bytes")?)?);
+                                }
+                            }
+                            let excerpts = String::from_utf8(excerpts)?;
+                            anyhow::ensure!(excerpts.contains("DIAGNOSTIC-BEGIN") && excerpts.contains("DIAGNOSTIC-END") && excerpts.contains("AssertionError: '100' != '95'"), "reviewer did not receive both diagnostic ends and the actual outer assertion failure");
+                        }
+                        if review_step >= 5 {
+                            let pass = packet["passing_executions"].as_object().context("passing executions")?.values()
+                                .find(|execution| execution["report"]["id"] == FIXTURE_VALIDATION_ID)
+                                .context("passing price execution")?;
+                            let data_ref = pass["inputs"]["hashes"]["data_ref"].as_str().context("passing input reference")?;
+                            let reference = &packet["input_blobs"][data_ref];
+                            let output = body["input"].as_array().context("review inputs")?.iter()
+                                .find(|item| item["type"] == "function_call_output" && item["call_id"] == "review-read-inputs")
+                                .context("reviewer's input map read was not returned")?;
+                            let encoded = match &output["output"] {
+                                serde_json::Value::String(text) => text.clone(),
+                                serde_json::Value::Array(items) => items.iter().filter_map(|item| item["text"].as_str()).collect::<Vec<_>>().join("\n"),
+                                _ => anyhow::bail!("input map read did not return text"),
+                            };
+                            let read: serde_json::Value = serde_json::from_str(&encoded)?;
+                            anyhow::ensure!(read["artifact_id"] == reference["artifact_id"] && read["canonical_sha256"] == reference["sha256"] && read["canonical_bytes"] == reference["byte_length"] && read["complete"] == true, "input map read did not verify canonical identity");
+                            anyhow::ensure!(read.get("unavailable_ranges").is_none() || read["unavailable_ranges"] == json!([]), "input map has missing ranges");
+                            let selected = &read["results"][0];
+                            anyhow::ensure!(selected["status"] == "ok" && selected["complete"] == true, "input map selection was incomplete");
+                            let bytes = if let Some(text) = selected["text"].as_str() {
+                                text.as_bytes().to_vec()
+                            } else {
+                                base64::engine::general_purpose::STANDARD.decode(selected["data_base64"].as_str().context("exact input map bytes")?)?
+                            };
+                            anyhow::ensure!(bytes.len() as u64 == reference["byte_length"].as_u64().context("input map length")? && format!("{:x}", Sha256::digest(&bytes)) == reference["sha256"].as_str().context("input map digest")?, "input map bytes changed");
+                            let passing: serde_json::Value = serde_json::from_slice(&bytes)?;
+                            anyhow::ensure!(format!("{:x}", Sha256::digest(serde_json::to_vec(&passing)?)) == data_ref, "passing map did not match original input identity");
+                            let failed_ref = packet["failing_executions"][FIXTURE_VALIDATION_ID]["inputs"]["hashes"]["data_ref"].as_str().context("failing input reference")?;
+                            let delta = &packet["input_blobs"][failed_ref];
+                            anyhow::ensure!(delta["base_data"] == data_ref, "failed map lost its passing base");
+                            let mut failing = passing.as_object().context("passing input map")?.clone();
+                            for removed in delta["remove"].as_array().context("removed inputs")? {
+                                failing.remove(removed.as_str().context("removed input path")?);
+                            }
+                            failing.extend(delta["set"].as_object().context("changed inputs")?.clone());
+                            anyhow::ensure!(format!("{:x}", Sha256::digest(serde_json::to_vec(&failing)?)) == failed_ref, "reconstructed failure map lost its original identity");
+                            for (map, product) in [(passing.as_object().unwrap(), &expected_corrected_product_source), (&failing, &expected_historical_product_source)] {
+                                anyhow::ensure!(map["src/product.py"] == format!("file:{}:{:x}", product.len(), Sha256::digest(product)), "reviewer received the wrong product input version");
+                                for (index, path) in review_input_paths.iter().enumerate() {
+                                    let expected = format!("{{\"input\":{index}}}\n");
+                                    anyhow::ensure!(map[path] == format!("file:{}:{:x}", expected.len(), Sha256::digest(expected.as_bytes())), "review input was lost or changed");
+                                }
+                            }
+                        }
+                        Ok(())
+                    })();
+                    if let Err(error) = inspected {
+                        review_errors.lock().unwrap().push(error.to_string());
+                        review["approved"] = json!(false);
+                        review["explanation"] = json!(format!("Required review input could not be verified: {error}"));
+                        return sse_response(terminal_candidate(10, &review.to_string()));
+                    }
+                    if review_step == 0 {
+                        let bytes = reference["byte_length"].as_u64().unwrap();
+                        return sse_response(sse(vec![
+                            ev_response_created("review-read-diff-response"),
+                            ev_function_call("review-read-diff", "read_tool_output", &json!({
+                                "artifact_id": reference["artifact_id"],
+                                "selectors": [{"kind":"bytes","start":0,"end":2048}, {"kind":"bytes","start":bytes-2048,"end":bytes}]
+                            }).to_string()),
+                            ev_completed("review-read-diff-response"),
+                        ]));
+                    }
+                    if review_step == 1 {
+                        let source = packet["source_blobs"].as_object().unwrap().values()
+                            .find(|source| source["repository_path"] == "src/test_behavior.py");
+                        if let Some(source) = source.filter(|source| source["artifact_id"].is_string() && source["byte_length"].is_u64()) {
+                            return sse_response(sse(vec![
+                                ev_response_created("review-read-source-response"),
+                                ev_function_call("review-read-source", "read_tool_output", &json!({
+                                    "artifact_id": source["artifact_id"],
+                                    "selectors": [{"kind":"bytes","start":0,"end":source["byte_length"]}]
+                                }).to_string()),
+                                ev_completed("review-read-source-response"),
+                            ]));
+                        }
+                        review_errors.lock().unwrap().push("current source has no reviewer-readable artifact".to_owned());
+                        review["approved"] = json!(false);
+                        review["explanation"] = json!("Current test source could not be authenticated through the reviewer's tools.");
+                        return sse_response(terminal_candidate(10, &review.to_string()));
+                    }
+                    if review_step == 2 {
+                        let source_ref = packet["failing_executions"][FIXTURE_VALIDATION_ID]
+                            ["inputs"]["sources"]["src/product.py"]["source_ref"]
+                            .as_str();
+                        if let Some(source) = source_ref
+                            .and_then(|source_ref| packet["source_blobs"].get(source_ref))
+                            .filter(|source| source["snapshot_path"] == "src/product.py" && source["artifact_id"].is_string() && source["sha256"].is_string() && source["byte_length"].is_u64())
+                        {
+                            return sse_response(sse(vec![
+                                ev_response_created("review-read-historical-source-response"),
+                                ev_function_call("review-read-historical-source", "read_tool_output", &json!({
+                                    "artifact_id": source["artifact_id"],
+                                    "selectors": [{"kind":"bytes","start":0,"end":source["byte_length"]}]
+                                }).to_string()),
+                                ev_completed("review-read-historical-source-response"),
+                            ]));
+                        }
+                        review_errors.lock().unwrap().push("historical source has no reviewer-readable artifact".to_owned());
+                        review["approved"] = json!(false);
+                        review["explanation"] = json!("Historical product source could not be authenticated through the reviewer's tools.");
+                        return sse_response(terminal_candidate(10, &review.to_string()));
+                    }
+                    if review_step == 3 {
+                        let diagnostic_ref = packet["failing_executions"][FIXTURE_VALIDATION_ID]
+                            ["report"]["diagnostic"]["diagnostic_ref"].as_str();
+                        if let Some(diagnostic) = diagnostic_ref.and_then(|hash| packet["diagnostic_blobs"].get(hash))
+                            .filter(|entry| entry["artifact_id"].is_string() && entry["byte_length"].as_u64().is_some_and(|bytes| bytes > 8000))
+                        {
+                            let bytes = diagnostic["byte_length"].as_u64().unwrap();
+                            return sse_response(sse(vec![
+                                ev_response_created("review-read-diagnostic-response"),
+                                ev_function_call("review-read-diagnostic", "read_tool_output", &json!({
+                                    "artifact_id":diagnostic["artifact_id"],
+                                    "selectors":[{"kind":"bytes","start":0,"end":128},{"kind":"bytes","start":bytes-2048,"end":bytes}]
+                                }).to_string()),
+                                ev_completed("review-read-diagnostic-response"),
+                            ]));
+                        }
+                        review_errors.lock().unwrap().push("complete failure diagnostic has no reviewer-readable artifact".to_owned());
+                        review["approved"] = json!(false);
+                        return sse_response(terminal_candidate(10, &review.to_string()));
+                    }
+                    if review_step == 4 {
+                        let pass = packet["passing_executions"].as_object().unwrap().values()
+                            .find(|execution| execution["report"]["id"] == FIXTURE_VALIDATION_ID).unwrap();
+                        let reference = &packet["input_blobs"][pass["inputs"]["hashes"]["data_ref"].as_str().unwrap()];
+                        if reference["kind"] == "tool-output-reference-v1" && reference["artifact_id"].is_string() && reference["byte_length"].as_u64().is_some_and(|bytes| bytes > 4096) {
+                            return sse_response(sse(vec![
+                                ev_response_created("review-read-inputs-response"),
+                                ev_function_call("review-read-inputs", "read_tool_output", &json!({
+                                    "artifact_id":reference["artifact_id"],
+                                    "selectors":[{"kind":"bytes","start":0,"end":reference["byte_length"]}]
+                                }).to_string()),
+                                ev_completed("review-read-inputs-response"),
+                            ]));
+                        }
+                        review_errors.lock().unwrap().push("large input map has no reviewer-readable artifact".to_owned());
+                        review["approved"] = json!(false);
+                        return sse_response(terminal_candidate(10, &review.to_string()));
+                    }
+                } else {
+                    assert!(packet["workspace_diff"].is_string());
+                }
+                let declarations = packet["required_test_declarations"][other_path].as_array().unwrap();
+                assert_eq!(declarations.len(), 1);
+                review["evaluated_test_paths"] = json!(["src/test_behavior.py", other_path]);
+                let mut input_paths = vec![
+                    "src/test_behavior.py",
+                    "src/product.py",
+                    other_path,
+                    "src/other/product.py",
+                ];
+                if oversized_diff {
+                    input_paths.push(generated_path);
+                    input_paths.extend(review_input_paths.iter().map(String::as_str));
+                }
+                review["input_paths"] = json!(input_paths);
+                review["obligations"].as_array_mut().unwrap().push(json!({
+                    "validation_id":"fixture.other", "test_id":"__main__.OtherContract.test_value",
+                    "test_path":other_path, "test_body":declarations[0]["body"],
+                    "oracle_source":"Current user request: the other CLI must output updated",
+                    "expected_behavior":"the other CLI prints updated",
+                    "runtime_path":"python src/other/product.py subprocess stdout",
+                    "defect_explanation":"The unchanged subprocess assertion rejects the old CLI output and passes after the combined product correction.",
+                    "failed_attempt_id":packet["failing_executions"]["fixture.other"]["attempt_id"],
+                    "product_paths":["src/other/product.py"]
+                }));
+            }
+            sse_response(terminal_candidate(10, &review.to_string()))
+        })
+        .with_priority(1)
+        .up_to_n_times(if oversized_diff { 6 } else { 1 })
+        .mount(harness.server()).await;
+    let polls = Arc::new(AtomicUsize::new(0));
+    let observed_polls = Arc::clone(&polls);
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path_regex(".*/responses"))
+        .and(|request: &wiremock::Request| quality_fixture_yielded_process(request).is_some())
+        .respond_with(move |request: &wiremock::Request| {
+            let poll = observed_polls.fetch_add(1, Ordering::SeqCst);
+            sse_response(write_stdin_call_response(
+                &format!("batch-process-poll-{poll}"),
+                quality_fixture_yielded_process(request).unwrap(),
+            ))
+        })
+        .with_priority(1)
+        .mount(harness.server())
+        .await;
+    let price_command = fixture.exact_focused_command();
+    let other_command = price_command.replace(FIXTURE_VALIDATION_ID, "fixture.other");
+    let mut responses = vec![exec_command_call_response(
+        "batch-price-fails",
+        &price_command,
+        &fixture.repo_path,
+    )];
+    if mismatched_before {
+        responses.push(exec_command_call_response(
+            "different-broken-version",
+            &format!("{} change_intermediate.py", available_python_command()?),
+            &fixture.repo_path,
+        ));
+    }
+    responses.extend([
+        exec_command_call_response("batch-other-fails", &other_command, &fixture.repo_path),
+        exec_command_call_response(
+            "fix-both-products",
+            &format!("{} fix_both.py", available_python_command()?),
+            &fixture.repo_path,
+        ),
+        exec_command_call_response("batch-price-passes", &price_command, &fixture.repo_path),
+        exec_command_call_response("batch-other-passes", &other_command, &fixture.repo_path),
+        sse(vec![
+            ev_response_created("batch-review"),
+            ev_function_call(
+                "batch-review",
+                "review_test_quality",
+                if oversized_diff {
+                    r#"{"test_paths":null}"#
+                } else if review_other {
+                    "{}"
+                } else {
+                    r#"{"test_paths":["src/test_behavior.py"]}"#
+                },
+            ),
+            ev_completed("batch-review"),
+        ]),
+    ]);
+    let accepted = review_other && !mismatched_before;
+    let scripted_calls = responses.len();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed_calls = Arc::clone(&calls);
+    // Tool calls and process polls already consume logical generations. Keep
+    // offering the terminal candidate until the real gate ends the rejected
+    // turn, rather than requiring 32 additional responses after the tools.
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path_regex(".*/responses"))
+        .respond_with(move |request: &wiremock::Request| {
+            let index = observed_calls.fetch_add(1, Ordering::SeqCst);
+            if oversized_diff && index == 0 {
+                // Check the actual provider-facing runtime registration. A mock
+                // provider otherwise accepts a schema the real API rejects.
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                let tool = body["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|tool| tool["name"] == "review_test_quality");
+                let valid = tool.is_some_and(|tool| {
+                    tool["strict"] == true
+                        && tool["parameters"]["additionalProperties"] == false
+                        && tool["parameters"]["required"] == json!(["test_paths"])
+                        && tool["parameters"]["properties"]["test_paths"]["anyOf"]
+                            .as_array()
+                            .is_some_and(|variants| {
+                                variants.iter().any(|v| v["type"] == "null")
+                                    && variants.iter().any(|v| {
+                                        v["type"] == "array" && v["items"]["type"] == "string"
+                                    })
+                            })
+                });
+                if !valid {
+                    schema_errors.lock().unwrap().push(
+                        "real provider would reject the review_test_quality schema".to_owned(),
+                    );
+                }
+            }
+            if let Some(response) = responses.get(index) {
+                return sse_response(response.clone());
+            }
+            if accepted && !oversized_diff {
+                assert_eq!(index, scripted_calls, "unexpected extra model generation");
+            }
+            if oversized_diff && index > scripted_calls {
+                // A rejected review must reach the assertions below promptly.
+                // The successful path ends on the first terminal candidate.
+                return sse_response(required_failure_call_response(
+                    "stop-after-oversized-review-rejection",
+                ));
+            }
+            sse_response(terminal_candidate(
+                index,
+                "Both requested CLI behaviors are corrected and checked.",
+            ))
+        })
+        .up_to_n_times((MAX_REGULAR_LOGICAL_GENERATIONS + 1) as u64)
+        .mount(harness.server())
+        .await;
+    let events = submit_and_collect(harness.test(), "Fix both CLI behaviors together: input 100 must output 95; the other CLI must output updated. Collect both failures, fix both products, then validate both.").await?;
+    for call in ["batch-price-fails", "batch-other-fails"] {
+        assert!(events.iter().any(|event| matches!(event, EventMsg::ExecCommandEnd(end) if end.call_id == call && end.exit_code != 0)));
+    }
+    for call in [
+        "fix-both-products",
+        "batch-price-passes",
+        "batch-other-passes",
+    ] {
+        assert!(events.iter().any(|event| matches!(event, EventMsg::ExecCommandEnd(end) if end.call_id == call && end.exit_code == 0)));
+    }
+    let boundary_errors = boundary_errors.lock().unwrap().clone();
+    assert!(boundary_errors.is_empty(), "{boundary_errors:?}");
+    assert_eq!(
+        function_call_output_success(&events, "batch-review"),
+        Some(accepted),
+        "{:?}",
+        function_call_output(&events, "batch-review")
+    );
+    if !accepted {
+        assert!(
+            function_call_output(&events, "batch-review")
+                .unwrap()
+                .contains("product correction without observed test coverage")
+        );
+        assert!(events.iter().all(|event| !is_assistant_output(event)));
+    }
+    assert!(events.iter().any(|event| matches!(event, EventMsg::TurnComplete(done) if done.error.is_none() == accepted && done.last_agent_message.is_some() == accepted)));
+    assert_eq!(
+        reviews.load(Ordering::SeqCst),
+        if oversized_diff { 6 } else { 1 }
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst)
+            + if accepted {
+                0
+            } else {
+                polls.load(Ordering::SeqCst)
+            },
+        if accepted {
+            scripted_calls + 1
+        } else {
+            MAX_REGULAR_LOGICAL_GENERATIONS + 1
+        },
+        "the actual turn must stop at successful completion or its generation limit"
+    );
+    assert_eq!(
+        fs::read(fixture.repo_path.join("src/test_behavior.py"))?,
+        price_source
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.repo_path.join(other_path))?,
+        other_source
+    );
+    let price_runs =
+        fs::read_to_string(fixture.repo_path.join(".fixture-state/quality-executions"))?;
+    let price_runs = price_runs
+        .lines()
+        .map(serde_json::from_str::<serde_json::Value>)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    assert_eq!(price_runs.len(), 2);
+    assert_eq!(price_runs[0]["actual"], "100");
+    assert_eq!(price_runs[1]["actual"], "95");
+    let other_runs = fs::read_to_string(fixture.repo_path.join(".fixture-state/other-executions"))?;
+    assert_eq!(
+        other_runs.lines().collect::<Vec<_>>(),
+        vec![
+            if mismatched_before {
+                "intermediate"
+            } else {
+                "baseline"
+            },
+            "updated"
+        ]
+    );
+    assert!(!fixture.marker_path.exists());
+    harness.test().codex.shutdown_and_wait().await?;
+    Ok(())
+}
+
 async fn run_quality_scenario(scenario: QualityScenario) -> Result<()> {
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
     let fixture = CompletionProofFixture::new()?;
     let fix = install_quality_behavior_fixture(&fixture, false)?;
+    if scenario == QualityScenario::PinnedProduct {
+        let config_path = fixture
+            .repo_path
+            .join(".codex/validation/completion-proof.toml");
+        let config = fs::read_to_string(&config_path)?;
+        let line = config
+            .lines()
+            .find(|line| line.starts_with("trusted_bundle_paths ="))
+            .context("trusted fixture bundle")?;
+        fs::write(
+            &config_path,
+            config.replace(line, &line.replace(']', ", \"src/product.py\"]")),
+        )?;
+        let path = fixture.repo_path.join("fix_price.py");
+        let script = fs::read_to_string(&path)?;
+        fs::write(
+            path,
+            format!(
+                "{script}import subprocess\nsubprocess.run(['git', 'add', 'src/product.py'], check=True)\nsubprocess.run(['git', 'commit', '--quiet', '-m', 'fixture pinned product correction'], check=True)\n"
+            ),
+        )?;
+        run_git(
+            &fixture.repo_path,
+            &[
+                "add",
+                ".codex/validation/completion-proof.toml",
+                "fix_price.py",
+            ],
+        )?;
+        run_git(
+            &fixture.repo_path,
+            &["commit", "--quiet", "--amend", "--no-edit"],
+        )?;
+    }
+    if scenario == QualityScenario::PartialBatch {
+        // Two consumed data files exceed the old combined prompt-sized capture
+        // limit. A narrow review must retain their identities without needing
+        // their repeated full contents in every execution's model input.
+        for name in ["catalog-a.json", "catalog-b.json"] {
+            fs::write(
+                fixture.repo_path.join("src").join(name),
+                format!("{{\"data\":\"{}\"}}", "x".repeat(1100 * 1024)),
+            )?;
+        }
+        let path = fixture.repo_path.join("src/other/test_product.py");
+        fs::write(
+            &path,
+            format!(
+                "{}\n# Changed fixture remains an independent obligation.\n",
+                fs::read_to_string(&path)?
+            ),
+        )?;
+    }
     let accepted = matches!(
         scenario,
-        QualityScenario::Accepted | QualityScenario::RustAccepted | QualityScenario::Recheck
+        QualityScenario::Accepted
+            | QualityScenario::RustAccepted
+            | QualityScenario::Recheck
+            | QualityScenario::PinnedProduct
+            | QualityScenario::Retired
     );
+    let review_accepted = accepted || scenario == QualityScenario::PartialBatch;
     let (test_path, test_body, test_id) = if scenario == QualityScenario::RustAccepted {
         install_rust_quality_test(&fixture)?;
         (
@@ -444,6 +1468,47 @@ async fn run_quality_scenario(scenario: QualityScenario) -> Result<()> {
     } else {
         ("src/test_behavior.py", QUALITY_TEST_BODY, QUALITY_TEST_ID)
     };
+    if scenario == QualityScenario::Accepted {
+        let focused_path = fixture.repo_path.join("focused.py");
+        let script = fs::read_to_string(&focused_path)?;
+        anyhow::ensure!(
+            script.matches("\nstarted_at =").count() == 1,
+            "native fixture timing boundary"
+        );
+        fs::write(&focused_path, script.replace("\nstarted_at =", "\nif VALIDATION_ID != 'fixture.other':\n    command.append('PriceContract.test_discount')\nstarted_at ="))?;
+        run_git(&fixture.repo_path, &["add", "focused.py"])?;
+        let path = fixture.repo_path.join(test_path);
+        let current = fs::read_to_string(&path)?.replace(
+            "if __name__ == '__main__':",
+            "    def test_rejects_non_numeric_price(self):\n        result = subprocess.run([sys.executable, '-B', 'src/product.py', 'invalid'], capture_output=True)\n        self.assertNotEqual(result.returncode, 0)\n\nif __name__ == '__main__':",
+        );
+        install_mixed_eol_quality_baseline(
+            &fixture,
+            test_path,
+            &current.replace(
+                "self.assertEqual(result.stdout.strip(), '95')",
+                "self.assertEqual(result.stdout.strip(), '100')",
+            ),
+            &current,
+        )?;
+    }
+    if scenario.reviews_retirement() {
+        let path = fixture.repo_path.join(test_path);
+        let current = fs::read_to_string(&path)?;
+        let old = current.replace(QUALITY_TEST_BODY, QUALITY_RETIRED_BODY);
+        fs::write(&path, &old)?;
+        fs::write(fixture.repo_path.join("src/retired_test.py"), old)?;
+        run_git(
+            &fixture.repo_path,
+            &["add", test_path, "src/retired_test.py"],
+        )?;
+        run_git(
+            &fixture.repo_path,
+            &["commit", "--quiet", "--amend", "--no-edit"],
+        )?;
+        fs::write(path, current)?;
+        fs::remove_file(fixture.repo_path.join("src/retired_test.py"))?;
+    }
     if scenario == QualityScenario::ChangedAssertions {
         let path = fixture.repo_path.join("fix_price.py");
         let fix_script = fs::read_to_string(&path)?;
@@ -465,6 +1530,25 @@ async fn run_quality_scenario(scenario: QualityScenario) -> Result<()> {
         fs::write(&path, source.replace("if __name__ == '__main__':", "    def test_missing_behavior(self):\n        self.assertTrue(True)\n\nif __name__ == '__main__':"))?;
     }
     let harness = fixture.harness_with_raw_response_items().await?;
+    // A validation can yield even with a long requested wait. Keep its native
+    // process running and collect its terminal result before the scripted model
+    // changes the product, starts another validation, or requests review.
+    let polls = Arc::new(AtomicUsize::new(0));
+    let observed_polls = Arc::clone(&polls);
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path_regex(".*/responses"))
+        .and(|request: &wiremock::Request| quality_fixture_yielded_process(request).is_some())
+        .respond_with(move |request: &wiremock::Request| {
+            let process = quality_fixture_yielded_process(request).expect("yielded process");
+            let poll = observed_polls.fetch_add(1, Ordering::SeqCst);
+            sse_response(write_stdin_call_response(
+                &format!("quality-process-poll-{poll}"),
+                process,
+            ))
+        })
+        .with_priority(1)
+        .mount(harness.server())
+        .await;
     let source_before = fs::read(fixture.repo_path.join(test_path))?;
     let responses = [
         exec_command_call_response(
@@ -480,7 +1564,15 @@ async fn run_quality_scenario(scenario: QualityScenario) -> Result<()> {
         ),
         sse(vec![
             ev_response_created("quality-review-request"),
-            ev_function_call("quality-review", "review_test_quality", "{}"),
+            ev_function_call(
+                "quality-review",
+                "review_test_quality",
+                if scenario == QualityScenario::PartialBatch {
+                    r#"{"test_paths":["src/test_behavior.py"]}"#
+                } else {
+                    "{}"
+                },
+            ),
             ev_completed("quality-review-request"),
         ]),
     ];
@@ -498,19 +1590,41 @@ async fn run_quality_scenario(scenario: QualityScenario) -> Result<()> {
                 if accepted { assert_eq!(index, 5, "unexpected extra model/review generation"); }
                 sse_response(terminal_candidate(index, "The price CLI now subtracts five, and the regression test detects the original bug."))
             }).up_to_n_times(if accepted { 6 } else { (MAX_REGULAR_LOGICAL_GENERATIONS + 2) as u64 })
-            .expect(if accepted { 6 } else { (MAX_REGULAR_LOGICAL_GENERATIONS + 2) as u64 }).mount(harness.server()).await;
-    let events = submit_and_collect(harness.test(), "Make the price CLI subtract five: input 100 must output 95. Add a regression test and validate this small change.").await?;
+            .mount(harness.server()).await;
+    let mut request = "Make the price CLI subtract five: input 100 must output 95. Add a regression test and validate this small change.".to_owned();
+    if scenario.reviews_retirement() {
+        request.push_str(QUALITY_RETIREMENT_REQUEST);
+    }
+    let events = submit_and_collect(harness.test(), &request).await?;
     assert!(events.iter().any(|e| matches!(e, EventMsg::ExecCommandEnd(end) if end.call_id == "behavior-detects-broken-cli" && end.exit_code != 0)));
     assert!(events.iter().any(|e| matches!(e, EventMsg::ExecCommandEnd(end) if end.call_id == "same-test-passes-corrected-cli" && end.exit_code == 0)));
     assert_eq!(
         function_call_output_success(&events, "quality-review"),
-        Some(accepted),
+        Some(review_accepted),
         "quality tool output: {:?}",
         function_call_output(&events, "quality-review")
     );
     assert!(events.iter().any(|event| matches!(event, EventMsg::TurnComplete(done) if done.error.is_none() == accepted && done.last_agent_message.is_some() == accepted)));
     if !accepted {
         assert!(events.iter().all(|event| !is_assistant_output(event)));
+    }
+    if scenario.reviews_retirement() {
+        assert!(!fixture.repo_path.join("src/retired_test.py").exists());
+        if !review_accepted {
+            let output = function_call_output(&events, "quality-review")
+                .context("missing retirement rejection")?;
+            let expected = match scenario {
+                QualityScenario::OmittedRetirement => "omitted retired test obligations",
+                QualityScenario::AlteredRetirement => {
+                    "changed or duplicated a retired test declaration"
+                }
+                _ => "lacks user authority or a verified behavior replacement",
+            };
+            assert!(
+                output.contains(expected),
+                "wrong retirement rejection: {output}"
+            );
+        }
     }
     if scenario != QualityScenario::ChangedAssertions {
         assert_eq!(fs::read(fixture.repo_path.join(test_path))?, source_before);
@@ -526,7 +1640,12 @@ async fn run_quality_scenario(scenario: QualityScenario) -> Result<()> {
     assert_ne!(executions[0]["execution"], executions[1]["execution"]);
     assert!(!fixture.marker_path.exists());
     assert_eq!(
-        calls.load(Ordering::SeqCst),
+        calls.load(Ordering::SeqCst)
+            + if accepted {
+                0
+            } else {
+                polls.load(Ordering::SeqCst)
+            },
         if accepted {
             6
         } else {
@@ -549,6 +1668,54 @@ async fn run_quality_scenario(scenario: QualityScenario) -> Result<()> {
                 "fixture completed price behavior",
             ],
         )?;
+        fs::write(
+            fixture.repo_path.join("src/product.py"),
+            "import sys\nprint(int(sys.argv[1]))\n",
+        )?;
+        // Restoring the prior correct bytes does not revive a pass that predates
+        // an observed regression, even if a reviewer tries to approve it.
+        let early = [
+            exec_command_call_response(
+                "regression-before-retest",
+                &fixture.exact_focused_command(),
+                &fixture.repo_path,
+            ),
+            exec_command_call_response("restore-before-retest", &fix, &fixture.repo_path),
+            sse(vec![
+                ev_response_created("premature-review"),
+                ev_function_call("premature-review", "review_test_quality", "{}"),
+                ev_completed("premature-review"),
+            ]),
+        ];
+        let early_calls = Arc::new(AtomicUsize::new(0));
+        let observed_early = Arc::clone(&early_calls);
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path_regex(".*/responses"))
+            .respond_with(move |request: &wiremock::Request| {
+                let index = observed_early.fetch_add(1, Ordering::SeqCst);
+                if index < early.len() {
+                    return sse_response(early[index].clone());
+                }
+                if index == early.len() {
+                    let review =
+                        quality_review_result(request, scenario, test_path, test_body, test_id);
+                    return sse_response(terminal_candidate(60, &review.to_string()));
+                }
+                sse_response(terminal_candidate(
+                    index,
+                    "The prior passing bytes were restored.",
+                ))
+            })
+            .up_to_n_times((MAX_REGULAR_LOGICAL_GENERATIONS + 2) as u64)
+            .mount(harness.server())
+            .await;
+        let premature = submit_and_collect(harness.test(), "The price regressed: input 100 must output 95. Restore the code and assess the retained evidence before retesting.").await?;
+        assert_eq!(
+            function_call_output_success(&premature, "premature-review"),
+            Some(false),
+            "an old pass cannot survive a later observed regression"
+        );
+        assert!(premature.iter().all(|event| !is_assistant_output(event)));
         fs::write(
             fixture.repo_path.join("src/product.py"),
             "import sys\nprint(int(sys.argv[1]))\n",
@@ -581,8 +1748,26 @@ async fn run_quality_scenario(scenario: QualityScenario) -> Result<()> {
                     return sse_response(responses[index].clone());
                 }
                 if index == 4 {
-                    let review =
+                    let mut review =
                         quality_review_result(request, scenario, test_path, test_body, test_id);
+                    let body: serde_json::Value =
+                        serde_json::from_slice(&request.body).expect("review JSON");
+                    let packet = body["input"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .flat_map(|item| item["content"].as_array().into_iter().flatten())
+                        .filter_map(|item| item["text"].as_str())
+                        .filter_map(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+                        .find(|value| value.get("failing_executions").is_some())
+                        .expect("quality packet");
+                    let earlier = packet["failing_executions"]
+                        .as_object()
+                        .unwrap()
+                        .iter()
+                        .find(|(key, _)| key.starts_with("attempt:"))
+                        .expect("the earlier observed failure must survive the later regression");
+                    review["obligations"][0]["failed_attempt_id"] = earlier.1["attempt_id"].clone();
                     return sse_response(terminal_candidate(40, &review.to_string()));
                 }
                 assert_eq!(index, 5);
@@ -619,11 +1804,23 @@ async fn run_quality_scenario(scenario: QualityScenario) -> Result<()> {
                 .iter()
                 .map(|e| e["actual"].as_str().unwrap())
                 .collect::<Vec<_>>(),
-            vec!["100", "95", "100", "95"]
+            vec!["100", "95", "100", "100", "95"]
         );
         assert!(!fixture.marker_path.exists());
     }
     if scenario == QualityScenario::Accepted {
+        // The following ordinary turn reloads this authenticated state. Reviews
+        // without retirements must keep the old serialized shape so that their
+        // authentication also survives the newly added optional field.
+        let (_, saved) = read_authenticated_completion_proof_state(
+            harness.test().codex_home_path(),
+            &fixture.repo_path,
+        )?;
+        let quality = saved["state"]["focused_completion"]["quality"]
+            .as_array()
+            .context("persisted quality evidence")?;
+        assert_eq!(quality.len(), 1);
+        assert!(quality[0]["review"].get("retirements").is_none());
         // An unrelated documentation edit runs only its existing doc check.
         // The real behavior executions and independent review remain reusable.
         mount_sse_sequence(
@@ -701,7 +1898,26 @@ async fn run_quality_scenario(scenario: QualityScenario) -> Result<()> {
             "unexpected quality rerun: {:?}",
             function_call_output(&independent, "reuse-price-quality")
         );
-        assert!(independent.iter().any(|event| matches!(event, EventMsg::TurnComplete(done) if done.error.is_none() && done.last_agent_message.is_some())), "independent task did not complete: {:?}", independent.iter().filter(|event| matches!(event, EventMsg::TurnComplete(_) | EventMsg::ExecCommandEnd(_))).collect::<Vec<_>>());
+        let requests = harness
+            .server()
+            .received_requests()
+            .await
+            .unwrap_or_default();
+        let last_input = requests
+            .last()
+            .and_then(|request| serde_json::from_slice::<serde_json::Value>(&request.body).ok())
+            .map(|body| {
+                body["input"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .flat_map(|item| item["content"].as_array().into_iter().flatten())
+                    .filter_map(|item| item["text"].as_str())
+                    .filter(|text| text.contains("CompletionProofGate"))
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            });
+        assert!(independent.iter().any(|event| matches!(event, EventMsg::TurnComplete(done) if done.error.is_none() && done.last_agent_message.is_some())), "independent task did not complete; validation={:?}; last model input={last_input:?}", function_call_output(&independent, "validate-only-independent-product"));
         assert_eq!(
             fs::read_to_string(fixture.repo_path.join(".fixture-state/quality-executions"))?
                 .lines()
@@ -833,15 +2049,51 @@ fn test_quality_changed_doctest_is_unsatisfied_without_remigrating_unchanged_doc
         || async {
             for changed_doctest in [true, false] {
                 let fixture = CompletionProofFixture::new()?;
+                run_git(&fixture.repo_path, &["config", "core.autocrlf", "false"])?;
                 let path = fixture.repo_path.join("src/inline_docs.rs");
+                let eol_only_test_path = fixture.repo_path.join("src/eol_only_test.rs");
+                let mixed_eol_path = fixture.repo_path.join("src/inline_eol.rs");
+                let mixed_eol_source = "pub const VALUE: u8 = 1;\n#[cfg(test)]\nmod tests {\n    fn value() -> u8 { 4 }\n    #[test]\n    fn stable_value() { assert_eq!(value(), 4); }\n}\n";
+                fs::write(&mixed_eol_path, mixed_eol_source.replace('\n', "\r\n"))?;
+                let helper_module_path = fixture.repo_path.join("src/product_helpers.py");
                 let baseline =
                     "//! ```\n//! assert_eq!(2 + 2, 4);\n//! ```\npub const VALUE: u8 = 1;\n";
                 fs::write(&path, baseline)?;
-                run_git(&fixture.repo_path, &["add", "src/inline_docs.rs"])?;
+                let eol_only_baseline =
+                    b"#[test]\r\nfn preserves_behavior() {\r\n    assert_eq!(2 + 2, 4);\r\n}\r\n";
+                fs::write(&eol_only_test_path, eol_only_baseline)?;
+                fs::write(
+                    &helper_module_path,
+                    "def test_normalize_helper(value):\n    return value\n\nDEFAULT_LIMIT = 8\n",
+                )?;
+                run_git(
+                    &fixture.repo_path,
+                    &[
+                        "add",
+                        "src/inline_docs.rs",
+                        "src/eol_only_test.rs",
+                        "src/inline_eol.rs",
+                        "src/product_helpers.py",
+                    ],
+                )?;
                 run_git(
                     &fixture.repo_path,
                     &["commit", "--quiet", "--amend", "--no-edit"],
                 )?;
+                let stored_eol_only_test = Command::new("git")
+                    .args(["show", "HEAD:src/eol_only_test.rs"])
+                    .current_dir(&fixture.repo_path)
+                    .env("GIT_OPTIONAL_LOCKS", "0")
+                    .output()?;
+                anyhow::ensure!(
+                    stored_eol_only_test.status.success(),
+                    "read committed EOL-only test: {}",
+                    String::from_utf8_lossy(&stored_eol_only_test.stderr)
+                );
+                assert_eq!(
+                    stored_eol_only_test.stdout.as_slice(),
+                    eol_only_baseline.as_slice()
+                );
                 fs::write(
                     &path,
                     if changed_doctest {
@@ -849,6 +2101,45 @@ fn test_quality_changed_doctest_is_unsatisfied_without_remigrating_unchanged_doc
                     } else {
                         baseline.replace("VALUE: u8 = 1", "VALUE: u8 = 2")
                     },
+                )?;
+                let eol_only_current =
+                    b"#[test]\nfn preserves_behavior() {\n    assert_eq!(2 + 2, 4);\n}\n";
+                fs::write(&eol_only_test_path, eol_only_current)?;
+                // The surrounding product changes, while the inline test and
+                // its helper change only from CRLF to LF.
+                fs::write(
+                    &mixed_eol_path,
+                    mixed_eol_source.replace("VALUE: u8 = 1", "VALUE: u8 = 2"),
+                )?;
+                fs::write(
+                    &helper_module_path,
+                    "def test_normalize_helper(value):\n    return value.strip()\n\nDEFAULT_LIMIT = 8\n",
+                )?;
+                assert_ne!(eol_only_baseline.as_slice(), eol_only_current.as_slice());
+                assert_eq!(
+                    String::from_utf8_lossy(eol_only_baseline).replace("\r\n", "\n"),
+                    String::from_utf8_lossy(eol_only_current)
+                );
+                let eol_only_diff = Command::new("git")
+                    .args(["diff", "--no-ext-diff", "--", "src/eol_only_test.rs"])
+                    .current_dir(&fixture.repo_path)
+                    .env("GIT_OPTIONAL_LOCKS", "0")
+                    .output()?;
+                anyhow::ensure!(
+                    eol_only_diff.status.success(),
+                    "inspect EOL-only worktree change: {}",
+                    String::from_utf8_lossy(&eol_only_diff.stderr)
+                );
+                assert!(
+                    !eol_only_diff.stdout.is_empty(),
+                    "the EOL-only dedicated test must remain a visible worktree change"
+                );
+                // Line-ending-only edits do not change a dedicated test, and a
+                // normal product helper named test_* is not a unittest test.
+                // Actual inline declarations and changed doctests still count.
+                fs::write(
+                    fixture.repo_path.join("src/test_quality.rs"),
+                    "pub const REVIEW_LIMIT: usize = 8;\n",
                 )?;
                 let harness = fixture.harness_with_raw_response_items().await?;
                 let mut responses = vec![exec_command_call_response(
@@ -1065,7 +2356,21 @@ fn required_tool_failure_extensions() -> Arc<ExtensionRegistry<Config>> {
     Arc::new(builder.build())
 }
 
+type FixtureCredentials =
+    Arc<std::sync::Mutex<Vec<codex_core::test_support::TemporaryCompletionProofCredential>>>;
+
+fn retain_fixture_credential(credentials: &FixtureCredentials, config: &Config) {
+    credentials.lock().expect("fixture credential scope").push(
+        codex_core::test_support::temporary_completion_proof_credential(
+            &config.codex_home,
+            config.cwd.as_path(),
+        )
+        .expect("own only a new disposable fixture credential"),
+    );
+}
+
 struct CompletionProofFixture {
+    credentials: FixtureCredentials,
     _repo: TempDir,
     repo_path: PathBuf,
     marker_path: PathBuf,
@@ -1524,6 +2829,7 @@ subprocess.run(
         )?;
 
         Ok(Self {
+            credentials: Default::default(),
             _repo: repo,
             repo_path,
             marker_path,
@@ -2243,19 +3549,23 @@ text = "the fixture exception remains explicitly quarantined"
 
     async fn harness(&self) -> Result<TestCodexHarness> {
         let cwd = self.repo_path.abs();
+        let credentials = Arc::clone(&self.credentials);
         TestCodexHarness::with_builder(test_codex().with_config(move |config| {
             set_fixture_workspace(config, cwd);
+            retain_fixture_credential(&credentials, config);
         }))
         .await
     }
 
     async fn harness_with_raw_response_items(&self) -> Result<TestCodexHarness> {
         let cwd = self.repo_path.abs();
-        TestCodexHarness::with_builder(
-            test_codex()
-                .with_raw_response_items()
-                .with_config(move |config| set_fixture_workspace(config, cwd)),
-        )
+        let credentials = Arc::clone(&self.credentials);
+        TestCodexHarness::with_builder(test_codex().with_raw_response_items().with_config(
+            move |config| {
+                set_fixture_workspace(config, cwd);
+                retain_fixture_credential(&credentials, config);
+            },
+        ))
         .await
     }
 
@@ -2264,22 +3574,26 @@ text = "the fixture exception remains explicitly quarantined"
         extensions: Arc<ExtensionRegistry<Config>>,
     ) -> Result<TestCodexHarness> {
         let cwd = self.repo_path.abs();
+        let credentials = Arc::clone(&self.credentials);
         TestCodexHarness::with_builder(
             test_codex()
                 .with_raw_response_items()
                 .with_extensions(extensions)
-                .with_config(move |config| set_fixture_workspace(config, cwd)),
+                .with_config(move |config| {
+                    set_fixture_workspace(config, cwd);
+                    retain_fixture_credential(&credentials, config);
+                }),
         )
         .await
     }
 
     async fn harness_with_home(&self, home: Arc<TempDir>) -> Result<TestCodexHarness> {
         let cwd = self.repo_path.abs();
-        TestCodexHarness::with_builder(
-            test_codex()
-                .with_home(home)
-                .with_config(move |config| set_fixture_workspace(config, cwd)),
-        )
+        let credentials = Arc::clone(&self.credentials);
+        TestCodexHarness::with_builder(test_codex().with_home(home).with_config(move |config| {
+            set_fixture_workspace(config, cwd);
+            retain_fixture_credential(&credentials, config);
+        }))
         .await
     }
 
@@ -2288,19 +3602,25 @@ text = "the fixture exception remains explicitly quarantined"
         home: Arc<TempDir>,
     ) -> Result<TestCodexHarness> {
         let cwd = self.repo_path.abs();
+        let credentials = Arc::clone(&self.credentials);
         TestCodexHarness::with_builder(
             test_codex()
                 .with_home(home)
                 .with_raw_response_items()
-                .with_config(move |config| set_fixture_workspace(config, cwd)),
+                .with_config(move |config| {
+                    set_fixture_workspace(config, cwd);
+                    retain_fixture_credential(&credentials, config);
+                }),
         )
         .await
     }
 
     async fn multi_agent_harness(&self) -> Result<TestCodexHarness> {
         let cwd = self.repo_path.abs();
+        let credentials = Arc::clone(&self.credentials);
         TestCodexHarness::with_builder(test_codex().with_config(move |config| {
             set_fixture_workspace(config, cwd);
+            retain_fixture_credential(&credentials, config);
             config
                 .features
                 .enable(Feature::Collab)
@@ -2319,6 +3639,7 @@ text = "the fixture exception remains explicitly quarantined"
 
 #[cfg(windows)]
 struct CurrentEvidenceFixture {
+    credentials: FixtureCredentials,
     _repo: TempDir,
     _outside: TempDir,
     repo_path: PathBuf,
@@ -2380,6 +3701,7 @@ impl CurrentEvidenceFixture {
             String::from_utf8_lossy(&output.stderr)
         );
         Ok(Self {
+            credentials: Default::default(),
             _repo: repo,
             _outside: outside,
             repo_path: repo_path.clone(),
@@ -2424,6 +3746,7 @@ impl CurrentEvidenceFixture {
         multi_agent_v2: bool,
     ) -> Result<TestCodexHarness> {
         let cwd = self.repo_path.abs();
+        let credentials = Arc::clone(&self.credentials);
         let outside = self.outside_path.abs();
         let fake_bin = self.repo_path.join(".fixture-bin");
         let sandbox_temp = self.repo_path.join(".fixture-state/sandbox-temp");
@@ -2450,6 +3773,7 @@ impl CurrentEvidenceFixture {
                         config.multi_agent_v2.tool_namespace = Some("agents".to_string());
                     }
                     config.cwd = cwd.clone();
+                    retain_fixture_credential(&credentials, config);
                     let roots = vec![cwd.clone(), outside.clone()];
                     config.workspace_roots = roots.clone();
                     config.permissions.set_workspace_roots(roots);
@@ -2541,8 +3865,7 @@ impl CurrentEvidenceFixture {
                 } else {
                     approval.attempt_id.clone()
                 },
-                focused_validation_id: FocusedReplacementApprovalReceiptV1::FOCUSED_VALIDATION_ID
-                    .to_owned(),
+                focused_validation_id: approval.focused_validation_id.clone(),
                 receipt_sha256: approval.receipt_sha256.clone(),
             },
             scope_review_set_sha256: proof_hash(
@@ -6046,7 +7369,31 @@ with connection:
 
 #[cfg(windows)]
 async fn historical_acceptance_requires_live_reviewer_and_current_approval_impl() -> Result<()> {
+    historical_acceptance_with_approval_route(false).await
+}
+
+#[cfg(windows)]
+#[test]
+fn historical_acceptance_consumes_transition_readiness_authority() -> Result<()> {
+    run_session_path_test(
+        "historical_acceptance_consumes_transition_readiness_authority",
+        historical_acceptance_consumes_transition_readiness_authority_impl,
+    )
+}
+
+#[cfg(windows)]
+async fn historical_acceptance_consumes_transition_readiness_authority_impl() -> Result<()> {
+    historical_acceptance_with_approval_route(true).await
+}
+
+#[cfg(windows)]
+async fn historical_acceptance_with_approval_route(transition_readiness: bool) -> Result<()> {
     let fixture = CurrentEvidenceFixture::new_historical_resolved()?;
+    let approval_command = if transition_readiness {
+        "just completion-focused inventory.transition-readiness"
+    } else {
+        &fixture.reconciliation_command
+    };
     let home = Arc::new(TempDir::new()?);
     let harness = fixture
         .historical_harness_with_home(Arc::clone(&home))
@@ -6055,7 +7402,7 @@ async fn historical_acceptance_requires_live_reviewer_and_current_approval_impl(
         harness.server(),
         vec![
             shell_command_call_response("historical-current", &fixture.exact_command),
-            shell_command_call_response("historical-reconcile", &fixture.reconciliation_command),
+            shell_command_call_response("historical-reconcile", approval_command),
             required_failure_call_response("stop-after-historical-authority"),
         ],
     )
@@ -6080,6 +7427,14 @@ async fn historical_acceptance_requires_live_reviewer_and_current_approval_impl(
             .clone(),
     )?;
     let proposal_path = ".fixture-state/historical-proposal.json";
+    assert_eq!(
+        approval.focused_validation_id,
+        if transition_readiness {
+            "inventory.transition-readiness"
+        } else {
+            "inventory.frozen-reconciliation"
+        }
+    );
     let proposal = fixture.write_historical_proposal(proposal_path, &approval, false)?;
     assert_eq!(proposal.scope_reviews.len(), 531);
     assert_eq!(fixture.historical_scope_ids()?.len(), 531);
@@ -6299,6 +7654,402 @@ async fn historical_acceptance_requires_live_reviewer_and_current_approval_impl(
     );
     assert!(!fixture.canonical_marker.exists());
     resumed.codex.shutdown_and_wait().await?;
+    Ok(())
+}
+
+#[cfg(windows)]
+#[test]
+fn focused_native_subset_executes_only_selected_and_keeps_other_failures() -> Result<()> {
+    run_session_path_test(
+        "focused_native_subset_executes_only_selected_and_keeps_other_failures",
+        || async {
+            let fixture = CurrentEvidenceFixture::new()?;
+            let justfile = fixture.repo_path.join("justfile");
+            let old = fs::read_to_string(&justfile)?.replace("\r\n", "\n");
+            let canonical = old
+                .split_once("[no-cd]\ncompletion-proof:")
+                .context("fixture canonical recipe")?
+                .1;
+            fs::write(
+                &justfile,
+                format!(
+                    "set positional-arguments\n\n[no-cd]\n[script(\"python\")]\ncompletion-focused validation_id *test_ids:\n    import runpy\n    runpy.run_path(\"runner_driver.py\", run_name=\"__main__\")\n\n[no-cd]\ncompletion-proof:{canonical}"
+                ),
+            )?;
+            let driver = fixture.repo_path.join("runner_driver.py");
+            let source = fs::read_to_string(&driver)?;
+            anyhow::ensure!(source.contains("\"focused\", sys.argv[1]"));
+            fs::write(
+                &driver,
+                source.replace("\"focused\", sys.argv[1]", "\"focused\", *sys.argv[1:]"),
+            )?;
+            for path in [
+                ".codex/validation/completion-proof.toml",
+                ".codex/validation/runner.toml",
+            ] {
+                let config = fixture.repo_path.join(path);
+                let value = fs::read_to_string(&config)?;
+                fs::write(
+                    config,
+                    value.replace(
+                        "consumed_paths = [\"scripts/test_runtime_path.py\",",
+                        "consumed_paths = [\"scripts/test_runtime_path.py\", \"scripts/price.py\",",
+                    ),
+                )?;
+            }
+            run_git(
+                &fixture.repo_path,
+                &["add", "justfile", "runner_driver.py", ".codex/validation"],
+            )?;
+            run_git(
+                &fixture.repo_path,
+                &[
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "native subset fixture runner",
+                ],
+            )?;
+            let product = fixture.repo_path.join("scripts/price.py");
+            fs::write(
+                &product,
+                "def price(amount): return amount\ndef tax(amount): return amount // 10\n",
+            )?;
+            fs::write(
+                fixture.repo_path.join("scripts/test_runtime_path.py"),
+                format!(
+                    r#"import pathlib
+import unittest
+from scripts.price import price, tax
+MARKER = pathlib.Path({marker})
+class RuntimePathTest(unittest.TestCase):
+    def test_price(self):
+        with MARKER.open('a', encoding='utf-8') as output: output.write('price\n')
+        self.assertEqual(price(100), 95)
+    def test_tax(self):
+        with MARKER.open('a', encoding='utf-8') as output: output.write('tax\n')
+        self.assertEqual(tax(100), 10)
+"#,
+                    marker = serde_json::to_string(&fixture.unit_marker.to_string_lossy())?
+                ),
+            )?;
+            // Keep the tests unchanged during the task. A subset must not inherit
+            // the configured group's coverage of every product input.
+            run_git(
+                &fixture.repo_path,
+                &[
+                    "add",
+                    "scripts/test_runtime_path.py",
+                    "scripts/price.py",
+                    "src/runtime.rs",
+                ],
+            )?;
+            run_git(
+                &fixture.repo_path,
+                &[
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "existing behavior tests",
+                ],
+            )?;
+            let home = Arc::new(TempDir::new()?);
+            let harness = fixture.harness_with_home(Arc::clone(&home)).await?;
+            let price_id = "scripts.test_runtime_path.RuntimePathTest.test_price";
+            let tax_id = "scripts.test_runtime_path.RuntimePathTest.test_tax";
+            for (index, ids, expected) in [
+                (0, vec![price_id], "actually ran and failed"),
+                (1, vec![tax_id], "omitted previously failed tests"),
+                (2, vec![price_id], "actually ran and passed"),
+                (
+                    3,
+                    vec!["scripts.test_runtime_path.RuntimePathTest.missing"],
+                    "undiscovered IDs",
+                ),
+                (4, vec![price_id, price_id], "unique nonempty exact IDs"),
+            ] {
+                if index == 1 {
+                    fs::write(
+                        &product,
+                        "def price(amount): return amount - 5\ndef tax(amount): return amount // 10\n",
+                    )?;
+                }
+                let call_id = format!("native-subset-{index}");
+                let args = std::iter::once("completion-focused")
+                    .chain(std::iter::once("maintenance.root-unittest"))
+                    .chain(ids)
+                    .collect::<Vec<_>>();
+                let response = sse(vec![
+                    ev_response_created(&call_id),
+                    ev_function_call(
+                        &call_id,
+                        "exec_command",
+                        &json!({
+                            "kind":"argv", "program":"just", "args":args,
+                            "workdir":fixture.repo_path, "yield_time_ms":30000,
+                            "tty":false,
+                        })
+                        .to_string(),
+                    ),
+                    ev_completed(&call_id),
+                ]);
+                let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let output = Arc::new(std::sync::Mutex::new(None::<String>));
+                let observed_output = Arc::clone(&output);
+                let response_call_id = call_id.clone();
+                let response_process_id = Arc::new(std::sync::Mutex::new(None::<u32>));
+                let mock = wiremock::Mock::given(wiremock::matchers::method("POST"))
+                    .and(wiremock::matchers::path_regex(".*/responses"))
+                    .respond_with(move |request: &wiremock::Request| {
+                        let request_index = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        if request_index == 0 {
+                            return sse_response(response.clone());
+                        }
+                        assert!(
+                            request_index < 12,
+                            "bounded native subset process did not finish"
+                        );
+                        let previous = if request_index == 1 {
+                            response_call_id.clone()
+                        } else {
+                            format!("{response_call_id}-poll-{}", request_index - 1)
+                        };
+                        let body: serde_json::Value =
+                            serde_json::from_slice(&request.body).expect("native request");
+                        let value = body["input"]
+                            .as_array()
+                            .expect("request input")
+                            .iter()
+                            .find(|item| {
+                                item["type"] == "function_call_output"
+                                    && item["call_id"] == previous
+                            })
+                            .expect("previous native tool result");
+                        let text = value["output"].as_str().expect("native tool output text");
+                        if let Some((_, tail)) = text.split_once("Process running with session ID ")
+                        {
+                            let id = tail
+                                .split(|c: char| !c.is_ascii_digit())
+                                .next()
+                                .unwrap()
+                                .parse::<u32>()
+                                .expect("yielded process ID");
+                            let mut process_id = response_process_id.lock().unwrap();
+                            assert_eq!(
+                                *process_id.get_or_insert(id),
+                                id,
+                                "poll the same yielded process"
+                            );
+                            return sse_response(write_stdin_call_response(
+                                &format!("{response_call_id}-poll-{request_index}"),
+                                id,
+                            ));
+                        }
+                        *observed_output.lock().unwrap() = Some(text.to_owned());
+                        sse_response(required_failure_call_response("stop-subset"))
+                    })
+                    .mount_as_scoped(harness.server())
+                    .await;
+                submit_and_collect(
+                    harness.test(),
+                    "Run only the explicitly selected native tests; preserve every other failure.",
+                )
+                .await?;
+                drop(mock);
+                let output = output
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .context("terminal native subset result")?;
+                assert!(output.contains(expected), "{index}: {output}");
+                assert!(!fixture.canonical_marker.exists());
+                assert!(!fixture.pytest_marker.exists());
+            }
+            assert_eq!(
+                fs::read_to_string(&fixture.unit_marker)?
+                    .lines()
+                    .collect::<Vec<_>>(),
+                vec!["price", "tax", "price"]
+            );
+            let (_, state) =
+                read_authenticated_completion_proof_state(home.path(), &fixture.repo_path)?;
+            let pass = state
+                .pointer("/state/focused_completion/passes/maintenance.root-unittest")
+                .context("retained subset pass")?;
+            assert_eq!(pass["report"]["intended_ids"], json!([price_id]));
+            assert_eq!(pass["report"]["executed_ids"], json!([price_id]));
+            assert_eq!(
+                state.pointer(
+                    "/state/poisoned_validations/maintenance.root-unittest/failed_test_ids"
+                ),
+                Some(&json!([price_id]))
+            );
+            mount_sse_sequence(
+                harness.server(),
+                repeated_terminal_candidates(
+                    MAX_REGULAR_LOGICAL_GENERATIONS,
+                    "The whole product change is validated by this subset.",
+                ),
+            )
+            .await;
+            let events = submit_and_collect(
+                harness.test(),
+                "Try ordinary completion using only the subset execution.",
+            )
+            .await?;
+            assert!(
+                events.iter().all(|event| !is_assistant_output(event)),
+                "a subset cannot inherit whole-group behavioral coverage"
+            );
+            harness.test().codex.shutdown_and_wait().await?;
+            Ok(())
+        },
+    )
+}
+
+#[cfg(windows)]
+#[test]
+fn transition_readiness_requires_current_catalog() -> Result<()> {
+    run_session_path_test(
+        "transition_readiness_requires_current_catalog",
+        transition_readiness_requires_current_catalog_impl,
+    )
+}
+
+#[cfg(windows)]
+async fn transition_readiness_requires_current_catalog_impl() -> Result<()> {
+    // Keep the unresolved baseline: a resolved fixture would conceal the
+    // circular prerequisite this route exists to remove.
+    let fixture = CurrentEvidenceFixture::new()?;
+    let home = Arc::new(TempDir::new()?);
+    let harness = fixture.harness_with_home(Arc::clone(&home)).await?;
+    let command = "just completion-focused inventory.transition-readiness";
+    let ledger_path = fixture
+        .repo_path
+        .join(".codex/validation/test-replacements-v1.json");
+    let ledger_before = fs::read(&ledger_path)?;
+
+    mount_sse_sequence(
+        harness.server(),
+        vec![
+            shell_command_call_response("missing-catalog", command),
+            required_failure_call_response("stop-missing-catalog"),
+        ],
+    )
+    .await;
+    let events = submit_and_collect(
+        harness.test(),
+        "check transition readiness before collecting evidence",
+    )
+    .await?;
+    assert_eq!(
+        function_call_output_success(&events, "missing-catalog"),
+        Some(false)
+    );
+    assert!(
+        function_call_output(&events, "missing-catalog")
+            .context("missing prerequisite output")?
+            .contains("current authenticated inventory catalog")
+    );
+    assert_fresh_current_evidence_markers(&fixture, 0, 0)?;
+
+    mount_sse_sequence(
+        harness.server(),
+        vec![
+            shell_command_call_response("collect-catalog", &fixture.exact_command),
+            required_failure_call_response("stop-collect-catalog"),
+        ],
+    )
+    .await;
+    let events = submit_and_collect(harness.test(), "collect current evidence").await?;
+    assert_eq!(
+        function_call_output_success(&events, "collect-catalog"),
+        Some(true)
+    );
+
+    mount_sse_sequence(
+        harness.server(),
+        vec![
+            shell_command_call_response("transition-check", command),
+            required_failure_call_response("stop-transition-check"),
+        ],
+    )
+    .await;
+    let events = submit_and_collect(
+        harness.test(),
+        "check transition readiness while retaining unresolved rows",
+    )
+    .await?;
+    let output =
+        function_call_output(&events, "transition-check").context("missing readiness output")?;
+    assert_eq!(
+        function_call_output_success(&events, "transition-check"),
+        Some(true),
+        "{output}"
+    );
+    assert!(
+        output.contains("unresolved identities still block final certification"),
+        "{output}"
+    );
+    let (_, envelope) = read_authenticated_completion_proof_state(home.path(), &fixture.repo_path)?;
+    let receipt: FocusedReplacementApprovalReceiptV1 = serde_json::from_value(
+        envelope
+            .pointer("/state/current_evidence_catalog/approval_receipt/receipt")
+            .context("no authenticated transition receipt")?
+            .clone(),
+    )?;
+    receipt.validate()?;
+    assert_eq!(
+        receipt.focused_validation_id,
+        "inventory.transition-readiness"
+    );
+    assert!(
+        envelope
+            .pointer("/state/current_evidence_catalog/approval_receipt/reviewed_proposal")
+            .is_none()
+    );
+    assert_eq!(fs::read(&ledger_path)?, ledger_before);
+    assert_fresh_current_evidence_markers(&fixture, 1, 1)?;
+    assert!(!fixture.canonical_marker.exists());
+
+    // Full reconciliation must still reject the same untouched ledger, and
+    // must revoke the earlier preparatory receipt when starting a new check.
+    mount_sse_sequence(
+        harness.server(),
+        vec![
+            shell_command_call_response("full-reconciliation", &fixture.reconciliation_command),
+            required_failure_call_response("stop-full-reconciliation"),
+        ],
+    )
+    .await;
+    let events = submit_and_collect(
+        harness.test(),
+        "attempt full reconciliation of the still-unresolved ledger",
+    )
+    .await?;
+    assert_eq!(
+        function_call_output_success(&events, "full-reconciliation"),
+        Some(false)
+    );
+    assert!(
+        function_call_output(&events, "full-reconciliation")
+            .context("missing unresolved rejection")?
+            .contains("unresolved")
+    );
+    let (_, envelope) = read_authenticated_completion_proof_state(home.path(), &fixture.repo_path)?;
+    assert!(
+        envelope
+            .pointer("/state/current_evidence_catalog/approval_receipt")
+            .is_none()
+    );
+    assert_eq!(fs::read(&ledger_path)?, ledger_before);
+    assert_fresh_current_evidence_markers(&fixture, 1, 1)?;
+    assert!(!fixture.canonical_marker.exists());
+    harness.test().codex.shutdown_and_wait().await?;
     Ok(())
 }
 

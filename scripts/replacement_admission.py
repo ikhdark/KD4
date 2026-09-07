@@ -34,7 +34,6 @@ if __package__:
     )
     from scripts.focused_replacement_approval_receipt import (
         FORMAT_ID as FOCUSED_REPLACEMENT_APPROVAL_RECEIPT_FORMAT_ID,
-        FOCUSED_VALIDATION_ID as FOCUSED_REPLACEMENT_APPROVAL_VALIDATION_ID,
         FocusedReplacementApprovalReceiptError,
         validate_focused_replacement_approval_receipt_v1,
     )
@@ -54,7 +53,6 @@ else:
     )
     from focused_replacement_approval_receipt import (  # type: ignore[no-redef]
         FORMAT_ID as FOCUSED_REPLACEMENT_APPROVAL_RECEIPT_FORMAT_ID,
-        FOCUSED_VALIDATION_ID as FOCUSED_REPLACEMENT_APPROVAL_VALIDATION_ID,
         FocusedReplacementApprovalReceiptError,
         validate_focused_replacement_approval_receipt_v1,
     )
@@ -618,7 +616,7 @@ def validate_manifest(
             if identity["test_id"] != replacement_id or catalog.get(replacement_id) != identity:
                 _fail(f"{location} successor is missing or differs from the current catalog: {replacement_id}")
             _require_digest(_hash(successor["current_identity_sha256"], f"{location}.successors[{index}].current_identity_sha256"), "kd4.replacement-admission.successor-identity.v1", identity, f"{location}.successors[{index}].current_identity_sha256")
-            source_files = _validate_file_bindings(repository_root, successor["source_files"], f"{location}.successors[{index}].source_files")
+            _validate_file_bindings(repository_root, successor["source_files"], f"{location}.successors[{index}].source_files")
             runtime_path = _sorted_unique_strings(successor["runtime_path"], f"{location}.successors[{index}].runtime_path", nonempty=True)
             _require_digest(_hash(successor["runtime_path_sha256"], f"{location}.successors[{index}].runtime_path_sha256"), "kd4.replacement-admission.runtime-path.v1", runtime_path, f"{location}.successors[{index}].runtime_path_sha256")
             contract_sources = _validate_file_bindings(repository_root, successor["contract_sources"], f"{location}.successors[{index}].contract_sources")
@@ -1115,7 +1113,7 @@ def _focused_replacement_approval_receipt_ref_v1(
         "format_id": FOCUSED_REPLACEMENT_APPROVAL_RECEIPT_FORMAT_ID,
         "schema_version": SCHEMA_VERSION,
         "attempt_id": receipt["attempt_id"],
-        "focused_validation_id": FOCUSED_REPLACEMENT_APPROVAL_VALIDATION_ID,
+        "focused_validation_id": receipt["focused_validation_id"],
         "receipt_sha256": receipt["receipt_sha256"],
     }
 

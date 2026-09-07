@@ -143,6 +143,15 @@ test-group = 'windows_process_heavy'
 slow-timeout = { period = "1m", terminate-after = 2 }
 
 [[profile.default.overrides]]
+# These exact library tests repeatedly project or authenticate the complete
+# 38 MB inventory generation. Observed successful Windows runs approach the
+# default 60-second ceiling; allow their unchanged assertions to finish while
+# retaining a bounded timeout and the profile's no-retry certification policy.
+platform = 'cfg(windows)'
+filter = 'package(codex-core) & binary(codex_core) & (test(=completion_proof::v2_activation::tests::historical_projection_preserves_every_edge_and_unresolved_child) | test(=completion_proof::v2_activation::tests::prepared_activation_replays_after_authenticated_resume_and_rejects_drift))'
+slow-timeout = { period = "1m", terminate-after = 2 }
+
+[[profile.default.overrides]]
 # These exact completion-proof session tests deliberately exercise a full
 # forced-terminal budget or a cold Windows resume. Let the real runtime path
 # return its own result instead of terminating it at the module-wide ceiling.

@@ -1,7 +1,7 @@
 {
-  "index_sha256": "814b81869d91647ef7d34ee88618dfd4f15175a97bc24faad0eb3ca87c683df5",
+  "index_sha256": "3f7382e75a9ed265f51f600e06a9a42ac2a6d89693cb11e8f42ce2b15a843819",
   "index_version": 1,
-  "manifest_sha256": "a1d61d5a8ca5def2087b9605695617135b5b4b617c2ec6d6c53193ceeaaab5fc",
+  "manifest_sha256": "fe24ccfb86d006806e5d4dadf423e53b48c8ab22b689431e609ed8e9bf972f4b",
   "omitted": {
     "relationships": 0
   },
@@ -350,6 +350,9 @@
         "scripts/completion_proof.py",
         "scripts/completion_proof_canonical.py",
         "scripts/completion_proof_inventory_v2.py",
+        "scripts/completion_proof_v2_live.py",
+        "codex-rs/core/src/completion_proof/v2_activation.rs",
+        "codex-rs/core/src/tools/handlers/inventory_activation.rs",
         "scripts/materialize_completion_proof_inventory_v2.py",
         ".codex/validation/child-validation-journal-v1.schema.json",
         "codex-rs/validation-contracts/Cargo.toml",
@@ -366,6 +369,7 @@
       "tests": [
         "scripts/test_completion_proof.py",
         "scripts/test_completion_proof_inventory_v2.py",
+        "scripts/test_completion_proof_v2_live.py",
         "scripts/test_materialize_completion_proof_inventory_v2.py",
         "codex-rs/validation-contracts/tests/cross_language_vectors.rs",
         "codex-rs/core/tests/suite/completion_proof_gate.rs"
@@ -2208,7 +2212,7 @@
       "evidence": [
         {
           "path": "justfile",
-          "symbol": "completion-focused validation_id:"
+          "symbol": "completion-focused validation_id *test_ids:"
         }
       ],
       "kind": "registers",
@@ -3514,7 +3518,7 @@
       "target": "path:scripts/test_workflow_preflight.py"
     }
   ],
-  "repository_revision": "manifest:a1d61d5a8ca5def2087b9605695617135b5b4b617c2ec6d6c53193ceeaaab5fc:sources:99ce8b8ce3aa33b5eb2ffe1304e2a54319dc314aebda3a31282a87a8cd44d7d7",
+  "repository_revision": "manifest:fe24ccfb86d006806e5d4dadf423e53b48c8ab22b689431e609ed8e9bf972f4b:sources:ec8d5306ddaf21c6c5dadf1bdd3689e77c95ed5102e5f7dec1d9a1a48de693ad",
   "schema_version": 2,
   "status": "complete",
   "unresolved": []

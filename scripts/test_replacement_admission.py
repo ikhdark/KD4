@@ -963,6 +963,41 @@ class ReplacementAdmissionCliTests(unittest.TestCase):
 
             jsonschema.Draft202012Validator(proposal_schema).validate(proposal)
 
+        # A transition-readiness approval keeps its own identity through the
+        # proposal reference; the admissions schema must accept exactly that.
+        vectors = json.loads(FOCUSED_APPROVAL_VECTORS.read_text(encoding="utf-8"))
+        transition = next(
+            copy.deepcopy(vector["receipt"])
+            for vector in vectors["valid_vectors"]
+            if vector["receipt"]["focused_validation_id"]
+            == "inventory.transition-readiness"
+        )
+        transition_proposal = admission.build_historical_replacement_acceptance_proposal_v1(
+            plan, transition, reviews
+        )
+        self.assertEqual(
+            transition_proposal["focused_replacement_approval_receipt_ref"][
+                "focused_validation_id"
+            ],
+            "inventory.transition-readiness",
+        )
+        self.assertEqual(
+            transition_proposal,
+            admission.validate_historical_replacement_acceptance_proposal_v1(
+                transition_proposal, REPOSITORY_ROOT, transition
+            ),
+        )
+        self.assertIn(
+            "inventory.transition-readiness",
+            schema["$defs"]["focusedReplacementApprovalReceiptRef"]["properties"][
+                "focused_validation_id"
+            ]["enum"],
+        )
+        if importlib.util.find_spec("jsonschema") is not None:
+            jsonschema.Draft202012Validator(proposal_schema).validate(
+                transition_proposal
+            )
+
     def test_historical_acceptance_cli_rejects_scope_and_plan_drift(self) -> None:
         plan = admission.compile_historical_replacement_review_plan(
             REPOSITORY_ROOT

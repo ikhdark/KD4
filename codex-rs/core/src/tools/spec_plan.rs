@@ -15,7 +15,7 @@ use crate::tools::handlers::CurrentTimeHandler;
 use crate::tools::handlers::DynamicToolHandler;
 use crate::tools::handlers::ExecCommandHandler;
 use crate::tools::handlers::ExecCommandHandlerOptions;
-use crate::tools::handlers::KdaHandler;
+use crate::tools::handlers::InventoryActivationHandler;
 use crate::tools::handlers::ListAvailablePluginsToInstallHandler;
 use crate::tools::handlers::ListMcpResourceTemplatesHandler;
 use crate::tools::handlers::ListMcpResourcesHandler;
@@ -126,17 +126,6 @@ impl PlannedTools {
     {
         self.runtimes
             .push(RegisteredTool::new(Arc::new(handler), class));
-    }
-
-    fn add_read_only_with_authorization_class<T>(&mut self, handler: T, class: TypedToolClass)
-    where
-        T: CoreToolRuntime + 'static,
-    {
-        self.runtimes.push(
-            RegisteredTool::new(Arc::new(handler), class).with_external_mutation_intent(
-                crate::agent::task_capabilities::ExternalMutationIntent::ProvenReadOnly,
-            ),
-        );
     }
 
     fn add_arc_with_exposure_and_authorization_class(
@@ -999,23 +988,14 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut
     let environment_mode = tool_environment_mode(context.step_context);
     planned_tools.add_with_authorization_class(ReadToolOutputHandler, TypedToolClass::ReadSearch);
 
-    if let Some(cwd) = context
-        .step_context
-        .environments
-        .single_local_environment_cwd()
-    {
-        planned_tools.add_read_only_with_authorization_class(
-            KdaHandler::new(cwd.into_path_buf()),
-            TypedToolClass::ReadSearch,
-        );
-    }
-
     if turn_context.collaboration_mode.mode != ModeKind::Plan {
         planned_tools.add_with_authorization_class(PlanHandler, TypedToolClass::OwnTask);
         if !crate::agent::task_capabilities::is_independent_review_source(
             &turn_context.session_source,
         ) {
             planned_tools.add_with_authorization_class(TestQualityHandler, TypedToolClass::OwnTask);
+            planned_tools
+                .add_with_authorization_class(InventoryActivationHandler, TypedToolClass::OwnTask);
         }
     }
 

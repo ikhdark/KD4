@@ -1072,6 +1072,9 @@ roots = [
     "scripts/completion_proof.py",
     "scripts/completion_proof_canonical.py",
     "scripts/completion_proof_inventory_v2.py",
+    "scripts/completion_proof_v2_live.py",
+    "codex-rs/core/src/completion_proof/v2_activation.rs",
+    "codex-rs/core/src/tools/handlers/inventory_activation.rs",
     "scripts/materialize_completion_proof_inventory_v2.py",
     ".codex/validation/child-validation-journal-v1.schema.json",
     "codex-rs/validation-contracts/Cargo.toml",
@@ -1117,6 +1120,7 @@ generated_mirrors = [
 tests = [
     "scripts/test_completion_proof.py",
     "scripts/test_completion_proof_inventory_v2.py",
+    "scripts/test_completion_proof_v2_live.py",
     "scripts/test_materialize_completion_proof_inventory_v2.py",
     "codex-rs/validation-contracts/tests/cross_language_vectors.rs",
     "codex-rs/core/tests/suite/completion_proof_gate.rs",
@@ -1158,7 +1162,7 @@ category = "runtime_registration"
 kind = "registers"
 target = "path:justfile"
 confidence = "declared"
-evidence = [{ path = "justfile", symbol = "completion-focused validation_id:" }]
+evidence = [{ path = "justfile", symbol = "completion-focused validation_id *test_ids:" }]
 
 [[owners.relationships]]
 category = "generated_artifacts"

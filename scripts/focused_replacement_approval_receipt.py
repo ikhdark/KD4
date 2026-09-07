@@ -30,6 +30,7 @@ FORMAT_ID = "kd4.focused-replacement-approval-receipt.v1"
 SCHEMA_VERSION = 1
 CLASSIFICATION = "confirmed-pass"
 FOCUSED_VALIDATION_ID = "inventory.frozen-reconciliation"
+TRANSITION_VALIDATION_ID = "inventory.transition-readiness"
 RECEIPT_HASH_DOMAIN = FORMAT_ID
 MAX_EXACT_JSON_INTEGER = 2**53 - 1
 
@@ -195,9 +196,9 @@ def validate_focused_replacement_approval_receipt_v1(receipt: Any) -> None:
     ):
         raise _contract_error(f"schema_version must be {SCHEMA_VERSION}")
     _require_uuid_v7(receipt["attempt_id"], "attempt_id")
-    if receipt["focused_validation_id"] != FOCUSED_VALIDATION_ID:
+    if receipt["focused_validation_id"] not in {FOCUSED_VALIDATION_ID, TRANSITION_VALIDATION_ID}:
         raise _contract_error(
-            f"focused_validation_id must be {FOCUSED_VALIDATION_ID!r}"
+            "focused_validation_id must name frozen reconciliation or transition readiness"
         )
     if receipt["classification"] != CLASSIFICATION:
         raise _contract_error(f"classification must be {CLASSIFICATION!r}")
@@ -267,10 +268,10 @@ def validate_against_trusted_current_context_v1(
             f"trusted schema_version must be {SCHEMA_VERSION}"
         )
     _require_uuid_v7(trusted["attempt_id"], "trusted attempt_id")
-    if trusted["focused_validation_id"] != FOCUSED_VALIDATION_ID:
+    if trusted["focused_validation_id"] not in {FOCUSED_VALIDATION_ID, TRANSITION_VALIDATION_ID}:
         raise _contract_error(
             "trusted focused_validation_id must be "
-            f"{FOCUSED_VALIDATION_ID!r}"
+            f"{FOCUSED_VALIDATION_ID!r} or {TRANSITION_VALIDATION_ID!r}"
         )
     if trusted["classification"] != CLASSIFICATION:
         raise _contract_error(

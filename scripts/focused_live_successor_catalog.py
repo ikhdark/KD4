@@ -448,7 +448,7 @@ def _validate_process(
         _fail(f"{label}.argv must be a nonempty array")
     for argument_index, argument in enumerate(argv):
         _nfc_string(argument, f"{label}.argv[{argument_index}]", nonempty=False)
-    cwd = _windows_absolute_path(process["cwd"], f"{label}.cwd")
+    _windows_absolute_path(process["cwd"], f"{label}.cwd")
     child = _object(
         process["child_process"],
         {
@@ -776,6 +776,28 @@ def _validate_successor_owner_map(value: Any) -> tuple[list[dict[str, Any]], lis
     return rows, successor_ids
 
 
+def resolve_current_successor_v1(
+    current_by_id: Mapping[str, Mapping[str, Any]], test_id: str
+) -> Mapping[str, Any] | None:
+    """Resolve an unchanged historical unittest native ID to its collected row.
+
+    Older mappings sometimes stored unittest's native ID without the inventory
+    framework prefix. Preserve those graph labels; accept only the exact native
+    identity observed under the canonical unittest inventory key.
+    """
+    current = current_by_id.get(test_id)
+    if current is not None:
+        return current
+    current = current_by_id.get(f"python-unittest::{test_id}")
+    if (
+        current is not None
+        and current["framework"] == "python-unittest"
+        and current["native_id"] == test_id
+    ):
+        return current
+    return None
+
+
 def _validate_catalog_resource_closure(
     current_inventory: list[dict[str, Any]],
     resolved_entries: list[dict[str, Any]],
@@ -812,14 +834,20 @@ def _validate_catalog_resource_closure(
         }
         if any(successor[field] != expected for field, expected in expected_bindings.items()):
             _fail(f"successor catalog bindings disagree with resolved entry: {test_id}")
-        current = current_by_id.get(test_id)
-        if current is None or current != {
-            "baseline_id": test_id,
+        current = resolve_current_successor_v1(current_by_id, test_id)
+        if current is None:
+            _fail(f"successor catalog identity is absent from current inventory: {test_id}")
+        # The resolver already proved the identity binding (exact key, or an
+        # unprefixed historical unittest label whose native ID matches). Compare
+        # only the fields this catalog itself asserts.
+        if {
+            "framework": current["framework"],
+            "native_id": current["native_id"],
+            "source": current["source"],
+        } != {
             "framework": successor["framework"],
             "native_id": successor["native_id"],
             "source": successor["source_path"],
-            "ignored": current.get("ignored") if current is not None else False,
-            "platforms": current.get("platforms") if current is not None else [],
         }:
             _fail(f"successor catalog identity disagrees with current inventory: {test_id}")
         expected_route, expected_selector_kind = FRAMEWORK_ROUTE_SELECTOR[current["framework"]]

@@ -515,12 +515,11 @@ source-map-check-only:
 # focused evidence only and can never establish whole-repository certification.
 [no-cd]
 [script("python")]
-completion-focused validation_id:
+completion-focused validation_id *test_ids:
     import runpy
     import sys
     script = r"{{ justfile_directory() }}/scripts/completion_proof.py"
-    validation_id = sys.argv[1]
-    sys.argv = [script, "focused", validation_id]
+    sys.argv = [script, "focused", *sys.argv[1:]]
     runpy.run_path(script, run_name="__main__")
 
 # The sole whole-repository certification command. The compiled runtime owns

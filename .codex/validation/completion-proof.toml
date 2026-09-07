@@ -14,6 +14,11 @@ host_platform = "windows"
 [focused_inventory_evidence]
 validation_ids = ["maintenance.root-unittest", "sdk.python.pytest"]
 
+# `just completion-focused inventory.transition-readiness` reuses the frozen
+# reconciliation route below for admission preparation. Unresolved baselines
+# and unadmitted current IDs remain blockers for full reconciliation and final
+# certification. Readiness is never a canonical required validation.
+
 # These tests require an independently installed Codex app-server and are
 # deliberately quarantined from the offline canonical certification.
 [[baseline_exception]]
@@ -95,7 +100,31 @@ timeout_seconds = 3600
 id = "rust.nextest.workspace"
 runner = "rust-nextest"
 owned_paths = ["codex-rs/**"]
-consumed_paths = ["codex-rs/**", "docs/schemas/investigation-evidence-v1.schema.json", "justfile", "scripts/rust_test_runner.py"]
+consumed_paths = [
+  "codex-rs/**",
+  "docs/schemas/investigation-evidence-v1.schema.json",
+  "justfile",
+  "scripts/rust_test_runner.py",
+  "scripts/replacement_admission.py",
+  "scripts/focused_replacement_approval_receipt.py",
+  "scripts/completion_proof_inventory_v2.py",
+  "scripts/completion_proof_canonical.py",
+  "scripts/fixtures/focused_live_successor_catalog_v1_vectors.json",
+  "scripts/fixtures/focused_replacement_approval_receipt_v1_vectors.json",
+  ".codex/validation/completion-proof.toml",
+  ".codex/validation/frozen-test-inventory-v1.json",
+  ".codex/validation/test-replacements-v1.json",
+  ".codex/validation/focused-live-successor-catalog-v1.schema.json",
+  ".codex/validation/inventory-shared-types-v1.schema.json",
+  ".codex/validation/frozen-test-inventory-v2.schema.json",
+  ".codex/validation/frozen-test-inventory-v2.json",
+  ".codex/validation/test-replacements-v2.json",
+  ".codex/validation/frozen-test-inventory-v2-recoveries.json",
+  ".codex/validation/frozen-test-inventory-v2-recovery-transition-receipts.json",
+  ".codex/validation/frozen-test-inventory-v2-doctest-recapture.json",
+  ".codex/validation/frozen-test-inventory-v2-unittest-recapture.json",
+  ".codex/validation/frozen-test-inventory-v2-unittest-source-exceptions.json",
+]
 timeout_seconds = 21600
 
 [[validation]]
@@ -109,7 +138,20 @@ timeout_seconds = 7200
 id = "maintenance.root-unittest"
 runner = "python-unittest"
 owned_paths = ["scripts/**", "tools/**", "codex-cli/**"]
-consumed_paths = ["scripts/**", "tools/**", "codex-cli/**", "justfile", "scripts/pyproject.toml", "scripts/uv.lock"]
+consumed_paths = [
+  "scripts/**", "tools/**", "codex-cli/**", "justfile", "scripts/pyproject.toml", "scripts/uv.lock",
+  ".codex/validation/replacement-admissions-v1.schema.json",
+  ".codex/validation/completion-proof.toml",
+  ".codex/validation/frozen-test-inventory-v1.json",
+  ".codex/validation/test-replacements-v1.json",
+  ".codex/validation/frozen-test-inventory-v2.json",
+  ".codex/validation/test-replacements-v2.json",
+  ".codex/validation/frozen-test-inventory-v2-recoveries.json",
+  ".codex/validation/frozen-test-inventory-v2-recovery-transition-receipts.json",
+  ".codex/validation/frozen-test-inventory-v2-doctest-recapture.json",
+  ".codex/validation/frozen-test-inventory-v2-unittest-recapture.json",
+  ".codex/validation/frozen-test-inventory-v2-unittest-source-exceptions.json",
+]
 timeout_seconds = 3600
 
 [[validation]]

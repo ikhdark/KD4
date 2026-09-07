@@ -1500,6 +1500,24 @@ impl ToolHistoryState {
                 } => (name, input, call_id),
                 _ => continue,
             };
+            // A fresh recovery read cannot make its originating command's
+            // workspace evidence current. Resolve known origins before using
+            // the observation captured for this read itself.
+            if name == "read_tool_output"
+                && let Some(candidate) = read_tool_output_artifact_id(arguments)
+                    .and_then(|artifact_id| self.artifact_call_ids.get(&artifact_id))
+                    .and_then(|origin_call_id| self.candidates.get(origin_call_id))
+            {
+                if (candidate.tool_identity == "functions.exec"
+                    && !self
+                        .non_workspace_code_mode_calls
+                        .contains(&candidate.call_id))
+                    || self.workspace_evidence.contains_key(&candidate.call_id)
+                {
+                    requirements.insert(call_id.clone(), candidate.call_id.clone());
+                }
+                continue;
+            }
             // Code-mode's `functions.exec` carrier can contain repository
             // reads even though the carrier itself is not a host executable.
             // Explicitly registered evidence is authoritative for any other
@@ -1511,35 +1529,7 @@ impl ToolHistoryState {
                 || tool_call_observes_workspace_parts(name, arguments);
             if call_observes_workspace || self.workspace_evidence.contains_key(call_id) {
                 requirements.insert(call_id.clone(), call_id.clone());
-                continue;
             }
-            if name != "read_tool_output" {
-                continue;
-            }
-            let Some(artifact_id) = read_tool_output_artifact_id(arguments) else {
-                continue;
-            };
-            let origin = self
-                .artifact_call_ids
-                .get(&artifact_id)
-                .and_then(|call_id| self.candidates.get(call_id));
-            match origin {
-                Some(candidate)
-                    if (candidate.tool_identity == "functions.exec"
-                        && !self
-                            .non_workspace_code_mode_calls
-                            .contains(&candidate.call_id))
-                        || self.workspace_evidence.contains_key(&candidate.call_id) =>
-                {
-                    requirements.insert(call_id.clone(), candidate.call_id.clone());
-                }
-                Some(_) => {}
-                None => {
-                    // Legacy or missing provenance cannot safely establish that recovered
-                    // output was independent of the workspace revision.
-                    requirements.insert(call_id.clone(), call_id.clone());
-                }
-            };
         }
         requirements
     }
@@ -2912,7 +2902,12 @@ fn output_call_id(item: &ResponseItem) -> Option<&str> {
 pub(crate) fn tool_observes_workspace(tool_identity: &str) -> bool {
     matches!(
         tool_identity,
-        "exec_command" | "shell_command" | "unified_exec" | "write_stdin" | "cargo_test"
+        "exec_command"
+            | "shell_command"
+            | "unified_exec"
+            | "write_stdin"
+            | "cargo_test"
+            | "read_tool_output"
     )
 }
 

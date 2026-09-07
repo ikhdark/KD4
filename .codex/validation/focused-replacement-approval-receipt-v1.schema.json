@@ -31,7 +31,7 @@
       "$ref": "#/$defs/uuid_v7"
     },
     "focused_validation_id": {
-      "const": "inventory.frozen-reconciliation"
+      "enum": ["inventory.frozen-reconciliation", "inventory.transition-readiness"]
     },
     "classification": {
       "const": "confirmed-pass"

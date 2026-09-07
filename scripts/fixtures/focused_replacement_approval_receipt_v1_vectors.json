@@ -43,6 +43,25 @@
         "receipt_sha256": "fc3403606589fbf54bb3c7ceb86151251d5f4751ce8ee0bf4c6b0654ac2b5437"
       },
       "expected_receipt_sha256": "fc3403606589fbf54bb3c7ceb86151251d5f4751ce8ee0bf4c6b0654ac2b5437"
+    },
+    {
+      "case": "transition-readiness-confirmed-pass",
+      "receipt": {
+        "format_id": "kd4.focused-replacement-approval-receipt.v1",
+        "schema_version": 1,
+        "attempt_id": "01890f45-7e9a-7cc3-98c4-dc0c0c07398f",
+        "focused_validation_id": "inventory.transition-readiness",
+        "classification": "confirmed-pass",
+        "frozen_inventory_hash": "1111111111111111111111111111111111111111111111111111111111111111",
+        "focused_inventory_catalog_semantic_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+        "inventory_discovery_processes_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+        "policy_id": "kd4",
+        "policy_runner_bundle_sha256": "4444444444444444444444444444444444444444444444444444444444444444",
+        "workspace_fingerprint": "5555555555555555555555555555555555555555555555555555555555555555",
+        "mutation_epoch": 7,
+        "receipt_sha256": "4ab7b0d1cd905f2782fee7eee520c27628772d9d5a7e039f4012525cf2bcfe19"
+      },
+      "expected_receipt_sha256": "4ab7b0d1cd905f2782fee7eee520c27628772d9d5a7e039f4012525cf2bcfe19"
     }
   ],
   "invalid_vectors": [
@@ -248,6 +267,76 @@
       },
       "expected": "reject",
       "reason": "a self-consistent confirmed-pass receipt cannot override the trusted current result classification"
+    },
+    {
+      "case": "transition-cannot-claim-full-reconciliation",
+      "kind": "trusted-current-context",
+      "receipt": {
+        "format_id": "kd4.focused-replacement-approval-receipt.v1",
+        "schema_version": 1,
+        "attempt_id": "01890f45-7e9a-7cc3-98c4-dc0c0c07398f",
+        "focused_validation_id": "inventory.frozen-reconciliation",
+        "classification": "confirmed-pass",
+        "frozen_inventory_hash": "1111111111111111111111111111111111111111111111111111111111111111",
+        "focused_inventory_catalog_semantic_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+        "inventory_discovery_processes_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+        "policy_id": "kd4",
+        "policy_runner_bundle_sha256": "4444444444444444444444444444444444444444444444444444444444444444",
+        "workspace_fingerprint": "5555555555555555555555555555555555555555555555555555555555555555",
+        "mutation_epoch": 7,
+        "receipt_sha256": "70b057ec7565ff5a3a94a313c846515174f8695af14061155818890a8637c6e8"
+      },
+      "trusted_current_context": {
+        "format_id": "kd4.focused-replacement-approval-receipt.v1",
+        "schema_version": 1,
+        "attempt_id": "01890f45-7e9a-7cc3-98c4-dc0c0c07398f",
+        "focused_validation_id": "inventory.transition-readiness",
+        "classification": "confirmed-pass",
+        "frozen_inventory_hash": "1111111111111111111111111111111111111111111111111111111111111111",
+        "focused_inventory_catalog_semantic_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+        "inventory_discovery_processes_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+        "policy_id": "kd4",
+        "policy_runner_bundle_sha256": "4444444444444444444444444444444444444444444444444444444444444444",
+        "workspace_fingerprint": "5555555555555555555555555555555555555555555555555555555555555555",
+        "mutation_epoch": 7
+      },
+      "expected": "reject",
+      "reason": "A correctly rehashed receipt cannot replace the validation identity authenticated by Core."
+    },
+    {
+      "case": "full-reconciliation-cannot-be-relabelled-as-transition",
+      "kind": "trusted-current-context",
+      "receipt": {
+        "format_id": "kd4.focused-replacement-approval-receipt.v1",
+        "schema_version": 1,
+        "attempt_id": "01890f45-7e9a-7cc3-98c4-dc0c0c07398f",
+        "focused_validation_id": "inventory.transition-readiness",
+        "classification": "confirmed-pass",
+        "frozen_inventory_hash": "1111111111111111111111111111111111111111111111111111111111111111",
+        "focused_inventory_catalog_semantic_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+        "inventory_discovery_processes_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+        "policy_id": "kd4",
+        "policy_runner_bundle_sha256": "4444444444444444444444444444444444444444444444444444444444444444",
+        "workspace_fingerprint": "5555555555555555555555555555555555555555555555555555555555555555",
+        "mutation_epoch": 7,
+        "receipt_sha256": "4ab7b0d1cd905f2782fee7eee520c27628772d9d5a7e039f4012525cf2bcfe19"
+      },
+      "trusted_current_context": {
+        "format_id": "kd4.focused-replacement-approval-receipt.v1",
+        "schema_version": 1,
+        "attempt_id": "01890f45-7e9a-7cc3-98c4-dc0c0c07398f",
+        "focused_validation_id": "inventory.frozen-reconciliation",
+        "classification": "confirmed-pass",
+        "frozen_inventory_hash": "1111111111111111111111111111111111111111111111111111111111111111",
+        "focused_inventory_catalog_semantic_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+        "inventory_discovery_processes_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+        "policy_id": "kd4",
+        "policy_runner_bundle_sha256": "4444444444444444444444444444444444444444444444444444444444444444",
+        "workspace_fingerprint": "5555555555555555555555555555555555555555555555555555555555555555",
+        "mutation_epoch": 7
+      },
+      "expected": "reject",
+      "reason": "A correctly rehashed receipt cannot replace the validation identity authenticated by Core."
     }
   ]
 }

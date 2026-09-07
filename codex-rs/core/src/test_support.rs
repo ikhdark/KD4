@@ -82,6 +82,61 @@ pub fn completion_proof_state_lock_path(codex_home: &Path, cwd: &Path) -> PathBu
     crate::completion_proof::completion_proof_state_lock_path_for_tests(codex_home, cwd)
 }
 
+/// Owns only the new physical credential of a disposable test home/repository.
+/// Keep this guard until every fixture session (including resumed sessions) ends.
+/// Existing credentials and credentials outside direct temporary fixtures are
+/// never owned. This leaves the real secure-storage path in use during the test.
+pub struct TemporaryCompletionProofCredential {
+    #[cfg(windows)]
+    account: Option<String>,
+}
+
+pub fn temporary_completion_proof_credential(
+    codex_home: &Path,
+    cwd: &Path,
+) -> Result<TemporaryCompletionProofCredential, String> {
+    #[cfg(windows)]
+    {
+        let temporary = dunce::canonicalize(std::env::temp_dir()).map_err(|e| e.to_string())?;
+        for path in [codex_home, cwd] {
+            let path = dunce::canonicalize(path).map_err(|e| e.to_string())?;
+            if path.parent() != Some(temporary.as_path())
+                || !path
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with(".tmp"))
+            {
+                return Err("credential cleanup requires disposable temporary fixtures".to_string());
+            }
+        }
+        let (service, account) =
+            crate::completion_proof::completion_proof_trust_anchor_identity_for_tests(
+                codex_home, cwd,
+            );
+        let existing = DefaultKeyringStore
+            .load(service, &account)
+            .map_err(|e| e.to_string())?;
+        return Ok(TemporaryCompletionProofCredential {
+            account: existing.is_none().then_some(account),
+        });
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (codex_home, cwd);
+        Ok(TemporaryCompletionProofCredential {})
+    }
+}
+
+impl Drop for TemporaryCompletionProofCredential {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        if let Some(account) = &self.account
+            && let Err(error) = DefaultKeyringStore.delete("Codex Completion Proof", account)
+        {
+            tracing::warn!(%error, "could not release the completed temporary fixture credential");
+        }
+    }
+}
+
 /// Test-only provider that supplies no user instructions.
 #[derive(Debug, Default)]
 pub struct EmptyUserInstructionsProvider;

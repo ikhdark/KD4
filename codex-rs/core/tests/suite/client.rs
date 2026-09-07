@@ -183,6 +183,61 @@ fn assert_codex_client_metadata(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retired_kda_tool_is_not_advertised_and_calls_are_rejected() -> anyhow::Result<()> {
+    let server = MockServer::start().await;
+    let call_id = "retired-kda-call";
+    let response_mock = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp1"),
+                ev_function_call(call_id, "kda", "{}"),
+                ev_completed("resp1"),
+            ]),
+            sse(vec![ev_response_created("resp2"), ev_completed("resp2")]),
+        ],
+    )
+    .await;
+    let credential = Arc::new(std::sync::Mutex::new(None));
+    let retained_credential = Arc::clone(&credential);
+    let test = test_codex()
+        .with_config(move |config| {
+            *retained_credential
+                .lock()
+                .expect("fixture credential scope") = Some(
+                codex_core::test_support::temporary_completion_proof_credential(
+                    &config.codex_home,
+                    config.cwd.as_path(),
+                )
+                .expect("own only a new disposable fixture credential"),
+            );
+        })
+        .build(&server)
+        .await?;
+
+    test.submit_turn("Check the available tools.").await?;
+
+    let requests = response_mock.requests();
+    assert_eq!(requests.len(), 2);
+    for request in &requests {
+        let body = request.body_json();
+        let tools = body["tools"].as_array().expect("model tool definitions");
+        assert!(!tools.is_empty(), "the runtime should advertise its tools");
+        assert!(
+            !serde_json::to_string(tools)?.contains("\"kda\""),
+            "the retired KDA tool must not be advertised"
+        );
+    }
+    assert_eq!(
+        requests[1].function_call_output_text(call_id).as_deref(),
+        Some("unsupported call: kda")
+    );
+
+    test.codex.shutdown_and_wait().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn openai_stateless_responses_requests_preserve_item_turn_metadata_across_turns() {
     let server = MockServer::start().await;
     let response_mock = mount_sse_sequence(

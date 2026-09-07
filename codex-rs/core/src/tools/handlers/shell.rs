@@ -1073,7 +1073,18 @@ async fn run_exec_like_with_exit_code_inner(
             session
                 .services
                 .completion_proof
-                .prepare_focused_attempt(&hook_command, exec_params.cwd.as_path())
+                .prepare_focused_attempt(
+                    &hook_command,
+                    exec_params.cwd.as_path(),
+                    if shell_wrapper_is_owned {
+                        None
+                    } else {
+                        exec_params
+                            .command
+                            .split_first()
+                            .map(|(program, args)| (program.as_str(), args))
+                    },
+                )
                 .await
                 .map_err(FunctionCallError::RespondToModel)?
         };

@@ -19,6 +19,7 @@ import unicodedata
 from typing import Any, Mapping, NoReturn, Sequence
 
 try:
+    from scripts.focused_live_successor_catalog import resolve_current_successor_v1
     from scripts.completion_proof_inventory_v2 import (
         InventoryV2ContractError,
         canonical_jcs,
@@ -29,6 +30,7 @@ try:
         validate_test_replacement_ledger_v2,
     )
 except ImportError:  # pragma: no cover - direct script execution
+    from focused_live_successor_catalog import resolve_current_successor_v1
     from completion_proof_inventory_v2 import (  # type: ignore[no-redef]
         InventoryV2ContractError,
         canonical_jcs,
@@ -611,7 +613,7 @@ def build_current_successor_projection_v1(
             isinstance(framework, str) and framework for framework in owner_frameworks
         ):
             reason = reason or "historical-owner-framework-conflict"
-        current = current_by_id.get(successor_id)
+        current = resolve_current_successor_v1(current_by_id, successor_id)
         if current is None:
             reason = reason or "missing-current-inventory-successor"
         elif current["framework"] not in owner_frameworks:

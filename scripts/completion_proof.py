@@ -49,6 +49,31 @@ except ImportError:  # pragma: no cover - direct script execution
         build_current_successor_projection_v1 as _build_current_successor_projection,
     )
 
+try:
+    from scripts import completion_proof_v2_live as _v2_live
+except ImportError:  # pragma: no cover - direct script execution
+    try:
+        import completion_proof_v2_live as _v2_live  # type: ignore[no-redef]
+    except ImportError:  # pragma: no cover - V1-only fixture bundles omit the reader
+        _v2_live = None  # type: ignore[assignment]
+
+V2_INVENTORY_FILENAME = "frozen-test-inventory-v2.json"
+
+
+def _is_v2_config(config: Mapping[str, Any]) -> bool:
+    """Same rule as Core's `v2_activation::is_v2`: the configured inventory file name."""
+    return Path(str(config.get("frozen_inventory", ""))).name == V2_INVENTORY_FILENAME
+
+
+def _v2_reader() -> Any:
+    """Return the Inventory V2 reader, failing closed when the bundle lacks it."""
+    if _v2_live is None:
+        raise ProofError(
+            "this runner bundle has no scripts/completion_proof_v2_live.py, so an "
+            "Inventory V2 configuration cannot be read"
+        )
+    return _v2_live
+
 _BOUNDED_PROCESS_MODULE_NAME = "_kd4_completion_proof_bounded_process"
 _BOUNDED_PROCESS_PATH = Path(__file__).resolve().with_name("bounded_process.py")
 _TRUSTED_BOUNDED_PROCESS_SHA256 = (
@@ -155,6 +180,7 @@ REPORT_TYPE = "CompletionProofAttemptReportV2"
 FOCUSED_COMMAND_TEMPLATE = "just completion-focused {validation_id}"
 FOCUSED_REPORT_TYPE = "FocusedValidationAttemptReportV2"
 CURRENT_EVIDENCE_VALIDATION_ID = "inventory.current-evidence"
+TRANSITION_READINESS_VALIDATION_ID = "inventory.transition-readiness"
 CURRENT_EVIDENCE_VALIDATION_IDS = (
     "maintenance.root-unittest",
     "sdk.python.pytest",
@@ -382,7 +408,10 @@ TEST_SURFACE_IGNORED_PATHSPECS = (
     ":(glob,top)**/*.bats",
 )
 TEST_SURFACE_REVIEWED_JUSTFILE_SHA256: dict[str, str] = {
-    "justfile": "71442d688363ccf73e8400a1f8c3ae44d160246e4569df4dff4afc1f38cefc02",
+    # LF-normalized UTF-8 digest, matching the `just-command-manifest`
+    # marker in `_test_surface_markers`. A raw-bytes digest of a CRLF
+    # checkout would leave the reviewed surface unowned.
+    "justfile": "396c1dadd06c945738455d7bd9d47a5864de9049277aa20a8602a1067afc989b",
 }
 TEST_SURFACE_REVIEWED_PACKAGE_SCRIPTS: dict[
     str, dict[str, tuple[str, tuple[str, ...]]]
@@ -1997,9 +2026,9 @@ def validation_configs(
         runner = str(item.get("runner", ""))
         if not validation_id or validation_id in ids:
             raise ProofError(f"duplicate or empty validation ID {validation_id!r}")
-        if validation_id == CURRENT_EVIDENCE_VALIDATION_ID:
+        if validation_id in {CURRENT_EVIDENCE_VALIDATION_ID, TRANSITION_READINESS_VALIDATION_ID}:
             raise ProofError(
-                "inventory.current-evidence is a focused preparatory mode and cannot "
+                f"{validation_id} is a focused preparatory mode and cannot "
                 "be declared as a required validation"
             )
         if runner not in VALIDATION_RUNNERS:
@@ -2805,13 +2834,15 @@ def run_process(
 
 
 def _rust_inventory(
-    repo_root: Path, env: Mapping[str, str], temp_dir: Path
+    repo_root: Path, env: Mapping[str, str], temp_dir: Path,
+    *, native_ids: Sequence[str] = (),
 ) -> tuple[list[dict[str, object]], ChildProcess]:
     execution_id = str(uuid.uuid4())
+    selection = _focused_rust_arguments(repo_root, env, native_ids) if native_ids else ["--workspace"]
     result = run_process(
         validation_id="inventory.rust-nextest",
         execution_id=execution_id,
-        command=["cargo", "nextest", "list", "--workspace", "-T", "json"],
+        command=["cargo", "nextest", "list", *selection, "-T", "json"],
         cwd=repo_root / "codex-rs",
         env=env,
         timeout_seconds=1800,
@@ -3811,6 +3842,11 @@ def _manifest_paths(repo_root: Path, config: Mapping[str, Any]) -> tuple[Path, P
 def _current_reconciliation_status(
     repo_root: Path, config: Mapping[str, Any]
 ) -> tuple[int, int]:
+    if _is_v2_config(config):
+        try:
+            return _v2_reader().status(repo_root, config)
+        except (ValueError, OSError, KeyError, TypeError) as error:
+            raise ProofError(f"V2 inventory status failed: {error}") from error
     _, ledger_path = _manifest_paths(repo_root, config)
     ledger = _load_json_object(ledger_path, label="configured replacement ledger")
     if ledger.get("schema_version") != 1 or not isinstance(ledger.get("rows"), list):
@@ -3832,6 +3868,16 @@ def load_frozen_inventory(
 ) -> tuple[dict[str, Any], list[dict[str, Any]], str]:
     frozen_path, _ = _manifest_paths(repo_root, config)
     frozen = _load_json_object(frozen_path, label="frozen inventory")
+    if frozen.get("schema_version") == 2:
+        try:
+            inventory, _ = _v2_reader().read_bundle(repo_root, config)
+            return (
+                inventory,
+                inventory["declaration_universe"],
+                config["frozen_inventory_hash"],
+            )
+        except (ValueError, OSError, KeyError, TypeError) as error:
+            raise ProofError(f"V2 inventory could not be read: {error}") from error
     if frozen.get("schema_version") != 1:
         raise ProofError("frozen inventory schema_version must be 1")
     tests = frozen.get("tests")
@@ -3903,7 +3949,21 @@ def reconcile_inventory(
     current_rows: Sequence[Mapping[str, object]],
     *,
     known_validation_ids: set[str] | None = None,
+    transition_readiness: bool = False,
 ) -> Reconciliation:
+    if _is_v2_config(config):
+        try:
+            return Reconciliation(
+                **_v2_reader().reconcile(
+                    repo_root,
+                    config,
+                    current_rows,
+                    known_validation_ids,
+                    transition_readiness,
+                )
+            )
+        except (ValueError, OSError, KeyError, TypeError) as error:
+            raise ProofError(f"V2 inventory reconciliation failed: {error}") from error
     frozen, baseline_rows, frozen_hash = load_frozen_inventory(repo_root, config)
     del frozen
     _, ledger_path = _manifest_paths(repo_root, config)
@@ -3978,6 +4038,16 @@ def reconcile_inventory(
                 errors.append(f"{baseline_id}: replacement has no replacement_ids")
                 continue
             replacement_ids = [str(item) for item in replacements]
+            # Resolve historical native unittest labels without changing the
+            # frozen graph or treating an uncollected selector as evidence.
+            replacement_ids = [
+                str(current["baseline_id"])
+                if (current := _focused_catalog.resolve_current_successor_v1(current_by_id, item)) is not None
+                else item
+                for item in replacement_ids
+            ]
+            if len(set(replacement_ids)) != len(replacement_ids):
+                errors.append(f"{baseline_id}: replacement IDs select a duplicate current identity")
             frozen_replacement_ids = sorted(set(replacement_ids) & baseline_ids)
             if frozen_replacement_ids:
                 errors.append(
@@ -4086,7 +4156,8 @@ def reconcile_inventory(
                     f"{baseline_id}: unresolved row contains fields other than "
                     "baseline_id and resolution"
                 )
-            errors.append(f"{baseline_id}: baseline resolution remains unresolved")
+            if not transition_readiness:
+                errors.append(f"{baseline_id}: baseline resolution remains unresolved")
         else:
             errors.append(f"{baseline_id}: unknown resolution {resolution!r}")
 
@@ -4162,7 +4233,7 @@ def reconcile_inventory(
         executable_ids.add(test_id)
 
     unmapped_current = sorted(set(current_by_id) - referenced_current)
-    if unmapped_current:
+    if unmapped_current and not transition_readiness:
         errors.append(
             f"current inventory contains unmapped IDs: {unmapped_current[:20]}"
         )
@@ -4261,7 +4332,7 @@ def _validation_report(
         "executed_count": len(executed),
         "outcomes": list(outcomes),
         "exit_code": exit_code,
-        "diagnostic": diagnostic[-8000:],
+        "diagnostic": diagnostic,
         "confirmed_failure_ids": [
             str(item.get("id")) for item in outcomes if item.get("outcome") == "failed"
         ],
@@ -5180,12 +5251,52 @@ def _parse_workspace_nextest_events(
     return started, outcomes, blocking_errors, trailing_parse_errors
 
 
+def _focused_rust_arguments(
+    repo_root: Path, env: Mapping[str, str], intended: Sequence[str],
+) -> list[str]:
+    identities = [re.fullmatch(r"([A-Za-z0-9_-]+)::([A-Za-z0-9_-]+)\$(.+)", value) for value in intended]
+    if not identities or any(identity is None for identity in identities):
+        raise ProofError("exact Rust selection requires package::binary$test native IDs")
+    pairs = {(identity[1], identity[2]) for identity in identities if identity}
+    if len(pairs) != 1:
+        raise ProofError("exact Rust selection must name one package and binary per focused invocation")
+    package, binary = pairs.pop()
+    metadata = run_process(
+        validation_id="inventory.rust-nextest", execution_id=str(uuid.uuid4()),
+        command=["cargo", "metadata", "--no-deps", "--format-version", "1"],
+        cwd=repo_root / "codex-rs", env=env, timeout_seconds=60,
+    )
+    if metadata.invocation_error or metadata.returncode != 0:
+        raise ProofError("cannot resolve exact Rust target from Cargo metadata")
+    try:
+        targets = [target for item in json.loads(metadata.stdout)["packages"]
+                   if item["name"] == package for target in item["targets"]
+                   if target["name"] == binary]
+    except (ValueError, KeyError, TypeError) as error:
+        raise ProofError("invalid Cargo metadata for exact Rust selection") from error
+    if len(targets) != 1:
+        raise ProofError("exact Rust native binary is missing or ambiguous")
+    kinds = set(targets[0]["kind"])
+    if kinds & {"lib", "proc-macro"}:
+        target_args = ["--lib"]
+    elif kinds == {"test"}:
+        target_args = ["--test", binary]
+    elif kinds == {"bin"}:
+        target_args = ["--bin", binary]
+    else:
+        raise ProofError("exact Rust selection has an unsupported target kind")
+    expressions = ["test(/^" + re.escape(identity[3]).replace("/", r"\/") + "$/)"
+                   for identity in identities if identity]
+    return ["-p", package, *target_args, "-E", " | ".join(expressions)]
+
+
 def _run_rust_nextest(
     repo_root: Path,
     intended: Sequence[str],
     env: Mapping[str, str],
     *,
     timeout_seconds: int,
+    narrow_selection: bool = False,
 ) -> tuple[dict[str, object], ChildProcess]:
     validation_id = "rust.nextest.workspace"
     execution_id = str(uuid.uuid4())
@@ -5229,6 +5340,8 @@ def _run_rust_nextest(
             ),
             child,
         )
+    if narrow_selection:
+        command[3:4] = _focused_rust_arguments(repo_root, env, intended)
     result = run_process(
         validation_id=validation_id,
         execution_id=execution_id,
@@ -5251,6 +5364,14 @@ def _run_rust_nextest(
         *trailing_parse_errors,
         *observation_errors,
     ]
+    diagnostic_parts = [
+        *([result.invocation_error] if result.invocation_error else []),
+        *evidence_errors,
+    ]
+    if result.stdout:
+        diagnostic_parts.append(f"nextest stdout:\n{result.stdout}")
+    if result.stderr:
+        diagnostic_parts.append(f"nextest stderr:\n{result.stderr}")
     classification, started, outcomes = _classify_observed_results(
         intended=intended,
         selected=intended,
@@ -5278,10 +5399,7 @@ def _run_rust_nextest(
             executed=started,
             outcomes=outcomes,
             exit_code=result.returncode,
-            diagnostic=(
-                result.invocation_error
-                or "\n".join([*evidence_errors, result.stderr[-6000:]])
-            ),
+            diagnostic="\n".join(diagnostic_parts),
         ),
         result.child,
     )
@@ -6796,6 +6914,7 @@ def _reconciliation_worker(
     input_path: Path,
     *,
     allow_test_config: bool,
+    transition_readiness: bool = False,
 ) -> int:
     repo_root, config = load_config(config_path, allow_test_config=allow_test_config)
     configured = validation_configs(
@@ -6842,6 +6961,7 @@ def _reconciliation_worker(
         config,
         current_rows,
         known_validation_ids=set(raw_known_ids),
+        transition_readiness=transition_readiness,
     )
     selected_ids = sorted(reconciliation.current_ids)
     if not selected_ids:
@@ -6853,6 +6973,7 @@ def _reconciliation_worker(
             {
                 "schema_version": 1,
                 "execution_id": execution_id,
+                "transition_readiness": transition_readiness,
                 "frozen_inventory_hash": frozen_digest,
                 "current_inventory_hash": inventory_hash(current_rows),
                 "selected_ids": selected_ids,
@@ -6880,7 +7001,8 @@ def _run_inventory_reconciliation(
     allow_test_config: bool,
     validation_config: Mapping[str, Any],
 ) -> tuple[dict[str, object], ChildProcess]:
-    validation_id = "inventory.frozen-reconciliation"
+    validation_id = str(validation_config["id"])
+    transition_readiness = validation_id == TRANSITION_READINESS_VALIDATION_ID
     execution_id = str(uuid.uuid4())
     intended = sorted(reconciliation.current_ids)
     worker_arguments = [
@@ -6905,6 +7027,8 @@ def _run_inventory_reconciliation(
         ]
     else:
         command = [sys.executable, str(Path(__file__).resolve()), *worker_arguments]
+    if transition_readiness:
+        command.append("--transition-readiness")
     if not intended:
         child = _unlaunched_child(
             validation_id=validation_id,
@@ -6968,6 +7092,7 @@ def _run_inventory_reconciliation(
                 )
                 exact = (
                     raw.get("schema_version") == 1
+                    and raw.get("transition_readiness") is transition_readiness
                     and raw.get("execution_id") == execution_id
                     and raw.get("frozen_inventory_hash") == frozen_inventory_hash
                     and raw.get("current_inventory_hash")
@@ -7139,7 +7264,7 @@ def _enforce_child_evidence_contract(
             prior = str(validation.get("diagnostic", ""))
             validation["diagnostic"] = "; ".join(
                 part for part in (prior, message) if part
-            )[-8000:]
+            )
             validation.pop("report_hash", None)
             validation["report_hash"] = _result_hash(validation)
             errors.append(f"{validation_id}: {message}")
@@ -7277,6 +7402,7 @@ def _focused_inventory_rows(
     runner: str,
     temp_dir: Path,
     allow_test_config: bool,
+    test_ids: Sequence[str] = (),
 ) -> list[dict[str, object]]:
     if runner == "inventory-reconciliation":
         _audit_test_system_surface(repo_root)
@@ -7289,7 +7415,7 @@ def _focused_inventory_rows(
         return testing_rows
     env = _network_disabled_env()
     if runner == "rust-nextest":
-        rows, _ = _rust_inventory(repo_root, env, temp_dir)
+        rows, _ = _rust_inventory(repo_root, env, temp_dir, native_ids=test_ids)
         return rows
     if runner == "rust-doctest":
         rows, _ = _doctest_inventory(repo_root, env)
@@ -7360,8 +7486,13 @@ def _run_focused_validation(
     allow_test_config: bool,
     proof_attempt_id: str,
     proof_receipt_nonce: str,
+    test_ids: Sequence[str] = (),
 ) -> tuple[dict[str, object], ChildProcess]:
     runner = str(item["runner"])
+    if test_ids and runner not in {
+        "rust-nextest", "python-unittest", "python-pytest",
+    }:
+        raise ProofError(f"exact focused test selection is unsupported for {runner}")
     env = _network_disabled_env()
     if runner == "typed-validation":
         return _run_typed_validation(
@@ -7387,6 +7518,7 @@ def _run_focused_validation(
         runner=runner,
         temp_dir=temp_dir,
         allow_test_config=allow_test_config,
+        test_ids=test_ids,
     )
     if runner == "inventory-reconciliation":
         known_validation_ids = {
@@ -7397,6 +7529,7 @@ def _run_focused_validation(
             config,
             rows,
             known_validation_ids=known_validation_ids,
+            transition_readiness=item["id"] == TRANSITION_READINESS_VALIDATION_ID,
         )
         return _run_inventory_reconciliation(
             repo_root=repo_root,
@@ -7422,6 +7555,14 @@ def _run_focused_validation(
         "windows-sandbox-smoke": "windows-sandbox-smoke",
     }[runner]
     intended = _focused_framework_ids(config, rows, framework)
+    if test_ids:
+        requested = sorted(test_ids)
+        if len(requested) != len(set(requested)) or any(not value for value in requested):
+            raise ProofError("exact focused test selection contains empty or duplicate IDs")
+        unknown = sorted(set(requested) - set(intended))
+        if unknown:
+            raise ProofError(f"exact focused test selection contains undiscovered IDs: {unknown}")
+        intended = requested
     timeout_seconds = int(item["timeout_seconds"])
     if runner == "rust-nextest":
         return _run_rust_nextest(
@@ -7429,6 +7570,7 @@ def _run_focused_validation(
             intended,
             env,
             timeout_seconds=timeout_seconds,
+            narrow_selection=bool(test_ids),
         )
     if runner == "rust-doctest":
         return _run_rust_doctests(
@@ -7909,8 +8051,11 @@ def _run_focused_attempt(
     requested_id: str,
     *,
     allow_test_config: bool = False,
+    test_ids: Sequence[str] = (),
 ) -> int:
     if requested_id == CURRENT_EVIDENCE_VALIDATION_ID:
+        if test_ids:
+            raise ProofError("current inventory evidence cannot accept a test subset")
         return _run_current_evidence_attempt(
             config_path, allow_test_config=allow_test_config
         )
@@ -7928,6 +8073,13 @@ def _run_focused_attempt(
     policy_id = KD4_POLICY_ID
     fatal_error = ""
     exact_command = f"just completion-focused {requested_id}"
+    if test_ids:
+        authorized = json.loads(os.environ.get("CODEX_COMPLETION_PROOF_FOCUSED_TEST_IDS", "null"))
+        if list(test_ids) != authorized:
+            raise ProofError("exact focused test selection was not authorized by Core")
+        exact_command = os.environ.get("CODEX_COMPLETION_PROOF_FOCUSED_COMMAND", "")
+        if not exact_command:
+            raise ProofError("exact focused test selection has no authorized command")
 
     def focused_report(
         classification: str,
@@ -7993,6 +8145,11 @@ def _run_focused_attempt(
             for item in configured_validations.values()
             if str(item["id"]) == requested_id
         ]
+        if requested_id == TRANSITION_READINESS_VALIDATION_ID:
+            reconciliation_config = configured_validations.get("inventory-reconciliation")
+            if reconciliation_config is None:
+                raise ProofError("transition readiness requires the configured frozen reconciliation route")
+            selected = [dict(reconciliation_config, id=requested_id)]
         if len(selected) != 1:
             raise ProofError(f"unknown focused validation ID {requested_id!r}")
 
@@ -8020,6 +8177,7 @@ def _run_focused_attempt(
                 config=config,
                 configured_validations=configured_validations,
                 item=selected[0],
+                test_ids=test_ids,
                 inventory_digest=inventory_digest,
                 temp_dir=Path(temp_name),
                 allow_test_config=allow_test_config,
@@ -8726,6 +8884,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("run")
     focused = subparsers.add_parser("focused")
     focused.add_argument("validation_id")
+    focused.add_argument("test_ids", nargs="*")
     subparsers.add_parser("inventory-freeze")
     subparsers.add_parser("inventory-check")
     subparsers.add_parser("fingerprint")
@@ -8733,6 +8892,7 @@ def build_parser() -> argparse.ArgumentParser:
         "reconciliation-worker", help=argparse.SUPPRESS
     )
     reconciliation_worker.add_argument("--input", type=Path, required=True)
+    reconciliation_worker.add_argument("--transition-readiness", action="store_true")
     return parser
 
 
@@ -8753,6 +8913,7 @@ def _dispatch(
                 args.config,
                 args.validation_id,
                 allow_test_config=allow_test_config,
+                test_ids=args.test_ids,
             )
         if args.command == "inventory-freeze":
             return _freeze_inventory(
@@ -8769,6 +8930,7 @@ def _dispatch(
                 args.config,
                 args.input,
                 allow_test_config=allow_test_config,
+                transition_readiness=args.transition_readiness,
             )
         if args.command == "fingerprint":
             repo_root, _ = load_config(args.config, allow_test_config=allow_test_config)

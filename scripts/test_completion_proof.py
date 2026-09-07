@@ -712,12 +712,15 @@ class CompletionProofCliTest(unittest.TestCase):
         *,
         child_returncode: int = 0,
         later_supervision_error: str | None = None,
+        stderr: str = "",
     ) -> tuple[subprocess.CompletedProcess[str], dict[str, object], dict[str, object]]:
         fixture_id = uuid.uuid4().hex
         event_path = self.base / f"nextest-events-{fixture_id}.jsonl"
+        stderr_path = self.base / f"nextest-stderr-{fixture_id}.txt"
         log_path = self.base / f"nextest-launch-{fixture_id}.json"
         child_path = self.base / "nextest-child.py"
         event_path.write_text(events + "\n", encoding="utf-8")
+        stderr_path.write_text(stderr, encoding="utf-8")
         child_path.write_text(
             textwrap.dedent(
                 f"""\
@@ -728,11 +731,13 @@ class CompletionProofCliTest(unittest.TestCase):
 
                 log_path = pathlib.Path(sys.argv[1])
                 event_path = pathlib.Path(sys.argv[2])
+                stderr_path = pathlib.Path(sys.argv[3])
                 log_path.write_text(
-                    json.dumps({{"pid": os.getpid(), "argv": sys.argv[3:]}}) + "\\n",
+                    json.dumps({{"pid": os.getpid(), "argv": sys.argv[4:]}}) + "\\n",
                     encoding="utf-8",
                 )
                 sys.stdout.write(event_path.read_text(encoding="utf-8"))
+                sys.stderr.write(stderr_path.read_text(encoding="utf-8"))
                 raise SystemExit({child_returncode})
                 """
             ),
@@ -753,6 +758,7 @@ class CompletionProofCliTest(unittest.TestCase):
                         {str(child_path)!r},
                         {str(log_path)!r},
                         {str(event_path)!r},
+                        {str(stderr_path)!r},
                         *command,
                     ]
                 result = _fixture_original_run_process(
@@ -1010,6 +1016,9 @@ class CompletionProofCliTest(unittest.TestCase):
 
     def test_canonical_nextest_preserves_failure_before_supervision_error(self) -> None:
         self._write_rust_nextest_workspace_fixture()
+        early_failure = "NATIVE_FAILURE_OUTPUT_AT_START"
+        early_stderr = "NEXTEST_STDERR_AT_START"
+        late_stderr = "NEXTEST_STDERR_AT_END"
         events = "\n".join(
             json.dumps(event)
             for event in (
@@ -1022,14 +1031,17 @@ class CompletionProofCliTest(unittest.TestCase):
                     "type": "test",
                     "event": "failed",
                     "name": RUST_NEXTEST_NATIVE_ID,
+                    "stdout": early_failure,
                 },
             )
         )
+        stderr = early_stderr + "\n" + ("late diagnostic filler\n" * 500) + late_stderr
 
         result, report, launch = self._run_rust_nextest_events(
             events,
             child_returncode=100,
             later_supervision_error="fixture supervision failed after validation",
+            stderr=stderr,
         )
 
         self.assertEqual(result.returncode, 1, result.stderr)
@@ -1043,6 +1055,14 @@ class CompletionProofCliTest(unittest.TestCase):
         self.assertEqual(validation["executed_ids"], [RUST_NEXTEST_NATIVE_ID])
         self.assertEqual(validation["confirmed_failure_ids"], [RUST_NEXTEST_NATIVE_ID])
         self.assertIn("fixture supervision failed", validation["diagnostic"])
+        self.assertIn(early_failure, validation["diagnostic"])
+        self.assertIn(early_stderr, validation["diagnostic"])
+        self.assertIn(late_stderr, validation["diagnostic"])
+        self.assertGreater(
+            validation["diagnostic"].index(late_stderr)
+            - validation["diagnostic"].index(early_failure),
+            8000,
+        )
         child = next(
             item
             for item in report["child_processes"]
@@ -2530,6 +2550,7 @@ class CompletionProofCliTest(unittest.TestCase):
         *,
         report: Path | None = None,
         patch_source: str | None = None,
+        test_ids: tuple[str, ...] = (),
     ) -> tuple[subprocess.CompletedProcess[str], Path]:
         report = report or self.base / f"focused-report-{uuid.uuid4()}.json"
         env = self._base_env()
@@ -2548,12 +2569,18 @@ class CompletionProofCliTest(unittest.TestCase):
                 ),
             }
         )
+        if test_ids:
+            env["CODEX_COMPLETION_PROOF_FOCUSED_TEST_IDS"] = json.dumps(test_ids)
+            env["CODEX_COMPLETION_PROOF_FOCUSED_COMMAND"] = " ".join(
+                ["just", "completion-focused", validation_id, *test_ids]
+            )
         result = subprocess.run(
             self._unittest_runner_command(
                 "--config",
                 str(self.config),
                 "focused",
                 validation_id,
+                *test_ids,
                 patch_source=patch_source,
             ),
             cwd=self.repository,
@@ -4394,6 +4421,33 @@ class CompletionProofCliTest(unittest.TestCase):
         self.assertEqual(canonical_report["attempt_classification"], "pre_result_error")
         self.assertEqual(self.marker.read_text(encoding="utf-8").splitlines(), executions)
 
+    def test_focused_rust_subset_executes_exact_native_test_without_building_other_packages(self) -> None:
+        self._write_config(mode="pass", use_testing_inventory=False)
+        with self.config.open("a", encoding="utf-8") as stream:
+            stream.write('\n[[validation]]\nid = "rust.nextest.workspace"\nrunner = "rust-nextest"\nowned_paths = ["codex-rs/**"]\nconsumed_paths = ["codex-rs/**"]\ntimeout_seconds = 120\n')
+        rust = self.repository / "codex-rs"
+        for relative in ("selected/tests", "unrelated/src", ".config"):
+            (rust / relative).mkdir(parents=True)
+        (rust / "Cargo.toml").write_text('[workspace]\nmembers = ["selected", "unrelated"]\nresolver = "2"\n')
+        (rust / "selected/Cargo.toml").write_text('[package]\nname = "focused-fixture"\nversion = "0.1.0"\nedition = "2021"\n')
+        (rust / "unrelated/Cargo.toml").write_text('[package]\nname = "unrelated-fixture"\nversion = "0.1.0"\nedition = "2021"\n')
+        (rust / "unrelated/src/lib.rs").write_text('compile_error!("focused discovery must not build this package");\n')
+        marker = self.base / "native-selection.txt"
+        (rust / "selected/tests/behavior.rs").write_text(
+            '#[test]\nfn selected_price() { std::fs::write(r#"' + str(marker) + '"#, "selected").unwrap(); }\n'
+            '#[test]\nfn selected_price_suffix() { panic!("an exact selector must exclude this test"); }\n'
+        )
+        (rust / ".config/nextest.toml").write_text('[profile.completion-proof]\ninherits = "default"\n')
+        (self.repository / ".gitignore").write_text('/codex-rs/target/\n/codex-rs/Cargo.lock\n')
+        native_id = "focused-fixture::behavior$selected_price"
+        result, report_path = self._run_focused("rust.nextest.workspace", test_ids=(native_id,))
+        report = self._load_report(report_path)
+        self.assertEqual(result.returncode, 0, report)
+        self.assertEqual(report["attempt_classification"], "confirmed_pass")
+        self.assertEqual(report["validations"][0]["executed_ids"], [native_id])
+        self.assertEqual(marker.read_text(), "selected")
+        self.assertFalse(self.marker.exists(), "another configured validation ran")
+
     def test_focused_cli_records_one_fresh_non_certifying_pass(self) -> None:
         result, report_path = self._run_focused("fixture.command")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -5846,6 +5900,72 @@ class CompletionProofCliTest(unittest.TestCase):
         self.assertEqual(report["attempt_classification"], "pre_result_error")
         self.assertIn("inventory reconciliation failed", report["fatal_error"])
         self.assertFalse(self.marker.exists())
+
+    def test_transition_readiness_keeps_unresolved_rows_blocking_certification(self) -> None:
+        ledger = json.loads(self.ledger.read_text(encoding="utf-8"))
+        ledger["rows"][0] = {
+            "baseline_id": self.baseline_rows[0]["baseline_id"],
+            "resolution": "unresolved",
+        }
+        self._write_json(self.ledger, ledger)
+        original = self.ledger.read_bytes()
+        result, report_path = self._run_focused("inventory.transition-readiness")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = self._load_report(report_path)
+        self.assertEqual(report["focused_validation_id"], "inventory.transition-readiness")
+        self.assertEqual(report["attempt_classification"], "confirmed_pass")
+        self.assertEqual(len(report["child_processes"]), 1)
+        self.assertFalse(self.marker.exists(), "readiness launched an implementation test")
+        self.assertEqual(self.ledger.read_bytes(), original)
+
+        for focused in (True, False):
+            with self.subTest(focused=focused):
+                result, path = (
+                    self._run_focused("inventory.frozen-reconciliation")
+                    if focused else self._run()
+                )
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("baseline resolution remains unresolved", self._load_report(path)["fatal_error"])
+                self.assertFalse(self.marker.exists())
+                self.assertEqual(self.ledger.read_bytes(), original)
+
+    def test_transition_readiness_rejects_broken_existing_mapping(self) -> None:
+        ledger = json.loads(self.ledger.read_text(encoding="utf-8"))
+        ledger["rows"][0]["replacement_ids"] = ["fixture-command::missing-runtime-path"]
+        self._write_json(self.ledger, ledger)
+        result, path = self._run_focused("inventory.transition-readiness")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("replacement IDs are not discovered", self._load_report(path)["fatal_error"])
+        self.assertFalse(self.marker.exists())
+
+    def test_transition_readiness_preserves_historical_unittest_native_mapping(self) -> None:
+        native_id = "scripts.test_fixture.FixtureTest.test_runtime_path"
+        current_id = f"python-unittest::{native_id}"
+        self._write_json(self.current_inventory, {"schema_version": 1, "tests": [
+            dict(self.current_rows[0], baseline_id=current_id, framework="python-unittest", native_id=native_id)
+        ]})
+        ledger = json.loads(self.ledger.read_text(encoding="utf-8"))
+        ledger["rows"][0]["replacement_ids"] = [native_id]
+        self._write_json(self.ledger, ledger)
+        original = self.ledger.read_bytes()
+        result, path = self._run_focused("inventory.transition-readiness")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = self._load_report(path)
+        validation = report["validations"][0]
+        self.assertEqual(validation["selected_ids"], [current_id])
+        self.assertEqual(validation["executed_ids"], [current_id])
+        self.assertEqual(self.ledger.read_bytes(), original)
+        self.assertFalse(self.marker.exists())
+
+        # An apparent canonical row with a different native selector cannot
+        # satisfy that same immutable historical label.
+        self._write_json(self.current_inventory, {"schema_version": 1, "tests": [
+            dict(self.current_rows[0], baseline_id=current_id, framework="python-unittest", native_id=native_id + "_other")
+        ]})
+        result, path = self._run_focused("inventory.transition-readiness")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("replacement IDs are not discovered", self._load_report(path)["fatal_error"])
+        self.assertEqual(self.ledger.read_bytes(), original)
 
     def test_replacement_cannot_reuse_another_frozen_baseline_identity(self) -> None:
         replacement_id = "fixture-command::still-baseline-behavior"
@@ -7568,6 +7688,17 @@ class CompletionProofCliTest(unittest.TestCase):
                 "justfile",
                 "scripts/pyproject.toml",
                 "scripts/uv.lock",
+                ".codex/validation/replacement-admissions-v1.schema.json",
+                ".codex/validation/completion-proof.toml",
+                ".codex/validation/frozen-test-inventory-v1.json",
+                ".codex/validation/test-replacements-v1.json",
+                ".codex/validation/frozen-test-inventory-v2.json",
+                ".codex/validation/test-replacements-v2.json",
+                ".codex/validation/frozen-test-inventory-v2-recoveries.json",
+                ".codex/validation/frozen-test-inventory-v2-recovery-transition-receipts.json",
+                ".codex/validation/frozen-test-inventory-v2-doctest-recapture.json",
+                ".codex/validation/frozen-test-inventory-v2-unittest-recapture.json",
+                ".codex/validation/frozen-test-inventory-v2-unittest-source-exceptions.json",
             ],
             "sdk.python.pytest": [
                 "sdk/python/**",

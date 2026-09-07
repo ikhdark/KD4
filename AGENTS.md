@@ -1,5 +1,14 @@
 # KD4 repository instructions
 
+### Scope and workspace
+
+- Ask a question when clarity is needed, do not continue to ask questions after implementation has begun.
+- Work within the requested scope. Do not publish, deploy, or modify upstream
+  state unless the user explicitly requests that action.
+- When edits overlap, compare the versions and keep or combine the changes
+  that best satisfy the affected contracts and tests. Preserve unrelated work.
+- If blocked by tests, do not repeat, simply finish the full task then report blocked by tests.
+
 ## Repository identity and runtime boundary
 
 - This is the user's local fork of [`openai/codex`](https://github.com/openai/codex).
@@ -16,11 +25,11 @@
   shell. Source changes become Desktop-visible only after rebuilding and
   replacing or updating the local binary, then restarting Desktop. Perform
   those activation steps only when the request includes them.
-
+- When validating do not fix errors one by one, fix all errors at the end of the test being used.
 
 ### Scope and workspace
 - For behavior changes, add or update tests that directly exercise the changed behavior and prove it is reachable through the real integration or runtime path. A single test may prove both. Do not rely only on helper-level tests or implementation-detail assertions. For documentation-only changes, run the nearest relevant existing validation instead of creating a test.
-
+- when doing validation, do not fix errors one by one, fix all at the end of the specific test.
 - Partial wiring of implemented code is forbidden, this is non-negotiable.
 - Ask questions for clarity before implementing.
 - Read the root `AGENTS.md` in full, and read every user-provided or user-named
@@ -33,6 +42,10 @@
   when it is better, and combine them when that produces the best result. If
   the existing version is already better than your proposed edit, leave it
   unchanged and move on.
+  - For behavior changes, add or update tests that directly exercise the changed behavior and prove it is reachable through the real integration or runtime path. A single test may prove both. Do not rely only on helper-level tests or implementation-detail assertions. For documentation-only changes, run the nearest relevant existing validation instead of creating a test.
+
+- Partial wiring of implemented code is forbidden, this is non-negotiable.
+- Ask questions for clarity before implementing.
 
 ## Routing and task scope
 

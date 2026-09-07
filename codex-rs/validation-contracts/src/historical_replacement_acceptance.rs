@@ -273,8 +273,7 @@ impl HistoricalReplacementAcceptanceProposalV1 {
             format_id: FocusedReplacementApprovalReceiptV1::FORMAT_ID.to_owned(),
             schema_version: 1,
             attempt_id: approval.attempt_id.clone(),
-            focused_validation_id: FocusedReplacementApprovalReceiptV1::FOCUSED_VALIDATION_ID
-                .to_owned(),
+            focused_validation_id: approval.focused_validation_id.clone(),
             receipt_sha256: approval.receipt_sha256.clone(),
         };
         if self.focused_replacement_approval_receipt_ref != expected_receipt_ref {

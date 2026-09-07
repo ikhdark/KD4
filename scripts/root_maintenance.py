@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import errno
 from functools import cache
 import hashlib
 import json
@@ -158,6 +159,11 @@ def tracked_script_entrypoints() -> tuple[Path, ...]:
             with path.open("rb") as script_file:
                 first_line = script_file.readline(256)
         except OSError as error:
+            # The index retains unstaged deletions. Current discovery inventories
+            # the working tree; frozen replacement obligations are reconciled
+            # separately. Keep unreadable files and dangling links fail-closed.
+            if error.errno == errno.ENOENT and not os.path.lexists(path):
+                continue
             raise ScriptInventoryDiscoveryError(
                 f"tracked script discovery could not read {target}: {error}"
             ) from error

@@ -9,6 +9,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::fs;
+use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -61,12 +62,37 @@ fn make_random_cap_sid_string() -> String {
 }
 
 fn persist_caps(path: &Path, caps: &CapSids) -> Result<()> {
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir).with_context(|| format!("create cap sid dir {}", dir.display()))?;
-    }
+    let dir = path.parent().ok_or_else(|| {
+        anyhow::anyhow!("cap sid file {} has no parent directory", path.display())
+    })?;
+    fs::create_dir_all(dir).with_context(|| format!("create cap sid dir {}", dir.display()))?;
     let json = serde_json::to_string(caps)?;
-    fs::write(path, json).with_context(|| format!("write cap sid file {}", path.display()))?;
+    // Replace atomically. A crash or a concurrent reader must never observe a
+    // truncated record: a damaged file fails closed instead of regenerating SIDs.
+    let mut staged = tempfile::Builder::new()
+        .prefix(".cap_sid-")
+        .tempfile_in(dir)
+        .with_context(|| format!("stage cap sid file in {}", dir.display()))?;
+    staged
+        .write_all(json.as_bytes())
+        .and_then(|()| staged.as_file().sync_all())
+        .with_context(|| format!("write staged cap sid file for {}", path.display()))?;
+    staged
+        .persist(path)
+        .map_err(|error| error.error)
+        .with_context(|| format!("replace cap sid file {}", path.display()))?;
     Ok(())
+}
+
+/// The legacy pre-JSON file held exactly one generated capability SID.
+fn is_capability_sid_string(value: &str) -> bool {
+    value.strip_prefix("S-1-5-21-").is_some_and(|rest| {
+        let components: Vec<&str> = rest.split('-').collect();
+        components.len() == 4
+            && components
+                .iter()
+                .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+    })
 }
 
 fn load_or_create_cap_sids_from_disk(codex_home: &Path) -> Result<CapSids> {
@@ -76,10 +102,22 @@ fn load_or_create_cap_sids_from_disk(codex_home: &Path) -> Result<CapSids> {
             .with_context(|| format!("read cap sid file {}", path.display()))?;
         let t = txt.trim();
         if t.starts_with('{') && t.ends_with('}') {
-            if let Ok(obj) = serde_json::from_str::<CapSids>(t) {
-                return Ok(obj);
-            }
+            // Regenerating here would silently orphan every ACL installed for the
+            // previous identities, including the per-workspace deny entries that
+            // protect `.codex`; a damaged record must stop the sandbox instead.
+            return serde_json::from_str::<CapSids>(t).with_context(|| {
+                format!(
+                    "cap sid file {} is not a valid capability SID record; refusing to regenerate capability SIDs",
+                    path.display()
+                )
+            });
         } else if !t.is_empty() {
+            if !is_capability_sid_string(t) {
+                anyhow::bail!(
+                    "cap sid file {} is neither a JSON record nor a capability SID; refusing to regenerate capability SIDs",
+                    path.display()
+                );
+            }
             let caps = CapSids {
                 workspace: t.to_string(),
                 readonly: make_random_cap_sid_string(),
@@ -308,6 +346,94 @@ mod tests {
             helper_sid
         );
         assert_eq!(cap_sid_disk_load_count(&codex_home), 2);
+    }
+
+    #[test]
+    fn damaged_json_cap_sid_file_fails_closed_and_is_preserved() {
+        let home = TempDir::new().expect("temp dir");
+        let path = cap_sid_file(home.path());
+        let damaged = br#"{"workspace": 1, "readonly": "S-1-5-21-1-2-3-4"}"#;
+        std::fs::write(&path, damaged).expect("write damaged record");
+
+        let error = load_or_create_cap_sids(home.path())
+            .expect_err("a damaged record must not regenerate capability SIDs");
+
+        assert!(
+            error.to_string().contains("refusing to regenerate"),
+            "{error:#}"
+        );
+        assert_eq!(std::fs::read(&path).expect("preserved bytes"), damaged);
+    }
+
+    #[test]
+    fn truncated_cap_sid_file_fails_closed_and_is_preserved() {
+        let home = TempDir::new().expect("temp dir");
+        let path = cap_sid_file(home.path());
+        // A write interrupted before the closing brace used to be treated as a
+        // legacy plain-text SID and silently replaced by a fresh record.
+        let truncated = br#"{"workspace":"S-1-5-21-1-2-3-4","readonly":"S-1-5-21-5-6"#;
+        std::fs::write(&path, truncated).expect("write truncated record");
+
+        let error = load_or_create_cap_sids(home.path())
+            .expect_err("a truncated record must not regenerate capability SIDs");
+
+        assert!(
+            error.to_string().contains("refusing to regenerate"),
+            "{error:#}"
+        );
+        assert_eq!(std::fs::read(&path).expect("preserved bytes"), truncated);
+    }
+
+    #[test]
+    fn legacy_plain_text_cap_sid_file_still_migrates() {
+        let home = TempDir::new().expect("temp dir");
+        let path = cap_sid_file(home.path());
+        std::fs::write(&path, "S-1-5-21-1-2-3-4\n").expect("write legacy record");
+
+        let caps = load_or_create_cap_sids(home.path()).expect("migrate legacy record");
+
+        assert_eq!(caps.workspace, "S-1-5-21-1-2-3-4");
+        let migrated: super::CapSids =
+            serde_json::from_slice(&std::fs::read(&path).expect("migrated bytes")).expect("json");
+        assert_eq!(migrated.workspace, caps.workspace);
+        assert_eq!(migrated.readonly, caps.readonly);
+    }
+
+    #[test]
+    fn persist_caps_replaces_the_file_without_staging_litter() {
+        let home = TempDir::new().expect("temp dir");
+        let path = cap_sid_file(home.path());
+        let first = load_or_create_cap_sids(home.path()).expect("initial record");
+        let extra_sid = workspace_write_cap_sid_for_root_keys(
+            home.path(),
+            "c:\\workspace",
+            "c:\\extra".to_string(),
+        )
+        .expect("persist new root through the runtime entrypoint");
+
+        let entries: Vec<String> = std::fs::read_dir(home.path())
+            .expect("home listing")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert_eq!(entries, vec!["cap_sid".to_string()]);
+        let reloaded: super::CapSids =
+            serde_json::from_slice(&std::fs::read(&path).expect("record bytes")).expect("json");
+        assert_eq!(reloaded.writable_root_by_path.len(), 1);
+        assert_eq!(reloaded.writable_root_by_path["c:\\extra"], extra_sid);
+        assert_eq!(reloaded.workspace, first.workspace);
+        assert_eq!(reloaded.readonly, first.readonly);
+        assert_eq!(reloaded.workspace_by_cwd, first.workspace_by_cwd);
+        let cached = load_or_create_cap_sids(home.path()).expect("runtime cache after write");
+        assert_eq!(cached.workspace, reloaded.workspace);
+        assert_eq!(cached.readonly, reloaded.readonly);
+        assert_eq!(cached.workspace_by_cwd, reloaded.workspace_by_cwd);
+        assert_eq!(cached.writable_root_by_path, reloaded.writable_root_by_path);
     }
 
     #[test]

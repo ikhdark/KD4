@@ -361,7 +361,7 @@ fn shared_catalog_vectors_match_python() {
         assert!(rule.starts_with("SHA256("));
         assert!(rule.contains("strict JCS"));
     }
-    assert_eq!(vectors.valid_vectors.len(), 4);
+    assert_eq!(vectors.valid_vectors.len(), 5);
     assert_eq!(vectors.invalid_vectors.len(), 68);
 
     for vector in &vectors.valid_vectors {

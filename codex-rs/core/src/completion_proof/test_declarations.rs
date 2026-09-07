@@ -15,10 +15,21 @@ pub(super) struct TestDeclaration {
     pub(super) context: String,
 }
 
+impl TestDeclaration {
+    // Baseline discovery ignores a checkout's newline convention. The body
+    // itself stays exact for reviewer output and failed/passing comparisons.
+    pub(super) fn matches_baseline(&self, old: &Self) -> bool {
+        self.name == old.name
+            && self.body.replace("\r\n", "\n") == old.body.replace("\r\n", "\n")
+            && self.context == old.context
+    }
+}
+
 pub(super) async fn test_declarations(
     root: &Path,
     path: &str,
     source: &str,
+    observed_pytest_module: bool,
 ) -> Result<Vec<TestDeclaration>, String> {
     if source.is_empty() {
         return Ok(Vec::new());
@@ -26,10 +37,24 @@ pub(super) async fn test_declarations(
     match Path::new(path).extension().and_then(|e| e.to_str()) {
         Some("rs") => rust_declarations(source),
         Some("py") => {
+            let collect_functions =
+                super::test_quality::dedicated_test_path(path) || observed_pytest_module;
             parse_with_process(
                 root,
                 "python",
-                &["-X", "utf8", "-I", "-S", "-c", PYTHON_DECLARATIONS],
+                &[
+                    "-X",
+                    "utf8",
+                    "-I",
+                    "-S",
+                    "-c",
+                    PYTHON_DECLARATIONS,
+                    if collect_functions {
+                        "functions"
+                    } else {
+                        "methods"
+                    },
+                ],
                 source,
             )
             .await
@@ -74,7 +99,10 @@ impl<'ast> Visit<'ast> for RustDeclarations<'_> {
                     }
                 }
             }
-            self.context = format!("{:x}", Sha256::digest(context.as_bytes()));
+            self.context = format!(
+                "{:x}",
+                Sha256::digest(context.replace("\r\n", "\n").as_bytes())
+            );
         }
         syn::visit::visit_item_mod(self, item);
         self.context = previous;
@@ -161,9 +189,17 @@ const PYTHON_DECLARATIONS: &str = r#"import ast, json, sys
 source = sys.stdin.buffer.read().decode("utf-8")
 lines = source.splitlines(keepends=True)
 tree = ast.parse(source)
+parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+collect_functions = sys.argv[1] == 'functions'
 result = []
 for node in ast.walk(tree):
     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith('test'):
+        # Ordinary module helpers are not unittest cases. Dedicated test modules
+        # and exact native pytest observations also admit free test functions.
+        # Keep class methods conservative for imported/custom TestCase bases.
+        marked_pytest = any(ast.unparse(d).startswith('pytest.mark.') for d in node.decorator_list)
+        if not collect_functions and not isinstance(parents.get(node), ast.ClassDef) and not marked_pytest:
+            continue
         start = min([node.lineno] + [d.lineno for d in node.decorator_list])
         result.append({'name': node.name, 'body': ''.join(lines[start - 1:node.end_lineno])})
 print(json.dumps(result))

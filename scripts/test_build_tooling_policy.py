@@ -2719,6 +2719,91 @@ elif tool == "just" and args == ["--summary"]:
                 self.assertIn("SCRIPT AUDIT INFRASTRUCTURE FAILED", stdout.getvalue())
                 self.assertNotIn("SCRIPT AUDIT PASSED", stdout.getvalue())
 
+    def test_unittest_cli_handles_tracked_deletions_and_rejects_unreadable_files(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            scripts = root / "scripts"
+            scripts.mkdir()
+            for name in ("root_maintenance.py", "completion_proof_unittest.py"):
+                shutil.copyfile(REPO_ROOT / "scripts" / name, scripts / name)
+            outside = root / "outside"
+            outside.mkdir()
+            live = outside / "test_live.py"
+            live.write_text(
+                "#!/usr/bin/env python3\n"
+                "import unittest\nfrom pathlib import Path\n"
+                "class LiveTest(unittest.TestCase):\n"
+                "    def test_executes(self):\n"
+                "        Path('executed.txt').write_text('surviving test ran')\n",
+                encoding="utf-8",
+            )
+            deleted = (root / "retired.rs", outside / "test_retired.py")
+            for path in deleted:
+                path.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+
+            def run(*command: str) -> subprocess.CompletedProcess[str]:
+                return subprocess.run(
+                    command,
+                    cwd=root,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=60,
+                    check=False,
+                )
+
+            for command in (("git", "init", "--quiet"), ("git", "add", ".")):
+                result = run(*command)
+                self.assertEqual(result.returncode, 0, result.stderr)
+            for path in deleted:
+                path.unlink()
+            wrapper = str(scripts / "completion_proof_unittest.py")
+            result = run(
+                sys.executable, wrapper, "collect", "--output", "collection.json"
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            collection = json.loads((root / "collection.json").read_bytes())
+            identity = "outside.test_live.LiveTest.test_executes"
+            self.assertEqual(collection["classification"], "discovered")
+            self.assertEqual([row["id"] for row in collection["tests"]], [identity])
+            (root / "expected.json").write_text(
+                json.dumps([identity]), encoding="utf-8"
+            )
+            result = run(
+                sys.executable,
+                wrapper,
+                "run",
+                "--expected-file",
+                "expected.json",
+                "--output",
+                "execution.json",
+                "--proof-attempt-id",
+                "deletion-attempt",
+                "--proof-execution-id",
+                "deletion-execution",
+                "--proof-receipt-nonce",
+                "deletion-nonce",
+                "--proof-scope",
+                "focused",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            execution = json.loads((root / "execution.json").read_bytes())
+            self.assertEqual(execution["classification"], "confirmed_pass")
+            self.assertEqual(execution["executed_ids"], [identity])
+            self.assertEqual((root / "executed.txt").read_text(), "surviving test ran")
+            # An existing indexed path that cannot be opened is not a deletion.
+            live.unlink()
+            live.mkdir()
+            result = run(
+                sys.executable, wrapper, "collect", "--output", "unreadable.json"
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("could not read outside/test_live.py", result.stderr)
+            self.assertFalse((root / "unreadable.json").exists())
+
     def test_root_maintenance_audit_rejects_empty_inventory(self) -> None:
         root_maintenance = load_root_maintenance_module()
         stdout = io.StringIO()

@@ -1104,25 +1104,90 @@ async fn environment_count_controls_environment_backed_tools() {
 }
 
 #[tokio::test]
-async fn kda_is_a_read_only_tool_for_one_local_environment() {
-    let local = probe(|_| {}).await;
-    local.assert_visible_contains(&["kda"]);
-    local.assert_registered_contains(&["kda"]);
-    assert_eq!(local.authorization_class("kda"), TypedToolClass::ReadSearch);
-    assert_eq!(
-        local.external_mutation_intents.get("kda"),
-        Some(&ExternalMutationIntent::ProvenReadOnly)
-    );
+async fn retired_kda_tool_is_not_exposed_or_registered() {
+    async fn isolated_probe(configure_turn: impl FnOnce(&mut TurnContext)) -> ToolPlanProbe {
+        let (session, mut turn) = make_session_and_context().await;
+        // This existing constructor discards its temporary home before returning.
+        // Release only its exact unchanged credential after the metadata probe,
+        // before any assertion on the returned tool plan can unwind this test.
+        #[cfg(windows)]
+        let credential = {
+            use codex_keyring_store::KeyringStore;
+            let home = turn.config.codex_home.clone();
+            let temporary = dunce::canonicalize(std::env::temp_dir()).expect("temporary root");
+            assert_eq!(home.as_path().parent(), Some(temporary.as_path()));
+            assert!(
+                home.file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with(".tmp"))
+            );
+            assert!(
+                !home.exists(),
+                "the test constructor must have discarded this home"
+            );
+            let (service, account) =
+                crate::completion_proof::completion_proof_trust_anchor_identity_for_tests(
+                    &home,
+                    turn.config.cwd.as_path(),
+                );
+            let value = codex_keyring_store::DefaultKeyringStore
+                .load(service, &account)
+                .expect("read only this discarded test home's credential");
+            (home, service, account, value)
+        };
+        configure_turn(&mut turn);
+        let step = StepContext::for_test(Arc::new(turn));
+        let cache = ToolSearchHandlerCache::default();
+        let router = ToolRouter::from_context(
+            step.as_ref(),
+            ToolRouterParams {
+                mcp_tools: None,
+                deferred_mcp_tools: None,
+                tool_suggest_candidates: None,
+                extension_tool_executors: Vec::new(),
+                dynamic_tools: &[],
+                exposure_identity: Default::default(),
+            },
+            &cache,
+        );
+        let result = ToolPlanProbe::from_router(router, &cache);
+        drop(step);
+        drop(session);
+        #[cfg(windows)]
+        {
+            use codex_keyring_store::KeyringStore;
+            let (home, service, account, value) = credential;
+            assert!(!home.exists(), "preserve a recreated fixture home");
+            let current = codex_keyring_store::DefaultKeyringStore
+                .load(service, &account)
+                .expect("recheck the exact discarded fixture credential");
+            assert!(
+                current == value,
+                "preserve an unexpectedly changed fixture credential"
+            );
+            if value.is_some() {
+                codex_keyring_store::DefaultKeyringStore
+                    .delete(service, &account)
+                    .expect("release the completed metadata fixture credential");
+            }
+        }
+        result
+    }
 
-    let no_environment = probe(|turn| turn.environments.turn_environments.clear()).await;
+    for tool_mode in [ToolMode::Direct, ToolMode::CodeMode, ToolMode::CodeModeOnly] {
+        let local = isolated_probe(|turn| turn.model_info.tool_mode = Some(tool_mode)).await;
+        local.assert_visible_lacks(&["kda"]);
+        local.assert_registered_lacks(&["kda"]);
+    }
+
+    let no_environment = isolated_probe(|turn| turn.environments.turn_environments.clear()).await;
     no_environment.assert_visible_lacks(&["kda"]);
     no_environment.assert_registered_lacks(&["kda"]);
 
-    let multiple_environments = probe(duplicate_primary_environment).await;
+    let multiple_environments = isolated_probe(duplicate_primary_environment).await;
     multiple_environments.assert_visible_lacks(&["kda"]);
     multiple_environments.assert_registered_lacks(&["kda"]);
 
-    let foreign_environment = probe(set_foreign_primary_environment).await;
+    let foreign_environment = isolated_probe(set_foreign_primary_environment).await;
     foreign_environment.assert_visible_lacks(&["kda"]);
     foreign_environment.assert_registered_lacks(&["kda"]);
 }

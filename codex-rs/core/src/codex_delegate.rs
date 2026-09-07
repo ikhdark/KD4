@@ -283,6 +283,11 @@ impl PreparedCodexOneShot {
         })
     }
 
+    /// Returns the initialized child identity before its first model request.
+    pub(crate) fn thread_id(&self) -> String {
+        self.io.session.thread_id.to_string()
+    }
+
     pub(crate) async fn submit_once(
         mut self,
         input: Vec<UserInput>,

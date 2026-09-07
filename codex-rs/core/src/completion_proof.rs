@@ -59,6 +59,7 @@ use uuid::Uuid;
 mod focused_completion;
 mod test_declarations;
 mod test_quality;
+mod v2_activation;
 use focused_completion::FocusedCompletionState;
 
 const STATE_SCHEMA_VERSION: u32 = 1;
@@ -148,6 +149,10 @@ const KD4_TRUSTED_BUNDLE_MEMBERS: &[TrustedBundleMember] = &[
     TrustedBundleMember {
         relative_path: "scripts/completion_proof_inventory_v2.py",
         bytes: include_bytes!("../../../scripts/completion_proof_inventory_v2.py"),
+    },
+    TrustedBundleMember {
+        relative_path: "scripts/completion_proof_v2_live.py",
+        bytes: include_bytes!("../../../scripts/completion_proof_v2_live.py"),
     },
     TrustedBundleMember {
         relative_path: "scripts/focused_live_successor_catalog.py",
@@ -1351,6 +1356,7 @@ pub(crate) struct CompletionProofAttempt {
 pub(crate) struct FocusedValidationAttempt {
     inner: CompletionProofAttempt,
     validation_id: String,
+    test_ids: Vec<String>,
     current_evidence: bool,
     approval_expectation: Option<FocusedReplacementApprovalExpectation>,
 }
@@ -1539,6 +1545,16 @@ impl CompletionProofReservation {
 impl FocusedValidationAttempt {
     pub(crate) fn apply_private_environment(&self, env: &mut HashMap<String, String>) {
         self.inner.apply_private_environment(env);
+        if !self.test_ids.is_empty() {
+            env.insert(
+                "CODEX_COMPLETION_PROOF_FOCUSED_TEST_IDS".to_owned(),
+                serde_json::to_string(&self.test_ids).expect("string selection is serializable"),
+            );
+            env.insert(
+                "CODEX_COMPLETION_PROOF_FOCUSED_COMMAND".to_owned(),
+                self.inner.exact_command.clone(),
+            );
+        }
     }
 }
 
@@ -1562,6 +1578,7 @@ pub(crate) enum FocusedValidationOutcome {
     },
     FocusedReplacementApprovalAccepted {
         receipt_sha256: String,
+        validation_id: String,
     },
     CurrentEvidenceValidationFailure {
         validation_ids: Vec<String>,
@@ -1595,8 +1612,16 @@ impl FocusedValidationOutcome {
             } => format!(
                 "Focused current-inventory evidence was authenticated and retained for {current_inventory_count} discovered tests. Historical successor mappings remain unresolved; this evidence is not completion certification, admission, or review approval."
             ),
-            Self::FocusedReplacementApprovalAccepted { receipt_sha256 } => format!(
-                "Focused frozen-inventory reconciliation was authenticated and retained for replacement review (receipt {receipt_sha256}). This evidence does not approve mappings or establish whole-repository certification."
+            Self::FocusedReplacementApprovalAccepted {
+                receipt_sha256,
+                validation_id,
+            } => format!(
+                "Focused {} was authenticated and retained for replacement review (receipt {receipt_sha256}). This evidence does not approve mappings or establish whole-repository certification.",
+                if validation_id == FocusedReplacementApprovalReceiptV1::TRANSITION_VALIDATION_ID {
+                    "transition readiness; unresolved identities still block final certification"
+                } else {
+                    "frozen-inventory reconciliation"
+                }
             ),
             Self::CurrentEvidenceValidationFailure {
                 validation_ids,
@@ -2126,6 +2151,8 @@ struct PoisonedValidation {
     relevant_input_contract: Option<ValidationInputContract>,
     #[serde(default)]
     failure_input_snapshot: Option<ValidationInputSnapshotV1>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    failed_test_ids: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -2265,6 +2292,8 @@ struct PersistentCompletionProofState {
     focused_completion: FocusedCompletionState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     current_evidence_catalog: Option<PersistedCurrentEvidenceCatalogV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    inventory_activation: Option<v2_activation::PersistedInventoryActivation>,
     #[serde(default)]
     poisoned_validations: BTreeMap<String, PoisonedValidation>,
     #[serde(default)]
@@ -2671,6 +2700,7 @@ impl PersistentCompletionProofState {
             registered_proof: None,
             focused_completion: FocusedCompletionState::new(),
             current_evidence_catalog: None,
+            inventory_activation: None,
             poisoned_validations: BTreeMap::new(),
             current_user_relaxation: None,
             current_user_relaxations_by_lineage: BTreeMap::new(),
@@ -2695,6 +2725,7 @@ struct CompletionProofState {
 #[derive(Clone, Debug)]
 struct CompletionProofPersistence {
     state_path: PathBuf,
+    staged_state_path: PathBuf,
     lock_path: PathBuf,
     attempts_dir: PathBuf,
     repository_key: String,
@@ -2898,8 +2929,34 @@ impl CompletionProofLedger {
                     .to_string(),
             );
         }
-        load_completion_proof_authority(&self.repository_root, self.requires_compiled_kd4_authority)
-            .await
+        let activation = {
+            let state = self.state.lock().await;
+            if let ProofStateIntegrity::Blocked(error) = &state.integrity {
+                return Err(error.clone());
+            }
+            state.persistent.inventory_activation.clone()
+        };
+        if let Some(activation) = activation
+            && let Some(authority) = v2_activation::selected_authority(
+                &self.repository_root,
+                &activation,
+                self.requires_compiled_kd4_authority,
+            )
+            .await?
+        {
+            return Ok(authority);
+        }
+        let authority = load_completion_proof_authority(
+            &self.repository_root,
+            self.requires_compiled_kd4_authority,
+        )
+        .await?;
+        if v2_activation::is_v2(&authority.config) {
+            return Err(
+                "Inventory V2 configuration has no private activation authority".to_string(),
+            );
+        }
+        Ok(authority)
     }
 
     async fn verify_pending_authority(
@@ -2999,6 +3056,10 @@ impl CompletionProofLedger {
                 .join("completion-proof")
                 .join("repositories")
                 .join(format!("{repository_key}.json")),
+            staged_state_path: codex_home
+                .join("completion-proof")
+                .join("repositories")
+                .join(format!("{repository_key}.staged.json")),
             lock_path: private_state_lock_path(&codex_home, &repository_root),
             attempts_dir: codex_home
                 .join("completion-proof")
@@ -3028,12 +3089,21 @@ impl CompletionProofLedger {
         };
         if matches!(integrity, ProofStateIntegrity::Trusted(_)) {
             let current_observation = workspace_observation(&repository_root).await;
+            let quality_observation = current_observation.clone();
             reconcile_external_workspace_change(
                 &repository_root,
                 &mut persistent,
                 current_observation,
             )
             .await;
+            if requires_compiled_kd4_authority && let Some(observation) = quality_observation {
+                focused_completion::adopt_kd4_quality_boundary(
+                    &repository_root,
+                    &mut persistent,
+                    &observation,
+                )
+                .await;
+            }
         }
         let ledger = Self {
             repository_root,
@@ -3290,14 +3360,43 @@ impl CompletionProofLedger {
         &self,
         displayed_command: &str,
         cwd: &Path,
+        direct_argv: Option<(&str, &[String])>,
     ) -> Result<Option<FocusedValidationAttempt>, String> {
         if !same_completion_proof_path(&canonical_repository_root(cwd), &self.repository_root) {
             return Ok(None);
         }
-        let recognition_authority = match self.authority_for_command_recognition().await {
+        // Extra selectors are admitted only from an actual argv launch. Never
+        // parse arbitrary shell text or grant a compound command private proof env.
+        let (recognition_command, test_ids) = match direct_argv {
+            Some(("just", args)) if args.len() > 2 && args[0] == "completion-focused" => {
+                let argv = std::iter::once("just".to_owned())
+                    .chain(args.iter().cloned())
+                    .collect::<Vec<_>>();
+                if codex_shell_command::parse_command::shlex_join(&argv) != displayed_command {
+                    return Err("focused argv did not match its displayed command".to_owned());
+                }
+                let ids = args[2..].to_vec();
+                if ids.len() > 256
+                    || ids
+                        .iter()
+                        .any(|id| id.is_empty() || id.len() > 4096 || id.contains('\0'))
+                    || ids.iter().collect::<BTreeSet<_>>().len() != ids.len()
+                {
+                    return Err(
+                        "focused test selection must contain unique nonempty exact IDs".to_owned(),
+                    );
+                }
+                (format!("just completion-focused {}", args[1]), ids)
+            }
+            _ => (displayed_command.to_owned(), Vec::new()),
+        };
+        let mut recognition_authority = match self.authority_for_command_recognition().await {
             Ok(authority) => authority,
             Err(_) => return Ok(None),
         };
+        recognition_authority
+            .config
+            .add_focused_transition_readiness();
         let generic_recognition_matches = recognition_authority
             .config
             .validation_ids
@@ -3307,7 +3406,7 @@ impl CompletionProofLedger {
                     .config
                     .focused_command
                     .replace("{validation_id}", validation_id)
-                    == displayed_command
+                    == recognition_command
             })
             .count();
         let current_evidence_recognition_matches = recognition_authority
@@ -3318,12 +3417,13 @@ impl CompletionProofLedger {
                 .config
                 .focused_command
                 .replace("{validation_id}", CURRENT_EVIDENCE_VALIDATION_ID)
-                == displayed_command;
+                == recognition_command;
         if generic_recognition_matches == 0 && !current_evidence_recognition_matches {
             return Ok(None);
         }
         let authority = self.verified_authority().await?;
-        let config = authority.config;
+        let mut config = authority.config;
+        config.add_focused_transition_readiness();
         let matching_validation_ids = config
             .validation_ids
             .iter()
@@ -3331,7 +3431,7 @@ impl CompletionProofLedger {
                 config
                     .focused_command
                     .replace("{validation_id}", validation_id)
-                    == displayed_command
+                    == recognition_command
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -3339,7 +3439,7 @@ impl CompletionProofLedger {
             && config
                 .focused_command
                 .replace("{validation_id}", CURRENT_EVIDENCE_VALIDATION_ID)
-                == displayed_command;
+                == recognition_command;
         let validation_id = match (matching_validation_ids.as_slice(), current_evidence) {
             ([validation_id], false) => validation_id.clone(),
             ([], true) => CURRENT_EVIDENCE_VALIDATION_ID.to_string(),
@@ -3356,6 +3456,19 @@ impl CompletionProofLedger {
                 );
             }
         };
+        if !test_ids.is_empty()
+            && !config
+                .validation_evidence_contracts
+                .get(&validation_id)
+                .is_some_and(|contract| {
+                    matches!(
+                        contract.runner.as_str(),
+                        "rust-nextest" | "python-unittest" | "python-pytest"
+                    )
+                })
+        {
+            return Err("this focused validation does not support exact test subsets".to_owned());
+        }
 
         let _operation = self.operation.lock().await;
         let _state_file_lock = acquire_private_state_lock(self.persistence.lock_path.clone())
@@ -3463,8 +3576,9 @@ impl CompletionProofLedger {
             })
             .collect::<Result<BTreeMap<_, _>, _>>()?;
         let requires_approval_catalog = validation_id
-            == FocusedReplacementApprovalReceiptV1::FOCUSED_VALIDATION_ID
-            && config.focused_inventory_evidence_validation_ids.is_some();
+            == FocusedReplacementApprovalReceiptV1::TRANSITION_VALIDATION_ID
+            || (validation_id == FocusedReplacementApprovalReceiptV1::FOCUSED_VALIDATION_ID
+                && config.focused_inventory_evidence_validation_ids.is_some());
         let inner = CompletionProofAttempt {
             attempt_id,
             nonce,
@@ -3520,6 +3634,7 @@ impl CompletionProofLedger {
         Ok(Some(FocusedValidationAttempt {
             inner,
             validation_id,
+            test_ids,
             current_evidence,
             approval_expectation,
         }))
@@ -3723,15 +3838,31 @@ impl CompletionProofLedger {
         }
         let failed_at_mutation_epoch = state.persistent.mutation_epoch;
         for validation_id in validation_ids {
-            state
+            if let Some(previous) = state
                 .persistent
                 .focused_completion
                 .passes
-                .remove(validation_id);
+                .remove(validation_id)
+            {
+                // Revocation removes active reuse, not historical observations.
+                // Freshness checks reject this archived pass after this failure.
+                state
+                    .persistent
+                    .focused_completion
+                    .passes
+                    .insert(format!("attempt:{}", previous.attempt_id), previous);
+            }
+            let failed_test_ids = state
+                .persistent
+                .poisoned_validations
+                .get(validation_id)
+                .map(|failure| failure.failed_test_ids.clone())
+                .unwrap_or_default();
             state.persistent.poisoned_validations.insert(
                 validation_id.clone(),
                 PoisonedValidation {
                     validation_id: validation_id.clone(),
+                    failed_test_ids,
                     failed_at_mutation_epoch,
                     relevant_path_patterns: validation_patterns
                         .get(validation_id)
@@ -3863,6 +3994,18 @@ impl CompletionProofLedger {
         }
 
         let validation = &report.validations[0];
+        if !attempt.test_ids.is_empty()
+            && validation.classification != ValidationClassification::PreResultError
+        {
+            let mut intended = attempt.test_ids.clone();
+            intended.sort();
+            if validation.intended_ids != intended || validation.selected_ids != intended {
+                return FocusedValidationOutcome::PreResultError {
+                    message: "focused execution did not confirm the exact authorized test subset"
+                        .to_owned(),
+                };
+            }
+        }
         if validation.classification == ValidationClassification::ConfirmedValidationFailure {
             if let Err(message) = validate_confirmed_failure(&pending, &report, validation).await {
                 return FocusedValidationOutcome::PreResultError { message };
@@ -3884,7 +4027,21 @@ impl CompletionProofLedger {
                 return FocusedValidationOutcome::PreResultError { message };
             }
             // Sensitivity evidence never clears ordinary failure poisoning.
-            let _ = self.record_scoped_focused_pass(&pending, validation).await;
+            if let Some(poison) = self
+                .state
+                .lock()
+                .await
+                .persistent
+                .poisoned_validations
+                .get_mut(&attempt.validation_id)
+            {
+                poison
+                    .failed_test_ids
+                    .extend(validation.confirmed_failure_ids.iter().cloned());
+            }
+            let _ = self
+                .record_scoped_focused_pass(&pending, validation, !attempt.test_ids.is_empty())
+                .await;
             let _ = self.persist().await;
             return FocusedValidationOutcome::ConfirmedValidationFailure {
                 validation_id: attempt.validation_id,
@@ -3946,7 +4103,14 @@ impl CompletionProofLedger {
                 .get(&attempt.validation_id)
                 .cloned()
         };
+        let mut omitted_failures = false;
         if let Some(poisoned_validation) = poisoned_validation {
+            omitted_failures = (!attempt.test_ids.is_empty()
+                && poisoned_validation.failed_test_ids.is_empty())
+                || poisoned_validation
+                    .failed_test_ids
+                    .iter()
+                    .any(|id| !validation.executed_ids.contains(id));
             match poisoned_validation_is_eligible_at_snapshot(
                 &self.repository_root,
                 &poisoned_validation,
@@ -3974,8 +4138,21 @@ impl CompletionProofLedger {
                 .finish_focused_replacement_approval(&pending, expectation, &runner_receipt.process)
                 .await;
         }
-        if let Err(message) = self.record_scoped_focused_pass(&pending, validation).await {
+        if let Err(message) = self
+            .record_scoped_focused_pass(&pending, validation, !attempt.test_ids.is_empty())
+            .await
+        {
             return FocusedValidationOutcome::PreResultError { message };
+        }
+        if omitted_failures {
+            // Retain actual execution for this batch's quality comparison. It
+            // cannot clear other failures; ordinary completion checks the union
+            // of current, corrected passes against every failed native identity.
+            return FocusedValidationOutcome::PreResultError {
+                message:
+                    "focused pass omitted previously failed tests; that failure remains unresolved"
+                        .to_owned(),
+            };
         }
         FocusedValidationOutcome::ConfirmedPass {
             validation_id: attempt.validation_id,
@@ -4055,7 +4232,10 @@ impl CompletionProofLedger {
             }
             return FocusedValidationOutcome::PreResultError { message };
         }
-        FocusedValidationOutcome::FocusedReplacementApprovalAccepted { receipt_sha256 }
+        FocusedValidationOutcome::FocusedReplacementApprovalAccepted {
+            receipt_sha256,
+            validation_id: expectation.context.focused_validation_id.clone(),
+        }
     }
 
     pub(crate) async fn prepare_historical_acceptance_review(
@@ -4178,6 +4358,7 @@ impl CompletionProofLedger {
             catalog,
             &approval.attempt_id,
             &approval.policy_id,
+            &approval.receipt.focused_validation_id,
         )?;
         approval
             .receipt
@@ -6004,6 +6185,25 @@ struct RepositoryCompletionProofConfig {
     trusted_runner_entrypoint_paths: BTreeSet<String>,
 }
 
+impl RepositoryCompletionProofConfig {
+    // This derived route exists only while preparing explicit focused work.
+    // It is never inserted into the canonical required-validation set.
+    fn add_focused_transition_readiness(&mut self) {
+        let source = FocusedReplacementApprovalReceiptV1::FOCUSED_VALIDATION_ID;
+        let target = FocusedReplacementApprovalReceiptV1::TRANSITION_VALIDATION_ID;
+        if let (Some(contract), Some(paths)) = (
+            self.validation_evidence_contracts.get(source).cloned(),
+            self.validation_path_patterns.get(source).cloned(),
+        ) {
+            self.validation_ids.insert(target.to_string());
+            self.validation_evidence_contracts
+                .insert(target.to_string(), contract);
+            self.validation_path_patterns
+                .insert(target.to_string(), paths);
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct TrustedRunnerEntrypoint {
     relative_path: String,
@@ -6014,6 +6214,7 @@ struct TrustedRunnerEntrypoint {
 struct CompletionProofAuthority {
     config: RepositoryCompletionProofConfig,
     policy_runner_bundle_sha256: String,
+    trusted_bundle_hashes: BTreeMap<String, String>,
     trusted_runner_entrypoints: BTreeSet<TrustedRunnerEntrypoint>,
 }
 
@@ -6084,6 +6285,15 @@ fn compiled_kd4_authority() -> Result<CompletionProofAuthority, String> {
     Ok(CompletionProofAuthority {
         config,
         policy_runner_bundle_sha256: trusted_bundle_sha256(KD4_TRUSTED_BUNDLE_MEMBERS),
+        trusted_bundle_hashes: KD4_TRUSTED_BUNDLE_MEMBERS
+            .iter()
+            .map(|member| {
+                (
+                    member.relative_path.to_owned(),
+                    format!("{:x}", Sha256::digest(member.bytes)),
+                )
+            })
+            .collect(),
         trusted_runner_entrypoints: BTreeSet::from([TrustedRunnerEntrypoint {
             relative_path: runner_member.relative_path.to_string(),
             sha256: format!("{:x}", Sha256::digest(runner_member.bytes)),
@@ -6182,6 +6392,10 @@ async fn load_completion_proof_authority(
     Ok(CompletionProofAuthority {
         config,
         policy_runner_bundle_sha256: trusted_repository_bundle_sha256(&trusted_members),
+        trusted_bundle_hashes: trusted_members
+            .iter()
+            .map(|(path, bytes)| (path.clone(), format!("{:x}", Sha256::digest(bytes))))
+            .collect(),
         trusted_runner_entrypoints,
     })
 }
@@ -6350,29 +6564,31 @@ fn parse_repository_config_bytes(
     if !is_sha256(&frozen_inventory_hash) {
         return Err("completion-proof frozen_inventory_hash must be lowercase SHA-256".to_string());
     }
-    let (frozen_inventory_path, replacement_ledger_path) =
-        match (table.get("frozen_inventory"), table.get("replacement_ledger")) {
-            (None, None) => (
-                INVENTORY_RELATIVE_PATH.to_string(),
-                REPLACEMENT_LEDGER_RELATIVE_PATH.to_string(),
-            ),
-            (Some(_), Some(_)) => (
-                normalize_trusted_repository_path(&exact_nonempty_config_string(
-                    &value,
-                    "frozen_inventory",
-                )?)?,
-                normalize_trusted_repository_path(&exact_nonempty_config_string(
-                    &value,
-                    "replacement_ledger",
-                )?)?,
-            ),
-            _ => {
-                return Err(
+    let (frozen_inventory_path, replacement_ledger_path) = match (
+        table.get("frozen_inventory"),
+        table.get("replacement_ledger"),
+    ) {
+        (None, None) => (
+            INVENTORY_RELATIVE_PATH.to_string(),
+            REPLACEMENT_LEDGER_RELATIVE_PATH.to_string(),
+        ),
+        (Some(_), Some(_)) => (
+            normalize_trusted_repository_path(&exact_nonempty_config_string(
+                &value,
+                "frozen_inventory",
+            )?)?,
+            normalize_trusted_repository_path(&exact_nonempty_config_string(
+                &value,
+                "replacement_ledger",
+            )?)?,
+        ),
+        _ => {
+            return Err(
                     "completion-proof configuration must select frozen_inventory and replacement_ledger together"
                         .to_string(),
                 );
-            }
-        };
+        }
+    };
     if frozen_inventory_path.eq_ignore_ascii_case(&replacement_ledger_path) {
         return Err("completion-proof inventory and ledger must use distinct paths".to_string());
     }
@@ -6429,9 +6645,11 @@ fn parse_repository_config_bytes(
     if validation_ids.is_empty() {
         return Err("completion-proof configuration declares no required validations".to_string());
     }
-    if validation_ids.contains(CURRENT_EVIDENCE_VALIDATION_ID) {
+    if validation_ids.contains(CURRENT_EVIDENCE_VALIDATION_ID)
+        || validation_ids.contains(FocusedReplacementApprovalReceiptV1::TRANSITION_VALIDATION_ID)
+    {
         return Err(
-            "inventory.current-evidence must remain a focused composite, not a canonical validation"
+            "inventory.current-evidence and inventory.transition-readiness must remain focused preparatory routes, not canonical validations"
                 .to_string(),
         );
     }
@@ -6910,6 +7128,14 @@ async fn load_inventory_hash(
     repository_root: &Path,
     config: &RepositoryCompletionProofConfig,
 ) -> Result<String, String> {
+    if v2_activation::is_v2(config) {
+        // Re-reads, parses and closure-validates the selected generation.
+        let root = repository_root.to_path_buf();
+        let config = config.clone();
+        return tokio::task::spawn_blocking(move || v2_activation::inventory_hash(&root, &config))
+            .await
+            .map_err(|error| error.to_string())?;
+    }
     let path = repository_root.join(&config.frozen_inventory_path);
     let bytes = tokio::fs::read(&path)
         .await
@@ -7122,6 +7348,11 @@ async fn load_expected_provenance(
     ),
     String,
 > {
+    if v2_activation::is_v2(config) {
+        // A selected generation carries its exceptions inside the ledger that
+        // load_inventory_hash already validated for this attempt.
+        return Ok((BTreeSet::new(), BTreeSet::new()));
+    }
     let inventory_path = repository_root.join(&config.frozen_inventory_path);
     let inventory_bytes = tokio::fs::read(&inventory_path)
         .await
@@ -7644,6 +7875,8 @@ struct ValidationAttemptReport {
     executed_count: usize,
     outcomes: Vec<serde_json::Value>,
     exit_code: Option<i32>,
+    // Preserve complete diagnostics from the bounded, authenticated runner.
+    // Reviewer prompt limits apply to artifact transport, not these observations.
     diagnostic: String,
     confirmed_failure_ids: Vec<String>,
     report_hash: String,
@@ -7917,7 +8150,6 @@ async fn validate_confirmed_pass(
             || validation.exit_code != Some(0)
             || !validation_evidence_contract_matches(validation, contract)
             || !confirmed_pass_evidence_shape_matches(validation)
-            || validation.diagnostic.len() > 8_000
             || !is_sha256(&validation.report_hash)
             || validation.execution_id.trim().is_empty()
             || !execution_ids.insert(validation.execution_id.clone())
@@ -7968,7 +8200,6 @@ async fn validate_current_component_pass(
         || validation.exit_code != Some(0)
         || !validation_evidence_contract_matches(validation, contract)
         || !confirmed_pass_evidence_shape_matches(validation)
-        || validation.diagnostic.len() > 8_000
         || !is_sha256(&validation.report_hash)
         || validation.execution_id.trim().is_empty()
         || report
@@ -8170,7 +8401,6 @@ async fn validate_confirmed_failure(
         || validation.exit_code.is_none_or(|exit_code| exit_code == 0)
         || !validation_evidence_contract_matches(validation, contract)
         || !confirmed_failure_evidence_shape_matches(validation)
-        || validation.diagnostic.len() > 8_000
         || !is_sha256(&validation.report_hash)
         || validation.execution_id.trim().is_empty()
         || report
@@ -9651,30 +9881,35 @@ async fn load_or_initialize_authenticated_state(
     persistence: &CompletionProofPersistence,
     repository_root: &Path,
 ) -> Result<(PersistentCompletionProofState, ProofStateIntegrity), String> {
-    let state_bytes = match tokio::fs::read(&persistence.state_path).await {
-        Ok(bytes) => Some(bytes),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-        Err(error) => {
-            return Err(format!(
-                "the authenticated completion-proof state could not be read: {error}"
-            ));
-        }
-    };
+    let state_bytes = read_private_state_file(
+        &persistence.state_path,
+        "the authenticated completion-proof state",
+    )
+    .await?;
+    let staged_bytes = read_private_state_file(
+        &persistence.staged_state_path,
+        "the staged authenticated completion-proof state",
+    )
+    .await?;
     let anchor_value = load_trust_anchor_value(persistence).await?;
 
-    match (state_bytes, anchor_value) {
-        (None, None) => {
+    match (state_bytes, staged_bytes, anchor_value) {
+        (None, None, None) => {
             let seal = initialize_trust_anchor(persistence).await?;
             Ok((
                 PersistentCompletionProofState::new(repository_root),
                 ProofStateIntegrity::Trusted(seal),
             ))
         }
-        (Some(_), None) => Err(
+        (_, Some(_), None) => Err(
+            "a staged completion-proof state was present without its runtime trust anchor"
+                .to_string(),
+        ),
+        (Some(_), None, None) => Err(
             "an unauthenticated or orphaned completion-proof state file was present without its runtime trust anchor"
                 .to_string(),
         ),
-        (None, Some(anchor_value)) => {
+        (None, None, Some(anchor_value)) => {
             let (anchor, authentication_key) =
                 parse_trust_anchor(persistence, &anchor_value)?;
             if anchor.committed_revision != 0 || anchor.committed_envelope_hash.is_some() {
@@ -9693,11 +9928,55 @@ async fn load_or_initialize_authenticated_state(
                 }),
             ))
         }
-        (Some(state_bytes), Some(anchor_value)) => {
-            let (persistent, seal) = load_authenticated_state_from_bytes(
+        (None, Some(staged_bytes), Some(anchor_value)) => {
+            let (anchor, authentication_key) =
+                parse_trust_anchor(persistence, &anchor_value)?;
+            if anchor.committed_revision != 0 || anchor.committed_envelope_hash.is_some() {
+                let (persistent, seal) = load_or_recover_authenticated_state_from_bytes(
+                    persistence,
+                    repository_root,
+                    None,
+                    Some(&staged_bytes),
+                    &anchor_value,
+                )
+                .await?;
+                return Ok((persistent, ProofStateIntegrity::Trusted(seal)));
+            }
+            let (staged, _) = require_authenticated_state(
                 persistence,
                 repository_root,
-                &state_bytes,
+                &staged_bytes,
+                &anchor,
+                &authentication_key,
+            )
+            .map_err(|error| format!("the staged authenticated state was invalid: {error}"))?;
+            if staged.revision != 1 {
+                return Err(
+                    "a pristine completion-proof anchor had staged state other than its first uncommitted successor"
+                        .to_string(),
+                );
+            }
+            remove_private_state_file(
+                &persistence.staged_state_path,
+                "the uncommitted first authenticated completion-proof successor",
+            )
+            .await?;
+            Ok((
+                PersistentCompletionProofState::new(repository_root),
+                ProofStateIntegrity::Trusted(ProofStateSeal {
+                    key_id: anchor.key_id,
+                    authentication_key,
+                    revision: 0,
+                    envelope_hash: None,
+                }),
+            ))
+        }
+        (state_bytes, staged_bytes, Some(anchor_value)) => {
+            let (persistent, seal) = load_or_recover_authenticated_state_from_bytes(
+                persistence,
+                repository_root,
+                state_bytes.as_deref(),
+                staged_bytes.as_deref(),
                 &anchor_value,
             )
             .await?;
@@ -9710,29 +9989,48 @@ async fn load_authenticated_state(
     persistence: &CompletionProofPersistence,
     repository_root: &Path,
 ) -> Result<(PersistentCompletionProofState, ProofStateSeal), String> {
-    let state_bytes = tokio::fs::read(&persistence.state_path)
-        .await
-        .map_err(|error| {
-            format!("the authenticated completion-proof state could not be read: {error}")
-        })?;
+    let state_bytes = read_private_state_file(
+        &persistence.state_path,
+        "the authenticated completion-proof state",
+    )
+    .await?;
+    let staged_bytes = read_private_state_file(
+        &persistence.staged_state_path,
+        "the staged authenticated completion-proof state",
+    )
+    .await?;
     let anchor_value = load_trust_anchor_value(persistence).await?.ok_or_else(|| {
         "the runtime trust anchor for completion-proof state was missing".to_string()
     })?;
-    load_authenticated_state_from_bytes(persistence, repository_root, &state_bytes, &anchor_value)
-        .await
+    load_or_recover_authenticated_state_from_bytes(
+        persistence,
+        repository_root,
+        state_bytes.as_deref(),
+        staged_bytes.as_deref(),
+        &anchor_value,
+    )
+    .await
 }
 
-async fn load_authenticated_state_from_bytes(
-    persistence: &CompletionProofPersistence,
-    repository_root: &Path,
+fn authenticated_state_from_bytes(
     state_bytes: &[u8],
-    anchor_value: &str,
-) -> Result<(PersistentCompletionProofState, ProofStateSeal), String> {
-    let (anchor, authentication_key) = parse_trust_anchor(persistence, anchor_value)?;
+) -> Result<(AuthenticatedCompletionProofStateV1, String), String> {
     let envelope: AuthenticatedCompletionProofStateV1 = serde_json::from_slice(state_bytes)
         .map_err(|error| {
             format!("the authenticated completion-proof state envelope was invalid: {error}")
         })?;
+    let envelope_hash = format!("{:x}", Sha256::digest(state_bytes));
+    Ok((envelope, envelope_hash))
+}
+
+fn require_authenticated_state(
+    persistence: &CompletionProofPersistence,
+    repository_root: &Path,
+    state_bytes: &[u8],
+    anchor: &CompletionProofTrustAnchorV1,
+    authentication_key: &[u8; TRUST_KEY_BYTES],
+) -> Result<(AuthenticatedCompletionProofStateV1, String), String> {
+    let (envelope, envelope_hash) = authenticated_state_from_bytes(state_bytes)?;
     if envelope.key_id != anchor.key_id {
         return Err(
             "the authenticated completion-proof state used a different runtime trust-key identity"
@@ -9743,38 +10041,159 @@ async fn load_authenticated_state_from_bytes(
         persistence,
         repository_root,
         &envelope,
-        &authentication_key,
+        authentication_key,
     )?;
-    let envelope_hash = format!("{:x}", Sha256::digest(state_bytes));
+    Ok((envelope, envelope_hash))
+}
 
+fn committed_state_mismatch(
+    envelope: &AuthenticatedCompletionProofStateV1,
+    envelope_hash: &str,
+    anchor: &CompletionProofTrustAnchorV1,
+) -> String {
     if envelope.revision < anchor.committed_revision {
-        return Err(format!(
+        return format!(
             "completion-proof state revision {} was replayed behind committed revision {}",
             envelope.revision, anchor.committed_revision
-        ));
+        );
     }
     if envelope.revision > anchor.committed_revision {
-        return Err(format!(
+        return format!(
             "completion-proof state revision {} was not committed at protected revision {}",
             envelope.revision, anchor.committed_revision
+        );
+    }
+    if anchor.committed_envelope_hash.as_deref() != Some(envelope_hash) {
+        return "completion-proof state did not match the exact committed authenticated envelope"
+            .to_string();
+    }
+
+    "completion-proof state did not match its protected commitment".to_string()
+}
+
+async fn load_or_recover_authenticated_state_from_bytes(
+    persistence: &CompletionProofPersistence,
+    repository_root: &Path,
+    state_bytes: Option<&[u8]>,
+    staged_bytes: Option<&[u8]>,
+    anchor_value: &str,
+) -> Result<(PersistentCompletionProofState, ProofStateSeal), String> {
+    let (anchor, authentication_key) = parse_trust_anchor(persistence, anchor_value)?;
+    let state = state_bytes.map(|bytes| {
+        require_authenticated_state(
+            persistence,
+            repository_root,
+            bytes,
+            &anchor,
+            &authentication_key,
+        )
+    });
+    let staged = staged_bytes
+        .map(|bytes| {
+            require_authenticated_state(
+                persistence,
+                repository_root,
+                bytes,
+                &anchor,
+                &authentication_key,
+            )
+            .map_err(|error| format!("the staged authenticated state was invalid: {error}"))
+        })
+        .transpose()?;
+
+    let state_is_committed = state.as_ref().is_some_and(|state| {
+        state.as_ref().ok().is_some_and(|(envelope, hash)| {
+            envelope.revision == anchor.committed_revision
+                && anchor.committed_envelope_hash.as_deref() == Some(hash.as_str())
+        })
+    });
+    let staged_is_committed = staged.as_ref().is_some_and(|(envelope, hash)| {
+        envelope.revision == anchor.committed_revision
+            && anchor.committed_envelope_hash.as_deref() == Some(hash.as_str())
+    });
+
+    if state_is_committed {
+        if let Some((staged_envelope, staged_hash)) = staged.as_ref() {
+            let is_uncommitted_successor = staged_envelope.revision
+                == anchor.committed_revision.saturating_add(1)
+                && Some(staged_hash.as_str()) != anchor.committed_envelope_hash.as_deref();
+            if !staged_is_committed && !is_uncommitted_successor {
+                return Err(
+                    "the staged authenticated state did not match the protected commitment or one uncommitted successor"
+                        .to_string(),
+                );
+            }
+            if let Err(error) = remove_private_state_file(
+                &persistence.staged_state_path,
+                "the consumed staged authenticated completion-proof state",
+            )
+            .await
+            {
+                tracing::warn!(%error, "could not remove safe completion-proof staging while loading");
+            }
+        }
+        let (envelope, envelope_hash) = state
+            .expect("committed state was checked above")
+            .expect("committed state was authenticated above");
+        return Ok((
+            envelope.state,
+            ProofStateSeal {
+                key_id: anchor.key_id,
+                authentication_key,
+                revision: envelope.revision,
+                envelope_hash: Some(envelope_hash),
+            },
         ));
     }
-    if anchor.committed_envelope_hash.as_deref() != Some(envelope_hash.as_str()) {
+
+    if staged_is_committed {
+        let staged_bytes = staged_bytes.expect("committed staging was checked above");
+        write_private_state(persistence.state_path.clone(), staged_bytes.to_vec())
+            .await
+            .map_err(|error| {
+                format!("the exact staged authenticated state could not be recovered: {error}")
+            })?;
+        let recovered_bytes = read_private_state_file(
+            &persistence.state_path,
+            "the recovered authenticated completion-proof state",
+        )
+        .await?
+        .ok_or_else(|| "the recovered authenticated state disappeared".to_string())?;
+        if recovered_bytes != staged_bytes {
+            return Err(
+                "the recovered authenticated state did not preserve the exact staged bytes"
+                    .to_string(),
+            );
+        }
+        if let Err(error) = remove_private_state_file(
+            &persistence.staged_state_path,
+            "the recovered staged authenticated completion-proof state",
+        )
+        .await
+        {
+            tracing::warn!(%error, "could not remove recovered completion-proof staging");
+        }
+        let (envelope, envelope_hash) = staged.expect("committed staging was checked above");
+        return Ok((
+            envelope.state,
+            ProofStateSeal {
+                key_id: anchor.key_id,
+                authentication_key,
+                revision: envelope.revision,
+                envelope_hash: Some(envelope_hash),
+            },
+        ));
+    }
+
+    if staged.is_some() {
         return Err(
-            "completion-proof state did not match the exact committed authenticated envelope"
+            "the staged authenticated state did not exactly match the protected revision and raw hash"
                 .to_string(),
         );
     }
-
-    Ok((
-        envelope.state,
-        ProofStateSeal {
-            key_id: anchor.key_id,
-            authentication_key,
-            revision: envelope.revision,
-            envelope_hash: Some(envelope_hash),
-        },
-    ))
+    let (envelope, envelope_hash) = state
+        .ok_or_else(|| "the authenticated completion-proof state was missing".to_string())??;
+    Err(committed_state_mismatch(&envelope, &envelope_hash, &anchor))
 }
 
 async fn initialize_trust_anchor(
@@ -9838,8 +10257,56 @@ async fn persist_authenticated_state(
         format!("the authenticated completion-proof state could not be encoded: {error}")
     })?;
     let envelope_hash = format!("{:x}", Sha256::digest(&bytes));
+    let repository_root = canonical_repository_root(Path::new(&envelope.state.repository_root));
+    if let Some(existing_staged) = read_private_state_file(
+        &persistence.staged_state_path,
+        "the staged authenticated completion-proof state",
+    )
+    .await?
+    {
+        let (existing, existing_hash) = require_authenticated_state(
+            persistence,
+            &repository_root,
+            &existing_staged,
+            &anchor,
+            &seal.authentication_key,
+        )?;
+        let is_current = existing.revision == anchor.committed_revision
+            && anchor.committed_envelope_hash.as_deref() == Some(existing_hash.as_str());
+        let is_uncommitted_successor = existing.revision
+            == anchor.committed_revision.saturating_add(1)
+            && Some(existing_hash.as_str()) != anchor.committed_envelope_hash.as_deref();
+        if !is_current && !is_uncommitted_successor {
+            return Err(
+                "the existing staged authenticated state was not a valid current state or uncommitted successor"
+                    .to_string(),
+            );
+        }
+        remove_private_state_file(
+            &persistence.staged_state_path,
+            "the superseded staged authenticated completion-proof state",
+        )
+        .await?;
+    }
+    write_private_state(persistence.staged_state_path.clone(), bytes.clone())
+        .await
+        .map_err(|error| {
+            format!("the authenticated completion-proof successor could not be staged: {error}")
+        })?;
+    let staged_readback = read_private_state_file(
+        &persistence.staged_state_path,
+        "the staged authenticated completion-proof state",
+    )
+    .await?
+    .ok_or_else(|| "the staged authenticated completion-proof successor disappeared".to_string())?;
+    if staged_readback != bytes {
+        return Err(
+            "the staged authenticated completion-proof successor did not preserve its exact bytes"
+                .to_string(),
+        );
+    }
     // Advance the protected high-water mark before replacing the file. If the file write
-    // is interrupted or fails, the older file is thereafter a replay and fails closed.
+    // is interrupted or fails, only the exact authenticated staged bytes can recover it.
     anchor.committed_revision = revision;
     anchor.committed_envelope_hash = Some(envelope_hash.clone());
     save_trust_anchor(persistence, &anchor).await?;
@@ -9848,6 +10315,26 @@ async fn persist_authenticated_state(
         .map_err(|error| {
             format!("the authenticated completion-proof state could not be committed: {error}")
         })?;
+    let committed_readback = read_private_state_file(
+        &persistence.state_path,
+        "the committed authenticated completion-proof state",
+    )
+    .await?
+    .ok_or_else(|| "the committed authenticated completion-proof state disappeared".to_string())?;
+    if format!("{:x}", Sha256::digest(&committed_readback)) != envelope_hash {
+        return Err(
+            "the committed authenticated completion-proof state did not match its protected raw hash"
+                .to_string(),
+        );
+    }
+    if let Err(error) = remove_private_state_file(
+        &persistence.staged_state_path,
+        "the committed staged authenticated completion-proof state",
+    )
+    .await
+    {
+        tracing::warn!(%error, "could not remove committed completion-proof staging; restart will validate and consume it");
+    }
 
     Ok(ProofStateSeal {
         key_id: seal.key_id.clone(),
@@ -10040,13 +10527,13 @@ fn focused_replacement_approval_context(
     catalog: &PersistedCurrentEvidenceCatalogV1,
     attempt_id: &str,
     policy_id: &str,
+    validation_id: &str,
 ) -> Result<FocusedReplacementApprovalCurrentContextV1, String> {
     Ok(FocusedReplacementApprovalCurrentContextV1 {
         format_id: FocusedReplacementApprovalReceiptV1::FORMAT_ID.to_string(),
         schema_version: 1,
         attempt_id: attempt_id.to_string(),
-        focused_validation_id: FocusedReplacementApprovalReceiptV1::FOCUSED_VALIDATION_ID
-            .to_string(),
+        focused_validation_id: validation_id.to_string(),
         classification: FocusedReplacementApprovalReceiptV1::CLASSIFICATION.to_string(),
         frozen_inventory_hash: catalog.catalog.frozen_inventory_hash.clone(),
         focused_inventory_catalog_semantic_sha256: catalog.catalog.semantic_sha256.clone(),
@@ -10093,6 +10580,11 @@ fn focused_replacement_approval_expectation(
             catalog,
             &pending.attempt_id,
             &pending.expected_policy_id,
+            pending
+                .expected_validation_ids
+                .iter()
+                .next()
+                .ok_or_else(|| "focused approval has no validation identity".to_string())?,
         )?,
     })
 }
@@ -10139,6 +10631,7 @@ fn persistent_focused_replacement_approval_is_valid(
         catalog,
         &approval.attempt_id,
         &approval.policy_id,
+        &approval.receipt.focused_validation_id,
     ) {
         Ok(context) => context,
         Err(_) => return false,
@@ -10156,7 +10649,7 @@ fn persistent_focused_replacement_approval_is_valid(
         && exact_nonempty(&approval.exact_command)
         && approval
             .exact_command
-            .contains(FocusedReplacementApprovalReceiptV1::FOCUSED_VALIDATION_ID)
+            .ends_with(&approval.receipt.focused_validation_id)
         && approval.runner_process_id > 0
         && approval.runner_executable_path.is_absolute()
         && approval.runner_entrypoint_path.is_absolute()
@@ -10397,6 +10890,50 @@ async fn write_private_state(state_path: PathBuf, bytes: Vec<u8>) -> io::Result<
         .map_err(|error| io::Error::other(format!("completion proof state task failed: {error}")))?
 }
 
+async fn read_private_state_file(path: &Path, label: &str) -> Result<Option<Vec<u8>>, String> {
+    match tokio::fs::symlink_metadata(path).await {
+        Ok(metadata) => {
+            if !metadata.file_type().is_file() || private_state_metadata_is_reparse(&metadata) {
+                return Err(format!("{label} was not a regular non-reparse file"));
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("{label} metadata could not be read: {error}")),
+    }
+    tokio::fs::read(path)
+        .await
+        .map(Some)
+        .map_err(|error| format!("{label} could not be read: {error}"))
+}
+
+async fn remove_private_state_file(path: &Path, label: &str) -> Result<(), String> {
+    match tokio::fs::symlink_metadata(path).await {
+        Ok(metadata) => {
+            if !metadata.file_type().is_file() || private_state_metadata_is_reparse(&metadata) {
+                return Err(format!("{label} was not a regular non-reparse file"));
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("{label} metadata could not be read: {error}")),
+    }
+    tokio::fs::remove_file(path)
+        .await
+        .map_err(|error| format!("{label} could not be removed: {error}"))
+}
+
+#[cfg(windows)]
+fn private_state_metadata_is_reparse(metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    metadata.file_attributes()
+        & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+        != 0
+}
+
+#[cfg(not(windows))]
+fn private_state_metadata_is_reparse(_metadata: &std::fs::Metadata) -> bool {
+    false
+}
+
 struct PrivateStateFileLock {
     file: std::fs::File,
 }
@@ -10469,6 +11006,13 @@ fn write_private_state_blocking(state_path: &Path, bytes: &[u8]) -> io::Result<(
     temporary.write_all(bytes)?;
     temporary.as_file().sync_all()?;
     temporary.persist(state_path).map_err(|error| error.error)?;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(state_path)?
+        .sync_all()?;
+    #[cfg(unix)]
+    std::fs::File::open(parent)?.sync_all()?;
     Ok(())
 }
 
@@ -10476,6 +11020,33 @@ fn write_private_state_blocking(state_path: &Path, bytes: &[u8]) -> io::Result<(
 mod tests {
     use super::*;
     use codex_keyring_store::tests::MockKeyringStore;
+
+    #[test]
+    fn focused_only_routes_cannot_be_declared_as_canonical_validations() {
+        let compiled = KD4_TRUSTED_BUNDLE_MEMBERS
+            .iter()
+            .find(|member| member.relative_path == CONFIG_RELATIVE_PATH)
+            .expect("compiled configuration member")
+            .bytes;
+        for id in [
+            CURRENT_EVIDENCE_VALIDATION_ID,
+            FocusedReplacementApprovalReceiptV1::TRANSITION_VALIDATION_ID,
+        ] {
+            let mut bytes = compiled.to_vec();
+            bytes.extend_from_slice(
+                format!(
+                    "\n[[validation]]\nid = \"{id}\"\nrunner = \"python-unittest\"\nowned_paths = [\"scripts/**\"]\nconsumed_paths = [\"scripts/**\"]\ntimeout_seconds = 60\n"
+                )
+                .as_bytes(),
+            );
+            let error = parse_repository_config_bytes(&bytes, Path::new(CONFIG_RELATIVE_PATH))
+                .expect_err("a focused-only route was accepted as a canonical validation");
+            assert!(
+                error.contains("must remain focused preparatory routes"),
+                "{id}: {error}"
+            );
+        }
+    }
 
     fn test_artifact(repository_root: &Path) -> CompletionProofArtifactV1 {
         CompletionProofArtifactV1 {
@@ -11534,7 +12105,76 @@ tests = ["tests/invariant.rs"]
     }
 
     #[tokio::test]
-    async fn failed_state_write_makes_older_file_a_replay_after_restart() {
+    async fn failed_state_write_recovers_only_exact_staged_successor_after_restart() {
+        // An interruption after the first durable stage but before the first anchor update leaves
+        // no predecessor file. The pristine anchor authenticates and discards only its revision-1
+        // uncommitted successor, then ordinary initialization can commit from revision 0.
+        let pristine_home = tempfile::tempdir().expect("pristine-interruption Codex home");
+        let pristine_repository = tempfile::tempdir().expect("pristine-interruption repository");
+        let pristine_root = canonical_repository_root(pristine_repository.path());
+        let pristine_repository_key = repository_state_key(&pristine_root);
+        let pristine_store = Arc::new(MockKeyringStore::default());
+        let pristine_trust_store: Arc<dyn KeyringStore> = pristine_store;
+        let pristine_persistence = CompletionProofPersistence {
+            state_path: pristine_home
+                .path()
+                .join("completion-proof")
+                .join("repositories")
+                .join(format!("{pristine_repository_key}.json")),
+            staged_state_path: pristine_home
+                .path()
+                .join("completion-proof")
+                .join("repositories")
+                .join(format!("{pristine_repository_key}.staged.json")),
+            lock_path: private_state_lock_path(pristine_home.path(), &pristine_root),
+            attempts_dir: pristine_home
+                .path()
+                .join("completion-proof")
+                .join("attempts")
+                .join(&pristine_repository_key),
+            repository_key: pristine_repository_key,
+            trust_anchor_account: proof_state_trust_anchor_account(
+                pristine_home.path(),
+                &pristine_root,
+            ),
+            trust_store: pristine_trust_store,
+        };
+        let pristine_seal = initialize_trust_anchor(&pristine_persistence)
+            .await
+            .expect("initialize pristine anchor");
+        let mut first_staged = AuthenticatedCompletionProofStateV1 {
+            schema_version: AUTHENTICATED_STATE_SCHEMA_VERSION,
+            repository_key: pristine_persistence.repository_key.clone(),
+            key_id: pristine_seal.key_id.clone(),
+            revision: 1,
+            state: PersistentCompletionProofState::new(&pristine_root),
+            authentication_tag: String::new(),
+        };
+        first_staged.authentication_tag =
+            authenticated_state_tag(&first_staged, &pristine_seal.authentication_key)
+                .expect("authenticate first staged successor");
+        write_private_state(
+            pristine_persistence.staged_state_path.clone(),
+            serde_json::to_vec_pretty(&first_staged).expect("encode first staged successor"),
+        )
+        .await
+        .expect("durably prepare first staged successor");
+        let (pristine_state, pristine_integrity) =
+            load_or_initialize_authenticated_state(&pristine_persistence, &pristine_root)
+                .await
+                .expect("recover pristine pre-anchor interruption");
+        assert_eq!(
+            serde_json::to_value(&pristine_state).expect("serialize recovered pristine state"),
+            serde_json::to_value(PersistentCompletionProofState::new(&pristine_root))
+                .expect("serialize expected pristine state")
+        );
+        let ProofStateIntegrity::Trusted(pristine_recovered_seal) = pristine_integrity else {
+            panic!("pristine interruption must retain trusted initialization authority");
+        };
+        assert_eq!(pristine_recovered_seal.revision, 0);
+        assert!(pristine_recovered_seal.envelope_hash.is_none());
+        assert!(!pristine_persistence.staged_state_path.exists());
+
         let codex_home = tempfile::tempdir().expect("temporary Codex home");
         let repository = tempfile::tempdir().expect("temporary repository");
         let trust_store = Arc::new(MockKeyringStore::default());
@@ -11568,6 +12208,7 @@ tests = ["tests/invariant.rs"]
             .await
             .expect_err("obstructed state write must fail");
         assert!(error.contains("could not be committed"));
+        assert!(ledger.persistence.staged_state_path.is_file());
         drop(state_file_lock);
         tokio::fs::remove_dir(&ledger.persistence.state_path)
             .await
@@ -11578,11 +12219,166 @@ tests = ["tests/invariant.rs"]
         drop(ledger);
 
         let resumed = test_ledger(codex_home.path(), repository.path(), trust_store).await;
+        let resumed_state = resumed.state.lock().await;
+        assert!(matches!(
+            &resumed_state.integrity,
+            ProofStateIntegrity::Trusted(_)
+        ));
+        assert!(resumed_state.persistent.requires_non_documentation_proof);
+        drop(resumed_state);
+        assert!(!resumed.persistence.staged_state_path.exists());
         let CompletionProofGateDecision::Blocked { message } = resumed.check_gate().await else {
-            panic!("an older file must not survive a failed newer write");
+            panic!("recovered non-documentation requirement must reach the runtime gate");
         };
-        assert!(message.contains("could not be authenticated"));
-        assert!(message.contains("replayed behind committed revision"));
+        assert!(message.contains("non-documentation changes"));
+        assert!(!message.contains("could not be authenticated"));
+        assert!(!message.contains("replayed behind committed revision"));
+        drop(resumed);
+
+        // A staged file with a broken authentication tag must never repair the predecessor.
+        let tamper_home = tempfile::tempdir().expect("tamper Codex home");
+        let tamper_repository = tempfile::tempdir().expect("tamper repository");
+        let tamper_store = Arc::new(MockKeyringStore::default());
+        let tamper = test_ledger(
+            tamper_home.path(),
+            tamper_repository.path(),
+            Arc::clone(&tamper_store),
+        )
+        .await;
+        let tamper_predecessor = tokio::fs::read(&tamper.persistence.state_path)
+            .await
+            .expect("read tamper predecessor");
+        tokio::fs::remove_file(&tamper.persistence.state_path)
+            .await
+            .expect("remove tamper state before obstruction");
+        tokio::fs::create_dir(&tamper.persistence.state_path)
+            .await
+            .expect("obstruct tamper state replacement");
+        let tamper_lock = acquire_private_state_lock(tamper.persistence.lock_path.clone())
+            .await
+            .expect("tamper state lock");
+        tamper
+            .state
+            .lock()
+            .await
+            .persistent
+            .requires_non_documentation_proof = true;
+        tamper
+            .persist()
+            .await
+            .expect_err("tamper staging setup must fail replacement");
+        drop(tamper_lock);
+        let tamper_staged_path = tamper.persistence.staged_state_path.clone();
+        let staged = tokio::fs::read(&tamper_staged_path)
+            .await
+            .expect("read staged successor");
+        let mut staged_json: serde_json::Value =
+            serde_json::from_slice(&staged).expect("parse staged successor before tampering");
+        assert_eq!(
+            staged_json["state"]["requires_non_documentation_proof"],
+            serde_json::Value::Bool(true)
+        );
+        staged_json["state"]["requires_non_documentation_proof"] = serde_json::Value::Bool(false);
+        tokio::fs::write(
+            &tamper_staged_path,
+            serde_json::to_vec_pretty(&staged_json).expect("encode valid-JSON staged tamper"),
+        )
+        .await
+        .expect("tamper staged successor");
+        tokio::fs::remove_dir(&tamper.persistence.state_path)
+            .await
+            .expect("remove tamper obstruction");
+        tokio::fs::write(&tamper.persistence.state_path, &tamper_predecessor)
+            .await
+            .expect("restore tamper predecessor");
+        drop(tamper);
+        let tampered = test_ledger(
+            tamper_home.path(),
+            tamper_repository.path(),
+            Arc::clone(&tamper_store),
+        )
+        .await;
+        let CompletionProofGateDecision::Blocked { message } = tampered.check_gate().await else {
+            panic!("tampered staged bytes must block authenticated recovery");
+        };
+        assert!(message.contains("staged authenticated state was invalid"));
+        assert!(message.contains("authentication failed"));
+        drop(tampered);
+
+        // Even valid predecessor bytes cannot masquerade as the protected successor.
+        tokio::fs::write(&tamper_staged_path, &tamper_predecessor)
+            .await
+            .expect("replace staging with authenticated predecessor");
+        let mismatched =
+            test_ledger(tamper_home.path(), tamper_repository.path(), tamper_store).await;
+        let CompletionProofGateDecision::Blocked { message } = mismatched.check_gate().await else {
+            panic!("mismatched authenticated staging must block recovery");
+        };
+        assert!(message.contains("did not exactly match the protected revision and raw hash"));
+        drop(mismatched);
+
+        // If durable preparation itself fails, the anchor and predecessor remain usable.
+        let prepare_home = tempfile::tempdir().expect("prepare-failure Codex home");
+        let prepare_repository = tempfile::tempdir().expect("prepare-failure repository");
+        let prepare_store = Arc::new(MockKeyringStore::default());
+        let prepare = test_ledger(
+            prepare_home.path(),
+            prepare_repository.path(),
+            Arc::clone(&prepare_store),
+        )
+        .await;
+        let prepare_predecessor = tokio::fs::read(&prepare.persistence.state_path)
+            .await
+            .expect("read prepare-failure predecessor");
+        let anchor_before = load_trust_anchor_value(&prepare.persistence)
+            .await
+            .expect("load prepare-failure anchor")
+            .expect("prepare-failure anchor exists");
+        tokio::fs::create_dir(&prepare.persistence.staged_state_path)
+            .await
+            .expect("obstruct durable staging");
+        let prepare_lock = acquire_private_state_lock(prepare.persistence.lock_path.clone())
+            .await
+            .expect("prepare-failure state lock");
+        prepare
+            .state
+            .lock()
+            .await
+            .persistent
+            .requires_non_documentation_proof = true;
+        let error = prepare
+            .persist()
+            .await
+            .expect_err("failed durable preparation must not advance the anchor");
+        assert!(error.contains("staged authenticated completion-proof state"));
+        assert_eq!(
+            tokio::fs::read(&prepare.persistence.state_path)
+                .await
+                .expect("reread prepare-failure predecessor"),
+            prepare_predecessor
+        );
+        assert_eq!(
+            load_trust_anchor_value(&prepare.persistence)
+                .await
+                .expect("reload prepare-failure anchor")
+                .expect("prepare-failure anchor remains"),
+            anchor_before
+        );
+        drop(prepare_lock);
+        tokio::fs::remove_dir(&prepare.persistence.staged_state_path)
+            .await
+            .expect("remove durable-staging obstruction");
+        drop(prepare);
+        let predecessor = test_ledger(
+            prepare_home.path(),
+            prepare_repository.path(),
+            prepare_store,
+        )
+        .await;
+        assert!(matches!(
+            &predecessor.state.lock().await.integrity,
+            ProofStateIntegrity::Trusted(_)
+        ));
     }
 
     #[tokio::test]
