@@ -545,11 +545,6 @@ path = "codex-rs/core/src/tools/runtimes/unified_exec.rs"
 contains = "begin_exec_mutation_evidence"
 
 [[features.evidence]]
-kind = "workflow"
-path = "scripts/workflow_preflight.py"
-contains = '"advisories": []'
-
-[[features.evidence]]
 kind = "test"
 path = "codex-rs/agent-task-store/src/tests.rs"
 contains = "completed_receipt_rejects_workspace_change_after_validation"

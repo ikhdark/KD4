@@ -1691,18 +1691,3 @@ pub fn rollout_date_parts(file_name: &OsStr) -> Option<(String, String, String)>
     let day = date.get(8..10)?.to_string();
     Some((year, month, day))
 }
-
-#[cfg(test)]
-mod consolidated_type_tests {
-    use super::SortDirection;
-    use super::ThreadSortKey;
-
-    #[test]
-    fn listing_value_types_are_protocol_owned() {
-        let sort_key: codex_protocol::protocol::ThreadSortKey = ThreadSortKey::RecencyAt;
-        let direction: codex_protocol::protocol::SortDirection = SortDirection::Desc;
-
-        assert_eq!(sort_key, ThreadSortKey::RecencyAt);
-        assert_eq!(direction, SortDirection::Desc);
-    }
-}

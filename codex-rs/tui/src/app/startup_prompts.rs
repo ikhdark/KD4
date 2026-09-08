@@ -366,25 +366,6 @@ mod tests {
     use tokio::sync::mpsc::unbounded_channel;
 
     #[test]
-    fn retired_model_prompt_suppression_infrastructure_stays_removed() {
-        let startup_prompts = include_str!("startup_prompts.rs");
-        let config_types = include_str!("../../../config/src/types.rs");
-        let config_edit = include_str!("../../../core/src/config/edit.rs");
-        let retired_keys = [
-            ["hide_", "gpt5_1_migration_prompt"].concat(),
-            ["hide_", "gpt-5.1-codex-max_migration_prompt"].concat(),
-        ];
-
-        for retired_key in retired_keys {
-            assert!(!startup_prompts.contains(&retired_key));
-            assert!(!config_types.contains(&retired_key));
-            assert!(!config_edit.contains(&retired_key));
-        }
-        assert!(!startup_prompts.contains(&["migration_prompt_", "hidden"].concat()));
-        assert!(!config_edit.contains(&["set_hide_", "model_migration_prompt"].concat()));
-    }
-
-    #[test]
     fn normalize_harness_overrides_resolves_relative_add_dirs() -> Result<()> {
         let temp_dir = tempdir()?;
         let base_cwd = temp_dir.path().join("base").abs();

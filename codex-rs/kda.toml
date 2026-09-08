@@ -1,0 +1,244 @@
+version = 1
+policy-pack = ["kd4@1"]
+
+# KD4's local Windows quality gate. Paths are relative to this Cargo workspace.
+# Preserve the registry's warn/deny defaults; overriding the global default
+# would also weaken existing deny rules. Enable the four opt-in lints below.
+# Do not exclude authored sources, tests, or workspace members.
+[lints]
+expect-in-library = "warn"
+await-holding-guard = "warn"
+capability-flow-unproven = "warn"
+generic-instantiation-uncertain = "warn"
+
+# Normal runtime and the only optional workspace feature (code-mode/Cargo.toml).
+# Trusted loading provides build-script outputs and procedural macro expansion.
+# Use --all-profiles to analyze both; --profile windows selects normal features.
+[[analysis-profile]]
+name = "windows"
+target = "x86_64-pc-windows-msvc"
+workspace-execution = "trusted"
+
+[[analysis-profile]]
+name = "windows-v8-sandbox"
+target = "x86_64-pc-windows-msvc"
+all-features = true
+workspace-execution = "trusted"
+
+# The generated index and its source manifest live at the repository root.
+# Missing/stale ownership and missing closure evidence must remain visible.
+# Validation receipts are not fabricated or permanently pinned in this file.
+[architecture-gate]
+base-ref = "HEAD"
+index = "../architecture_index.json"
+
+# Public enums are part of KD4's local protocol and extension contracts.
+[enum-state-analysis]
+analyze-public-enums = true
+
+[test-analysis]
+history = true
+base-ref = "HEAD"
+minimum-dependency-changes = 2
+ignored-max-commits = 100
+# Mutation execution requires a separate bounded test run; ordinary analysis
+# must not rewrite KD4's source or silently execute a workspace-wide test suite.
+mutation = false
+mutation-limit = 8
+test-attributes = ["test", "tokio::test", "async_std::test", "rstest", "test_case"]
+oracle-macros = [
+  "assert", "assert_eq", "assert_ne", "assert_matches",
+  "debug_assert", "debug_assert_eq", "debug_assert_ne",
+  "assert_snapshot", "assert_debug_snapshot", "assert_json_snapshot",
+  "assert_yaml_snapshot", "assert_toml_snapshot",
+]
+
+[transition-analysis]
+minimum-materiality = 45
+enforce-lifecycle-metadata = true
+# No fixed analysis-date: a committed date would make expiry checks stale.
+
+# Cargo direction and public signature boundaries are separate obligations.
+# Evidence: protocol/, app-server-protocol/, code-mode-protocol/,
+# exec-server-protocol/, and ext/extension-api/ Cargo manifests and lib.rs files.
+# These shared contracts must not depend on their host implementations.
+[[policy]]
+id = "kd4-protocol-independent-of-hosts"
+crates = "codex-protocol"
+forbid-deps = ["codex-core", "codex-app-server", "codex-cli", "codex-exec"]
+
+[[policy]]
+id = "kd4-specialized-protocols-independent-of-hosts"
+crates = "codex-*-protocol"
+forbid-deps = ["codex-core", "codex-app-server", "codex-cli", "codex-exec", "codex-code-mode-host"]
+
+[[policy]]
+id = "kd4-extension-api-independent-of-hosts"
+crates = "codex-extension-api"
+forbid-deps = ["codex-core", "codex-app-server", "codex-cli", "codex-exec"]
+
+[[public-boundary]]
+id = "kd4-protocol-public-types"
+crates = "codex-protocol"
+forbid-public-types-from = ["codex-core", "codex-app-server", "codex-cli", "codex-exec"]
+severity = "deny"
+
+[[public-boundary]]
+id = "kd4-specialized-protocol-public-types"
+crates = "codex-*-protocol"
+forbid-public-types-from = ["codex-core", "codex-app-server", "codex-cli", "codex-exec", "codex-code-mode-host"]
+severity = "deny"
+
+[[public-boundary]]
+id = "kd4-extension-api-public-types"
+crates = "codex-extension-api"
+forbid-public-types-from = ["codex-core", "codex-app-server", "codex-cli", "codex-exec"]
+severity = "deny"
+
+# Extend those boundaries to resolved runtime calls and public signatures.
+[workspace-scale-surfaces.dependencies.package-layers]
+codex-protocol = "protocol"
+codex-app-server-protocol = "protocol"
+codex-code-mode-protocol = "protocol"
+codex-exec-server-protocol = "protocol"
+codex-extension-api = "extension-api"
+codex-core = "host"
+codex-app-server = "host"
+codex-cli = "host"
+codex-exec = "host"
+codex-code-mode-host = "host"
+
+[[workspace-scale-surfaces.dependencies.directions]]
+name = "kd4-protocol-cannot-own-host-runtime"
+from-layer = "protocol"
+forbidden-to-layer = "host"
+roles = ["public_signature", "runtime_call"]
+
+[[workspace-scale-surfaces.dependencies.directions]]
+name = "kd4-extension-api-cannot-own-host-runtime"
+from-layer = "extension-api"
+forbidden-to-layer = "host"
+roles = ["public_signature", "runtime_call"]
+
+# Tool routing is async and lies on every model tool dispatch path.
+# Evidence: core/src/tools/router.rs and core/src/tools/registry.rs.
+[[contract]]
+id = "kd4-router-dispatch-nonblocking"
+functions = "codex_core::tools::router::ToolRouter::dispatch_tool_call_with_terminal_outcome"
+no-blocking = true
+severity = "deny"
+
+[[contract]]
+id = "kd4-registry-dispatch-nonblocking"
+functions = "codex_core::tools::registry::ToolRegistry::dispatch_any_with_terminal_outcome"
+no-blocking = true
+severity = "deny"
+
+# The shared runtime must enter the router before reaching registry dispatch.
+# This catches future direct/nested dispatch paths that bypass the router.
+# Evidence: core/src/tools/parallel.rs -> router.rs -> registry.rs.
+[[required-mediation]]
+id = "kd4-tool-runtime-through-router"
+entrypoints = ["codex_core::tools::parallel::ToolCallRuntime::handle_tool_call_with_source_and_timing"]
+effect = "codex_core::tools::registry::ToolRegistry::dispatch_any_with_terminal_outcome"
+mediators = ["codex_core::tools::router::ToolRouter::dispatch_tool_call_with_terminal_outcome"]
+severity = "deny"
+
+# The router explicitly invokes both authorization checks before delegating.
+# These effect contracts prove ordering, rather than treating the presence of
+# an unrelated authorization call elsewhere as sufficient.
+[[semantic-effect-policy.ordering]]
+id = "kd4-independent-review-before-tool-dispatch"
+within-callable = "codex_core::tools::router::ToolRouter::dispatch_tool_call_with_terminal_outcome"
+prerequisite-callables = ["codex_core::tools::router::authorize_independent_review_tool_call"]
+dependent-callables = ["codex_core::tools::registry::ToolRegistry::dispatch_any_with_terminal_outcome"]
+severity = "deny"
+unknown-behavior = "diagnose"
+message = "Tool dispatch must follow the independent review capability check."
+remediation = "Retain the independent review authorization and propagate its denial before registry dispatch."
+
+[[semantic-effect-policy.ordering]]
+id = "kd4-typed-authorization-before-tool-dispatch"
+within-callable = "codex_core::tools::router::ToolRouter::dispatch_tool_call_with_terminal_outcome"
+prerequisite-callables = ["codex_core::tools::router::authorize_bound_typed_tool_call"]
+dependent-callables = ["codex_core::tools::registry::ToolRegistry::dispatch_any_with_terminal_outcome"]
+severity = "deny"
+unknown-behavior = "diagnose"
+message = "Tool dispatch must follow authorization against the bound typed task."
+remediation = "Await typed task authorization and propagate its result before registry dispatch."
+
+[[workspace-scale-routes.wrapper-envelopes]]
+id = "kd4-router-authorization-envelope"
+wrappers = ["codex_core::tools::router::ToolRouter::dispatch_tool_call_with_terminal_outcome"]
+delegates = ["codex_core::tools::registry::ToolRegistry::dispatch_any_with_terminal_outcome"]
+max-depth = 32
+report-uncertainty = true
+required-effects = [
+  { id = "independent-review", patterns = ["codex_core::tools::router::authorize_independent_review_tool_call"] },
+  { id = "typed-task-authorization", patterns = ["codex_core::tools::router::authorize_bound_typed_tool_call"] },
+]
+
+# Exact credential fields, not every String or every authentication result.
+# Evidence: login/src/token_data.rs; tracing macros own diagnostic log sinks.
+# No blanket sanitizer is trusted to erase credential provenance.
+[[semantic-effect-policy.sensitive-sinks]]
+id = "kd4-credentials-must-not-enter-logs"
+source-adts = ["codex_login::token_data::TokenData"]
+source-fields = [
+  "codex_login::token_data::TokenData::access_token",
+  "codex_login::token_data::TokenData::refresh_token",
+  "codex_login::token_data::IdTokenInfo::raw_jwt",
+]
+sink-macro-crates = ["tracing", "log"]
+severity = "deny"
+message = "Authentication credentials must not be exposed through diagnostic logging."
+remediation = "Log non-secret status or identifiers instead of tokens or the complete credential structure."
+
+# Every declared wire variant needs an explicit persistence decision, including
+# deliberate exclusion. This does not require persisting transient events.
+# Evidence: protocol/src/{protocol,models}.rs -> rollout/src/policy.rs.
+[[variant-flow]]
+id = "kd4-rollout-item-persistence-disposition"
+kind = "durable-state"
+enum-path = "codex_protocol::protocol::RolloutItem"
+subject = "declared"
+source-universe = "authored-workspace"
+unknown-behavior = "report-inconclusive"
+stages = [
+  { name = "rollout-persistence-policy", path-patterns = ["rollout/src/policy.rs"], function-patterns = ["is_persisted_rollout_item"], required-disposition = "explicit" },
+]
+
+[[variant-flow]]
+id = "kd4-response-item-persistence-disposition"
+kind = "durable-state"
+enum-path = "codex_protocol::models::ResponseItem"
+subject = "declared"
+source-universe = "authored-workspace"
+unknown-behavior = "report-inconclusive"
+stages = [
+  { name = "rollout-persistence-policy", path-patterns = ["rollout/src/policy.rs"], function-patterns = ["should_persist_response_item"], required-disposition = "explicit" },
+  { name = "memory-persistence-policy", path-patterns = ["rollout/src/policy.rs"], function-patterns = ["should_persist_response_item_for_memories"], required-disposition = "explicit" },
+]
+
+[[variant-flow]]
+id = "kd4-event-persistence-disposition"
+kind = "durable-state"
+enum-path = "codex_protocol::protocol::EventMsg"
+subject = "declared"
+source-universe = "authored-workspace"
+unknown-behavior = "report-inconclusive"
+stages = [
+  { name = "event-persistence-policy", path-patterns = ["rollout/src/policy.rs"], function-patterns = ["should_persist_event_msg"], required-disposition = "explicit" },
+]
+
+# Limits of this configuration:
+# - kd4@1 supplies its existing capability, lifecycle, timing, identity,
+#   durability, output and Windows process policies; do not duplicate them.
+# - Unsafe/FFI, pinning, typestate and resource protocols need reviewed operation
+#   semantics. Empty tables or guessed contracts would not establish coverage.
+# - Persistence/change comparisons need real baseline snapshots; generated
+#   artifact and architecture proofs need current source-bound receipts.
+# - Alternate-query parity needs canonical query summaries from an embedding;
+#   there is no TOML switch that can supply those facts.
+# - Contract selectors and profile coverage must be checked in the run receipt;
+#   unresolved or skipped analyses are not successful proofs.

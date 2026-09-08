@@ -49,7 +49,7 @@ an SDK, schema, package, installed binary, or Codex Desktop.
 Update it in the same change whenever the repository materially changes.
 
 <!-- BEGIN TRACKED PATH SNAPSHOT -->
-Tracked repository path snapshot: `count=5007 sha256=356f2ef7a762ef4a43a57ffe55ba752f633a9aaca1ba6cbbeba5d8381a1ae1a8`.
+Tracked repository path snapshot: `count=4994 sha256=88353c8ecc334cd6bba98e2f928646c9a4d49de22522b13c638cd33cd3bc496e`.
 <!-- END TRACKED PATH SNAPSHOT -->
 
 Every repository file or directory add, delete, move, or rename also requires
@@ -149,7 +149,7 @@ below.
 
 | Path                                                             | Owns                                                                                                                                                                                                                                                                  |
 | ---------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `.codex/`                                                        | Repo-local Codex configuration, environment setup, durable harness material, fork-local skills, and workspace policy                                                                                                                                                  |
+| `.codex/`                                                        | Repo-local Codex configuration, environment setup, fork-local skills, and workspace policy                                                                                                                                                  |
 | `.vscode/`                                                       | Checked-in editor and workspace defaults                                                                                                                                                                                                                              |
 | `architecture_index.json`                                        | Generated, manifest-keyed source-owner relationship graph consumed by task-scoped architecture discovery                                                                                                                                                              |
 | `codex-cli/`                                                     | npm-facing `@openai/codex` wrapper, native binary discovery, and npm package inputs                                                                                                                                                                                   |
@@ -387,7 +387,6 @@ owner must trace every reader and writer before completion.
 | Desktop-visible completion                  | local publish output plus app-server/CLI runtime                                                                                                                              | publish final, restart Desktop, prove process path and binary hash/version, inspect initialize/model metadata, capture visible evidence                                       |
 | Source-owner and architecture index refresh | `source_owners.toml`, `scripts/source_owners.py`, `scripts/test_source_owners.py`                                                                                             | regenerate `architecture_index.json` and the marked `SOURCEMAP.md` block through the owner workflow; run source-owner freshness and representative relationship-recall checks |
 | Generated schema freshness                  | `scripts/config_schema_check.py`, `scripts/app_server_schema_runtime_check.py`, `scripts/generated_output_lock.py`                                                            | use the owning check/regeneration command under the shared generated-output lock; never hand-edit generated schemas                                                           |
-| Shared-worktree workflow preflight          | `scripts/workflow_preflight.py`                                                                                                                                               | preserve manifest/lease, path and contract claims, dependencies, generated-output ownership, validation ownership, Cargo-lane routing, and machine-readable diagnostics       |
 | KD4 audits, evaluation, and measurement     | `scripts/kd4_sync_audit.py`, `scripts/kd4_model_attempt_analysis.py`, `scripts/kd4_perf_snapshot.py`, `scripts/investigation_evidence_smoke.py`, `scripts/investigation_eval` | matching fixture/unit test; keep audits non-mutating and distinguish measured subprocess wall time from startup-only timing, test duration, estimates, and stale binaries     |
 | Runtime binary selection proof              | `scripts/vscode_runtime_proof.py`                                                                                                                                             | read-only path, version, and environment evidence; binary replacement remains owned by the explicit publish/update flow                                                       |
 
@@ -404,7 +403,6 @@ remain required.
 | Source map or structural inventory           | `python -m unittest scripts.test_source_map_check` and `just source-map-check`                                                                                                   |
 | Source-owner manifest or architecture index  | `python -m unittest scripts.test_source_owners` and `just source-owners-check`                                                                                                   |
 | Root or Python maintenance scripts           | closest `python -m unittest scripts.test_<name>` plus syntax/lint appropriate to the script                                                                                      |
-| Shared-worktree workflow preflight           | `python -m unittest scripts.test_workflow_preflight`                                                                                                                             |
 | KD4 audit, evaluation, or measurement script | closest matching `python -m unittest scripts.test_<name>` plus only the fixture/freshness check owned by the changed surface                                                     |
 | Named Rust test runner or manifest           | `python -m unittest scripts.test_rust_test_runner` and `just core-test-manifest-check`                                                                                           |
 | `codex-core` Rust tests                      | `just core-test <target>`, `just core-test-fast <target>`, or `just core-gate <gate>`; `just core-test-list` prints the names                                                    |
@@ -449,7 +447,7 @@ install tools or add dependencies solely to follow this reference.
 | Repository-wide editing policy                                     | `AGENTS.md`                                                           |
 | Rust workspace policy                                              | `AGENTS.md`, then the Rust workflow reference in this map             |
 | Script ownership and validation                                    | Owner script help or the closest checked-in README                    |
-| Repo-local Codex setup and durable harness                         | `.codex/harness/README.md`                                            |
+| Repo-local Codex setup | `.codex/config.toml` and `.codex/environments/README.md` |
 | Local build and Desktop publish                                    | `scripts/publish-local-codex.ps1` and the build/publish section above |
 | Standalone installation                                            | `scripts/install/README.md`                                           |
 | Product usage, configuration, authentication, and sandbox guidance | [OpenAI Codex documentation](https://developers.openai.com/codex)     |

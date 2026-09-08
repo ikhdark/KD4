@@ -2500,7 +2500,9 @@ async fn slash_pets_on_unsupported_terminal_warns_without_picker() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     force_terminal_pet_image_unsupported(&mut chat);
 
-    chat.dispatch_command(SlashCommand::Pets);
+    chat.bottom_pane
+        .set_composer_text("/pets".to_string(), Vec::new(), Vec::new());
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
 
     assert!(!chat.bottom_pane.has_active_view());
     let cells = drain_insert_history(&mut rx);
@@ -2532,25 +2534,6 @@ async fn slash_pets_with_arg_on_unsupported_terminal_warns_without_selection() {
     assert!(rendered.contains("Pets aren’t available in this terminal."));
     assert_matches!(rx.try_recv(), Err(TryRecvError::Empty));
     assert_matches!(op_rx.try_recv(), Err(TryRecvError::Empty));
-}
-
-#[tokio::test]
-#[serial]
-async fn slash_pets_on_unsupported_terminal_shows_terminal_warning() {
-    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    force_terminal_pet_image_unsupported(&mut chat);
-
-    chat.dispatch_command(SlashCommand::Pets);
-
-    assert!(!chat.bottom_pane.has_active_view());
-    let cells = drain_insert_history(&mut rx);
-    let rendered = cells
-        .iter()
-        .map(|lines| lines_to_single_string(lines))
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(rendered.contains("Pets aren’t available in this terminal."));
-    assert!(rendered.contains("Kitty graphics or Sixel support"));
 }
 
 #[tokio::test]

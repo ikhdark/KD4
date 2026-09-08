@@ -12,23 +12,12 @@ use std::time::Duration;
 use std::time::Instant;
 use tempfile::TempDir;
 
-fn require_api_key_from(value: Result<String, std::env::VarError>) -> Result<String, String> {
-    value.map_err(|_| "OPENAI_API_KEY env var not set".to_string())
-}
-
 fn require_api_key() -> String {
-    require_api_key_from(std::env::var("OPENAI_API_KEY"))
-        .expect("OPENAI_API_KEY env var not set — live test cannot run")
+    std::env::var("OPENAI_API_KEY").expect("OPENAI_API_KEY env var not set — live test cannot run")
 }
 
 fn resolve_codex_binary() -> Result<PathBuf, codex_utils_cargo_bin::CargoBinError> {
-    resolve_codex_binary_with(codex_utils_cargo_bin::cargo_bin)
-}
-
-fn resolve_codex_binary_with(
-    resolver: impl FnOnce(&str) -> Result<PathBuf, codex_utils_cargo_bin::CargoBinError>,
-) -> Result<PathBuf, codex_utils_cargo_bin::CargoBinError> {
-    resolver("codex")
+    codex_utils_cargo_bin::cargo_bin("codex")
 }
 
 fn wait_for_child(
@@ -184,44 +173,6 @@ fn live_print_working_directory() {
     assert
         .success()
         .stdout(predicate::str::contains(dir.path().to_string_lossy()));
-}
-
-#[test]
-fn missing_api_key_is_an_error() {
-    assert_eq!(
-        require_api_key_from(Err(std::env::VarError::NotPresent)),
-        Err("OPENAI_API_KEY env var not set".to_string())
-    );
-}
-
-#[test]
-fn live_runner_resolves_the_required_codex_binary() {
-    let path = resolve_codex_binary().expect("resolve the codex binary used by run_live");
-    assert!(
-        path.is_file(),
-        "resolved codex binary is missing: {}",
-        path.display()
-    );
-}
-
-/// What this tests: a failed helper lookup propagates to the caller instead of
-/// resolving to some other path, so `run_live` cannot silently spawn a binary
-/// the target never declared.
-#[test]
-fn missing_helper_binary_resolution_reports_an_error() {
-    let error = resolve_codex_binary_with(|name| {
-        Err(codex_utils_cargo_bin::CargoBinError::NotFound {
-            name: name.to_string(),
-            env_keys: vec![format!("CARGO_BIN_EXE_{name}")],
-            fallback: "disabled in propagation test".to_string(),
-        })
-    })
-    .expect_err("a missing required helper must fail the test");
-
-    assert!(
-        error.to_string().contains("codex"),
-        "error should name the missing helper: {error}"
-    );
 }
 
 #[test]

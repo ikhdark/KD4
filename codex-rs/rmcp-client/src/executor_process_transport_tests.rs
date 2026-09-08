@@ -6,68 +6,31 @@ use super::LineBuffer;
 const TEST_LINE_LIMIT: usize = 64;
 
 #[test]
-fn searches_only_new_bytes_after_partial_line() {
+fn fragmented_lines_preserve_order_and_the_unterminated_tail() {
     let mut buffer = LineBuffer::default();
 
     buffer
         .extend_from_slice(b"partial", TEST_LINE_LIMIT)
         .unwrap();
     assert_eq!(buffer.take_line(), None);
-    assert_eq!(
-        buffer,
-        LineBuffer {
-            bytes: BytesMut::from(&b"partial"[..]),
-            scanned_len: 7,
-            trailing_line_len: 7,
-        }
-    );
 
     buffer.extend_from_slice(b" line", TEST_LINE_LIMIT).unwrap();
     assert_eq!(buffer.take_line(), None);
-    assert_eq!(
-        buffer,
-        LineBuffer {
-            bytes: BytesMut::from(&b"partial line"[..]),
-            scanned_len: 12,
-            trailing_line_len: 12,
-        }
-    );
 
     buffer
-        .extend_from_slice(b"\nnext", TEST_LINE_LIMIT)
+        .extend_from_slice(b"\nnext\npartial", TEST_LINE_LIMIT)
         .unwrap();
     assert_eq!(
         buffer.take_line(),
         Some(BytesMut::from(&b"partial line"[..]))
     );
-    assert_eq!(
-        buffer,
-        LineBuffer {
-            bytes: BytesMut::from(&b"next"[..]),
-            scanned_len: 0,
-            trailing_line_len: 4,
-        }
-    );
-}
-
-#[test]
-fn splits_multiple_lines_and_retains_partial_tail() {
-    let mut buffer = LineBuffer::default();
-    buffer
-        .extend_from_slice(b"first\nsecond\npartial", TEST_LINE_LIMIT)
-        .unwrap();
-
-    assert_eq!(buffer.take_line(), Some(BytesMut::from(&b"first"[..])));
-    assert_eq!(buffer.take_line(), Some(BytesMut::from(&b"second"[..])));
+    assert_eq!(buffer.take_line(), Some(BytesMut::from(&b"next"[..])));
     assert_eq!(buffer.take_line(), None);
     assert_eq!(
-        buffer,
-        LineBuffer {
-            bytes: BytesMut::from(&b"partial"[..]),
-            scanned_len: 7,
-            trailing_line_len: 7,
-        }
+        buffer.take_remaining(),
+        Some(BytesMut::from(&b"partial"[..]))
     );
+    assert_eq!(buffer.take_remaining(), None);
 }
 
 #[test]
@@ -82,11 +45,23 @@ fn takes_unterminated_remaining_bytes_at_eof() {
         buffer.take_remaining(),
         Some(BytesMut::from(&b"remaining"[..]))
     );
-    assert_eq!(buffer, LineBuffer::default());
+    assert_eq!(buffer.take_line(), None);
+    assert_eq!(buffer.take_remaining(), None);
+
+    let at_limit = vec![b'x'; TEST_LINE_LIMIT];
+    buffer
+        .extend_from_slice(&at_limit, TEST_LINE_LIMIT)
+        .unwrap();
+    buffer.extend_from_slice(b"\n", TEST_LINE_LIMIT).unwrap();
+    assert_eq!(
+        buffer.take_line(),
+        Some(BytesMut::from(at_limit.as_slice()))
+    );
+    assert_eq!(buffer.take_remaining(), None);
 }
 
 #[test]
-fn rejects_an_oversized_unterminated_line_without_growing() {
+fn rejected_oversized_append_preserves_the_accepted_line() {
     let mut buffer = LineBuffer::default();
     let at_limit = vec![b'x'; TEST_LINE_LIMIT];
     buffer
@@ -94,8 +69,13 @@ fn rejects_an_oversized_unterminated_line_without_growing() {
         .unwrap();
 
     assert!(buffer.extend_from_slice(b"x", TEST_LINE_LIMIT).is_err());
-    assert_eq!(buffer.bytes.len(), TEST_LINE_LIMIT);
-    assert_eq!(buffer.trailing_line_len, TEST_LINE_LIMIT);
+    assert_eq!(buffer.take_line(), None);
+    buffer.extend_from_slice(b"\n", TEST_LINE_LIMIT).unwrap();
+    assert_eq!(
+        buffer.take_line(),
+        Some(BytesMut::from(at_limit.as_slice()))
+    );
+    assert_eq!(buffer.take_remaining(), None);
 }
 
 #[test]
@@ -113,5 +93,6 @@ fn bounds_each_line_instead_of_the_aggregate_buffer() {
         Some(BytesMut::from(&b"second line"[..]))
     );
     assert_eq!(buffer.take_line(), Some(BytesMut::from(&b"third line"[..])));
-    assert_eq!(buffer, LineBuffer::default());
+    assert_eq!(buffer.take_line(), None);
+    assert_eq!(buffer.take_remaining(), None);
 }

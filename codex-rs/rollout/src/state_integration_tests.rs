@@ -189,16 +189,6 @@ async fn slow_read_repair_uses_the_full_rollout_as_provider_authority() -> anyho
         .await?
         .expect("slow repair should create the missing row");
     assert_eq!(repaired.model_provider, "test-provider");
-
-    let source = include_str!("state_integration.rs");
-    let slow_path = source
-        .split("pub async fn read_repair_rollout_path")
-        .nth(1)
-        .expect("read repair function exists")
-        .split("/// Apply rollout items incrementally")
-        .next()
-        .expect("read repair function body exists");
-    assert!(!slow_path.contains("read_session_meta_line"));
     Ok(())
 }
 

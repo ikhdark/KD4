@@ -290,7 +290,7 @@ mod tests {
     }
 
     #[test]
-    fn serialize_outgoing_message_uses_one_json_serialization_pass() {
+    fn serialize_outgoing_message_preserves_response_wire_format() {
         let message = OutgoingMessage::Response(OutgoingResponse {
             id: RequestId::Integer(7),
             result: json!({ "ok": true }),
@@ -300,16 +300,6 @@ mod tests {
             serialize_outgoing_message(message).as_deref(),
             Some(r#"{"id":7,"result":{"ok":true}}"#)
         );
-
-        let source = include_str!("mod.rs");
-        let function = source
-            .split("fn serialize_outgoing_message")
-            .nth(1)
-            .expect("serializer function exists")
-            .split("#[cfg(test)]")
-            .next()
-            .expect("production serializer body exists");
-        assert!(!function.contains("serde_json::to_value"));
     }
 
     #[tokio::test]

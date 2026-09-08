@@ -1,26 +1,6 @@
 use super::*;
 
 #[test]
-fn turn_clients_use_normal_mcp_elicitation_handling() {
-    const { assert!(!MCP_ELICITATIONS_AUTO_DENY) };
-}
-
-#[test]
-fn typed_turn_responses_reach_the_dispatch_boundary_without_inner_wrappers() {
-    let source = include_str!("turn_processor.rs");
-    for removed_wrapper in [
-        "thread_inject_items_response_inner",
-        "thread_settings_update_inner",
-        "turn_interrupt_inner",
-    ] {
-        assert!(
-            !source.contains(removed_wrapper),
-            "{removed_wrapper} must not reintroduce a pass-through call hop"
-        );
-    }
-}
-
-#[test]
 fn turn_interrupt_rejects_retained_interrupted_snapshot() {
     let error = validate_turn_interrupt_target(
         Some(("turn-1", &TurnStatus::Interrupted)),

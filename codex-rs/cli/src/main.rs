@@ -3833,12 +3833,11 @@ mod tests {
     fn config_explain_parses_optional_filter() {
         let cli = MultitoolCli::try_parse_from(["codex", "config", "explain", "sandbox"])
             .expect("parse should succeed");
-        let Some(Subcommand::Config(config_cmd::ConfigCli {
-            subcommand: config_cmd::ConfigSubcommand::Explain(args),
-        })) = cli.subcommand
-        else {
+        let Some(Subcommand::Config(config)) = cli.subcommand else {
             panic!("expected config explain subcommand");
         };
+        assert_eq!(config.config_subcommand_name(), "config explain");
+        let config_cmd::ConfigSubcommand::Explain(args) = config.subcommand;
         assert_eq!(args.filter.as_deref(), Some("sandbox"));
     }
 

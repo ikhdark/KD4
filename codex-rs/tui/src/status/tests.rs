@@ -130,6 +130,7 @@ async fn test_config(temp_home: &TempDir) -> Config {
         .await
         .expect("load config");
     config.approvals_reviewer = ApprovalsReviewer::User;
+    config.model = Some("gpt-5.6-sol".to_string());
     config
         .permissions
         .set_permission_profile(app_server_workspace_write_profile(
@@ -1166,7 +1167,7 @@ async fn status_snapshot_uses_generic_limit_labels_for_unsupported_windows() {
 }
 
 #[tokio::test]
-async fn status_snapshot_shows_unlimited_credits() {
+async fn status_snapshot_credit_display() {
     let temp_home = TempDir::new().expect("temp home");
     let config = test_config(&temp_home).await;
     let account_display = test_status_account_display();
@@ -1175,198 +1176,58 @@ async fn status_snapshot_shows_unlimited_credits() {
         .with_ymd_and_hms(2024, 2, 3, 4, 5, 6)
         .single()
         .expect("timestamp");
-    let snapshot = RateLimitSnapshot {
-        limit_id: None,
-        limit_name: None,
-        primary: None,
-        secondary: None,
-        credits: Some(CreditsSnapshot {
-            has_credits: true,
-            unlimited: true,
-            balance: None,
-        }),
-        individual_limit: None,
-        spend_control_reached: None,
-        plan_type: None,
-        rate_limit_reached_type: None,
-    };
-    let rate_display = rate_limit_snapshot_display(&snapshot, captured_at);
-    let model_slug = get_model_offline_for_tests(config.model.as_deref());
-    let token_info = token_info_for(&model_slug, &config, &usage);
-    let composite = new_status_output(
-        &config,
-        account_display.as_ref(),
-        Some(&token_info),
-        &usage,
-        &None,
-        /*thread_name*/ None,
-        /*forked_from*/ None,
-        Some(&rate_display),
-        None,
-        captured_at,
-        &model_slug,
-        /*collaboration_mode*/ None,
-        /*reasoning_effort_override*/ None,
-    );
-    let rendered = render_lines(&composite.display_lines(/*width*/ 120));
-    assert!(
-        rendered
-            .iter()
-            .any(|line| line.contains("Credits:") && line.contains("Unlimited")),
-        "expected Credits: Unlimited line, got {rendered:?}"
-    );
-}
-
-#[tokio::test]
-async fn status_snapshot_shows_positive_credits() {
-    let temp_home = TempDir::new().expect("temp home");
-    let config = test_config(&temp_home).await;
-    let account_display = test_status_account_display();
-    let usage = TokenUsage::default();
-    let captured_at = chrono::Local
-        .with_ymd_and_hms(2024, 3, 4, 5, 6, 7)
-        .single()
-        .expect("timestamp");
-    let snapshot = RateLimitSnapshot {
-        limit_id: None,
-        limit_name: None,
-        primary: None,
-        secondary: None,
-        credits: Some(CreditsSnapshot {
-            has_credits: true,
-            unlimited: false,
-            balance: Some("12.5".to_string()),
-        }),
-        individual_limit: None,
-        spend_control_reached: None,
-        plan_type: None,
-        rate_limit_reached_type: None,
-    };
-    let rate_display = rate_limit_snapshot_display(&snapshot, captured_at);
-    let model_slug = get_model_offline_for_tests(config.model.as_deref());
-    let token_info = token_info_for(&model_slug, &config, &usage);
-    let composite = new_status_output(
-        &config,
-        account_display.as_ref(),
-        Some(&token_info),
-        &usage,
-        &None,
-        /*thread_name*/ None,
-        /*forked_from*/ None,
-        Some(&rate_display),
-        None,
-        captured_at,
-        &model_slug,
-        /*collaboration_mode*/ None,
-        /*reasoning_effort_override*/ None,
-    );
-    let rendered = render_lines(&composite.display_lines(/*width*/ 120));
-    assert!(
-        rendered
-            .iter()
-            .any(|line| line.contains("Credits:") && line.contains("13 credits")),
-        "expected Credits line with rounded credits, got {rendered:?}"
-    );
-}
-
-#[tokio::test]
-async fn status_snapshot_hides_zero_credits() {
-    let temp_home = TempDir::new().expect("temp home");
-    let config = test_config(&temp_home).await;
-    let account_display = test_status_account_display();
-    let usage = TokenUsage::default();
-    let captured_at = chrono::Local
-        .with_ymd_and_hms(2024, 4, 5, 6, 7, 8)
-        .single()
-        .expect("timestamp");
-    let snapshot = RateLimitSnapshot {
-        limit_id: None,
-        limit_name: None,
-        primary: None,
-        secondary: None,
-        credits: Some(CreditsSnapshot {
-            has_credits: true,
-            unlimited: false,
-            balance: Some("0".to_string()),
-        }),
-        individual_limit: None,
-        spend_control_reached: None,
-        plan_type: None,
-        rate_limit_reached_type: None,
-    };
-    let rate_display = rate_limit_snapshot_display(&snapshot, captured_at);
-    let model_slug = get_model_offline_for_tests(config.model.as_deref());
-    let token_info = token_info_for(&model_slug, &config, &usage);
-    let composite = new_status_output(
-        &config,
-        account_display.as_ref(),
-        Some(&token_info),
-        &usage,
-        &None,
-        /*thread_name*/ None,
-        /*forked_from*/ None,
-        Some(&rate_display),
-        None,
-        captured_at,
-        &model_slug,
-        /*collaboration_mode*/ None,
-        /*reasoning_effort_override*/ None,
-    );
-    let rendered = render_lines(&composite.display_lines(/*width*/ 120));
-    assert!(
-        rendered.iter().all(|line| !line.contains("Credits:")),
-        "expected no Credits line, got {rendered:?}"
-    );
-}
-
-#[tokio::test]
-async fn status_snapshot_hides_when_has_no_credits_flag() {
-    let temp_home = TempDir::new().expect("temp home");
-    let config = test_config(&temp_home).await;
-    let account_display = test_status_account_display();
-    let usage = TokenUsage::default();
-    let captured_at = chrono::Local
-        .with_ymd_and_hms(2024, 5, 6, 7, 8, 9)
-        .single()
-        .expect("timestamp");
-    let snapshot = RateLimitSnapshot {
-        limit_id: None,
-        limit_name: None,
-        primary: None,
-        secondary: None,
-        credits: Some(CreditsSnapshot {
-            has_credits: false,
-            unlimited: true,
-            balance: None,
-        }),
-        individual_limit: None,
-        spend_control_reached: None,
-        plan_type: None,
-        rate_limit_reached_type: None,
-    };
-    let rate_display = rate_limit_snapshot_display(&snapshot, captured_at);
-    let model_slug = get_model_offline_for_tests(config.model.as_deref());
-    let token_info = token_info_for(&model_slug, &config, &usage);
-    let composite = new_status_output(
-        &config,
-        account_display.as_ref(),
-        Some(&token_info),
-        &usage,
-        &None,
-        /*thread_name*/ None,
-        /*forked_from*/ None,
-        Some(&rate_display),
-        None,
-        captured_at,
-        &model_slug,
-        /*collaboration_mode*/ None,
-        /*reasoning_effort_override*/ None,
-    );
-    let rendered = render_lines(&composite.display_lines(/*width*/ 120));
-    assert!(
-        rendered.iter().all(|line| !line.contains("Credits:")),
-        "expected no Credits line when has_credits is false, got {rendered:?}"
-    );
+    for (case, has_credits, unlimited, balance, expected) in [
+        ("unlimited", true, true, None, Some("Unlimited")),
+        ("positive", true, false, Some("12.5"), Some("13 credits")),
+        ("zero", true, false, Some("0"), None),
+        ("no credits", false, true, None, None),
+    ] {
+        let snapshot = RateLimitSnapshot {
+            limit_id: None,
+            limit_name: None,
+            primary: None,
+            secondary: None,
+            credits: Some(CreditsSnapshot {
+                has_credits,
+                unlimited,
+                balance: balance.map(str::to_string),
+            }),
+            individual_limit: None,
+            spend_control_reached: None,
+            plan_type: None,
+            rate_limit_reached_type: None,
+        };
+        let rate_display = rate_limit_snapshot_display(&snapshot, captured_at);
+        let model_slug = get_model_offline_for_tests(config.model.as_deref());
+        let token_info = token_info_for(&model_slug, &config, &usage);
+        let composite = new_status_output(
+            &config,
+            account_display.as_ref(),
+            Some(&token_info),
+            &usage,
+            &None,
+            /*thread_name*/ None,
+            /*forked_from*/ None,
+            Some(&rate_display),
+            None,
+            captured_at,
+            &model_slug,
+            /*collaboration_mode*/ None,
+            /*reasoning_effort_override*/ None,
+        );
+        let rendered = render_lines(&composite.display_lines(/*width*/ 120));
+        let credit_line = rendered.iter().find(|line| line.contains("Credits:"));
+        match expected {
+            Some(expected) => assert!(
+                credit_line.is_some_and(|line| line.contains(expected)),
+                "{case}: expected Credits line containing {expected:?}, got {rendered:?}"
+            ),
+            None => assert!(
+                credit_line.is_none(),
+                "{case}: expected no Credits line, got {rendered:?}"
+            ),
+        }
+    }
 }
 
 #[tokio::test]

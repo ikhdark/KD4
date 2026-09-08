@@ -618,21 +618,6 @@ pub(crate) async fn record_pending_input(
     record_additional_contexts(sess, turn_context, additional_contexts).await;
 }
 
-#[cfg(test)]
-mod compaction_hook_gate_contract_tests {
-    #[test]
-    fn local_and_remote_compaction_use_the_shared_hook_gates() {
-        for source in [
-            include_str!("compact.rs"),
-            include_str!("compact_remote_v2.rs"),
-        ] {
-            assert!(source.contains("run_pre_compact_hook_gate"));
-            assert!(source.contains("run_post_compact_hook_gate"));
-            assert!(!source.contains("emit_hook_stop_reason"));
-        }
-    }
-}
-
 async fn run_context_injecting_hook<Fut>(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,

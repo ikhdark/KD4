@@ -466,33 +466,6 @@ primary_entries = [{ path = "source.rs", symbol = "locate" }]
             missing_digest.update(b"\0missing-or-not-a-file\0")
             self.assertEqual(snapshot, (missing_digest.hexdigest(), 0, 0))
 
-    def test_bounded_ranking_uses_partial_selection_and_preserves_order(self) -> None:
-        items = [{"rank": rank} for rank in range(100, 0, -1)]
-        with mock.patch.object(
-            source_owners.heapq,
-            "nsmallest",
-            wraps=source_owners.heapq.nsmallest,
-        ) as nsmallest:
-            selected = source_owners._bounded_sorted(
-                items, lambda item: item["rank"], 4
-            )
-
-        self.assertEqual([item["rank"] for item in selected], [1, 2, 3, 4])
-        nsmallest.assert_called_once()
-
-    def test_round_robin_relationship_cap_preserves_facet_order(self) -> None:
-        relationships = {
-            "control": [{"id": "c0"}, {"id": "c1"}, {"id": "c2"}],
-            "tests": [{"id": "t0"}, {"id": "t1"}],
-            "invariants": [{"id": "i0"}],
-        }
-
-        retained = source_owners._round_robin_relationships(relationships, 4)
-
-        self.assertEqual([item["id"] for item in retained["control"]], ["c0", "c1"])
-        self.assertEqual([item["id"] for item in retained["tests"]], ["t0"])
-        self.assertEqual([item["id"] for item in retained["invariants"]], ["i0"])
-
     def test_generate_reads_source_map_once(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -704,7 +677,6 @@ tests = ["src/lib.rs"]
 [owners.facet_exclusions]
 callers_and_consumers = "No consumers in this fixture."
 generated_artifacts = "No generated output in this fixture."
-invariants = "No invariant in this fixture."
 [[owners.relationships]]
 category = "control_flow"
 kind = "calls"
@@ -723,6 +695,12 @@ kind = "reads_config"
 target = "config:settings"
 confidence = "declared"
 evidence = [{ path = "src/lib.rs", symbol = "item" }]
+[[owners.invariants]]
+id = "stable"
+kind = "semantic"
+statement = "Retain the behavioral contract when capping relationships."
+evidence = [{ path = "src/lib.rs", symbol = "item" }]
+tests = ["src/lib.rs"]
 """,
                 encoding="utf-8",
             )
@@ -736,19 +714,57 @@ evidence = [{ path = "src/lib.rs", symbol = "item" }]
             self.assertIn("critical_cache.rs", ranked[0]["target"])
             self.assertIn("secondary.rs", ranked[1]["target"])
 
-            bounded = source_owners.architecture_slice(
-                manifest,
-                digest,
-                root,
-                ["alpha"],
-                max_relationships=2,
-                focus="repair critical cache",
-            )
-            self.assertEqual(len(bounded["control_and_data_flow"]["relationships"]), 1)
-            self.assertEqual(
-                len(bounded["configuration_and_gates"]["relationships"]), 1
-            )
-            self.assertGreater(bounded["omitted_relationships"], 0)
+            for cap, control_count, entry_count, test_count, invariant_count in (
+                (2, 1, 0, 0, 0),
+                (4, 1, 1, 1, 0),
+                (5, 1, 1, 1, 1),
+                (6, 2, 1, 1, 1),
+            ):
+                with self.subTest(cap=cap):
+                    bounded = source_owners.architecture_slice(
+                        manifest,
+                        digest,
+                        root,
+                        ["alpha"],
+                        max_relationships=cap,
+                        focus="repair critical cache",
+                    )
+                    self.assertEqual(
+                        [
+                            edge["target"]
+                            for edge in bounded["control_and_data_flow"][
+                                "relationships"
+                            ]
+                        ],
+                        ["path:src/critical_cache.rs", "path:src/secondary.rs"][
+                            :control_count
+                        ],
+                    )
+                    self.assertEqual(
+                        [
+                            edge["target"]
+                            for edge in bounded["configuration_and_gates"][
+                                "relationships"
+                            ]
+                        ],
+                        ["config:settings"],
+                    )
+                    self.assertEqual(
+                        len(bounded["registration_and_entrypoints"]["relationships"]),
+                        entry_count,
+                    )
+                    self.assertEqual(
+                        len(bounded["tests_and_contracts"]["relationships"]), test_count
+                    )
+                    self.assertEqual(
+                        [
+                            edge["target"]
+                            for edge in bounded["invariants"]["relationships"]
+                        ],
+                        ["contract:stable"][:invariant_count],
+                    )
+                    self.assertEqual(bounded["omitted_relationships"], 6 - cap)
+                    self.assertEqual(bounded["truncated"], cap < 6)
 
     def test_architecture_slice_ranks_focus_before_relationship_cap(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

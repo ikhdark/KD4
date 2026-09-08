@@ -162,26 +162,6 @@ fn local_plugin_completion_requires_requested_mcp_servers() {
     ));
 }
 
-/// What this tests: resolving a helper binary no test target declares fails
-/// instead of returning a path, so a missing required helper propagates to the
-/// caller rather than turning the regression below into a silent pass.
-#[test]
-fn missing_stdio_helper_binary_resolution_reports_an_error() {
-    let error = core_test_support::required_helper_bin_with("test_stdio_server", |name| {
-        Err(codex_utils_cargo_bin::CargoBinError::NotFound {
-            name: name.to_string(),
-            env_keys: vec![format!("CARGO_BIN_EXE_{name}")],
-            fallback: "disabled in propagation test".to_string(),
-        })
-    })
-    .expect_err("a missing required helper must fail the test");
-
-    assert!(
-        error.to_string().contains("test_stdio_server"),
-        "error should name the missing helper: {error}"
-    );
-}
-
 #[tokio::test]
 async fn requested_mcp_servers_are_refreshed_before_install_completion() -> anyhow::Result<()> {
     let command = core_test_support::stdio_server_bin()

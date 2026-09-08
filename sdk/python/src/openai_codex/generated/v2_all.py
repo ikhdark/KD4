@@ -4265,15 +4265,43 @@ class CommandExecutionThreadItem(BaseModel):
             alias="durationMs", description="The duration of the command execution in milliseconds."
         ),
     ] = None
+    execution_id: Annotated[
+        str | None,
+        Field(
+            alias="executionId",
+            description="Unique dispatch execution id used by timing and lifecycle records.",
+        ),
+    ] = None
     exit_code: Annotated[
         int | None, Field(alias="exitCode", description="The command's exit code.")
     ] = None
     id: str
+    parent_call_id: Annotated[
+        str | None,
+        Field(
+            alias="parentCallId",
+            description="Model-visible exec call that owns a nested code-mode command.",
+        ),
+    ] = None
+    parent_cell_id: Annotated[
+        str | None,
+        Field(
+            alias="parentCellId",
+            description="Stable code-mode cell that issued the nested command.",
+        ),
+    ] = None
     process_id: Annotated[
         str | None,
         Field(
             alias="processId",
             description="Identifier for the underlying PTY process (when available).",
+        ),
+    ] = None
+    runtime_tool_call_id: Annotated[
+        str | None,
+        Field(
+            alias="runtimeToolCallId",
+            description="Runtime invocation id within the owning code-mode cell.",
         ),
     ] = None
     source: CommandExecutionSource | None = "agent"
@@ -8289,7 +8317,12 @@ class TurnTimingCounters(BaseModel):
         TurnTimingAttemptKindCounts | None, Field(alias="attemptsByKind")
     ] = {"fallback": 0, "primary": 0, "retry": 0}
     attributable_recovery_generation_count: Annotated[
-        int | None, Field(alias="attributableRecoveryGenerationCount", ge=0)
+        int | None,
+        Field(
+            alias="attributableRecoveryGenerationCount",
+            description="Tool-result generations immediately following an observed `read_tool_output` recovery transaction. This is independent of whether the recovered projection was truncated again.",
+            ge=0,
+        ),
     ] = 0
     clock_regression_count: Annotated[int, Field(alias="clockRegressionCount", ge=0)]
     exact_repeated_wait_count: Annotated[
@@ -8475,7 +8508,12 @@ class TurnTimingCounters(BaseModel):
     ] = 0
     tool_router_reuse_count: Annotated[int | None, Field(alias="toolRouterReuseCount", ge=0)] = 0
     truncation_induced_continuation_count: Annotated[
-        int | None, Field(alias="truncationInducedContinuationCount", ge=0)
+        int | None,
+        Field(
+            alias="truncationInducedContinuationCount",
+            description="Tool-result generations immediately following provider-visible output that actually omitted or truncated canonical tool information.",
+            ge=0,
+        ),
     ] = 0
     user_input_wait_count: Annotated[int, Field(alias="userInputWaitCount", ge=0)]
     wait_only_generation_count: Annotated[
@@ -9667,6 +9705,13 @@ class TurnTimingModelRequest(BaseModel):
         int | None, Field(alias="firstActionableOutputMs", ge=0)
     ] = None
     first_model_output_ms: Annotated[int | None, Field(alias="firstModelOutputMs", ge=0)] = None
+    fixed_prefix_reuse_eligible: Annotated[
+        bool | None,
+        Field(
+            alias="fixedPrefixReuseEligible",
+            description="Whether this logical request exactly matched the preceding stable prompt prefix under the same prompt-cache identity.",
+        ),
+    ] = None
     generation_index: Annotated[
         int | None,
         Field(
@@ -9716,6 +9761,13 @@ class TurnTimingModelRequest(BaseModel):
     progress_kinds: Annotated[list[TurnTimingProgressKind] | None, Field(alias="progressKinds")] = (
         None
     )
+    prompt_cache_key_fingerprint: Annotated[
+        str | None,
+        Field(
+            alias="promptCacheKeyFingerprint",
+            description="Stable SHA-256 fingerprint of the prompt cache key sent to the provider. The raw key is intentionally not persisted in timing diagnostics.",
+        ),
+    ] = None
     reasoning_output_tokens: Annotated[int | None, Field(alias="reasoningOutputTokens", ge=0)] = 0
     relevant_state_fingerprint: Annotated[
         str | None,

@@ -100,7 +100,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn frame_tick_must_be_nonzero() {
-        assert!(FRAME_TICK_DEFAULT.as_millis() > 0);
+    fn current_frame_advances_and_wraps() {
+        let mut animation =
+            AsciiAnimation::with_variants(FrameRequester::test_dummy(), &[&["first", "second"]], 0);
+        animation.frame_tick = Duration::from_secs(60);
+        for (elapsed_secs, expected) in [(30, "first"), (90, "second"), (150, "first")] {
+            animation.start = Instant::now() - Duration::from_secs(elapsed_secs);
+            assert_eq!(
+                animation.current_frame(),
+                expected,
+                "elapsed: {elapsed_secs}s"
+            );
+        }
     }
 }

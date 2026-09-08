@@ -10,7 +10,7 @@ max_depth = 1
 
 [features.multi_agent_v2]
 enabled = true
-max_concurrent_threads_per_session = 5
+max_concurrent_threads_per_session = 20
 
 [reasoning_phase_efforts]
 orient = "high"

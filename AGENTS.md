@@ -1,5 +1,3 @@
-# KD4 repository instructions
-
 ## Repository identity and runtime boundary
 
 - This is the user's local fork of [`openai/codex`](https://github.com/openai/codex).
@@ -18,21 +16,29 @@
   those activation steps only when the request includes them.
 
 
-### Scope and workspace
+#### Scope and workspace
+
+- Ask questions in plain language when clarity is needed, do not continue to ask questions after implementation has begun.
+- When edits overlap, compare the versions and pick the most capable one and move on.
+- Do not communicate with other agents from different sessions.
+- Do not over-engineer implementations.
+- Partial wiring of implemented code is forbidden, this is non-negotiable. End to end wiring is mandatory.
+
+### Validation
+*All three of the following are mandatory*
+1. Do not create a test that does not prove direct behavior and/or logic. 
+2. Every test must prove direct behavior and/or logic. 
+3. If you find a test that does not follow this policy, fix it.
+
+If you need a more detailed verison:
 - For behavior changes, add or update tests that directly exercise the changed behavior and prove it is reachable through the real integration or runtime path. A single test may prove both. Do not rely only on helper-level tests or implementation-detail assertions. For documentation-only changes, run the nearest relevant existing validation instead of creating a test.
 
-- Partial wiring of implemented code is forbidden, this is non-negotiable.
-- Ask questions for clarity before implementing.
-- Read the root `AGENTS.md` in full, and read every user-provided or user-named
-  file in full.
-- Communicate with the user in very plain language.
-- Do not publish, deploy, or modify upstream state unless the user explicitly
-  requests that action.
-- When you encounter overlapping edits, choose the best version. Implement your
-  version when it is better, keep the current or concurrently changing version
-  when it is better, and combine them when that produces the best result. If
-  the existing version is already better than your proposed edit, leave it
-  unchanged and move on.
+- If blocked by tests, do not repeat, simply finish the full task then report blocked by tests.
+
+- Never run the full test suite unless specfically told to.
+
+- When validating do not fix errors one by one, wait until the test completes, then you are allowed to fix them in batches.
+
 
 ## Routing and task scope
 
@@ -58,11 +64,3 @@ description>" --max-relationships 32`. Require an untruncated result with no
 - After adding, deleting, moving, or renaming a repository file or directory,
   run `just source-map-check`. Run it even when ownership prose is unchanged;
   the command also rewrites the tracked-path snapshot.
-
-## Delegated workflows
-
-- Load [`.codex/harness/workflow.md`](.codex/harness/workflow.md) only when the
-  request names delegation, a durable artifact, or the architect lane. Give
-  each child only the role and rules assigned by that workflow. If a child fails
-  to start, returns a tool error, or omits its assigned output, continue in the
-  primary agent.

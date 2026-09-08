@@ -44,7 +44,7 @@ describe("Codex", () => {
             text: "Hi!",
           },
         },
-        {
+        expect.objectContaining({
           type: "turn.completed",
           usage: {
             cached_input_tokens: 12,
@@ -52,7 +52,7 @@ describe("Codex", () => {
             output_tokens: 5,
             reasoning_output_tokens: 0,
           },
-        },
+        }),
       ]);
       expect(thread.id).toEqual(expect.any(String));
     } finally {

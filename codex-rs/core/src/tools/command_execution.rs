@@ -1493,17 +1493,6 @@ mod tests {
     use std::process::Command;
     use tokio_util::sync::CancellationToken;
 
-    #[test]
-    fn command_process_state_has_no_unused_order_mirror() {
-        let source = include_str!("command_execution.rs");
-        let obsolete_process_queue = ["running", "_order"].concat();
-
-        assert!(
-            !source.contains(&obsolete_process_queue),
-            "unused running process ordering state must remain removed"
-        );
-    }
-
     fn key(command: &str) -> CommandAttemptKey {
         CommandAttemptKey::new("exec_command", "local", "C:/repo", &[command.to_string()])
     }

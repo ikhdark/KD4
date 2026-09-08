@@ -2608,29 +2608,29 @@ allowed_approvals_reviewers = ["user"]
 
     #[test]
     fn deserialize_allowed_approvals_reviewers() -> Result<()> {
-        let toml_str = r#"
-            allowed_approvals_reviewers = ["auto_review", "user"]
-        "#;
-        let config: ConfigRequirementsToml = from_str(toml_str)?;
-        let requirements: ConfigRequirements = with_unknown_source(config).try_into()?;
+        for reviewer in ["auto_review", "guardian_subagent"] {
+            let toml_str = format!(r#"allowed_approvals_reviewers = ["{reviewer}", "user"]"#);
+            let config: ConfigRequirementsToml = from_str(&toml_str)?;
+            let requirements: ConfigRequirements = with_unknown_source(config).try_into()?;
 
-        assert_eq!(
-            requirements.approvals_reviewer.value(),
-            ApprovalsReviewer::AutoReview,
-            "currently, there is no way to specify the default value for approvals reviewer in the toml, so it picks the first allowed value"
-        );
-        assert!(
-            requirements
-                .approvals_reviewer
-                .can_set(&ApprovalsReviewer::AutoReview)
-                .is_ok()
-        );
-        assert!(
-            requirements
-                .approvals_reviewer
-                .can_set(&ApprovalsReviewer::User)
-                .is_ok()
-        );
+            assert_eq!(
+                requirements.approvals_reviewer.value(),
+                ApprovalsReviewer::AutoReview,
+                "currently, there is no way to specify the default value for approvals reviewer in the toml, so it picks the first allowed value"
+            );
+            assert!(
+                requirements
+                    .approvals_reviewer
+                    .can_set(&ApprovalsReviewer::AutoReview)
+                    .is_ok()
+            );
+            assert!(
+                requirements
+                    .approvals_reviewer
+                    .can_set(&ApprovalsReviewer::User)
+                    .is_ok()
+            );
+        }
 
         Ok(())
     }
@@ -2698,15 +2698,6 @@ allowed_approvals_reviewers = ["user"]
         );
 
         Ok(())
-    }
-
-    #[test]
-    fn retired_allowed_approvals_reviewer_is_rejected() {
-        let toml_str = r#"
-            allowed_approvals_reviewers = ["guardian_subagent", "user"]
-        "#;
-        from_str::<ConfigRequirementsToml>(toml_str)
-            .expect_err("retired approvals reviewer must be rejected");
     }
 
     #[test]

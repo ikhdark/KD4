@@ -213,19 +213,3 @@ pub(crate) async fn handle_message_string_tool(
 
     Ok(FunctionToolOutput::from_text(String::new(), Some(true)))
 }
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn message_handlers_are_owned_by_shared_dispatch_module() {
-        let source = include_str!("message_tool.rs");
-        let parent_source = include_str!("../multi_agents_v2.rs");
-
-        for handler in ["SendMessageHandler", "FollowupTaskHandler"] {
-            assert!(source.contains(&format!("pub(crate) struct {handler};")));
-        }
-        for module in ["send_message", "followup_task"] {
-            assert!(!parent_source.contains(&format!("mod {module};")));
-        }
-    }
-}

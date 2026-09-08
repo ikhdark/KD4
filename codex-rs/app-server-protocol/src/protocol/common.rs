@@ -3125,7 +3125,8 @@ mod tests {
                         "type": "dangerFullAccess"
                     },
                     "activePermissionProfile": null,
-                    "reasoningEffort": null
+                    "reasoningEffort": null,
+                    "selectedEnvironment": null
                 }
             }),
             serde_json::to_value(&response)?,

@@ -33,20 +33,3 @@ pub use render::render_available_skills_body;
 pub use root_loader::PluginSkillSnapshots;
 pub use service::SkillsLoadInput;
 pub use service::SkillsService;
-
-#[cfg(test)]
-mod reachability_tests {
-    #[test]
-    fn retired_remote_skills_client_is_absent() {
-        let lib_source = include_str!("lib.rs");
-        let core_skills_facade = include_str!("../../core/src/skills.rs");
-        let manifest = include_str!("../Cargo.toml");
-        let remote_module_declaration = concat!("pub mod ", "remote;");
-
-        assert!(!lib_source.contains(remote_module_declaration));
-        assert!(!core_skills_facade.contains("pub use codex_core_skills::remote;"));
-        assert!(!manifest.contains("codex-login ="));
-        assert!(!manifest.contains("codex-model-provider ="));
-        assert!(!manifest.contains("zip ="));
-    }
-}

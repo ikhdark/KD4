@@ -493,12 +493,6 @@ mod tests {
         );
         session.finish();
     }
-
-    #[test]
-    fn opaque_pty_handle_uses_send_directly() {
-        let removed_trait = ["trait PtyHandle", "KeepAlive"].concat();
-        assert!(!include_str!("process.rs").contains(&removed_trait));
-    }
 }
 
 /// Adapts a closure into a `ChildTerminator` implementation.

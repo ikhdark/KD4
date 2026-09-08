@@ -1118,27 +1118,19 @@ mod tests {
     }
 
     #[test]
-    fn default_budget_uses_two_percent_with_a_firm_global_ceiling() {
-        assert_eq!(
-            default_skill_metadata_budget(Some(200_000)),
-            SkillMetadataBudget::Tokens(MAX_SKILL_METADATA_TOKEN_BUDGET)
-        );
-        assert_eq!(
-            default_skill_metadata_budget(Some(99)),
-            SkillMetadataBudget::Tokens(1)
-        );
-    }
-
-    #[test]
-    fn default_budget_uses_the_global_token_ceiling_without_context_window() {
-        assert_eq!(
-            default_skill_metadata_budget(/*context_window*/ None),
-            SkillMetadataBudget::Tokens(MAX_SKILL_METADATA_TOKEN_BUDGET)
-        );
-        assert_eq!(
-            default_skill_metadata_budget(Some(-1)),
-            SkillMetadataBudget::Tokens(MAX_SKILL_METADATA_TOKEN_BUDGET)
-        );
+    fn default_budget_uses_context_window_with_a_global_ceiling_and_fallback() {
+        for (context_window, expected) in [
+            (Some(200_000), MAX_SKILL_METADATA_TOKEN_BUDGET),
+            (Some(99), 1),
+            (None, MAX_SKILL_METADATA_TOKEN_BUDGET),
+            (Some(-1), MAX_SKILL_METADATA_TOKEN_BUDGET),
+        ] {
+            assert_eq!(
+                default_skill_metadata_budget(context_window),
+                SkillMetadataBudget::Tokens(expected),
+                "context window: {context_window:?}"
+            );
+        }
     }
 
     #[test]

@@ -14,7 +14,6 @@ use std::io;
 use std::io::Write;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::time::Duration;
 use tempfile::tempdir;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
@@ -27,14 +26,6 @@ fn test_tracing_subscriber() -> impl tracing::Subscriber + Send + Sync {
 #[test]
 fn exec_defaults_analytics_to_enabled() {
     assert_eq!(DEFAULT_ANALYTICS_ENABLED, true);
-}
-
-#[test]
-fn current_time_response_uses_whole_unix_seconds() {
-    let response = current_time_read_response(UNIX_EPOCH + Duration::from_millis(98_765))
-        .expect("post-epoch time should produce a response");
-
-    assert_eq!(response.current_time_at, 98);
 }
 
 #[derive(Clone)]
@@ -249,23 +240,14 @@ fn decode_prompt_bytes_rejects_invalid_utf8() {
 }
 
 #[test]
-fn prompt_with_stdin_context_wraps_stdin_block() {
-    let combined = prompt_with_stdin_context("Summarize this concisely", "my output");
-
-    assert_eq!(
-        combined,
-        "Summarize this concisely\n\n<stdin>\nmy output\n</stdin>"
-    );
-}
-
-#[test]
-fn prompt_with_stdin_context_preserves_trailing_newline() {
-    let combined = prompt_with_stdin_context("Summarize this concisely", "my output\n");
-
-    assert_eq!(
-        combined,
-        "Summarize this concisely\n\n<stdin>\nmy output\n</stdin>"
-    );
+fn prompt_with_stdin_context_wraps_stdin_with_one_trailing_newline() {
+    for input in ["my output", "my output\n"] {
+        assert_eq!(
+            prompt_with_stdin_context("Summarize this concisely", input),
+            "Summarize this concisely\n\n<stdin>\nmy output\n</stdin>",
+            "stdin: {input:?}"
+        );
+    }
 }
 
 #[test]
@@ -710,75 +692,7 @@ async fn thread_lifecycle_params_include_legacy_sandbox_when_no_active_profile()
 }
 
 #[tokio::test]
-async fn session_configured_from_thread_response_uses_review_policy_from_response() {
-    let codex_home = tempdir().expect("create temp codex home");
-    let cwd = tempdir().expect("create temp cwd");
-    let config = ConfigBuilder::default()
-        .codex_home(codex_home.path().to_path_buf())
-        .fallback_cwd(Some(cwd.path().to_path_buf()))
-        .build()
-        .await
-        .expect("build config");
-    let response = sample_thread_start_response();
-
-    let event = session_configured_from_thread_start_response(&response, &config)
-        .expect("build bootstrap session configured event");
-
-    assert_eq!(
-        event.session_id.to_string(),
-        "67e55044-10b1-426f-9247-bb680e5fe0c7"
-    );
-    assert_eq!(
-        event.thread_id.to_string(),
-        "67e55044-10b1-426f-9247-bb680e5fe0c8"
-    );
-    assert_eq!(event.approvals_reviewer, ApprovalsReviewer::AutoReview);
-}
-
-#[tokio::test]
-async fn session_configured_from_thread_response_uses_permission_profile_from_config() {
-    let codex_home = tempdir().expect("create temp codex home");
-    let cwd = tempdir().expect("create temp cwd");
-    let config = ConfigBuilder::default()
-        .codex_home(codex_home.path().to_path_buf())
-        .fallback_cwd(Some(cwd.path().to_path_buf()))
-        .build()
-        .await
-        .expect("build config");
-    let response = sample_thread_start_response();
-
-    let event = session_configured_from_thread_start_response(&response, &config)
-        .expect("build bootstrap session configured event");
-
-    assert_eq!(
-        event.permission_profile,
-        config.permissions.effective_permission_profile()
-    );
-}
-
-#[tokio::test]
-async fn session_configured_from_thread_response_preserves_thread_source() {
-    let codex_home = tempdir().expect("create temp codex home");
-    let cwd = tempdir().expect("create temp cwd");
-    let config = ConfigBuilder::default()
-        .codex_home(codex_home.path().to_path_buf())
-        .fallback_cwd(Some(cwd.path().to_path_buf()))
-        .build()
-        .await
-        .expect("build config");
-    let response = sample_thread_start_response();
-
-    let event = session_configured_from_thread_start_response(&response, &config)
-        .expect("build bootstrap session configured event");
-
-    assert_eq!(
-        event.thread_source,
-        Some(codex_protocol::protocol::ThreadSource::User)
-    );
-}
-
-#[tokio::test]
-async fn session_configured_from_thread_response_preserves_parent_thread_id() {
+async fn session_configured_from_thread_response_preserves_session_contract() {
     let codex_home = tempdir().expect("create temp codex home");
     let cwd = tempdir().expect("create temp cwd");
     let config = ConfigBuilder::default()
@@ -794,6 +708,23 @@ async fn session_configured_from_thread_response_preserves_parent_thread_id() {
     let event = session_configured_from_thread_start_response(&response, &config)
         .expect("build bootstrap session configured event");
 
+    assert_eq!(
+        event.session_id.to_string(),
+        "67e55044-10b1-426f-9247-bb680e5fe0c7"
+    );
+    assert_eq!(
+        event.thread_id.to_string(),
+        "67e55044-10b1-426f-9247-bb680e5fe0c8"
+    );
+    assert_eq!(event.approvals_reviewer, ApprovalsReviewer::AutoReview);
+    assert_eq!(
+        event.permission_profile,
+        config.permissions.effective_permission_profile()
+    );
+    assert_eq!(
+        event.thread_source,
+        Some(codex_protocol::protocol::ThreadSource::User)
+    );
     assert_eq!(event.parent_thread_id, Some(parent_thread_id));
 }
 

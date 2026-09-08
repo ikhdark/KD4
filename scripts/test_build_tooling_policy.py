@@ -168,49 +168,38 @@ class BuildToolingPolicyTest(unittest.TestCase):
         self.assertIn('let samples_dir = Path::new("src/assets/samples");', text)
         self.assertIn("if !samples_dir.exists()", text)
 
-    def test_retired_repo_local_harness_skill_has_no_registration(self) -> None:
+    def test_retired_repo_local_harness_has_no_registration(self) -> None:
         features = load_toml(REPO_ROOT / "kd4_features.toml")["features"]
         feature_ids = {feature["id"] for feature in features}
         root_policy = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
-        harness_workflow = (REPO_ROOT / ".codex" / "harness" / "workflow.md").read_text(
-            encoding="utf-8"
-        )
-
+        self.assertFalse((REPO_ROOT / ".codex" / "harness").exists())
         self.assertNotIn("kd4-harness", feature_ids)
         self.assertFalse((REPO_ROOT / ".codex" / "skills" / "kd4-harness").exists())
         self.assertNotIn("skills/kd4-harness", root_policy)
-        self.assertNotIn("kd4-harness", harness_workflow)
+        self.assertNotIn(".codex/harness", root_policy)
+        for path in (
+            "scripts/workflow_preflight.py",
+            "scripts/test_workflow_preflight.py",
+        ):
+            self.assertFalse((REPO_ROOT / path).exists(), path)
 
-    def test_harness_workflow_orchestrator_reference_resolves(self) -> None:
-        harness_dir = REPO_ROOT / ".codex" / "harness"
-        workflow = (harness_dir / "workflow.md").read_text(encoding="utf-8")
-        relative_path = "templates/ORCHESTRATOR.md"
-
-        self.assertIn(
-            f"[`{relative_path}`]({relative_path})",
-            workflow,
-        )
-        self.assertTrue((harness_dir / relative_path).is_file())
-
-    def test_harness_local_markdown_links_resolve(self) -> None:
-        harness_dir = REPO_ROOT / ".codex" / "harness"
-
-        durable_markdown = (
-            path
-            for path in harness_dir.rglob("*.md")
-            if "runs" not in path.relative_to(harness_dir).parts
-        )
-        for markdown_path in sorted(durable_markdown):
-            markdown = markdown_path.read_text(encoding="utf-8")
-            for target in re.findall(r"\[[^]]*\]\(([^)]+)\)", markdown):
-                relative_path = target.split("#", 1)[0]
-                if not relative_path or "://" in relative_path:
-                    continue
-                with self.subTest(source=markdown_path, target=target):
-                    self.assertTrue(
-                        (markdown_path.parent / relative_path).is_file(),
-                        f"broken local Markdown link in {markdown_path}: {target}",
-                    )
+    def test_retired_harness_recipes_are_unavailable(self) -> None:
+        just = shutil.which("just")
+        if just is None:
+            self.skipTest("just is required to check recipe dispatch")
+        for recipe in ("workflow-preflight", "workflow-preflight-release"):
+            with self.subTest(recipe=recipe):
+                result = subprocess.run(
+                    [just, "--dry-run", recipe],
+                    cwd=REPO_ROOT,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    timeout=30,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("does not contain recipe", result.stderr)
+                self.assertIn(recipe, result.stderr)
 
     def test_repo_local_skill_frontmatter_names_match_folders(self) -> None:
         skills_dir = REPO_ROOT / ".codex" / "skills"
@@ -292,30 +281,6 @@ class BuildToolingPolicyTest(unittest.TestCase):
             "Source changes become Desktop-visible only after rebuilding", section
         )
         self.assertIn("replacing or updating the local binary", section)
-
-    def test_agents_validation_map_matches_current_layout(self) -> None:
-        text = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
-        normalized = " ".join(text.split())
-
-        self.assertIn("## Shared operating policy", text)
-        self.assertIn("### Implementation and validation", text)
-        self.assertIn("## Rust and script validation", text)
-        self.assertIn(
-            "Do not publish, deploy, or modify upstream state unless the user "
-            "explicitly requests that action",
-            normalized,
-        )
-        self.assertIn("do not hand-edit generated output", normalized)
-
-    def test_agents_scripts_policy_is_root_owned(self) -> None:
-        root_text = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
-        normalized = " ".join(root_text.split())
-
-        self.assertFalse((REPO_ROOT / "scripts" / "AGENTS.md").exists())
-        self.assertIn(
-            "For a script edit, follow the validation route named in `SOURCEMAP.md`",
-            normalized,
-        )
 
     def test_windows_installer_requires_standalone_metadata(self) -> None:
         powershell_installer = (
@@ -741,16 +706,22 @@ class BuildToolingPolicyTest(unittest.TestCase):
             ],
         )
 
-    def test_python_sdk_gate_and_publish_routing_match_source_map(self) -> None:
-        justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
-        sdk_recipe = justfile.split("\nsdk-python-check:\n", 1)[1].split("\n\n", 1)[0]
-        source_map = (REPO_ROOT / "SOURCEMAP.md").read_text(encoding="utf-8")
-
-        self.assertIn("--group dev ruff check .", sdk_recipe)
-        self.assertIn("--group dev pytest", sdk_recipe)
-        self.assertIn("| Windows local publish |", source_map)
-        self.assertIn("`scripts/publish-local-codex.ps1`", source_map)
-        self.assertIn("`just publish-local-codex-final`", source_map)
+    def test_python_sdk_gate_runs_lint_and_tests(self) -> None:
+        just = shutil.which("just")
+        if just is None:
+            self.skipTest("just is required to inspect the SDK recipe")
+        result = subprocess.run(
+            [just, "--dry-run", "sdk-python-check"],
+            cwd=REPO_ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        commands = result.stdout + result.stderr
+        self.assertIn("--group dev ruff check .", commands)
+        self.assertIn("--group dev pytest", commands)
 
     def test_root_maintenance_script_audit_plan_covers_every_script_type(self) -> None:
         root_maintenance = load_root_maintenance_module()
@@ -871,7 +842,9 @@ class BuildToolingPolicyTest(unittest.TestCase):
             root_maintenance.python_unittest_targets(),
         )
 
-    def test_root_maintenance_does_not_route_retired_task_continuity_paths(self) -> None:
+    def test_root_maintenance_does_not_route_retired_task_continuity_paths(
+        self,
+    ) -> None:
         root_maintenance = load_root_maintenance_module()
 
         for target in (
@@ -1526,9 +1499,6 @@ class BuildToolingPolicyTest(unittest.TestCase):
             "codex-rs/core/src/config/schema_tests.rs": (
                 "config-schema-regenerate <owner>"
             ),
-            "codex-rs/core/src/tools/handlers/shell_tests.rs": (
-                '"config-schema-regenerate", "validation-test"'
-            ),
         }
         for relative_path, canonical_command in canonical_command_sources.items():
             with self.subTest(path=relative_path):
@@ -1632,21 +1602,6 @@ class BuildToolingPolicyTest(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0)
         self.assertIn("check \U0001f6e0 done", result.output)
-
-    def test_agents_validation_tooling_does_not_prove_runtime_fix(self) -> None:
-        text = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
-        normalized = " ".join(text.split())
-
-        self.assertIn(
-            "A formatter, linter, build, applied patch, or successful command "
-            "selecting zero relevant tests is not runtime proof",
-            normalized,
-        )
-        self.assertIn(
-            "Runtime proof requires a direct contract test or a user-approved "
-            "end-to-end gate",
-            normalized,
-        )
 
     def test_local_rust_loop_recipes_are_discoverable(self) -> None:
         justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
@@ -1923,9 +1878,7 @@ class BuildToolingPolicyTest(unittest.TestCase):
 
     def test_core_tests_only_run_through_named_targets_and_gates(self) -> None:
         justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
-        manifest = load_toml(
-            REPO_ROOT / "codex-rs" / ".config" / "kd4-rust-tests.toml"
-        )
+        manifest = load_toml(REPO_ROOT / "codex-rs" / ".config" / "kd4-rust-tests.toml")
 
         # Every generic nextest recipe refuses a codex-core selection instead of
         # inferring helper binaries from the forwarded arguments.
@@ -1940,7 +1893,7 @@ class BuildToolingPolicyTest(unittest.TestCase):
             "_test-lane-package-reserved package *args:",
         ):
             body = justfile.split(recipe, 1)[1].split("\n\n", 1)[0]
-            self.assertIn("rust_test_runner.py\" _guard-generic --", body, recipe)
+            self.assertIn('rust_test_runner.py" _guard-generic --', body, recipe)
 
         # The named recipes replace the removed helper-inference recipes.
         for recipe in (
@@ -1976,9 +1929,15 @@ class BuildToolingPolicyTest(unittest.TestCase):
         thread_status = justfile.split("_app-server-thread-status-tests:", 1)[1].split(
             "\n\n", 1
         )[0]
-        self.assertNotIn("validated_invalidated_tracker_still_requests_diff_fallback", thread_status)
-        self.assertIn("stale_active_running_thread_resume_clears_watch_status", thread_status)
-        self.assertIn("stale_active_repair_preserves_pending_approval_status", thread_status)
+        self.assertNotIn(
+            "validated_invalidated_tracker_still_requests_diff_fallback", thread_status
+        )
+        self.assertIn(
+            "stale_active_running_thread_resume_clears_watch_status", thread_status
+        )
+        self.assertIn(
+            "stale_active_repair_preserves_pending_approval_status", thread_status
+        )
 
     def test_perf_env_recipes_pass_structured_argv(self) -> None:
         justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")

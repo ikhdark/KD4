@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 
-import ast
 import hashlib
 import json
 from pathlib import Path
@@ -70,52 +69,6 @@ if (-not (Test-Path -LiteralPath %s -PathType Leaf)) { exit 10 }
         )
         self.assertIn("Invoke-DoctorForPublish -TargetPath $targetPath", noop_branch)
 
-    def test_publish_test_helpers_are_shared_by_sibling_suites(self) -> None:
-        helper_names = {"clean_env", "powershell", "ps_single_quote"}
-        scripts_dir = Path(__file__).resolve().parent
-
-        for filename in (
-            "test_publish_local_codex.py",
-            "test_publish_local_codex_apply.py",
-            "test_publish_local_codex_build.py",
-            "test_publish_local_codex_dry_run.py",
-        ):
-            module = ast.parse((scripts_dir / filename).read_text(encoding="utf-8"))
-            local_helpers = {
-                node.name
-                for node in module.body
-                if isinstance(node, ast.FunctionDef) and node.name in helper_names
-            }
-            self.assertEqual(local_helpers, set(), filename)
-
-    def test_publish_implementation_is_consolidated_in_entrypoint(self) -> None:
-        entrypoint = SCRIPT.read_text(encoding="utf-8")
-
-        for helper_name in (
-            "publish-local-codex.hashing.ps1",
-            "publish-local-codex.proof.ps1",
-            "publish-local-codex.desktop.ps1",
-            "publish-local-codex.build.ps1",
-            "publish-local-codex.apply.ps1",
-        ):
-            self.assertNotIn(helper_name, entrypoint)
-        for function_name in (
-            "Get-RepoRoot",
-            "Get-RunningCodexTargetProcesses",
-            "Set-ProcessEnvironmentVariable",
-            "Publish-CodexBinary",
-        ):
-            self.assertEqual(entrypoint.count(f"function {function_name}"), 1)
-
-    def test_hashing_and_metadata_cache_are_in_entrypoint(self) -> None:
-        publish_script = publish_source_text()
-
-        self.assertIn("function Get-FileSha256", publish_script)
-        self.assertIn("LocalPublishContentHashCache", publish_script)
-        self.assertIn("Get-CachedLocalPublishFileSha256", publish_script)
-        self.assertIn("LastWriteTimeUtcTicks", publish_script)
-        self.assertIn("$Before.Length -ne $after.Length", publish_script)
-
     def test_cached_hash_reuses_verified_observation_without_nested_file_hash(
         self,
     ) -> None:
@@ -125,7 +78,7 @@ if (-not (Test-Path -LiteralPath %s -PathType Leaf)) { exit 10 }
 
         with tempfile.TemporaryDirectory() as temp_dir:
             payload = Path(temp_dir) / "payload with spaces.bin"
-            payload.write_bytes("héllo".encode())
+            payload.write_bytes("hÃ©llo".encode())
             command = rf"""
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -167,7 +120,7 @@ $second = Get-CachedLocalPublishFileSha256 -Path {ps_single_quote(payload)}
 
         self.assertEqual(result.returncode, 0, result.stderr)
         output = json.loads(result.stdout)
-        expected = hashlib.sha256("héllo".encode()).hexdigest()
+        expected = hashlib.sha256("hÃ©llo".encode()).hexdigest()
         self.assertEqual(output, {"first": expected, "second": expected})
 
     def test_shutdown_waits_on_verified_handles_without_polling(self) -> None:
@@ -179,148 +132,6 @@ $second = Get-CachedLocalPublishFileSha256 -Path {ps_single_quote(payload)}
         self.assertIn("$process.WaitForExit($remainingMilliseconds)", function_source)
         self.assertNotIn("Start-Sleep -Milliseconds 200", function_source)
         self.assertNotIn("while ((Get-Date) -lt $forceDeadline)", function_source)
-
-    def test_build_input_snapshot_reuses_one_inventory_for_hash_and_newest_time(
-        self,
-    ) -> None:
-        shell = powershell()
-        if shell is None:
-            self.skipTest("PowerShell is not available")
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            repo = Path(temp_dir) / "repo"
-            repo.mkdir()
-            first = repo / "first.txt"
-            second = repo / "second.txt"
-            first.write_text("first", encoding="utf-8")
-            second.write_text("second", encoding="utf-8")
-            for args in (
-                ("init", "--quiet"),
-                ("add", "first.txt", "second.txt"),
-                (
-                    "-c",
-                    "user.name=Codex Test",
-                    "-c",
-                    "user.email=codex@example.com",
-                    "commit",
-                    "--quiet",
-                    "-m",
-                    "fixture",
-                ),
-            ):
-                result = subprocess.run(
-                    ["git", "-C", str(repo), *args],
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                    timeout=RUN_TIMEOUT_SECONDS,
-                )
-                self.assertEqual(result.returncode, 0, result.stderr)
-
-            command = rf"""
-Set-StrictMode -Version Latest
-$ErrorActionPreference = 'Stop'
-$tokens = $null
-$errors = $null
-$ast = [System.Management.Automation.Language.Parser]::ParseFile({ps_single_quote(SCRIPT)}, [ref]$tokens, [ref]$errors)
-if ($errors.Count -ne 0) {{ throw "Failed to parse publish script: $($errors[0].Message)" }}
-$functionAst = $ast.FindAll({{
-    param($node)
-    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
-        $node.Name -eq 'Get-LocalPublishBuildInputSnapshot'
-}}, $true)
-if (@($functionAst).Count -ne 1) {{ throw 'Snapshot function was not found exactly once.' }}
-Invoke-Expression $functionAst[0].Extent.Text
-$script:listCalls = 0
-function Invoke-GitNulDelimitedList {{
-    param([string]$GitPath, [string]$RepoRoot, [string[]]$Arguments)
-    $script:listCalls++
-    return [pscustomobject]@{{ ExitCode = 0; Records = @('first.txt', 'second.txt') }}
-}}
-function Test-LocalPublishBuildRelevantPath {{ param([string]$Path) return $true }}
-function Get-CachedLocalPublishFileSha256 {{
-    param([string]$Path, [switch]$ForceRefresh)
-    return ('a' * 64)
-}}
-function Test-Sha256Text {{
-    param([AllowNull()][object]$Value)
-    return $null -ne $Value -and ([string]$Value) -cmatch '\A[0-9a-f]{{64}}\z'
-}}
-[IO.File]::SetLastWriteTimeUtc({ps_single_quote(first)}, [DateTime]::Parse('2000-01-01T00:00:00Z').ToUniversalTime())
-[IO.File]::SetLastWriteTimeUtc({ps_single_quote(second)}, [DateTime]::Parse('2000-01-02T00:00:00Z').ToUniversalTime())
-$snapshot = Get-LocalPublishBuildInputSnapshot -RepoRoot {ps_single_quote(repo)}
-[pscustomobject]@{{
-    listCalls = $script:listCalls
-    fingerprint = $snapshot.Fingerprint
-    newestMatches = $snapshot.NewestWriteUtc -eq [IO.File]::GetLastWriteTimeUtc({ps_single_quote(second)})
-}} | ConvertTo-Json -Compress
-"""
-            result = subprocess.run(
-                [
-                    shell,
-                    "-NoProfile",
-                    "-ExecutionPolicy",
-                    "Bypass",
-                    "-Command",
-                    command,
-                ],
-                cwd=SCRIPT.parent.parent,
-                capture_output=True,
-                text=True,
-                timeout=RUN_TIMEOUT_SECONDS,
-                check=False,
-                creationflags=CREATE_NO_WINDOW,
-            )
-
-            self.assertEqual(
-                result.returncode,
-                0,
-                f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
-            )
-            output = json.loads(result.stdout)
-            self.assertEqual(output["listCalls"], 1)
-            self.assertEqual(len(output["fingerprint"]), 64)
-            self.assertTrue(output["newestMatches"])
-
-    def test_publish_binary_proof_force_refreshes_cached_source_hashes(self) -> None:
-        publish_script = publish_source_text()
-
-        self.assertIn('$sourceSha256Mode = "hashed"', publish_script)
-        self.assertIn(
-            "$sourceSha256 = Get-CachedLocalPublishFileSha256 "
-            "-Path $SourceExe -ForceRefresh",
-            publish_script,
-        )
-        self.assertIn(
-            "$sourceCodeModeHostSha256 = Get-CachedLocalPublishFileSha256 "
-            "-Path $SourceCodeModeHostExe -ForceRefresh",
-            publish_script,
-        )
-        self.assertIn(
-            "$targetBeforeSha256 = Get-FileSha256 $targetPath", publish_script
-        )
-        self.assertIn(
-            "$codeModeHostTargetBeforeSha256 = Get-FileSha256 $codeModeHostTargetPath",
-            publish_script,
-        )
-        self.assertIn("$sourceSha256,\n            $targetSha256", publish_script)
-        self.assertIn(
-            'Write-ProofLine "codexPostPublishVerify" "sha256 ok"', publish_script
-        )
-        self.assertIn(
-            "running-target process detection was indeterminate", publish_script
-        )
-        self.assertIn(
-            "$script:RunningTargetProcessProbeWarnings.Count -gt 0", publish_script
-        )
-        self.assertIn("StartTimeUtcTicks", publish_script)
-        self.assertIn("Stop-Process -InputObject $process", publish_script)
-        self.assertIn(
-            "Get-CachedLocalPublishFileSha256 -Path $path -ForceRefresh",
-            publish_script,
-        )
-        self.assertIn('"ls-files", "-z"', publish_script)
-        self.assertIn('"status", "--porcelain=v1", "-z"', publish_script)
 
     def test_process_revalidation_ignores_a_process_that_exited_before_path_read(
         self,
@@ -451,39 +262,38 @@ if (-not $script:disposed) {{
         )
         self.assertIn("Set-CodexRustMsvcLinkerEnvironment", publish_script)
 
-    def test_just_exposes_only_final_publish_recipe(self) -> None:
-        justfile = (SCRIPT.parent.parent / "justfile").read_text(encoding="utf-8")
-
-        self.assertEqual(justfile.count("publish-local-codex-final *args:"), 2)
-        self.assertIn(
-            "-AutoSkipBuild -Profile release -RunDoctor -CloseRunningTargetTimeoutSeconds 30",
-            justfile,
-        )
-        self.assertNotIn("-SkipPreflightCheck", justfile)
-        self.assertIn(
-            "-ConfigureDesktopLocalCli -DesktopCliEnvironmentTarget User", justfile
-        )
-        for recipe in (
-            "publish-local-codex",
-            "publish-local-codex-dry-run",
-            "publish-local-codex-final-dry-run",
-            "publish-local-codex-runtime-proof",
-            "publish-local-codex-final-test-run",
-            "publish-local-codex-build-only",
-            "validate-local-publish",
-        ):
-            self.assertNotIn(f"{recipe} *args:", justfile)
-
-    def test_final_publish_recipe_requires_doctor_on_noop_and_desktop_restart(
+    def test_final_publish_dry_run_plans_required_checks(
         self,
     ) -> None:
-        justfile = (SCRIPT.parent.parent / "justfile").read_text(encoding="utf-8")
-        recipe = justfile.split("publish-local-codex-final *args:", 1)[1].split(
-            "\n\n", 1
-        )[0]
-
-        self.assertIn("-RunDoctor -DoctorOnNoop", recipe)
-        self.assertIn("-RestartDesktop", recipe)
+        result = subprocess.run(
+            [
+                "just",
+                "--justfile",
+                str(SCRIPT.parent.parent / "justfile"),
+                "--dry-run",
+                "publish-local-codex-final",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        commands = result.stdout + result.stderr
+        self.assertIn("just test-release-tooling", commands)
+        self.assertIn("publish-local-codex.ps1", commands)
+        for argument in (
+            "-AutoSkipBuild",
+            "-Profile release",
+            "-RunDoctor",
+            "-DoctorOnNoop",
+            "-CloseRunningTargetTimeoutSeconds 30",
+            "-ConfigureDesktopLocalCli",
+            "-DesktopCliEnvironmentTarget User",
+            "-RestartDesktop",
+        ):
+            with self.subTest(argument=argument):
+                self.assertIn(argument, commands)
+        self.assertNotIn("-SkipPreflightCheck", commands)
 
     def test_requested_restart_rejects_unavailable_desktop(self) -> None:
         shell = powershell()

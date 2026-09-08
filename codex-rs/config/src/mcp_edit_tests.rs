@@ -6,33 +6,37 @@ use std::collections::HashMap;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
-#[test]
-fn config_editors_share_document_loader() -> anyhow::Result<()> {
-    let plugin_editor = include_str!("plugin_edit.rs");
-    let mcp_editor = include_str!("mcp_edit.rs");
-    let marketplace_editor = include_str!("marketplace_edit.rs");
-
-    for (name, source) in [
-        ("plugin", plugin_editor),
-        ("MCP", mcp_editor),
-        ("marketplace", marketplace_editor),
-    ] {
-        assert!(
-            !source.contains("fn read_or_create_document"),
-            "{name} editor should not maintain a private document loader"
-        );
-        assert!(source.contains("read_or_create_config_document"));
-    }
-
+#[tokio::test]
+async fn config_editors_reject_invalid_toml_without_overwriting_it() -> anyhow::Result<()> {
     let temp = tempfile::tempdir()?;
     let config_path = temp.path().join(CONFIG_TOML_FILE);
-    let empty = crate::read_or_create_config_document(Some(&config_path))?;
-    assert!(empty.as_table().is_empty());
-
-    std::fs::write(&config_path, "not = [valid")?;
-    let err = crate::read_or_create_config_document(Some(&config_path))
-        .expect_err("invalid TOML should be rejected");
-    assert_eq!(err.kind(), ErrorKind::InvalidData);
+    let invalid = "not = [valid";
+    std::fs::write(&config_path, invalid)?;
+    for editor in ["MCP", "plugin", "marketplace"] {
+        let result = match editor {
+            "MCP" => {
+                ConfigEditsBuilder::new(temp.path())
+                    .replace_mcp_servers(&BTreeMap::new())
+                    .apply()
+                    .await
+            }
+            "plugin" => {
+                crate::plugin_edit::set_user_plugin_enabled(
+                    temp.path(),
+                    "demo@local".to_string(),
+                    true,
+                )
+                .await
+            }
+            "marketplace" => {
+                crate::marketplace_edit::remove_user_marketplace(temp.path(), "local").map(|_| ())
+            }
+            _ => unreachable!(),
+        };
+        let err = result.expect_err(editor);
+        assert_eq!(err.kind(), ErrorKind::InvalidData, "{editor}");
+        assert_eq!(std::fs::read_to_string(&config_path)?, invalid, "{editor}");
+    }
     Ok(())
 }
 

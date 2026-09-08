@@ -1956,27 +1956,6 @@ mod tests {
     use serial_test::serial;
     use tempfile::TempDir;
 
-    #[test]
-    fn startup_does_not_call_retired_personality_migration() {
-        let source = include_str!("lib.rs");
-        let wrapper_name = ["migrate_personality_", "if_needed"].concat();
-
-        assert!(!source.contains(&wrapper_name));
-    }
-
-    #[test]
-    fn single_child_ui_namespaces_are_collapsed() {
-        let tui_lib = include_str!("lib.rs");
-        let status_mod = include_str!("status/mod.rs");
-        let obsolete_widgets_module = ["mod public_", "widgets;"].concat();
-        let obsolete_account_module = ["mod acc", "ount;"].concat();
-
-        assert!(!tui_lib.contains(&obsolete_widgets_module));
-        assert!(tui_lib.contains("mod composer_input;"));
-        assert!(!status_mod.contains(&obsolete_account_module));
-        assert!(status_mod.contains("enum StatusAccountDisplay"));
-    }
-
     async fn build_config(temp_dir: &TempDir) -> std::io::Result<Config> {
         let mut config = ConfigBuilder::default()
             .codex_home(temp_dir.path().to_path_buf())

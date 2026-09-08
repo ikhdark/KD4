@@ -3,78 +3,22 @@ use codex_exec_server::Environment;
 use codex_utils_path_uri::PathUri;
 use std::sync::Arc;
 
-#[tokio::test]
-async fn approval_key_includes_environment_id_and_approval_scope() {
+fn shell_request(environment_id: &str) -> ShellRequest {
     let cwd = AbsolutePathBuf::try_from(std::env::current_dir().expect("read current dir"))
         .expect("current dir is absolute");
-    let mut request = ShellRequest {
+    ShellRequest {
         command: vec!["echo".to_string(), "hello".to_string()],
         command_for_approval: vec!["echo".to_string(), "hello".to_string()],
 
         approved_powershell_direct_argv: None,
         turn_environment: TurnEnvironment::new(
-            "remote".to_string(),
+            environment_id.to_string(),
             Arc::new(Environment::default_for_tests()),
             PathUri::from_abs_path(&cwd),
             /*shell*/ None,
         ),
         shell_type: None,
         hook_command: "echo hello".to_string(),
-        cwd: cwd.clone(),
-        timeout_ms: None,
-        stall_timeout_ms: None,
-        cancellation_token: CancellationToken::new(),
-        env: HashMap::new(),
-        explicit_env_overrides: HashMap::new(),
-        network: None,
-        sandbox_permissions: SandboxPermissions::UseDefault,
-        additional_permissions: None,
-        justification: None,
-        exec_approval_requirement: ExecApprovalRequirement::Skip {
-            bypass_sandbox: false,
-            proposed_execpolicy_amendment: None,
-        },
-        known_delta: None,
-        validation_launch: None,
-        workspace_operation_root: None,
-    };
-    let runtime = ShellRuntime::for_shell_command();
-    let original_key = runtime.approval_keys(&request);
-    request.turn_environment.environment = Arc::new(Environment::default_for_tests());
-    let replacement_key = runtime.approval_keys(&request);
-    assert_ne!(original_key, replacement_key);
-
-    request.turn_environment.environment_id = "other".to_string();
-    let other_key = runtime.approval_keys(&request);
-
-    assert_ne!(replacement_key, other_key);
-}
-
-#[tokio::test]
-async fn approval_key_uses_inspectable_command_instead_of_encoded_payload() {
-    let cwd = AbsolutePathBuf::try_from(std::env::current_dir().expect("read current dir"))
-        .expect("current dir is absolute");
-    let request = ShellRequest {
-        command: vec![
-            "pwsh".to_string(),
-            "-EncodedCommand".to_string(),
-            "RwBlAHQALQBDAGgAaQBsAGQASQB0AGUAbQA=".to_string(),
-        ],
-        command_for_approval: vec![
-            "pwsh".to_string(),
-            "-Command".to_string(),
-            "Get-ChildItem".to_string(),
-        ],
-
-        approved_powershell_direct_argv: None,
-        turn_environment: TurnEnvironment::new(
-            "local".to_string(),
-            Arc::new(Environment::default_for_tests()),
-            PathUri::from_abs_path(&cwd),
-            /*shell*/ None,
-        ),
-        shell_type: Some(ShellType::PowerShell),
-        hook_command: "Get-ChildItem".to_string(),
         cwd,
         timeout_ms: None,
         stall_timeout_ms: None,
@@ -92,6 +36,41 @@ async fn approval_key_uses_inspectable_command_instead_of_encoded_payload() {
         known_delta: None,
         validation_launch: None,
         workspace_operation_root: None,
+    }
+}
+
+#[tokio::test]
+async fn approval_key_includes_environment_id_and_approval_scope() {
+    let mut request = shell_request("remote");
+    let runtime = ShellRuntime::for_shell_command();
+    let original_key = runtime.approval_keys(&request);
+    request.turn_environment.environment = Arc::new(Environment::default_for_tests());
+    let replacement_key = runtime.approval_keys(&request);
+    assert_ne!(original_key, replacement_key);
+
+    request.turn_environment.environment_id = "other".to_string();
+    let other_key = runtime.approval_keys(&request);
+
+    assert_ne!(replacement_key, other_key);
+}
+
+#[tokio::test]
+async fn approval_key_uses_inspectable_command_instead_of_encoded_payload() {
+    let request = ShellRequest {
+        command: vec![
+            "pwsh".to_string(),
+            "-EncodedCommand".to_string(),
+            "RwBlAHQALQBDAGgAaQBsAGQASQB0AGUAbQA=".to_string(),
+        ],
+        command_for_approval: vec![
+            "pwsh".to_string(),
+            "-Command".to_string(),
+            "Get-ChildItem".to_string(),
+        ],
+
+        shell_type: Some(ShellType::PowerShell),
+        hook_command: "Get-ChildItem".to_string(),
+        ..shell_request("local")
     };
     let runtime = ShellRuntime::for_shell_command();
 

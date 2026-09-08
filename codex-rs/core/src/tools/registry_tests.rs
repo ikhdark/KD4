@@ -2647,20 +2647,6 @@ fn registered_tool_rejects_unknown_authorization_class() {
     let _registered = RegisteredTool::new(runtime, TypedToolClass::Unknown);
 }
 
-#[test]
-fn prevalidated_registry_constructor_does_not_repeat_duplicate_filtering() {
-    let source = include_str!("registry.rs");
-    let constructor = source
-        .split_once("fn from_unique_registered_tools")
-        .expect("prevalidated registry constructor")
-        .1
-        .split_once("pub(crate) fn")
-        .map_or(source, |(body, _)| body);
-
-    assert!(!constructor.contains("contains_key"));
-    assert!(!constructor.contains("continue"));
-}
-
 #[derive(Clone)]
 enum LifecycleTestResult {
     Ok { success: bool },

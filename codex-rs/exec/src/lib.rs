@@ -146,7 +146,6 @@ use std::io::Read;
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::SystemTime;
-use std::time::UNIX_EPOCH;
 use supports_color::Stream;
 use tokio::sync::mpsc;
 use tracing::Instrument;
@@ -1532,16 +1531,6 @@ fn canceled_mcp_server_elicitation_response() -> Result<Value, String> {
     .map_err(|err| format!("failed to encode mcp elicitation response: {err}"))
 }
 
-fn current_time_read_response(now: SystemTime) -> Result<CurrentTimeReadResponse, String> {
-    let seconds = now
-        .duration_since(UNIX_EPOCH)
-        .map_err(|err| format!("system time is before the Unix epoch: {err}"))?
-        .as_secs();
-    let current_time_at = i64::try_from(seconds)
-        .map_err(|_| "current Unix time does not fit in an i64".to_string())?;
-    Ok(CurrentTimeReadResponse { current_time_at })
-}
-
 async fn request_shutdown(
     client: &InProcessAppServerClient,
     request_ids: &mut RequestIdSequencer,
@@ -1692,7 +1681,7 @@ async fn handle_server_request(
             .await
         }
         ServerRequest::CurrentTimeRead { request_id, .. } => {
-            match current_time_read_response(SystemTime::now()).and_then(|response| {
+            match CurrentTimeReadResponse::try_from(SystemTime::now()).and_then(|response| {
                 serde_json::to_value(response)
                     .map_err(|err| format!("failed to serialize current time response: {err}"))
             }) {

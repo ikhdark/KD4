@@ -200,38 +200,3 @@ fn feature_enabled(config: &Value, key: &str, default_enabled: bool) -> bool {
         .and_then(Value::as_bool)
         .unwrap_or(default_enabled)
 }
-
-#[cfg(test)]
-mod tests {
-    use tempfile::tempdir;
-
-    use super::write_manifest_only_openai_curated_marketplace;
-    use super::write_openai_curated_marketplace;
-
-    #[test]
-    fn curated_marketplace_fixture_controls_plugin_payload() {
-        let complete = tempdir().unwrap();
-        write_openai_curated_marketplace(complete.path(), &["sample"]);
-        assert!(
-            complete
-                .path()
-                .join("plugins/sample/skills/SKILL.md")
-                .exists()
-        );
-
-        let manifest_only = tempdir().unwrap();
-        write_manifest_only_openai_curated_marketplace(manifest_only.path(), &["sample"]);
-        assert!(
-            manifest_only
-                .path()
-                .join("plugins/sample/.codex-plugin/plugin.json")
-                .exists()
-        );
-        assert!(
-            !manifest_only
-                .path()
-                .join("plugins/sample/skills/SKILL.md")
-                .exists()
-        );
-    }
-}

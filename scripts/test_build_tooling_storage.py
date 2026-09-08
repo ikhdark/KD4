@@ -699,54 +699,32 @@ class BuildToolingStorageTest(unittest.TestCase):
                 self.assertTrue(rust_build_status.cargo_lock_is_busy(lane))
                 self.assertTrue(rust_build_status.lane_active_lock_is_held(lane))
 
-    def test_prune_rechecks_lane_lock_before_delete(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            repo_root = Path(temp_dir)
-            lane_root = repo_root / "codex-rs" / "target" / "lanes"
-            lane = lane_root / "late-busy"
-            lane.mkdir(parents=True)
-            snapshot = rust_build_status.BuildStatusSnapshot.collect(
-                repo_root=repo_root,
-                processes=[],
-            )
-
-            with mock.patch.object(
-                rust_build_status,
-                "cargo_lock_is_busy",
-                return_value=True,
+    def test_prune_rechecks_locks_before_delete(self) -> None:
+        for lock_check in ("cargo_lock_is_busy", "lane_active_lock_is_held"):
+            with (
+                self.subTest(lock_check=lock_check),
+                tempfile.TemporaryDirectory() as temp_dir,
             ):
-                removed = rust_build_status.prune_stale_lanes(
+                repo_root = Path(temp_dir)
+                lane = repo_root / "codex-rs" / "target" / "lanes" / "late-busy"
+                lane.mkdir(parents=True)
+                snapshot = rust_build_status.BuildStatusSnapshot.collect(
                     repo_root=repo_root,
-                    snapshot=snapshot,
-                    keep_warm_per_base=0,
-                    max_age_days=None,
+                    processes=[],
                 )
 
-            self.assertEqual(removed, [])
-            self.assertTrue(lane.exists())
+                with mock.patch.object(
+                    rust_build_status, lock_check, return_value=True
+                ):
+                    removed = rust_build_status.prune_stale_lanes(
+                        repo_root=repo_root,
+                        snapshot=snapshot,
+                        keep_warm_per_base=0,
+                        max_age_days=None,
+                    )
 
-    def test_prune_rechecks_active_reservation_before_delete(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            repo_root = Path(temp_dir)
-            lane = repo_root / "codex-rs" / "target" / "lanes" / "late-reserved"
-            lane.mkdir(parents=True)
-            snapshot = rust_build_status.BuildStatusSnapshot.collect(
-                repo_root=repo_root,
-                processes=[],
-            )
-
-            with mock.patch.object(
-                rust_build_status, "lane_active_lock_is_held", return_value=True
-            ):
-                removed = rust_build_status.prune_stale_lanes(
-                    repo_root=repo_root,
-                    snapshot=snapshot,
-                    keep_warm_per_base=0,
-                    max_age_days=None,
-                )
-
-            self.assertEqual(removed, [])
-            self.assertTrue(lane.exists())
+                self.assertEqual(removed, [])
+                self.assertTrue(lane.exists())
 
     def test_prune_skips_path_that_becomes_indirect(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

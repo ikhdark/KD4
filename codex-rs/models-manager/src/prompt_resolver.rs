@@ -2,15 +2,19 @@ use crate::model_info::clear_instruction_messages;
 use codex_protocol::openai_models::ModelInfo;
 use tracing::debug;
 
-/// Authoritative registration for models that use the local GPT-5.6 prompt policy.
-pub(crate) const GPT_5_6_PROMPT_POLICY_SLUGS: &[&str] =
-    &["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"];
+/// Authoritative registration for models that use the fork's local prompt policy.
+pub(crate) const LOCAL_PROMPT_POLICY_SLUGS: &[&str] = &[
+    "gpt-6-astra",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
+];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PromptId {
     Catalog,
     ProtocolDefault,
-    Gpt56,
+    LocalPolicy,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -44,9 +48,9 @@ pub(crate) fn resolve_prompt<'a>(
     slug: &str,
     catalog_prompt: Option<&'a str>,
 ) -> ResolvedPrompt<'a> {
-    if GPT_5_6_PROMPT_POLICY_SLUGS.contains(&slug) {
+    if LOCAL_PROMPT_POLICY_SLUGS.contains(&slug) {
         return ResolvedPrompt {
-            id: PromptId::Gpt56,
+            id: PromptId::LocalPolicy,
             source: PromptSource::LocalModelPolicy,
             normalization: PromptNormalization::Trim,
             content: codex_protocol::models::BASE_INSTRUCTIONS_DEFAULT.trim(),
@@ -107,10 +111,10 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     #[test]
-    fn resolver_reports_gpt_5_6_canonical_prompt_provenance() {
+    fn resolver_reports_local_policy_canonical_prompt_provenance() {
         let resolved = resolve_prompt("gpt-5.6-sol", Some("remote prompt"));
 
-        assert_eq!(resolved.id, PromptId::Gpt56);
+        assert_eq!(resolved.id, PromptId::LocalPolicy);
         assert_eq!(resolved.source, PromptSource::LocalModelPolicy);
         assert_eq!(resolved.normalization, PromptNormalization::Trim);
         assert_eq!(

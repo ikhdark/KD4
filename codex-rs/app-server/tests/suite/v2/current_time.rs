@@ -83,9 +83,12 @@ async fn current_time_read_round_trip_adds_reminder_to_model_input() -> Result<(
     app_server
         .send_response(
             request_id,
-            serde_json::to_value(CurrentTimeReadResponse {
-                current_time_at: CURRENT_TIME_AT,
-            })?,
+            serde_json::to_value(
+                CurrentTimeReadResponse::try_from(
+                    std::time::UNIX_EPOCH + Duration::from_secs(CURRENT_TIME_AT as u64),
+                )
+                .map_err(anyhow::Error::msg)?,
+            )?,
         )
         .await?;
     timeout(

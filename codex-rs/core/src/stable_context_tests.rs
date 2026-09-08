@@ -326,16 +326,8 @@ fn selected_skill_compacts_each_catalog_without_collapsing_authority() {
             .any(|text| text.starts_with("<environment_skills_instructions>"))
     );
 
-    let second = project_stable_context(first.items, StableContextTarget::Sampling);
-    assert_eq!(
-        second
-            .manifest
-            .components()
-            .iter()
-            .filter(|component| component.kind == StableContextKind::SkillCatalog)
-            .count(),
-        3
-    );
+    let second = project_stable_context(first.items.clone(), StableContextTarget::Sampling);
+    assert_eq!(second.items, first.items);
 }
 
 #[test]

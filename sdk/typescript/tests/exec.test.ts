@@ -1,6 +1,7 @@
 import * as child_process from "node:child_process";
 import { EventEmitter } from "node:events";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
@@ -11,6 +12,15 @@ jest.mock("node:child_process", () => {
   const actual = jest.requireActual<typeof import("node:child_process")>("node:child_process");
   return { ...actual, spawn: jest.fn() };
 });
+
+jest.mock("node:module", () => ({ createRequire: jest.fn() }));
+
+// Keep the real manifest reader and filesystem checks; replace only npm lookup.
+const packageRequire = Object.assign(
+  (manifestPath: string) => JSON.parse(readFileSync(manifestPath, "utf8")),
+  { resolve: jest.fn<string, [string]>() },
+);
+jest.mocked(createRequire).mockReturnValue(packageRequire as unknown as NodeJS.Require);
 
 const _actualChildProcess =
   jest.requireActual<typeof import("node:child_process")>("node:child_process");
@@ -263,69 +273,104 @@ describe("CodexExec", () => {
     }
   });
 
-  it("resolves the package-layout binary and PATH directory", async () => {
-    const { resolveNativePackage } = await import("../src/exec");
-    const vendorRoot = mkdtempSync(path.join(tmpdir(), "codex-sdk-vendor-"));
-    const packageRoot = path.join(vendorRoot, "x86_64-pc-windows-msvc");
-    const binDir = path.join(packageRoot, "bin");
-    const pathDir = path.join(packageRoot, "codex-path");
-    mkdirSync(binDir, { recursive: true });
-    mkdirSync(pathDir, { recursive: true });
-    writeFileSync(path.join(packageRoot, "codex-package.json"), "{}");
-    writeFileSync(path.join(binDir, "codex.exe"), "");
+  describe("installed runtime", () => {
+    let packageRoot: string;
+    let nativeRoot: string;
+    let pathDir: string;
+    let manifestPath: string;
+    const targetTriple = "x86_64-pc-windows-msvc";
 
-    expect(resolveNativePackage(vendorRoot, "x86_64-pc-windows-msvc", "codex.exe")).toEqual({
-      executablePath: path.join(binDir, "codex.exe"),
-      pathDirs: [pathDir],
+    beforeEach(() => {
+      spawnMock.mockClear();
+      packageRoot = mkdtempSync(path.join(tmpdir(), "codex-sdk-vendor-"));
+      nativeRoot = path.join(packageRoot, "vendor", targetTriple);
+      pathDir = path.join(nativeRoot, "codex-path");
+      manifestPath = path.join(packageRoot, "package.json");
+      mkdirSync(path.join(nativeRoot, "bin"), { recursive: true });
+      mkdirSync(pathDir);
+      writeFileSync(path.join(nativeRoot, "codex-package.json"), "{}");
+      writeFileSync(path.join(nativeRoot, "bin", "codex.exe"), "");
+      writeFileSync(
+        manifestPath,
+        JSON.stringify({
+          codexNativeTargets: {
+            [`${process.platform}-${process.arch}`]: {
+              targetTriple,
+              package: "@openai/codex-test-platform",
+              binary: "codex.exe",
+            },
+          },
+        }),
+      );
+      packageRequire.resolve.mockImplementation((id) => {
+        if (
+          id === "@openai/codex/package.json" ||
+          id === "@openai/codex-test-platform/package.json"
+        ) {
+          return manifestPath;
+        }
+        throw new Error(`Unexpected package lookup: ${id}`);
+      });
     });
-  });
 
-  it("resolves platform metadata from the installed CLI manifest", async () => {
-    const { resolveNativeTarget } = await import("../src/exec");
-    const manifest = {
-      codexNativeTargets: {
-        "win32-x64": {
-          targetTriple: "x86_64-pc-windows-msvc",
-          package: "@openai/codex-win32-x64",
-          binary: "codex.exe",
-        },
+    afterEach(() => {
+      rmSync(packageRoot, { recursive: true, force: true });
+      packageRequire.resolve.mockReset();
+    });
+
+    it.each(["PATH", "Path"])(
+      "launches the manifest binary and deduplicates %s",
+      async (pathKey) => {
+        const { Codex } = await import("../src/codex");
+        const child = new FakeChildProcess();
+        spawnMock.mockReturnValue(child as unknown as child_process.ChildProcess);
+        setImmediate(() => {
+          child.stdout.end(
+            JSON.stringify({
+              type: "item.completed",
+              item: { id: "item-1", type: "agent_message", text: "runtime launched" },
+            }) + "\n",
+          );
+          child.stderr.end();
+          child.emit("exit", 0, null);
+        });
+        const existingPath = path.join(packageRoot, "existing-tools");
+        const env = {
+          PATH: "discard duplicate key",
+          [pathKey]: `${existingPath}${path.delimiter}${pathDir}`,
+        };
+        const result = await new Codex({ env }).startThread().run("hello");
+
+        expect(result.finalResponse).toBe("runtime launched");
+        expect(spawnMock).toHaveBeenCalledTimes(1);
+        const [executable, , options] = spawnMock.mock.calls[0]!;
+        expect(executable).toBe(path.join(nativeRoot, "bin", "codex.exe"));
+        const pathEntries = Object.entries(options!.env!).filter(
+          ([key]) => key.toLowerCase() === "path",
+        );
+        expect(pathEntries).toEqual([[pathKey, `${pathDir}${path.delimiter}${existingPath}`]]);
       },
-    };
-
-    expect(resolveNativeTarget(manifest, "win32", "x64")).toEqual(
-      manifest.codexNativeTargets["win32-x64"],
     );
-    expect(resolveNativeTarget(manifest, "linux", "x64")).toBeNull();
-  });
 
-  it("rejects the retired legacy binary layout", async () => {
-    const { resolveNativePackage } = await import("../src/exec");
-    const vendorRoot = mkdtempSync(path.join(tmpdir(), "codex-sdk-vendor-"));
-    const packageRoot = path.join(vendorRoot, "x86_64-pc-windows-msvc");
-    const binDir = path.join(packageRoot, "codex");
-    mkdirSync(binDir, { recursive: true });
-    writeFileSync(path.join(binDir, "codex.exe"), "");
+    it.each(["legacy-layout", "missing-platform"])(
+      "rejects %s before spawning",
+      async (problem) => {
+        const { Codex } = await import("../src/codex");
+        if (problem === "legacy-layout") {
+          rmSync(path.join(nativeRoot, "bin", "codex.exe"));
+          mkdirSync(path.join(nativeRoot, "codex"));
+          writeFileSync(path.join(nativeRoot, "codex", "codex.exe"), "");
+        } else {
+          writeFileSync(manifestPath, JSON.stringify({ codexNativeTargets: {} }));
+        }
 
-    expect(resolveNativePackage(vendorRoot, "x86_64-pc-windows-msvc", "codex.exe")).toBeNull();
-  });
-
-  it("prepends package PATH entries without duplicating them", async () => {
-    const { prependPathDirs } = await import("../src/exec");
-    const pathDir = path.join(tmpdir(), "codex-path");
-    const env = { PATH: `/usr/bin${path.delimiter}${pathDir}` };
-
-    prependPathDirs(env, [pathDir]);
-
-    expect(env).toEqual({ PATH: `${pathDir}${path.delimiter}/usr/bin` });
-  });
-
-  it("preserves the Windows Path key when prepending package PATH entries", async () => {
-    const { prependPathDirs } = await import("../src/exec");
-    const pathDir = path.join(tmpdir(), "codex-path");
-    const env = { PATH: "/usr/bin", Path: `C\\Windows${path.delimiter}${pathDir}` };
-
-    prependPathDirs(env, [pathDir]);
-
-    expect(env).toEqual({ Path: `${pathDir}${path.delimiter}C\\Windows` });
+        expect(() => new Codex()).toThrow(
+          problem === "legacy-layout"
+            ? /Unable to locate Codex CLI binaries/
+            : /Unsupported platform/,
+        );
+        expect(spawnMock).not.toHaveBeenCalled();
+      },
+    );
   });
 });

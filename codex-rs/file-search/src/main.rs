@@ -224,7 +224,7 @@ mod tests {
     }
 
     #[test]
-    fn cli_is_owned_by_the_binary_and_preserves_parser_behavior() {
+    fn cli_parses_search_options() {
         let cli = Cli::try_parse_from([
             "codex-file-search",
             "--limit",
@@ -240,9 +240,5 @@ mod tests {
         assert!(cli.compute_indices);
         assert_eq!(cli.exclude, ["target"]);
         assert_eq!(cli.pattern.as_deref(), Some("needle"));
-
-        let library_source = include_str!("lib.rs");
-        assert!(!library_source.contains(&["mod ", "cli;"].concat()));
-        assert!(!library_source.contains("pub use cli::Cli;"));
     }
 }

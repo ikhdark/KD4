@@ -122,6 +122,22 @@ async fn list_models_returns_all_models_with_large_limit() -> Result<()> {
     let expected_models = expected_visible_models();
 
     assert_eq!(items, expected_models);
+    let astra = &items[0];
+    assert_eq!(astra.model, "gpt-6-astra");
+    assert!(astra.is_default && !astra.hidden);
+    assert_eq!(
+        astra.default_reasoning_effort,
+        codex_protocol::openai_models::ReasoningEffort::Low
+    );
+    assert_eq!(
+        astra
+            .supported_reasoning_efforts
+            .iter()
+            .map(|option| option.reasoning_effort.to_string())
+            .collect::<Vec<_>>(),
+        vec!["low", "medium", "high", "xhigh", "max", "ultra"]
+    );
+    assert_eq!(astra.service_tiers[0].id, "priority");
     assert!(next_cursor.is_none());
     Ok(())
 }

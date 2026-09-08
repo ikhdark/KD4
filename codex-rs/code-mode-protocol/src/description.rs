@@ -277,7 +277,7 @@ mod tests {
     }
 
     #[test]
-    fn code_mode_only_prompt_omits_contract_while_runtime_metadata_preserves_it() {
+    fn augment_tool_definition_preserves_long_descriptions_and_schema_guidance() {
         let mandatory_tail = "mandatory safety and citation rules";
         let tool_description = format!("{}\n{mandatory_tail}", "d".repeat(1_250));
         let tool = ToolDefinition {
@@ -302,15 +302,6 @@ mod tests {
             })),
             output_schema: None,
         };
-        let description = build_exec_tool_description(true, false, &[]);
-
-        assert!(!description.contains("sample_tool"));
-        assert!(!description.contains(mandatory_tail));
-        assert!(!description.contains("description: string;"));
-        assert!(!description.contains("schema-only guidance"));
-        assert!(!description.contains("schema-only property guidance"));
-        assert!(!description.contains("// schema-only guidance"));
-
         let runtime_description = augment_tool_definition(tool).description;
         assert!(runtime_description.contains(mandatory_tail));
         assert!(runtime_description.contains("description: string;"));

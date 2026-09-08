@@ -112,19 +112,3 @@ fn winhttp_error_classification_preserves_specific_failures_and_resolver_fallbac
         );
     }
 }
-
-#[test]
-fn resolver_fallback_does_not_enumerate_equivalent_winhttp_codes() {
-    let source = include_str!("windows.rs");
-
-    for redundant_code in [
-        "ERROR_WINHTTP_CANNOT_CONNECT",
-        "ERROR_WINHTTP_CONNECTION_ERROR",
-        "ERROR_WINHTTP_NAME_NOT_RESOLVED",
-    ] {
-        assert!(
-            !source.contains(redundant_code),
-            "{redundant_code} should use the resolver-error fallback"
-        );
-    }
-}

@@ -12,9 +12,9 @@ import {
   sse,
   responseFailed,
   startResponsesTestProxy,
-  SseResponseBody,
 } from "./responsesProxy";
 import { createMockClient, createTestClient } from "./testCodex";
+import type { ThreadOptions } from "../src/threadOptions";
 
 describe("Codex", () => {
   it("returns thread events", async () => {
@@ -222,185 +222,57 @@ describe("Codex", () => {
     }
   });
 
-  it("passes modelReasoningEffort to exec", async () => {
+  it.each<{ name: string; options: ThreadOptions; configValue: string }>([
+    {
+      name: "modelReasoningEffort",
+      options: { modelReasoningEffort: "high" },
+      configValue: 'model_reasoning_effort="high"',
+    },
+    {
+      name: "networkAccessEnabled",
+      options: { networkAccessEnabled: true },
+      configValue: "sandbox_workspace_write.network_access=true",
+    },
+    {
+      name: "webSearchEnabled",
+      options: { webSearchEnabled: true },
+      configValue: 'web_search="live"',
+    },
+    {
+      name: "webSearchMode",
+      options: { webSearchMode: "cached" },
+      configValue: 'web_search="cached"',
+    },
+    {
+      name: "webSearchEnabled false",
+      options: { webSearchEnabled: false },
+      configValue: 'web_search="disabled"',
+    },
+    {
+      name: "approvalPolicy",
+      options: { approvalPolicy: "on-request" },
+      configValue: 'approval_policy="on-request"',
+    },
+  ])("passes $name to exec", async ({ options, configValue }) => {
     const { url, close } = await startResponsesTestProxy({
       statusCode: 200,
       responseBodies: [
         sse(
           responseStarted("response_1"),
-          assistantMessage("Reasoning effort applied", "item_1"),
+          assistantMessage("Options applied", "item_1"),
           responseCompleted("response_1"),
         ),
       ],
     });
-
     const { args: spawnArgs, restore } = codexExecSpy();
     const { client, cleanup } = createMockClient(url);
 
     try {
-      const thread = client.startThread({
-        modelReasoningEffort: "high",
-      });
-      await thread.run("apply reasoning effort");
-
+      const result = await client.startThread(options).run("apply thread options");
+      expect(result.finalResponse).toBe("Options applied");
       const commandArgs = spawnArgs[0];
       expect(commandArgs).toBeDefined();
-      expectPair(commandArgs, ["--config", 'model_reasoning_effort="high"']);
-    } finally {
-      cleanup();
-      restore();
-      await close();
-    }
-  });
-
-  it("passes networkAccessEnabled to exec", async () => {
-    const { url, close } = await startResponsesTestProxy({
-      statusCode: 200,
-      responseBodies: [
-        sse(
-          responseStarted("response_1"),
-          assistantMessage("Network access enabled", "item_1"),
-          responseCompleted("response_1"),
-        ),
-      ],
-    });
-
-    const { args: spawnArgs, restore } = codexExecSpy();
-    const { client, cleanup } = createMockClient(url);
-
-    try {
-      const thread = client.startThread({
-        networkAccessEnabled: true,
-      });
-      await thread.run("test network access");
-
-      const commandArgs = spawnArgs[0];
-      expect(commandArgs).toBeDefined();
-      expectPair(commandArgs, ["--config", "sandbox_workspace_write.network_access=true"]);
-    } finally {
-      cleanup();
-      restore();
-      await close();
-    }
-  });
-
-  it("passes webSearchEnabled to exec", async () => {
-    const { url, close } = await startResponsesTestProxy({
-      statusCode: 200,
-      responseBodies: [
-        sse(
-          responseStarted("response_1"),
-          assistantMessage("Web search enabled", "item_1"),
-          responseCompleted("response_1"),
-        ),
-      ],
-    });
-
-    const { args: spawnArgs, restore } = codexExecSpy();
-    const { client, cleanup } = createMockClient(url);
-
-    try {
-      const thread = client.startThread({
-        webSearchEnabled: true,
-      });
-      await thread.run("test web search");
-
-      const commandArgs = spawnArgs[0];
-      expect(commandArgs).toBeDefined();
-      expectPair(commandArgs, ["--config", 'web_search="live"']);
-    } finally {
-      cleanup();
-      restore();
-      await close();
-    }
-  });
-
-  it("passes webSearchMode to exec", async () => {
-    const { url, close } = await startResponsesTestProxy({
-      statusCode: 200,
-      responseBodies: [
-        sse(
-          responseStarted("response_1"),
-          assistantMessage("Web search cached", "item_1"),
-          responseCompleted("response_1"),
-        ),
-      ],
-    });
-
-    const { args: spawnArgs, restore } = codexExecSpy();
-    const { client, cleanup } = createMockClient(url);
-
-    try {
-      const thread = client.startThread({
-        webSearchMode: "cached",
-      });
-      await thread.run("test web search mode");
-
-      const commandArgs = spawnArgs[0];
-      expect(commandArgs).toBeDefined();
-      expectPair(commandArgs, ["--config", 'web_search="cached"']);
-    } finally {
-      cleanup();
-      restore();
-      await close();
-    }
-  });
-
-  it("passes webSearchEnabled false to exec", async () => {
-    const { url, close } = await startResponsesTestProxy({
-      statusCode: 200,
-      responseBodies: [
-        sse(
-          responseStarted("response_1"),
-          assistantMessage("Web search disabled", "item_1"),
-          responseCompleted("response_1"),
-        ),
-      ],
-    });
-
-    const { args: spawnArgs, restore } = codexExecSpy();
-    const { client, cleanup } = createMockClient(url);
-
-    try {
-      const thread = client.startThread({
-        webSearchEnabled: false,
-      });
-      await thread.run("test web search disabled");
-
-      const commandArgs = spawnArgs[0];
-      expect(commandArgs).toBeDefined();
-      expectPair(commandArgs, ["--config", 'web_search="disabled"']);
-    } finally {
-      cleanup();
-      restore();
-      await close();
-    }
-  });
-
-  it("passes approvalPolicy to exec", async () => {
-    const { url, close } = await startResponsesTestProxy({
-      statusCode: 200,
-      responseBodies: [
-        sse(
-          responseStarted("response_1"),
-          assistantMessage("Approval policy set", "item_1"),
-          responseCompleted("response_1"),
-        ),
-      ],
-    });
-
-    const { args: spawnArgs, restore } = codexExecSpy();
-    const { client, cleanup } = createMockClient(url);
-
-    try {
-      const thread = client.startThread({
-        approvalPolicy: "on-request",
-      });
-      await thread.run("test approval policy");
-
-      const commandArgs = spawnArgs[0];
-      expect(commandArgs).toBeDefined();
-      expectPair(commandArgs, ["--config", 'approval_policy="on-request"']);
+      expectPair(commandArgs, ["--config", configValue]);
     } finally {
       cleanup();
       restore();
@@ -751,26 +623,35 @@ describe("Codex", () => {
       await close();
     }
   });
-  it("throws ThreadRunError on turn failures", async () => {
+  it("reports the provider error when a turn fails", async () => {
     const { url, close } = await startResponsesTestProxy({
       statusCode: 200,
-      responseBodies: (function* (): Generator<SseResponseBody> {
-        yield sse(responseStarted("response_1"));
-        while (true) {
-          yield sse(responseFailed("rate limit exceeded"));
-        }
-      })(),
+      responseBodies: [sse(responseStarted(), responseFailed("provider rejected the request"))],
     });
-    const { client, cleanup } = createMockClient(url);
+    const { client, cleanup } = createTestClient({
+      config: {
+        model_provider: "mock",
+        model_providers: {
+          mock: {
+            name: "Mock provider for test",
+            base_url: url,
+            wire_api: "responses",
+            supports_websockets: false,
+            request_max_retries: 0,
+            stream_max_retries: 0,
+          },
+        },
+      },
+    });
 
     try {
       const thread = client.startThread();
-      await expect(thread.run("fail")).rejects.toThrow("stream disconnected before completion:");
+      await expect(thread.run("fail")).rejects.toThrow("provider rejected the request");
     } finally {
       cleanup();
       await close();
     }
-  }, 10000); // TODO(pakrym): remove timeout
+  });
 });
 
 /**

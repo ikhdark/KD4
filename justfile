@@ -592,16 +592,6 @@ app-server-schema-check:
 app-server-schema-regenerate owner experimental="":
     {{ python }} "{{ justfile_directory() }}/scripts/app_server_schema_runtime_check.py" --mode force --owner "{{ owner }}" -- {{ if experimental == "--experimental" { "--experimental" } else if experimental == "" { "" } else { error("app-server-schema-regenerate only accepts --experimental") } }}
 
-# Validate and resolve a shared-worktree preflight manifest.
-[no-cd]
-workflow-preflight manifest output:
-    {{ python }} "{{ justfile_directory() }}/scripts/workflow_preflight.py" "{{ manifest }}" --output "{{ output }}"
-
-# Release a terminal assignment from the active workflow-preflight registry.
-[no-cd]
-workflow-preflight-release assignment_id:
-    {{ python }} "{{ justfile_directory() }}/scripts/workflow_preflight.py" --release "{{ assignment_id }}" --repository-root "{{ justfile_directory() }}"
-
 # Regenerate hook schema artifacts through the Rust workspace from any cwd.
 [no-cd]
 write-hooks-schema:

@@ -193,43 +193,40 @@ fn code_mode_only_requires_code_mode() {
 }
 
 #[test]
-fn code_mode_host_is_stable_and_enabled_by_default() {
-    assert_eq!(Feature::CodeModeHost.stage(), Stage::Stable);
-    assert_eq!(Feature::CodeModeHost.default_enabled(), true);
-    assert_eq!(
-        feature_for_key("code_mode_host"),
-        Some(Feature::CodeModeHost)
-    );
-}
-
-#[test]
-fn guardian_approval_is_stable_and_enabled_by_default() {
-    let spec = Feature::GuardianApproval.info();
-
-    assert_eq!(spec.stage, Stage::Stable);
-    assert_eq!(Feature::GuardianApproval.default_enabled(), true);
-}
-
-#[test]
 fn completed_runtime_mechanisms_are_stable_and_enabled_by_default() {
-    for feature in [
-        Feature::DeferredExecutor,
-        Feature::CodeMode,
-        Feature::LocalThreadStoreCompression,
-        Feature::ApplyPatchStreamingEvents,
-        Feature::ExecPermissionApprovals,
-        Feature::RequestPermissionsTool,
-        Feature::MultiAgentV2,
+    let defaults = Features::with_defaults();
+    for (feature, key) in [
+        (Feature::CodeModeHost, "code_mode_host"),
+        (Feature::GuardianApproval, "guardian_approval"),
+        (Feature::ToolSuggest, "tool_suggest"),
+        (Feature::SecretAuthStorage, "secret_auth_storage"),
+        (Feature::UnifiedExec, "unified_exec"),
+        (Feature::KnownDeltaStore, "known_delta_store"),
+        (Feature::DeferredExecutor, "deferred_executor"),
+        (Feature::CodeMode, "code_mode"),
+        (
+            Feature::LocalThreadStoreCompression,
+            "local_thread_store_compression",
+        ),
+        (
+            Feature::ApplyPatchStreamingEvents,
+            "apply_patch_streaming_events",
+        ),
+        (
+            Feature::ExecPermissionApprovals,
+            "exec_permission_approvals",
+        ),
+        (Feature::RequestPermissionsTool, "request_permissions_tool"),
+        (Feature::MultiAgentV2, "multi_agent_v2"),
     ] {
-        assert_eq!(feature.stage(), Stage::Stable, "{feature:?}");
-        assert_eq!(feature.default_enabled(), true, "{feature:?}");
+        assert_eq!(feature_for_key(key), Some(feature), "{key}");
+        assert_eq!(feature.stage(), Stage::Stable, "{key}");
+        assert!(feature.default_enabled(), "{key}");
+        assert!(
+            defaults.enabled(feature),
+            "{key} must be enabled in resolved defaults"
+        );
     }
-}
-
-#[test]
-fn tool_suggest_is_stable_and_enabled_by_default() {
-    assert_eq!(Feature::ToolSuggest.stage(), Stage::Stable);
-    assert_eq!(Feature::ToolSuggest.default_enabled(), true);
 }
 
 #[test]
@@ -243,16 +240,6 @@ fn network_proxy_is_experimental_and_disabled_by_default() {
         Stage::Experimental { .. }
     ));
     assert_eq!(Feature::NetworkProxy.default_enabled(), false);
-}
-
-#[test]
-fn secret_auth_storage_defaults_to_enabled() {
-    assert_eq!(Feature::SecretAuthStorage.stage(), Stage::Stable);
-    assert!(Feature::SecretAuthStorage.default_enabled());
-    assert_eq!(
-        feature_for_key("secret_auth_storage"),
-        Some(Feature::SecretAuthStorage)
-    );
 }
 
 #[test]
@@ -773,13 +760,6 @@ fn unstable_warning_event_uses_canonical_keys() {
 }
 
 #[test]
-fn unified_exec_is_stable_and_enabled_by_default() {
-    assert_eq!(Feature::UnifiedExec.stage(), Stage::Stable);
-    assert_eq!(Feature::UnifiedExec.default_enabled(), true);
-    assert_eq!(feature_for_key("unified_exec"), Some(Feature::UnifiedExec));
-}
-
-#[test]
 fn direct_runtime_is_user_settable_and_disabled_by_default() {
     assert_eq!(Feature::DirectRuntime.stage(), Stage::UnderDevelopment);
     assert_eq!(Feature::DirectRuntime.default_enabled(), false);
@@ -789,15 +769,6 @@ fn direct_runtime_is_user_settable_and_disabled_by_default() {
     );
 }
 
-#[test]
-fn known_delta_store_is_enabled_by_default() {
-    assert_eq!(Feature::KnownDeltaStore.stage(), Stage::Stable);
-    assert_eq!(Feature::KnownDeltaStore.default_enabled(), true);
-    assert_eq!(
-        feature_for_key("known_delta_store"),
-        Some(Feature::KnownDeltaStore)
-    );
-}
 #[test]
 fn windows_only_feature_catalog_excludes_unix_shell_backends() {
     assert!(super::feature_for_key("shell_zsh_fork").is_none());

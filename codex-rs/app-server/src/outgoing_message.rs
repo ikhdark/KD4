@@ -1628,17 +1628,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn internal_api_visibility_is_minimal() {
-        let source = include_str!("outgoing_message.rs");
-        let obsolete_declaration = ["fn", " all_targets_accepted"].concat();
-
-        assert!(
-            !source.contains(&obsolete_declaration),
-            "obsolete test-only dispatch utility must remain removed"
-        );
-    }
-
     fn turn_completed_notification(thread_id: ThreadId, turn_id: &str) -> ServerNotification {
         ServerNotification::TurnCompleted(TurnCompletedNotification {
             surfaced_result: None,

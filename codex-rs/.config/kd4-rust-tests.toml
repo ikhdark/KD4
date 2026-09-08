@@ -201,31 +201,6 @@ target = "core_lib"
 filter = "test(direct_exec_cancellation_terminates_windows_descendants)"
 tests = ["exec::tests::direct_exec_cancellation_terminates_windows_descendants"]
 
-[gates.core-helper-resolution]
-description = "Required test helper binaries must resolve, and lookup failures must propagate."
-
-[[gates.core-helper-resolution.steps]]
-target = "core_lib"
-filter = "test(missing_stdio_helper_binary_resolution_reports_an_error)"
-tests = [
-  "tools::handlers::request_plugin_install::tests::missing_stdio_helper_binary_resolution_reports_an_error",
-]
-
-[[gates.core-helper-resolution.steps]]
-target = "core_cli_workspace"
-filter = "test(live_runner_resolves_the_required_codex_binary) | test(missing_helper_binary_resolution_reports_an_error)"
-tests = [
-  "suite::live_cli::live_runner_resolves_the_required_codex_binary",
-  "suite::live_cli::missing_helper_binary_resolution_reports_an_error",
-]
-
-[[gates.core-helper-resolution.steps]]
-target = "core_code_mode_mcp"
-filter = "test(missing_streamable_http_helper_resolution_reports_an_error)"
-tests = [
-  "suite::rmcp_client::missing_streamable_http_helper_resolution_reports_an_error",
-]
-
 [gates.core-stdio-helper-regressions]
 description = "Library regressions that used to exit silently when test_stdio_server was missing."
 

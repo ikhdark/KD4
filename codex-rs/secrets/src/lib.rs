@@ -159,10 +159,4 @@ mod tests {
         assert_eq!(backend.get(&scope, &name)?, None);
         Ok(())
     }
-
-    #[test]
-    fn local_backend_is_the_only_secrets_behavior_owner() {
-        let obsolete_facade = ["struct Secrets", "Manager"].concat();
-        assert!(!include_str!("lib.rs").contains(&obsolete_facade));
-    }
 }

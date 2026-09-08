@@ -197,8 +197,11 @@ export function shell_call(): SseEvent {
 
 export function responseFailed(errorMessage: string): SseEvent {
   return {
-    type: "error",
-    error: { code: "rate_limit_exceeded", message: errorMessage },
+    type: "response.failed",
+    response: {
+      id: DEFAULT_RESPONSE_ID,
+      error: { code: "server_error", message: errorMessage },
+    },
   };
 }
 

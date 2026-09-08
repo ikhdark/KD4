@@ -3,13 +3,6 @@ use crate::config::edit::ConfigEditsBuilder;
 use crate::config::edit::apply_blocking;
 use assert_matches::assert_matches;
 use codex_config::CONFIG_TOML_FILE;
-
-#[test]
-fn core_config_module_reexports_the_config_crate_filename_owner() {
-    let source = include_str!("mod.rs");
-    assert!(source.contains("pub use codex_config::CONFIG_TOML_FILE;"));
-    assert!(!source.contains("pub const CONFIG_TOML_FILE"));
-}
 use codex_config::ConfigLayerEntry;
 use codex_config::ConfigLayerSource;
 use codex_config::ConfigLayerStack;
@@ -5891,23 +5884,6 @@ bearer_token = "secret"
     assert!(err.to_string().contains("bearer_token is not supported"));
 
     Ok(())
-}
-
-#[test]
-fn retired_raw_config_loader_wrappers_are_removed() {
-    let source = include_str!("mod.rs");
-    let retired_names = [
-        ["load_config_as_toml_", "with_cli_overrides"].concat(),
-        ["load_config_as_toml_", "with_cli_and_loader_overrides"].concat(),
-        ["load_config_as_toml_", "with_cli_and_load_options"].concat(),
-    ];
-
-    for name in retired_names {
-        assert!(
-            !source.contains(&format!("pub async fn {name}")),
-            "retired raw ConfigToml loader wrapper still exists: {name}"
-        );
-    }
 }
 
 #[tokio::test]

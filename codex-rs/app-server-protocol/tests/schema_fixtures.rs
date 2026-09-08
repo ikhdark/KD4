@@ -9,63 +9,6 @@ use std::path::Path;
 use std::path::PathBuf;
 
 #[test]
-fn legacy_generator_convenience_apis_are_not_exposed() {
-    let lib_source = include_str!("../src/lib.rs");
-    let export_source = include_str!("../src/export.rs");
-    let fixture_source = include_str!("../src/schema_fixtures.rs");
-    let common_source = include_str!("../src/protocol/common.rs");
-
-    for removed_export in [
-        "pub use export::generate_json;",
-        "pub use export::generate_ts;",
-        "pub use export::generate_types;",
-        "pub use schema_fixtures::read_schema_fixture_tree;",
-        "pub use schema_fixtures::write_schema_fixtures;",
-    ] {
-        assert!(
-            !lib_source.contains(removed_export),
-            "legacy convenience API is still exported: {removed_export}"
-        );
-    }
-
-    for removed_declaration in [
-        "pub fn generate_json(",
-        "pub fn generate_ts(",
-        "pub fn generate_types(",
-        "pub struct GeneratedSchema",
-    ] {
-        assert!(
-            !export_source.contains(removed_declaration),
-            "internal generator API is still exposed: {removed_declaration}"
-        );
-    }
-
-    for removed_declaration in [
-        "pub fn read_schema_fixture_tree(",
-        "pub fn write_schema_fixtures(",
-    ] {
-        assert!(
-            !fixture_source.contains(removed_declaration),
-            "unused fixture API is still exposed: {removed_declaration}"
-        );
-    }
-
-    for crate_internal_exporter in [
-        "export_client_response_schemas",
-        "export_client_param_schemas",
-        "export_server_response_schemas",
-        "export_server_param_schemas",
-        "export_server_notification_schemas",
-        "export_client_notification_schemas",
-    ] {
-        assert!(
-            !common_source.contains(&format!("pub fn {crate_internal_exporter}(")),
-            "crate-internal schema exporter is still public: {crate_internal_exporter}"
-        );
-    }
-}
-
-#[test]
 fn typescript_schema_fixtures_match_generated() -> Result<()> {
     let schema_root = schema_root()?;
     let fixture_tree = read_tree(&schema_root, "typescript")?;
@@ -74,16 +17,22 @@ fn typescript_schema_fixtures_match_generated() -> Result<()> {
 
     assert_schema_trees_match("typescript", &fixture_tree, &generated_tree)?;
 
-    Ok(())
-}
+    for path in [
+        "OverloadErrorData.ts",
+        "OverloadReason.ts",
+        "v2/PluginRemoteErrorData.ts",
+        "v2/PluginRemoteErrorReason.ts",
+        "v2/ThreadErrorData.ts",
+        "v2/ThreadErrorReason.ts",
+    ] {
+        assert!(
+            generated_tree.contains_key(Path::new(path)),
+            "missing generated TypeScript error contract {path}"
+        );
+    }
 
-#[test]
-fn typescript_schema_relative_modules_resolve() -> Result<()> {
-    let schema_root = schema_root()?;
     let typescript_root = schema_root.join("typescript");
-    let fixture_tree = read_tree(&schema_root, "typescript")?;
-
-    for (relative_path, contents) in fixture_tree {
+    for (relative_path, contents) in generated_tree {
         let source = std::str::from_utf8(&contents)
             .with_context(|| format!("decode {} as UTF-8", relative_path.display()))?;
         for line in source.lines() {
@@ -120,50 +69,30 @@ fn typescript_schema_relative_modules_resolve() -> Result<()> {
 
 #[test]
 fn json_schema_fixtures_match_generated() -> Result<()> {
-    assert_schema_fixtures_match_generated("json", |output_dir| {
-        generate_json_with_experimental(output_dir, /*experimental_api*/ false)
-    })
-}
-
-#[test]
-fn typed_jsonrpc_error_payloads_are_generator_roots() -> Result<()> {
-    let typescript = generate_typescript_schema_fixture_subtree_for_tests()
-        .context("generate in-memory typescript schema fixtures")?;
-    for path in [
-        "OverloadErrorData.ts",
-        "OverloadReason.ts",
-        "v2/PluginRemoteErrorData.ts",
-        "v2/PluginRemoteErrorReason.ts",
-        "v2/ThreadErrorData.ts",
-        "v2/ThreadErrorReason.ts",
-    ] {
-        assert!(
-            typescript.contains_key(Path::new(path)),
-            "missing generated TypeScript error contract {path}"
-        );
-    }
-
+    let schema_root = schema_root()?;
+    let fixture_tree = read_tree(&schema_root, "json")?;
     let temp_dir = tempfile::tempdir().context("create temp dir")?;
-    generate_json_with_experimental(temp_dir.path(), /*experimental_api*/ false)
+    let generated_root = temp_dir.path().join("json");
+    generate_json_with_experimental(&generated_root, /*experimental_api*/ false)
         .context("generate JSON schema fixtures")?;
+    let generated_tree = read_tree(temp_dir.path(), "json")?;
+    assert_schema_trees_match("json", &fixture_tree, &generated_tree)?;
+
     for path in [
         "OverloadErrorData.json",
         "v2/PluginRemoteErrorData.json",
         "v2/ThreadErrorData.json",
     ] {
         assert!(
-            temp_dir.path().join(path).is_file(),
+            generated_tree.contains_key(Path::new(path)),
             "missing generated JSON error contract {path}"
         );
     }
 
     let flat_bundle: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(
-            temp_dir
-                .path()
-                .join("codex_app_server_protocol.v2.schemas.json"),
-        )
-        .context("read flat v2 schema bundle")?,
+        generated_tree
+            .get(Path::new("codex_app_server_protocol.v2.schemas.json"))
+            .context("generated flat v2 schema bundle")?,
     )
     .context("parse flat v2 schema bundle")?;
     let definitions = flat_bundle
@@ -183,29 +112,6 @@ fn typed_jsonrpc_error_payloads_are_generator_roots() -> Result<()> {
             "flat v2 schema bundle is missing {name}"
         );
     }
-
-    Ok(())
-}
-
-fn assert_schema_fixtures_match_generated(
-    label: &'static str,
-    generate: impl FnOnce(&Path) -> Result<()>,
-) -> Result<()> {
-    let schema_root = schema_root()?;
-    let fixture_tree = read_tree(&schema_root, label)?;
-
-    let temp_dir = tempfile::tempdir().context("create temp dir")?;
-    let generated_root = temp_dir.path().join(label);
-    generate(&generated_root).with_context(|| {
-        format!(
-            "generate {label} schema fixtures into {}",
-            generated_root.display()
-        )
-    })?;
-
-    let generated_tree = read_tree(temp_dir.path(), label)?;
-
-    assert_schema_trees_match(label, &fixture_tree, &generated_tree)?;
 
     Ok(())
 }

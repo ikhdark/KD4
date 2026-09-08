@@ -1,0 +1,10 @@
+C:\Users\kuh\Desktop\kd4\codex-rs\codex-rs\target\lanes\suite-cleanup\debug\deps\autocfg-c09252ce5ae5502a.d: C:\Users\kuh\scoop\persist\rustup\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\autocfg-1.5.1\src\lib.rs C:\Users\kuh\scoop\persist\rustup\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\autocfg-1.5.1\src\error.rs C:\Users\kuh\scoop\persist\rustup\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\autocfg-1.5.1\src\rustc.rs C:\Users\kuh\scoop\persist\rustup\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\autocfg-1.5.1\src\version.rs
+
+C:\Users\kuh\Desktop\kd4\codex-rs\codex-rs\target\lanes\suite-cleanup\debug\deps\libautocfg-c09252ce5ae5502a.rlib: C:\Users\kuh\scoop\persist\rustup\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\autocfg-1.5.1\src\lib.rs C:\Users\kuh\scoop\persist\rustup\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\autocfg-1.5.1\src\error.rs C:\Users\kuh\scoop\persist\rustup\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\autocfg-1.5.1\src\rustc.rs C:\Users\kuh\scoop\persist\rustup\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\autocfg-1.5.1\src\version.rs
+
+C:\Users\kuh\Desktop\kd4\codex-rs\codex-rs\target\lanes\suite-cleanup\debug\deps\libautocfg-c09252ce5ae5502a.rmeta: C:\Users\kuh\scoop\persist\rustup\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\autocfg-1.5.1\src\lib.rs C:\Users\kuh\scoop\persist\rustup\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\autocfg-1.5.1\src\error.rs C:\Users\kuh\scoop\persist\rustup\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\autocfg-1.5.1\src\rustc.rs C:\Users\kuh\scoop\persist\rustup\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\autocfg-1.5.1\src\version.rs
+
+C:\Users\kuh\scoop\persist\rustup\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\autocfg-1.5.1\src\lib.rs:
+C:\Users\kuh\scoop\persist\rustup\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\autocfg-1.5.1\src\error.rs:
+C:\Users\kuh\scoop\persist\rustup\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\autocfg-1.5.1\src\rustc.rs:
+C:\Users\kuh\scoop\persist\rustup\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\autocfg-1.5.1\src\version.rs:

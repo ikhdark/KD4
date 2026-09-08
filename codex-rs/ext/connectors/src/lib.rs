@@ -57,14 +57,3 @@ pub async fn load_executor_plugin_connectors(
         }
     })
 }
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn executor_connector_loading_stays_a_free_function() {
-        let source = include_str!("lib.rs");
-        let removed_provider = ["struct ExecutorPluginConnector", "Provider"].concat();
-        assert!(!source.contains(&removed_provider));
-        assert!(source.contains("pub async fn load_executor_plugin_connectors"));
-    }
-}

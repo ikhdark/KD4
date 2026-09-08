@@ -127,36 +127,3 @@ pub const DB_LOG_PHASE_DURATION_METRIC: &str = "codex.sqlite.logs.phase.duration
 pub const DB_LOG_RETENTION_METRIC: &str = "codex.sqlite.logs.retention.count";
 /// Rollout fallback attempts. Tags: [caller, reason]
 pub const DB_FALLBACK_METRIC: &str = "codex.sqlite.fallback.count";
-
-#[cfg(test)]
-mod module_consolidation_tests {
-    use std::path::Path;
-
-    #[test]
-    fn runtime_owns_its_file_timestamp_helper() {
-        let state_lib = include_str!("lib.rs");
-        let runtime = include_str!("runtime.rs");
-        let obsolete_paths_module = ["mod pa", "ths;"].concat();
-
-        assert!(!state_lib.contains(&obsolete_paths_module));
-        assert!(runtime.contains("async fn file_modified_time_utc"));
-    }
-
-    #[test]
-    fn validation_history_is_migration_only() {
-        let state_lib = include_str!("lib.rs");
-        let runtime = include_str!("runtime.rs");
-        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let obsolete_module = ["mod validation_", "history;"].concat();
-        let obsolete_store = ["ValidationHistory", "Store"].concat();
-
-        assert!(!state_lib.contains(&obsolete_module));
-        assert!(!runtime.contains(&obsolete_store));
-        assert!(!manifest_dir.join("src/validation_history.rs").exists());
-        assert!(
-            manifest_dir
-                .join("migrations/0041_validation_history.sql")
-                .is_file()
-        );
-    }
-}

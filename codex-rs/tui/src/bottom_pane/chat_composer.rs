@@ -7255,107 +7255,80 @@ mod tests {
         use crossterm::event::KeyEvent;
         use crossterm::event::KeyModifiers;
 
-        let (tx, _rx) = unbounded_channel::<AppEvent>();
-        let sender = AppEventSender::new(tx);
-        let mut composer = ChatComposer::new(
-            /*has_input_focus*/ true,
-            sender,
-            /*enhanced_keys_supported*/ false,
-            "Ask Codex to do anything".to_string(),
-            /*disable_paste_burst*/ false,
-        );
-        let input = "x".repeat(MAX_USER_INPUT_TEXT_CHARS);
-        composer.draft.textarea.set_text_clearing_elements(&input);
+        for key in [KeyCode::Enter, KeyCode::Tab] {
+            let (tx, _rx) = unbounded_channel::<AppEvent>();
+            let sender = AppEventSender::new(tx);
+            let mut composer = ChatComposer::new(
+                /*has_input_focus*/ true,
+                sender,
+                /*enhanced_keys_supported*/ false,
+                "Ask Codex to do anything".to_string(),
+                /*disable_paste_burst*/ false,
+            );
+            composer.set_task_running(key == KeyCode::Tab);
+            let input = "x".repeat(MAX_USER_INPUT_TEXT_CHARS);
+            composer.set_text_content(input.clone(), Vec::new(), Vec::new());
 
-        let (result, _needs_redraw) =
-            composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            let (result, _needs_redraw) =
+                composer.handle_key_event(KeyEvent::new(key, KeyModifiers::NONE));
 
-        assert!(matches!(
-            result,
-            InputResult::Submitted { text, .. } if text == input
-        ));
+            match (key, result) {
+                (KeyCode::Enter, InputResult::Submitted { text, .. })
+                | (KeyCode::Tab, InputResult::Queued { text, .. }) => assert_eq!(text, input),
+                (key, result) => panic!("unexpected result for {key:?}: {result:?}"),
+            }
+        }
     }
 
     #[test]
-    fn oversized_submit_reports_error_and_restores_draft() {
+    fn oversized_submission_reports_error_and_restores_draft() {
         use crossterm::event::KeyCode;
         use crossterm::event::KeyEvent;
         use crossterm::event::KeyModifiers;
 
-        let (tx, mut rx) = unbounded_channel::<AppEvent>();
-        let sender = AppEventSender::new(tx);
-        let mut composer = ChatComposer::new(
-            /*has_input_focus*/ true,
-            sender,
-            /*enhanced_keys_supported*/ false,
-            "Ask Codex to do anything".to_string(),
-            /*disable_paste_burst*/ false,
-        );
-        let input = "x".repeat(MAX_USER_INPUT_TEXT_CHARS + 1);
-        composer.draft.textarea.set_text_clearing_elements(&input);
+        for (running, key) in [
+            (false, KeyCode::Enter),
+            (true, KeyCode::Enter),
+            (true, KeyCode::Tab),
+        ] {
+            let (tx, mut rx) = unbounded_channel::<AppEvent>();
+            let sender = AppEventSender::new(tx);
+            let mut composer = ChatComposer::new(
+                /*has_input_focus*/ true,
+                sender,
+                /*enhanced_keys_supported*/ false,
+                "Ask Codex to do anything".to_string(),
+                /*disable_paste_burst*/ false,
+            );
+            composer.set_task_running(running);
+            let input = "x".repeat(MAX_USER_INPUT_TEXT_CHARS + 1);
+            composer.set_text_content(input.clone(), Vec::new(), Vec::new());
 
-        let (result, _needs_redraw) =
-            composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            let (result, _needs_redraw) =
+                composer.handle_key_event(KeyEvent::new(key, KeyModifiers::NONE));
 
-        assert_eq!(InputResult::None, result);
-        assert_eq!(composer.draft.textarea.text(), input);
+            assert_eq!(InputResult::None, result);
+            assert_eq!(composer.draft.textarea.text(), input);
 
-        let mut found_error = false;
-        while let Ok(event) = rx.try_recv() {
-            if let AppEvent::InsertHistoryCell(cell) = event {
-                let message = cell
-                    .display_lines(/*width*/ 80)
-                    .into_iter()
-                    .map(|line| line.to_string())
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                assert!(message.contains(&user_input_too_large_message(input.chars().count())));
-                found_error = true;
-                break;
+            let mut found_error = false;
+            while let Ok(event) = rx.try_recv() {
+                if let AppEvent::InsertHistoryCell(cell) = event {
+                    let message = cell
+                        .display_lines(/*width*/ 80)
+                        .into_iter()
+                        .map(|line| line.to_string())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    assert!(message.contains(&format!(
+                        "Message exceeds the maximum length of {MAX_USER_INPUT_TEXT_CHARS} characters ({} provided).",
+                        MAX_USER_INPUT_TEXT_CHARS + 1,
+                    )), "{key:?}: {message}");
+                    found_error = true;
+                    break;
+                }
             }
+            assert!(found_error, "expected oversized-input error history cell");
         }
-        assert!(found_error, "expected oversized-input error history cell");
-    }
-
-    #[test]
-    fn oversized_queued_submission_reports_error_and_restores_draft() {
-        use crossterm::event::KeyCode;
-        use crossterm::event::KeyEvent;
-        use crossterm::event::KeyModifiers;
-
-        let (tx, mut rx) = unbounded_channel::<AppEvent>();
-        let sender = AppEventSender::new(tx);
-        let mut composer = ChatComposer::new(
-            /*has_input_focus*/ true,
-            sender,
-            /*enhanced_keys_supported*/ false,
-            "Ask Codex to do anything".to_string(),
-            /*disable_paste_burst*/ false,
-        );
-        let input = "x".repeat(MAX_USER_INPUT_TEXT_CHARS + 1);
-        composer.draft.textarea.set_text_clearing_elements(&input);
-
-        let (result, _needs_redraw) =
-            composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-
-        assert_eq!(InputResult::None, result);
-        assert_eq!(composer.draft.textarea.text(), input);
-
-        let mut found_error = false;
-        while let Ok(event) = rx.try_recv() {
-            if let AppEvent::InsertHistoryCell(cell) = event {
-                let message = cell
-                    .display_lines(/*width*/ 80)
-                    .into_iter()
-                    .map(|line| line.to_string())
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                assert!(message.contains(&user_input_too_large_message(input.chars().count())));
-                found_error = true;
-                break;
-            }
-        }
-        assert!(found_error, "expected oversized-input error history cell");
     }
 
     /// Behavior: editing that removes a paste placeholder should also clear the associated

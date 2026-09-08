@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import queue
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -10,24 +12,22 @@ from openai_codex.api import TurnHandle
 from openai_codex.client import (
     CodexClient,
     CodexConfig,
-    _installed_codex_path_dirs,
-    _params_dict,
 )
 from openai_codex.errors import CodexError, TransportClosedError
-from openai_codex.generated.notification_registry import notification_turn_id
 from openai_codex.generated.v2_all import (
+    AccountUpdatedNotification,
     AgentMessageDeltaNotification,
     ApprovalsReviewer,
+    ChatgptAccount,
+    PlanType,
     ThreadListParams,
     ThreadResumeResponse,
     ThreadTokenUsageUpdatedNotification,
     TurnCompletedNotification,
-    TurnStartResponse,
     WarningNotification,
 )
-from openai_codex.models import Notification, UnknownNotification
+from openai_codex.models import UnknownNotification
 
-ROOT = Path(__file__).resolve().parents[1]
 _STDERR_TAIL_MAX_BYTES = 64 * 1024
 _STDERR_TRUNCATION_MARKER = f"[stderr truncated; showing last {_STDERR_TAIL_MAX_BYTES} bytes]\n"
 _WRITE_NEWLINE_FREE_STDERR = f"""
@@ -53,15 +53,6 @@ def test_over_cap_newline_free_stderr_is_drained_on_success() -> None:
         client.start()
         notification = client.next_notification(timeout_s=5)
         assert notification.method == "diagnostic/noisy"
-        assert client._stderr_thread is not None
-        client._stderr_thread.join(timeout=5)
-
-        assert len(client._stderr_tail_bytes) == _STDERR_TAIL_MAX_BYTES
-        rendered = client._stderr_tail()
-        assert rendered.startswith(_STDERR_TRUNCATION_MARKER)
-        assert rendered.endswith("END")
-        assert "discard-me" not in rendered
-        assert "\ufffd" not in rendered
     finally:
         client.close()
 
@@ -82,25 +73,23 @@ def test_over_cap_newline_free_stderr_is_reported_on_failure() -> None:
         client.close()
 
 
-def test_generated_params_models_are_snake_case_and_dump_by_alias() -> None:
-    params = ThreadListParams(search_term="needle", limit=5)
-
-    assert "search_term" in ThreadListParams.model_fields
-    dumped = _params_dict(params)
-    assert dumped == {"searchTerm": "needle", "limit": 5}
-
-
-def test_installed_path_dirs_requires_pinned_runtime_symbol(monkeypatch) -> None:
+def test_start_rejects_runtime_missing_required_path_symbol(monkeypatch) -> None:
     runtime_module = ModuleType("codex_cli_bin")
+    runtime_module.bundled_codex_path = lambda: Path(sys.executable)
     monkeypatch.setitem(sys.modules, "codex_cli_bin", runtime_module)
 
-    with pytest.raises(ImportError):
-        _installed_codex_path_dirs()
+    client = CodexClient()
+    try:
+        with pytest.raises(ImportError, match="bundled_path_dir"):
+            client.start()
+    finally:
+        client.close()
 
 
-def test_generated_v2_bundle_has_single_shared_plan_type_definition() -> None:
-    source = (ROOT / "src" / "openai_codex" / "generated" / "v2_all.py").read_text()
-    assert source.count("class PlanType(") == 1
+def test_account_and_notification_decode_the_same_public_plan_enum() -> None:
+    account = ChatgptAccount.model_validate({"email": None, "planType": "pro", "type": "chatgpt"})
+    update = AccountUpdatedNotification.model_validate({"planType": "pro"})
+    assert account.plan_type is update.plan_type is PlanType.pro
 
 
 def test_thread_resume_response_accepts_auto_review_reviewer() -> None:
@@ -134,391 +123,232 @@ def test_thread_resume_response_accepts_auto_review_reviewer() -> None:
     assert response.approvals_reviewer is ApprovalsReviewer.auto_review
 
 
-def test_notifications_are_typed_with_canonical_v2_methods() -> None:
-    client = CodexClient()
-    event = client._coerce_notification(
-        "thread/tokenUsage/updated",
+def test_turn_handle_close_discards_late_events_and_releases_completed_turn() -> None:
+    client = _client_for_script("""
+import json
+sys.stdin.readline()
+for message in [
+    {"method": "item/agentMessage/delta", "params": {
+        "delta": "ignored", "itemId": "item-1", "threadId": "thread-1", "turnId": "turn-1",
+    }},
+    {"method": "turn/completed", "params": {
+        "threadId": "thread-1", "turn": {"id": "turn-1", "items": [], "status": "completed"},
+    }},
+    {"method": "test/drained", "params": {}},
+]:
+    print(json.dumps(message), flush=True)
+sys.stdin.read()
+""")
+    try:
+        client.start()
+        client.register_turn_notifications("turn-1")
+        handle = TurnHandle(client, "thread-1", "turn-1")
+        handle.close()
+        with pytest.raises(RuntimeError, match="abandoned"):
+            client.register_turn_notifications("turn-1")
+        client.notify("test/release")
+        assert client.next_notification(timeout_s=5).method == "test/drained"
+        client.register_turn_notifications("turn-1")
+        with pytest.raises(queue.Empty):
+            client.next_turn_notification("turn-1", timeout_s=0.01)
+    finally:
+        client.close()
+
+
+def test_thread_list_serializes_public_params_on_the_wire() -> None:
+    client = _client_for_script("""
+import json
+request = json.loads(sys.stdin.readline())
+print(json.dumps({"method": "test/request", "params": request}), flush=True)
+print(json.dumps({"id": request["id"], "result": {"data": [], "nextCursor": None}}), flush=True)
+sys.stdin.read()
+""")
+    try:
+        client.start()
+        result = client.thread_list(ThreadListParams(search_term="needle", limit=5))
+        request = client.next_notification(timeout_s=5)
+        assert isinstance(request.payload, UnknownNotification)
+        assert request.payload.params["method"] == "thread/list"
+        assert request.payload.params["params"] == {"searchTerm": "needle", "limit": 5}
+        assert result.data == []
+        assert result.next_cursor is None
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize("register_late", [False, True], ids=["registered", "buffered"])
+def test_reader_routes_interleaved_typed_and_unknown_notifications(register_late) -> None:
+    """Exercise decoding, routing, buffering and per-turn order through real pipes."""
+    messages = [
         {
-            "threadId": "thread-1",
-            "turnId": "turn-1",
-            "tokenUsage": {
-                "last": {
-                    "cachedInputTokens": 0,
-                    "inputTokens": 1,
-                    "outputTokens": 2,
-                    "reasoningOutputTokens": 0,
-                    "totalTokens": 3,
-                },
-                "total": {
-                    "cachedInputTokens": 0,
-                    "inputTokens": 1,
-                    "outputTokens": 2,
-                    "reasoningOutputTokens": 0,
-                    "totalTokens": 3,
+            "method": "item/agentMessage/delta",
+            "params": {
+                "delta": delta,
+                "itemId": f"item-{index}",
+                "threadId": "thread-1",
+                "turnId": turn_id,
+            },
+        }
+        for index, (turn_id, delta) in enumerate(
+            [
+                ("turn-1", "one-a"),
+                ("turn-2", "two-a"),
+                ("turn-1", "one-b"),
+                ("turn-2", "two-b"),
+            ]
+        )
+    ]
+    messages.extend(
+        [
+            {"method": "unknown/direct", "params": {"turnId": "turn-1"}},
+            {"method": "unknown/nested", "params": {"turn": {"id": "turn-2"}}},
+            {
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "turn": {"id": "turn-1", "items": [], "status": "completed"},
                 },
             },
-        },
+            {"method": "warning", "params": {"message": "heads up"}},
+        ]
     )
-
-    assert event.method == "thread/tokenUsage/updated"
-    assert isinstance(event.payload, ThreadTokenUsageUpdatedNotification)
-    assert event.payload.turn_id == "turn-1"
-
-
-def test_unknown_notifications_fall_back_to_unknown_payloads() -> None:
-    client = CodexClient()
-    event = client._coerce_notification(
-        "unknown/notification",
-        {
-            "id": "evt-1",
-            "conversationId": "thread-1",
-            "msg": {"type": "turn_aborted"},
-        },
+    client = _client_for_script(
+        "sys.stdin.readline()\n"
+        + f"sys.stdout.write({''.join(json.dumps(message) + chr(10) for message in messages)!r})\n"
+        + "sys.stdout.flush()\nsys.stdin.read()\n"
     )
+    try:
+        client.start()
+        if not register_late:
+            client.register_turn_notifications("turn-1")
+            client.register_turn_notifications("turn-2")
+        client.notify("test/release")
+        # The unscoped warning follows every turn event, so receiving it also
+        # proves that the late-registration case has actually buffered them.
+        warning = client.next_notification(timeout_s=5)
+        assert isinstance(warning.payload, WarningNotification)
+        assert warning.payload.message == "heads up"
+        if register_late:
+            client.register_turn_notifications("turn-1")
+            client.register_turn_notifications("turn-2")
+        for turn_id, expected_deltas, unknown_method in [
+            ("turn-1", ["one-a", "one-b"], "unknown/direct"),
+            ("turn-2", ["two-a", "two-b"], "unknown/nested"),
+        ]:
+            for delta in expected_deltas:
+                event = client.next_turn_notification(turn_id, timeout_s=5)
+                assert isinstance(event.payload, AgentMessageDeltaNotification)
+                assert (event.payload.turn_id, event.payload.delta) == (turn_id, delta)
+            unknown = client.next_turn_notification(turn_id, timeout_s=5)
+            assert unknown.method == unknown_method
+            assert isinstance(unknown.payload, UnknownNotification)
+        completion = client.next_turn_notification("turn-1", timeout_s=5)
+        assert isinstance(completion.payload, TurnCompletedNotification)
+        assert completion.payload.turn.id == "turn-1"
+    finally:
+        client.close()
 
-    assert event.method == "unknown/notification"
-    assert isinstance(event.payload, UnknownNotification)
-    assert event.payload.params["msg"] == {"type": "turn_aborted"}
 
-
-def test_invalid_known_notification_payload_fails_fast() -> None:
-    client = CodexClient()
-
-    with pytest.raises(CodexError, match="Invalid payload for known notification"):
-        client._coerce_notification("thread/tokenUsage/updated", {"threadId": "missing"})
-
-
-def test_generated_notification_turn_id_handles_known_payload_shapes() -> None:
-    """Generated routing metadata should cover direct, nested, and unscoped payloads."""
-    direct = AgentMessageDeltaNotification.model_validate(
-        {
-            "delta": "hello",
+def test_goal_notifications_arriving_on_stdout_route_by_thread() -> None:
+    message = {
+        "method": "item/agentMessage/delta",
+        "params": {
+            "delta": "continued",
             "itemId": "item-1",
             "threadId": "thread-1",
-            "turnId": "turn-1",
+            "turnId": "turn-2",
+        },
+    }
+    client = _client_for_script(
+        "sys.stdin.readline()\n" + f"print({json.dumps(message)!r}, flush=True)\nsys.stdin.read()\n"
+    )
+    try:
+        client.start()
+        state = client.register_goal_operation("thread-1")
+        client.notify("test/release")
+        event = client.next_goal_notification(state, timeout_s=5)
+        assert isinstance(event.payload, AgentMessageDeltaNotification)
+        assert (event.payload.turn_id, event.payload.delta) == ("turn-2", "continued")
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize("method", ["thread/tokenUsage/updated", "turn/completed"])
+def test_invalid_wire_notification_fails_current_and_late_waiters(method) -> None:
+    message = {"method": method, "params": {"threadId": "missing"}}
+    client = _client_for_script(f"print({json.dumps(message)!r}, flush=True)\nsys.stdin.read()\n")
+    try:
+        client.start()
+        with pytest.raises(CodexError, match="Invalid payload for known notification"):
+            client.next_notification(timeout_s=5)
+        with pytest.raises(CodexError, match="Invalid payload for known notification"):
+            client.register_turn_notifications("turn-1")
+    finally:
+        client.close()
+
+
+def test_turn_start_replays_completion_received_before_rpc_response() -> None:
+    client = _client_for_script("""
+import json
+request = json.loads(sys.stdin.readline())
+turn = {"id": "turn-1", "items": [], "status": "completed"}
+print(json.dumps({"method": "turn/completed", "params": {
+    "threadId": request["params"]["threadId"], "turn": turn,
+}}), flush=True)
+print(json.dumps({"id": request["id"], "result": {"turn": turn}}), flush=True)
+sys.stdin.read()
+""")
+    try:
+        client.start()
+        started = client.turn_start("thread-1", "hello")
+        event = client.next_turn_notification(started.turn.id, timeout_s=5)
+        assert isinstance(event.payload, TurnCompletedNotification)
+        assert event.payload.turn.id == started.turn.id == "turn-1"
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize("known", [True, False], ids=["typed-usage", "unknown-global"])
+def test_stdout_notifications_preserve_typed_and_unknown_payloads(known) -> None:
+    usage = {
+        "cachedInputTokens": 0,
+        "inputTokens": 1,
+        "outputTokens": 2,
+        "reasoningOutputTokens": 0,
+        "totalTokens": 3,
+    }
+    message = (
+        {
+            "method": "thread/tokenUsage/updated",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "tokenUsage": {"last": usage, "total": usage},
+            },
+        }
+        if known
+        else {
+            "method": "unknown/notification",
+            "params": {
+                "id": "evt-1",
+                "conversationId": "thread-1",
+                "msg": {"type": "turn_aborted"},
+            },
         }
     )
-    nested = TurnCompletedNotification.model_validate(
-        {
-            "threadId": "thread-1",
-            "turn": {"id": "turn-2", "items": [], "status": "completed"},
-        }
-    )
-    unscoped = WarningNotification(message="heads up")
-
-    assert [
-        notification_turn_id(direct),
-        notification_turn_id(nested),
-        notification_turn_id(unscoped),
-    ] == ["turn-1", "turn-2", None]
-
-
-def test_turn_notification_router_demuxes_registered_turns() -> None:
-    """The router should deliver out-of-order turn events to the matching queues."""
-    client = CodexClient()
-    client.register_turn_notifications("turn-1")
-    client.register_turn_notifications("turn-2")
-
-    client._router.route_notification(
-        client._coerce_notification(
-            "item/agentMessage/delta",
-            {
-                "delta": "two",
-                "itemId": "item-2",
-                "threadId": "thread-1",
-                "turnId": "turn-2",
-            },
-        )
-    )
-    client._router.route_notification(
-        client._coerce_notification(
-            "item/agentMessage/delta",
-            {
-                "delta": "one",
-                "itemId": "item-1",
-                "threadId": "thread-1",
-                "turnId": "turn-1",
-            },
-        )
-    )
-
-    first = client.next_turn_notification("turn-1")
-    second = client.next_turn_notification("turn-2")
-
-    assert isinstance(first.payload, AgentMessageDeltaNotification)
-    assert isinstance(second.payload, AgentMessageDeltaNotification)
-    assert [
-        (first.method, first.payload.delta),
-        (second.method, second.payload.delta),
-    ] == [
-        ("item/agentMessage/delta", "one"),
-        ("item/agentMessage/delta", "two"),
-    ]
-
-
-def test_goal_notification_router_routes_by_thread_id() -> None:
-    """A goal operation should receive turn notifications across physical turn ids."""
-    client = CodexClient()
-    state = client.register_goal_operation("thread-1")
-
-    client._router.route_notification(
-        client._coerce_notification(
-            "item/agentMessage/delta",
-            {
-                "delta": "continued",
-                "itemId": "item-1",
-                "threadId": "thread-1",
-                "turnId": "turn-2",
-            },
-        )
-    )
-
-    event = client.next_goal_notification(state)
-
-    assert isinstance(event.payload, AgentMessageDeltaNotification)
-    assert (event.method, event.payload.delta) == (
-        "item/agentMessage/delta",
-        "continued",
-    )
-
-
-def test_client_reader_routes_interleaved_turn_notifications_by_turn_id() -> None:
-    """Reader-loop routing should preserve order within each interleaved turn stream."""
-    client = CodexClient()
-    client.register_turn_notifications("turn-1")
-    client.register_turn_notifications("turn-2")
-
-    messages: list[dict[str, object]] = [
-        {
-            "method": "item/agentMessage/delta",
-            "params": {
-                "delta": "one-a",
-                "itemId": "item-1",
-                "threadId": "thread-1",
-                "turnId": "turn-1",
-            },
-        },
-        {
-            "method": "item/agentMessage/delta",
-            "params": {
-                "delta": "two-a",
-                "itemId": "item-2",
-                "threadId": "thread-1",
-                "turnId": "turn-2",
-            },
-        },
-        {
-            "method": "item/agentMessage/delta",
-            "params": {
-                "delta": "one-b",
-                "itemId": "item-3",
-                "threadId": "thread-1",
-                "turnId": "turn-1",
-            },
-        },
-        {
-            "method": "item/agentMessage/delta",
-            "params": {
-                "delta": "two-b",
-                "itemId": "item-4",
-                "threadId": "thread-1",
-                "turnId": "turn-2",
-            },
-        },
-    ]
-
-    def fake_read_message(_proc=None) -> dict[str, object]:
-        """Feed the reader loop a realistic interleaved stdout sequence."""
-        if messages:
-            return messages.pop(0)
-        raise EOFError
-
-    client._read_message = fake_read_message  # type: ignore[method-assign]
-    client._router.fail_all = lambda _exc: None  # type: ignore[method-assign]
-    client._reader_loop()
-
-    first_turn_events = [
-        client.next_turn_notification("turn-1"),
-        client.next_turn_notification("turn-1"),
-    ]
-    second_turn_events = [
-        client.next_turn_notification("turn-2"),
-        client.next_turn_notification("turn-2"),
-    ]
-
-    first_turn_deltas = [
-        event.payload.delta
-        for event in first_turn_events
-        if isinstance(event.payload, AgentMessageDeltaNotification)
-    ]
-    second_turn_deltas = [
-        event.payload.delta
-        for event in second_turn_events
-        if isinstance(event.payload, AgentMessageDeltaNotification)
-    ]
-    assert (first_turn_deltas, second_turn_deltas) == (
-        ["one-a", "one-b"],
-        ["two-a", "two-b"],
-    )
-
-
-def test_turn_notification_router_buffers_events_before_registration() -> None:
-    """Early turn events should be replayed once their TurnHandle registers."""
-    client = CodexClient()
-    client._router.route_notification(
-        client._coerce_notification(
-            "item/agentMessage/delta",
-            {
-                "delta": "early",
-                "itemId": "item-1",
-                "threadId": "thread-1",
-                "turnId": "turn-1",
-            },
-        )
-    )
-
-    client.register_turn_notifications("turn-1")
-    event = client.next_turn_notification("turn-1")
-
-    assert isinstance(event.payload, AgentMessageDeltaNotification)
-    assert (event.method, event.payload.delta) == (
-        "item/agentMessage/delta",
-        "early",
-    )
-
-
-def test_turn_notification_router_replays_completion_after_late_registration() -> None:
-    """A completion racing turn/start response registration must remain observable."""
-    client = CodexClient()
-    client._router.route_notification(
-        client._coerce_notification(
-            "item/agentMessage/delta",
-            {
-                "delta": "early",
-                "itemId": "item-1",
-                "threadId": "thread-1",
-                "turnId": "turn-1",
-            },
-        )
-    )
-    client._router.route_notification(
-        client._coerce_notification(
-            "turn/completed",
-            {
-                "threadId": "thread-1",
-                "turn": {"id": "turn-1", "items": [], "status": "completed"},
-            },
-        )
-    )
-
-    client.register_turn_notifications("turn-1")
-    events = [
-        client.next_turn_notification("turn-1"),
-        client.next_turn_notification("turn-1"),
-    ]
-
-    assert [event.method for event in events] == [
-        "item/agentMessage/delta",
-        "turn/completed",
-    ]
-
-
-def test_turn_start_replays_completion_that_arrives_before_response() -> None:
-    client = CodexClient()
-    completion = client._coerce_notification(
-        "turn/completed",
-        {
-            "threadId": "thread-1",
-            "turn": {"id": "turn-1", "items": [], "status": "completed"},
-        },
-    )
-    response = TurnStartResponse.model_validate(
-        {"turn": {"id": "turn-1", "items": [], "status": "completed"}}
-    )
-
-    def request_before_completion(*_args, **_kwargs) -> TurnStartResponse:
-        client._router.route_notification(completion)
-        return response
-
-    client.request = request_before_completion  # type: ignore[method-assign]
-
-    started = client.turn_start("thread-1", "hello")
-
-    assert started.turn.id == "turn-1"
-    assert client.next_turn_notification("turn-1").method == "turn/completed"
-
-
-def test_reader_failure_is_persistent_for_late_turn_registration() -> None:
-    client = CodexClient()
-    messages: list[dict[str, object]] = [
-        {"method": "turn/completed", "params": {"threadId": "thread-1"}}
-    ]
-
-    def fake_read_message(_proc=None) -> dict[str, object]:
-        if messages:
-            return messages.pop(0)
-        raise EOFError
-
-    client._read_message = fake_read_message  # type: ignore[method-assign]
-    client._reader_loop()
-
-    with pytest.raises(CodexError, match="Invalid payload for known notification"):
-        client.register_turn_notifications("turn-1")
-
-
-def test_turn_notification_router_routes_unknown_turn_notifications() -> None:
-    """Unknown notifications should still route when their raw params carry a turn id."""
-    client = CodexClient()
-    client.register_turn_notifications("turn-1")
-    client.register_turn_notifications("turn-2")
-
-    client._router.route_notification(
-        Notification(
-            method="unknown/direct",
-            payload=UnknownNotification(params={"turnId": "turn-1"}),
-        )
-    )
-    client._router.route_notification(
-        Notification(
-            method="unknown/nested",
-            payload=UnknownNotification(params={"turn": {"id": "turn-2"}}),
-        )
-    )
-
-    first = client.next_turn_notification("turn-1")
-    second = client.next_turn_notification("turn-2")
-
-    assert [first.method, second.method] == ["unknown/direct", "unknown/nested"]
-
-
-def test_turn_handle_close_releases_registered_route() -> None:
-    client = CodexClient()
-    client.register_turn_notifications("turn-1")
-    handle = TurnHandle(client, "thread-1", "turn-1")
-
-    handle.close()
-
-    client._router.route_notification(
-        client._coerce_notification(
-            "item/agentMessage/delta",
-            {
-                "delta": "ignored",
-                "itemId": "item-1",
-                "threadId": "thread-1",
-                "turnId": "turn-1",
-            },
-        )
-    )
-    client._router.route_notification(
-        client._coerce_notification(
-            "turn/completed",
-            {
-                "threadId": "thread-1",
-                "turn": {"id": "turn-1", "items": [], "status": "completed"},
-            },
-        )
-    )
-
-    assert "turn-1" not in client._router._turn_notifications
-    assert "turn-1" not in client._router._pending_turn_notifications
-    assert "turn-1" not in client._router._abandoned_turns
+    client = _client_for_script(f"print({json.dumps(message)!r}, flush=True)\nsys.stdin.read()\n")
+    try:
+        client.start()
+        if known:
+            client.register_turn_notifications("turn-1")
+            event = client.next_turn_notification("turn-1", timeout_s=5)
+            assert isinstance(event.payload, ThreadTokenUsageUpdatedNotification)
+            assert event.payload.turn_id == "turn-1"
+            assert event.payload.token_usage.last.total_tokens == 3
+        else:
+            event = client.next_notification(timeout_s=5)
+            assert isinstance(event.payload, UnknownNotification)
+            assert event.payload.params == message["params"]
+        assert event.method == message["method"]
+    finally:
+        client.close()

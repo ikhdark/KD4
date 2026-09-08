@@ -1371,17 +1371,20 @@ fn tool_history_receipt_only_in_new_tail_keeps_proven_inheritance() {
 #[tokio::test]
 async fn stable_context_fallback_request_replays_authoritative_projected_input() {
     let client = test_model_client(SessionSource::Cli);
-    let old = history_test_item(
+    let mut old = history_test_item(
         "# AGENTS.md instructions for /repo\n\n<INSTRUCTIONS>\nold\n</INSTRUCTIONS>",
         None,
     );
-    let current = history_test_item(
+    let mut current = history_test_item(
         "# AGENTS.md instructions for /repo\n\n<INSTRUCTIONS>\ncurrent\n</INSTRUCTIONS>",
         None,
     );
     let projected = history_test_item("projected delta", None);
+    let expected = vec![current.clone(), projected.clone()];
+    crate::stable_context::mark_trusted_stable_context_item(&mut old);
+    crate::stable_context::mark_trusted_stable_context_item(&mut current);
     let projection = project_stable_context(
-        vec![old.clone(), projected.clone(), current.clone()].into(),
+        vec![old, projected, current].into(),
         StableContextTarget::Sampling,
     );
     let prompt = Prompt {
@@ -1428,11 +1431,8 @@ async fn stable_context_fallback_request_replays_authoritative_projected_input()
         .expect("fallback request should build");
 
     for request in [&normal, &fallback] {
-        assert!(!request.input.contains(&old));
-        assert!(request.input.contains(&current));
-        assert!(request.input.contains(&projected));
+        assert_eq!(request.input.as_ref(), expected.as_slice());
     }
-    assert_eq!(fallback.input, normal.input);
 }
 
 #[tokio::test]

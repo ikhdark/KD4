@@ -315,25 +315,6 @@ fn out_of_range_truncation_drops_only_unfinished_suffix_mid_turn() {
 }
 
 #[test]
-fn fork_thread_accepts_legacy_usize_snapshot_argument() {
-    fn assert_legacy_snapshot_callsite(
-        manager: &ThreadManager,
-        config: Config,
-        path: std::path::PathBuf,
-    ) {
-        let _future = manager.fork_thread(
-            usize::MAX,
-            config,
-            path,
-            /*thread_source*/ None,
-            /*parent_trace*/ None,
-        );
-    }
-
-    let _: fn(&ThreadManager, Config, std::path::PathBuf) = assert_legacy_snapshot_callsite;
-}
-
-#[test]
 fn out_of_range_truncation_drops_pre_user_active_turn_prefix() {
     let items = vec![
         RolloutItem::ResponseItem(user_msg("u1")),
@@ -2439,19 +2420,6 @@ async fn interrupted_fork_snapshot_uses_persisted_mid_turn_history_without_live_
             .count(),
         1,
     );
-}
-
-#[test]
-fn thread_manager_does_not_forward_model_catalog_operations() {
-    let source = include_str!("thread_manager.rs");
-    for method_name in ["list_models", "list_collaboration_modes"] {
-        let obsolete_forwarder = ["pub fn ", method_name, "("].concat();
-        let obsolete_async_forwarder = ["pub async fn ", method_name, "("].concat();
-        assert!(
-            !source.contains(&obsolete_forwarder) && !source.contains(&obsolete_async_forwarder),
-            "ThreadManager must not forward model catalog method `{method_name}`"
-        );
-    }
 }
 
 #[test]

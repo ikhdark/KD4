@@ -1065,44 +1065,6 @@ mod tests {
     use tokio_tungstenite::tungstenite::handshake::server::Response as WebSocketResponse;
     use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
 
-    #[test]
-    fn retired_personality_migration_wrapper_is_removed() {
-        let source = include_str!("lib.rs");
-        let wrapper_name = ["migrate_personality_", "if_needed"].concat();
-
-        assert!(!source.contains(&format!("fn {wrapper_name}")));
-    }
-
-    #[test]
-    fn client_request_surfaces_delegate_to_request_handles() {
-        let source = include_str!("lib.rs");
-        let in_process_client_impl = source
-            .split_once("impl InProcessAppServerClient {")
-            .expect("in-process client implementation should exist")
-            .1
-            .split_once("impl InProcessAppServerRequestHandle {")
-            .expect("request handle implementation should follow client implementation")
-            .0;
-        let app_server_client_impl = source
-            .split_once("impl AppServerClient {")
-            .expect("app-server client implementation should exist")
-            .1
-            .split_once("#[cfg(test)]")
-            .expect("tests should follow app-server client implementation")
-            .0;
-
-        for client_impl in [in_process_client_impl, app_server_client_impl] {
-            assert!(
-                client_impl.contains("self.request_handle().request(request).await"),
-                "raw requests should delegate to the canonical request handle"
-            );
-            assert!(
-                client_impl.contains("self.request_handle().request_typed(request).await"),
-                "typed requests should delegate to the canonical request handle"
-            );
-        }
-    }
-
     async fn build_test_config() -> Config {
         match ConfigBuilder::default().build().await {
             Ok(config) => config,

@@ -294,9 +294,12 @@ mod tests {
                 .expect("both stdio halves should terminate")
                 .expect("stdio task should not panic");
         }
-        assert!(matches!(
-            transport_event_rx.try_recv(),
-            Err(mpsc::error::TryRecvError::Empty)
-        ));
+        assert!(
+            timeout(Duration::from_secs(1), transport_event_rx.recv())
+                .await
+                .expect("transport should close after both stdio tasks finish")
+                .is_none(),
+            "shutdown must emit exactly one connection-closed event"
+        );
     }
 }

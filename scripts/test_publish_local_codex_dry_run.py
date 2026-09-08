@@ -520,117 +520,128 @@ class PublishLocalCodexDryRunTest(PublishLocalCodexTestBase):
                 result.stdout,
             )
 
-    def test_dry_run_reports_stale_source_build_when_skip_build_would_noop(
-        self,
-    ) -> None:
+    def test_stale_local_build_is_blocked_without_a_bundle_manifest(self) -> None:
         self.init_repo_fixture()
-        with tempfile.TemporaryDirectory() as temp_dir:
-            temp_path = Path(temp_dir)
-            install_dir = temp_path / "install"
-            install_dir.mkdir()
-            stale_timestamp = 946684800
-            fake_codex = self.write_fake_codex(
-                temp_path / "fake-codex.cmd",
-                timestamp=stale_timestamp,
-            )
-            target = install_dir / "codex.exe"
-            target.write_bytes(fake_codex.read_bytes())
-            os.utime(target, (stale_timestamp, stale_timestamp))
-            self.install_matching_publish_helpers(install_dir)
+        built_dir = (
+            self.repo_root / "codex-rs" / "target" / "publish-release" / "release"
+        )
+        built_dir.mkdir(parents=True)
+        binaries = {
+            "codex.exe": self.source_exe_bytes,
+            "codex-code-mode-host.exe": self.source_code_mode_host_bytes,
+            "codex-windows-sandbox-setup.exe": self.source_windows_sandbox_setup_bytes,
+            "codex-command-runner.exe": self.source_command_runner_bytes,
+        }
+        stale_timestamp = 946684800
+        for name, content in binaries.items():
+            binary = built_dir / name
+            binary.write_bytes(content)
+            os.utime(binary, (stale_timestamp, stale_timestamp))
 
-            result = self.run_script(
-                "-DryRun",
-                "-SkipBuild",
-                "-SourceExe",
-                str(fake_codex),
-                "-InstallDir",
-                str(install_dir),
-            )
+        for scenario, flags in (
+            ("dry-run-noop", ["-DryRun"]),
+            (
+                "runtime-proof-missing-target",
+                ["-DryRun", "-RunDoctor", "-RuntimeProof", "-FailOnStaleSourceBuild"],
+            ),
+            ("apply", []),
+        ):
+            with (
+                self.subTest(scenario=scenario),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                install_dir = Path(temp_dir) / "install"
+                install_dir.mkdir()
+                target = install_dir / "codex.exe"
+                if scenario == "dry-run-noop":
+                    target.write_bytes(self.source_exe_bytes)
+                    os.utime(target, (stale_timestamp, stale_timestamp))
+                    self.install_matching_publish_helpers(install_dir)
+                elif scenario == "apply":
+                    target.write_bytes(b"previous-codex")
+                before = {
+                    str(path.relative_to(install_dir)): path.read_bytes()
+                    for path in install_dir.rglob("*")
+                    if path.is_file()
+                }
 
-            self.assertEqual(
-                result.returncode,
-                0,
-                f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
-            )
-            self.assertIn("sourceBuildStale: True", result.stdout)
-            self.assert_publish_readiness(result.stdout, "blocked: source build stale")
-            self.assertIn(
-                "sourceBuildStaleRemedy: Run just publish-local-codex-final, then restart Codex Desktop.",
-                result.stdout,
-            )
-            self.assertIn("binaryChanged: false", result.stdout)
-            self.assertIn("replace: not run: source build stale", result.stdout)
-            self.assertIn("restartRequired: unknown until rebuild", result.stdout)
-            self.assertNotIn("replace: not run: target already current", result.stdout)
+                # Use default local build paths: run_script would inject a trusted
+                # manifest for explicit binaries and bypass timestamp freshness.
+                result = subprocess.run(
+                    [
+                        self.shell,
+                        "-NoProfile",
+                        "-ExecutionPolicy",
+                        "Bypass",
+                        "-File",
+                        str(SCRIPT),
+                        "-RepoRoot",
+                        str(self.repo_root),
+                        "-SkipBuild",
+                        "-InstallDir",
+                        str(install_dir),
+                        *flags,
+                    ],
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    env=clean_env(),
+                    timeout=RUN_TIMEOUT_SECONDS,
+                    creationflags=CREATE_NO_WINDOW,
+                )
 
-    def test_runtime_proof_reports_doctor_skip_before_stale_source_failure(
-        self,
-    ) -> None:
-        self.init_repo_fixture()
-        with tempfile.TemporaryDirectory() as temp_dir:
-            temp_path = Path(temp_dir)
-            install_dir = temp_path / "install"
-            install_dir.mkdir()
-            stale_timestamp = 946684800
-            fake_codex = self.write_fake_codex(
-                temp_path / "fake-codex.cmd",
-                timestamp=stale_timestamp,
-            )
-
-            result = self.run_script(
-                "-DryRun",
-                "-SkipBuild",
-                "-RunDoctor",
-                "-RuntimeProof",
-                "-FailOnStaleSourceBuild",
-                "-SourceExe",
-                str(fake_codex),
-                "-InstallDir",
-                str(install_dir),
-            )
-
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn("runtimeProof: requested", result.stdout)
-            self.assertIn("sourceBuildStale: True", result.stdout)
-            self.assert_publish_readiness(result.stdout, "blocked: source build stale")
-            self.assertIn(
-                f'doctorCommand: "{install_dir / "codex.exe"}" doctor --json (not run: target missing)',
-                result.stdout,
-            )
-            self.assertIn("doctorStatus: skipped: target missing", result.stdout)
-            self.assertIn("Dry-run source build is stale", result.stderr)
-
-    def test_apply_blocks_skip_build_when_source_binary_is_stale(self) -> None:
-        self.init_repo_fixture()
-        with tempfile.TemporaryDirectory() as temp_dir:
-            temp_path = Path(temp_dir)
-            install_dir = temp_path / "install"
-            install_dir.mkdir()
-            fake_codex = self.write_fake_codex(
-                temp_path / "fake-codex.cmd",
-                timestamp=946684800,
-            )
-            target = install_dir / "codex.exe"
-            target.write_bytes(b"previous-codex")
-
-            result = self.run_script(
-                "-SkipBuild",
-                "-SourceExe",
-                str(fake_codex),
-                "-InstallDir",
-                str(install_dir),
-            )
-
-            self.assertNotEqual(result.returncode, 0)
-            self.assertEqual(target.read_bytes(), b"previous-codex")
-            self.assertFalse((install_dir / "backups").exists())
-            self.assertIn("sourceBuildStale: True", result.stdout)
-            self.assertIn("replace: blocked: source build stale", result.stdout)
-            self.assertIn("restartRequired: unknown until rebuild", result.stdout)
-            self.assertIn(
-                "SkipBuild cannot publish the newest Codex bundle",
-                result.stderr,
-            )
+                self.assert_proof_value(result.stdout, "sourceBuildStale", "True")
+                self.assert_proof_value(
+                    result.stdout,
+                    "sourceBuildFreshnessBasis",
+                    "source/artifact timestamps",
+                )
+                self.assert_publish_readiness(
+                    result.stdout, "blocked: source build stale"
+                )
+                self.assert_proof_value(
+                    result.stdout, "restartRequired", "unknown until rebuild"
+                )
+                self.assertEqual(
+                    {
+                        str(path.relative_to(install_dir)): path.read_bytes()
+                        for path in install_dir.rglob("*")
+                        if path.is_file()
+                    },
+                    before,
+                )
+                self.assertFalse((install_dir / "backups").exists())
+                if scenario == "dry-run-noop":
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assert_proof_value(result.stdout, "binaryChanged", "false")
+                    self.assert_proof_value(
+                        result.stdout, "replace", "not run: source build stale"
+                    )
+                    self.assertNotIn(
+                        "replace: not run: target already current", result.stdout
+                    )
+                else:
+                    self.assertNotEqual(result.returncode, 0)
+                    if scenario == "apply":
+                        self.assert_proof_value(
+                            result.stdout, "replace", "blocked: source build stale"
+                        )
+                        self.assertIn(
+                            "SkipBuild cannot publish the newest Codex bundle",
+                            result.stderr,
+                        )
+                    else:
+                        self.assert_proof_value(
+                            result.stdout, "runtimeProof", "requested"
+                        )
+                        self.assert_proof_value(
+                            result.stdout, "doctorStatus", "skipped: target missing"
+                        )
+                        self.assertIn(
+                            f'doctorCommand: "{target}" doctor --json (not run: target missing)',
+                            result.stdout,
+                        )
+                        self.assertIn("Dry-run source build is stale", result.stderr)
 
 
 if __name__ == "__main__":

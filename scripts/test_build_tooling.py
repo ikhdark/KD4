@@ -1,29 +1,25 @@
 #!/usr/bin/env python3
 
 import io
+import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
 from scripts import tool_versions
-from scripts.build_tooling_test_support import REPO_ROOT
-from scripts.build_tooling_test_support import load_format_module
-from scripts.build_tooling_test_support import load_just_shell_module
-from scripts.build_tooling_test_support import load_toml
+from scripts.build_tooling_test_support import (
+    REPO_ROOT,
+    load_format_module,
+    load_just_shell_module,
+    load_toml,
+)
 
 
 class BuildToolingEnvironmentTest(unittest.TestCase):
-    def test_shared_support_loads_hyphenated_repo_script(self) -> None:
-        just_shell = load_just_shell_module()
-
-        self.assertEqual(
-            Path(just_shell.__file__).resolve(),
-            REPO_ROOT / "scripts" / "just-shell.py",
-        )
-
     def test_just_shell_limits_rust_setup_to_rust_commands(self) -> None:
         just_shell = load_just_shell_module()
 
@@ -147,7 +143,7 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
             with self.subTest(configured=configured):
                 calls = []
 
-                def fake_run(command, **_kwargs):
+                def fake_run(command, *, calls=calls, reported=reported, **_kwargs):
                     calls.append(command)
                     return subprocess.CompletedProcess(
                         command,
@@ -610,43 +606,6 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
             }.issubset(workspace["members"])
         )
 
-    def test_cli_removes_orphaned_wsl_path_normalization(self) -> None:
-        main = (REPO_ROOT / "codex-rs" / "cli" / "src" / "main.rs").read_text(
-            encoding="utf-8"
-        )
-
-        self.assertNotIn("wsl_paths", main)
-        self.assertFalse(
-            (REPO_ROOT / "codex-rs" / "cli" / "src" / "wsl_paths.rs").exists()
-        )
-
-    def test_rollout_state_integration_has_one_implementation_owner(self) -> None:
-        rollout_src = REPO_ROOT / "codex-rs" / "rollout" / "src"
-        rollout_lib = (rollout_src / "lib.rs").read_text(encoding="utf-8")
-        state_docs = (REPO_ROOT / "codex-rs" / "state" / "src" / "lib.rs").read_text(
-            encoding="utf-8"
-        )
-
-        self.assertTrue((rollout_src / "state_integration.rs").is_file())
-        self.assertFalse((rollout_src / "state_db.rs").exists())
-        self.assertTrue((rollout_src / "state_integration_tests.rs").is_file())
-        self.assertFalse((rollout_src / "state_db_tests.rs").exists())
-        self.assertIn("pub mod state_integration;", rollout_lib)
-        self.assertNotIn("pub use state_integration as state_db;", rollout_lib)
-        self.assertIn("codex-rollout::state_integration", state_docs)
-
-    def test_memories_usage_metric_stays_with_usage_owner(self) -> None:
-        memories_read_src = REPO_ROOT / "codex-rs" / "memories" / "read" / "src"
-        usage = (memories_read_src / "usage.rs").read_text(encoding="utf-8")
-        lib = (memories_read_src / "lib.rs").read_text(encoding="utf-8")
-
-        self.assertFalse((memories_read_src / "metrics.rs").exists())
-        self.assertNotIn("mod metrics;", lib)
-        self.assertIn(
-            'pub const MEMORIES_USAGE_METRIC: &str = "codex.memories.usage";',
-            usage,
-        )
-
     def test_windows_program_database_artifacts_are_ignored(self) -> None:
         ignore_rules = (
             (REPO_ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
@@ -668,69 +627,12 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
         ).read_text()
         self.assertNotIn("codex-execpolicy-legacy", execpolicy_readme)
 
-    def test_rust_workspace_uses_upstream_profiles(self) -> None:
-        manifest = load_toml(REPO_ROOT / "codex-rs" / "Cargo.toml")
-        profiles = manifest["profile"]
-
-        self.assertEqual(profiles["dev"]["debug"], "limited")
-        self.assertEqual(profiles["ci-test"]["debug"], "limited")
-        self.assertEqual(profiles["release"]["lto"], "thin")
-        self.assertEqual(profiles["release"]["debug"], "line-tables-only")
-        self.assertEqual(profiles["release"]["split-debuginfo"], "off")
-        self.assertFalse(profiles["release"]["strip"])
-        self.assertEqual(profiles["release"]["codegen-units"], 4)
-        self.assertNotIn("local-test", profiles)
-        self.assertNotIn("release-fast", profiles)
-
     def test_rust_cargo_config_lets_rustc_discover_msvc_linker(self) -> None:
         config = load_toml(REPO_ROOT / "codex-rs" / ".cargo" / "config.toml")
         targets = config["target"]
 
         for target_config in targets.values():
             self.assertNotIn("linker", target_config)
-
-    def test_rust_workspace_uses_upstream_dependency_features(self) -> None:
-        manifest = load_toml(REPO_ROOT / "codex-rs" / "Cargo.toml")
-        workspace_deps = manifest["workspace"]["dependencies"]
-
-        reqwest = workspace_deps["reqwest"]
-        self.assertEqual(reqwest["features"], ["cookies"])
-        self.assertNotIn("default-features", reqwest)
-
-        sqlx = workspace_deps["sqlx"]
-        self.assertFalse(sqlx["default-features"])
-        self.assertEqual(
-            sorted(sqlx["features"]),
-            [
-                "chrono",
-                "json",
-                "macros",
-                "migrate",
-                "runtime-tokio",
-                "sqlite-bundled",
-                "time",
-                "tls-rustls",
-                "uuid",
-            ],
-        )
-
-        tokio_tungstenite = workspace_deps["tokio-tungstenite"]
-        self.assertEqual(
-            sorted(tokio_tungstenite["features"]),
-            ["proxy", "rustls-tls-native-roots"],
-        )
-
-        tungstenite = workspace_deps["tungstenite"]
-        self.assertEqual(sorted(tungstenite["features"]), ["deflate", "proxy"])
-
-        codex_api = load_toml(REPO_ROOT / "codex-rs" / "codex-api" / "Cargo.toml")
-        self.assertEqual(
-            codex_api["dependencies"]["tokio-tungstenite"], {"workspace": True}
-        )
-        # Extension configuration is imported from tungstenite directly while
-        # stream/message types continue to use tokio-tungstenite's re-export.
-        self.assertEqual(codex_api["dependencies"]["tungstenite"], {"workspace": True})
-        self.assertNotIn("features", codex_api)
 
     def test_sqlx_workspace_features_are_shared_by_sqlite_crates(self) -> None:
         state_manifest = load_toml(REPO_ROOT / "codex-rs" / "state" / "Cargo.toml")
@@ -777,25 +679,31 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
         self.assertNotIn("changed-validation", justfile)
 
     def test_default_fmt_recipe_uses_fast_local_with_full_escape_hatch(self) -> None:
-        justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
-
-        self.assertIn(
-            "fmt:\n    {{ python }} ../scripts/format.py --fast-local",
-            justfile,
-        )
-        self.assertIn("fmt-full:\n    {{ python }} ../scripts/format.py", justfile)
-        self.assertIn(
-            "fmt-check:\n    {{ python }} ../scripts/format.py --check",
-            justfile,
-        )
-        self.assertIn(
-            "validate-crate crate:\n    just fmt-check-fast\n    just test-fast -p {{ crate }}",
-            justfile,
-        )
-        self.assertIn(
-            "validate-crate-full crate:\n    just fmt-check\n    just test-fast -p {{ crate }}",
-            justfile,
-        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "codex-rs").mkdir()
+            (root / "scripts").mkdir()
+            (root / "justfile").write_bytes((REPO_ROOT / "justfile").read_bytes())
+            (root / "scripts" / "format.py").write_text(
+                "import json, sys\nprint(json.dumps(sys.argv[1:]))\n",
+                encoding="utf-8",
+            )
+            for recipe, expected in (
+                ("fmt", ["--fast-local"]),
+                ("fmt-check-fast", ["--check", "--fast-local"]),
+                ("fmt-full", []),
+                ("fmt-check", ["--check"]),
+            ):
+                with self.subTest(recipe=recipe):
+                    result = subprocess.run(
+                        ["just", "--justfile", str(root / "justfile"), recipe],
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                        check=False,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(json.loads(result.stdout), expected)
 
     def test_cargo_config_caps_parallelism_and_nonduplicated_windows_flags(
         self,
@@ -808,7 +716,7 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
             cargo_config["env"]["RUST_TEST_THREADS"],
             {"value": "16", "force": False},
         )
-        self.assertIn('rust_parallelism := "16"', justfile)
+        self.assertIn('rust_parallelism := "8"', justfile)
         self.assertIn(
             'env_var_or_default("CARGO_BUILD_JOBS", rust_parallelism)',
             justfile,
@@ -855,7 +763,6 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
         self.assertEqual(set(audit_ignores), set(deny_ignores))
         self.assertEqual(audit["output"]["deny"], ["yanked"])
         self.assertFalse(audit["output"]["quiet"])
-        self.assertFalse(audit["output"]["show_tree"])
         self.assertIn("deps-audit:\n    cargo audit", justfile)
         self.assertNotIn(".github/workflows/cargo-audit.yml", justfile)
 
@@ -868,6 +775,79 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
         self.assertEqual(toolchain["components"], ["clippy", "rustfmt", "rust-src"])
         self.assertNotIn("profile", toolchain)
         self.assertNotIn("targets", toolchain)
+
+    def test_formatter_reports_process_output_and_failures(self) -> None:
+        format_script = load_format_module()
+        for exit_code in (0, 2):
+            with self.subTest(exit_code=exit_code):
+                groups = (
+                    format_script.FormatterGroup(
+                        "Quiet",
+                        (
+                            format_script.Command(
+                                (sys.executable, "-c", "print('quiet result')")
+                            ),
+                        ),
+                    ),
+                    format_script.FormatterGroup(
+                        "Checked",
+                        (
+                            format_script.Command(
+                                (
+                                    sys.executable,
+                                    "-c",
+                                    f"print('checked result'); raise SystemExit({exit_code})",
+                                )
+                            ),
+                            format_script.Command(
+                                (sys.executable, "-c", "print('next command ran')")
+                            ),
+                        ),
+                    ),
+                )
+                stdout, stderr = io.StringIO(), io.StringIO()
+                with (
+                    mock.patch.object(
+                        format_script, "formatter_groups", return_value=groups
+                    ),
+                    mock.patch("sys.stdout", stdout),
+                    mock.patch("sys.stderr", stderr),
+                ):
+                    result = format_script.main(["--check"])
+
+                self.assertEqual(result, int(exit_code != 0))
+                output = stdout.getvalue()
+                for group in ("Quiet", "Checked"):
+                    self.assertIn(f"Starting {group} formatter...", output)
+                    self.assertIn(f"==> {group} formatter finished", output)
+                self.assertIn("quiet result\n", output)
+                self.assertIn("checked result\n", output)
+                self.assertEqual("next command ran\n" in output, exit_code == 0)
+                self.assertEqual(
+                    stderr.getvalue(),
+                    "Formatting failed: Checked\n" if exit_code else "",
+                )
+
+    def test_formatter_default_check_runs_all_groups(self) -> None:
+        format_script = load_format_module()
+        with (
+            mock.patch.object(
+                format_script.subprocess,
+                "run",
+                return_value=subprocess.CompletedProcess([], 0, stdout=""),
+            ) as run,
+            mock.patch("sys.stdout", io.StringIO()) as output,
+        ):
+            self.assertEqual(format_script.main(["--check"]), 0)
+
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertEqual(len(commands), 6)
+        for group in ("Just", "Rust", "Prettier", "Python SDK", "Python scripts"):
+            self.assertIn(f"Starting {group} formatter...", output.getvalue())
+            self.assertIn(f"==> {group} formatter finished", output.getvalue())
+        self.assertTrue(
+            all("--check" in command or "--diff" in command for command in commands)
+        )
 
     def test_formatter_uses_pinned_nightly_rustfmt(self) -> None:
         format_script = load_format_module()

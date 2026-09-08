@@ -67,10 +67,42 @@ fn failed_turn_does_not_overwrite_output_last_message_file() {
 #[test]
 fn output_last_message_write_failure_is_returned() {
     let tempdir = tempdir().expect("create tempdir");
+    let mut processor = EventProcessorWithJsonOutput::new(Some(tempdir.path().to_path_buf()));
+    processor.collect_thread_events(ServerNotification::ItemCompleted(
+        codex_app_server_protocol::ItemCompletedNotification {
+            item: ThreadItem::AgentMessage {
+                id: "msg-1".to_string(),
+                text: "final answer".to_string(),
+                phase: None,
+                memory_citation: None,
+            },
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            completed_at_ms: 0,
+        },
+    ));
 
-    let result = handle_last_message(Some("final answer"), tempdir.path());
-
-    assert!(result.is_err());
+    processor.collect_thread_events(ServerNotification::TurnCompleted(
+        codex_app_server_protocol::TurnCompletedNotification {
+            surfaced_result: None,
+            thread_id: "thread-1".to_string(),
+            timing: None,
+            turn: codex_app_server_protocol::Turn {
+                id: "turn-1".to_string(),
+                items_view: codex_app_server_protocol::TurnItemsView::Full,
+                items: Vec::new(),
+                status: TurnStatus::Completed,
+                error: None,
+                started_at: None,
+                completed_at: Some(0),
+                duration_ms: None,
+                timing: None,
+                surfaced_result: None,
+                reasoning_policy_history: None,
+            },
+        },
+    ));
+    assert!(EventProcessor::print_final_output(&mut processor).is_err());
 }
 
 #[test]

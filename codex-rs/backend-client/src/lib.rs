@@ -26,38 +26,3 @@ pub use types::TokenUsageProfile;
 pub use types::TokenUsageProfileDailyBucket;
 pub use types::TokenUsageProfileStats;
 pub use types::TurnAttemptsSiblingTurnsResponse;
-
-#[cfg(test)]
-mod concrete_task_details_tests {
-    use super::CodeTaskDetailsResponse;
-
-    #[test]
-    fn task_details_helpers_are_inherent_response_methods() {
-        let details: CodeTaskDetailsResponse = serde_json::from_str(include_str!(
-            "../tests/fixtures/task_details_with_diff.json"
-        ))
-        .expect("fixture should deserialize");
-        let failed_details: CodeTaskDetailsResponse = serde_json::from_str(include_str!(
-            "../tests/fixtures/task_details_with_error.json"
-        ))
-        .expect("error fixture should deserialize");
-
-        assert!(
-            details
-                .unified_diff()
-                .is_some_and(|diff| diff.contains("diff --git"))
-        );
-        assert_eq!(
-            details.assistant_text_messages(),
-            vec!["Assistant response".to_string()]
-        );
-        assert_eq!(
-            details.user_text_prompt().as_deref(),
-            Some("First line\n\nSecond line")
-        );
-        assert_eq!(
-            failed_details.assistant_error_message().as_deref(),
-            Some("APPLY_FAILED: Patch could not be applied")
-        );
-    }
-}

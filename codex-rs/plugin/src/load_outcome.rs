@@ -250,14 +250,6 @@ mod tests {
     }
 
     #[test]
-    fn plugin_resolution_and_skill_roots_stay_concrete() {
-        let removed_skill_roots_trait = ["trait Effective", "SkillRoots"].concat();
-        let removed_provider_trait = ["trait Plugin", "Provider"].concat();
-        assert!(!include_str!("load_outcome.rs").contains(&removed_skill_roots_trait));
-        assert!(!include_str!("provider.rs").contains(&removed_provider_trait));
-    }
-
-    #[test]
     fn cloning_an_outcome_reuses_immutable_plugin_storage() {
         let outcome =
             PluginLoadOutcome::from_plugins(vec![loaded_plugin("sample@test", Vec::new())]);

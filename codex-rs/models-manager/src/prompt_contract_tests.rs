@@ -4,13 +4,13 @@ use codex_protocol::openai_models::ModelsResponse;
 use pretty_assertions::assert_eq;
 use std::collections::BTreeSet;
 
-use crate::prompt_resolver::GPT_5_6_PROMPT_POLICY_SLUGS;
+use crate::prompt_resolver::LOCAL_PROMPT_POLICY_SLUGS;
 
 #[derive(Clone, Copy)]
 enum PromptScope {
     FallbackAndBundled,
-    Gpt56AndFallback,
-    Gpt56,
+    LocalPolicyAndFallback,
+    LocalPolicy,
     FallbackAndGpt52,
 }
 
@@ -79,7 +79,7 @@ const PROMPT_CONTRACTS: &[PromptContract] = &[
     },
     PromptContract {
         id: "economical-tool-use",
-        scope: PromptScope::Gpt56AndFallback,
+        scope: PromptScope::LocalPolicyAndFallback,
         expectation: AnchorExpectation::All,
         anchors: &[
             "Match tool work to the complexity of the user's request.",
@@ -90,7 +90,7 @@ const PROMPT_CONTRACTS: &[PromptContract] = &[
     },
     PromptContract {
         id: "general-repository-discovery",
-        scope: PromptScope::Gpt56,
+        scope: PromptScope::LocalPolicy,
         expectation: AnchorExpectation::All,
         anchors: &[
             "Prefer fast, scoped search",
@@ -100,7 +100,7 @@ const PROMPT_CONTRACTS: &[PromptContract] = &[
     },
     PromptContract {
         id: "general-tool-discipline",
-        scope: PromptScope::Gpt56,
+        scope: PromptScope::LocalPolicy,
         expectation: AnchorExpectation::All,
         anchors: &[
             "Group independent tool work.",
@@ -109,7 +109,7 @@ const PROMPT_CONTRACTS: &[PromptContract] = &[
     },
     PromptContract {
         id: "scoped-autonomy",
-        scope: PromptScope::Gpt56,
+        scope: PromptScope::LocalPolicy,
         expectation: AnchorExpectation::All,
         anchors: &[
             "Read every applicable AGENTS.md",
@@ -121,7 +121,7 @@ const PROMPT_CONTRACTS: &[PromptContract] = &[
     },
     PromptContract {
         id: "general-change-discipline",
-        scope: PromptScope::Gpt56,
+        scope: PromptScope::LocalPolicy,
         expectation: AnchorExpectation::All,
         anchors: &[
             "Before editing, identify the relevant owner or contract",
@@ -135,7 +135,7 @@ const PROMPT_CONTRACTS: &[PromptContract] = &[
     },
     PromptContract {
         id: "workspace-ownership",
-        scope: PromptScope::Gpt56,
+        scope: PromptScope::LocalPolicy,
         expectation: AnchorExpectation::All,
         anchors: &[
             "Existing and newly observed changes belong to the user",
@@ -147,7 +147,7 @@ const PROMPT_CONTRACTS: &[PromptContract] = &[
     },
     PromptContract {
         id: "general-global-prompt",
-        scope: PromptScope::Gpt56,
+        scope: PromptScope::LocalPolicy,
         expectation: AnchorExpectation::None,
         anchors: &[
             "KD4",
@@ -158,7 +158,7 @@ const PROMPT_CONTRACTS: &[PromptContract] = &[
     },
     PromptContract {
         id: "environment-neutral-global-prompt",
-        scope: PromptScope::Gpt56,
+        scope: PromptScope::LocalPolicy,
         expectation: AnchorExpectation::None,
         anchors: &[r"C:\Users\", "/Users/", "/home/"],
     },
@@ -203,16 +203,16 @@ fn prompts_for_scope(scope: PromptScope, response: &ModelsResponse) -> Vec<(Stri
             }
             prompts
         }
-        PromptScope::Gpt56AndFallback => {
+        PromptScope::LocalPolicyAndFallback => {
             std::iter::once(("fallback".to_string(), BASE_INSTRUCTIONS_DEFAULT))
                 .chain(
-                    GPT_5_6_PROMPT_POLICY_SLUGS
+                    LOCAL_PROMPT_POLICY_SLUGS
                         .iter()
                         .map(|slug| ((*slug).to_string(), model(slug).base_instructions.as_str())),
                 )
                 .collect()
         }
-        PromptScope::Gpt56 => GPT_5_6_PROMPT_POLICY_SLUGS
+        PromptScope::LocalPolicy => LOCAL_PROMPT_POLICY_SLUGS
             .iter()
             .map(|slug| ((*slug).to_string(), model(slug).base_instructions.as_str()))
             .collect(),
@@ -253,10 +253,10 @@ fn resolved_prompts_satisfy_named_contract_registry() {
 }
 
 #[test]
-fn gpt_5_6_family_uses_one_canonical_prompt_within_size_limit() {
+fn local_policy_models_use_one_canonical_prompt_within_size_limit() {
     const PROMPT_CHAR_LIMIT: usize = 6_000;
     let response = crate::bundled_models_response().expect("bundled models.json should parse");
-    let prompts = GPT_5_6_PROMPT_POLICY_SLUGS
+    let prompts = LOCAL_PROMPT_POLICY_SLUGS
         .iter()
         .map(|slug| {
             response
@@ -275,14 +275,14 @@ fn gpt_5_6_family_uses_one_canonical_prompt_within_size_limit() {
 }
 
 #[test]
-fn bundled_gpt_5_6_catalog_defers_prompt_to_local_policy() {
+fn bundled_local_policy_catalog_defers_prompt_to_local_policy() {
     let catalog: serde_json::Value = serde_json::from_str(include_str!("../models.json"))
         .expect("bundled models.json should parse");
     let models = catalog["models"]
         .as_array()
         .expect("bundled models.json should contain a models array");
 
-    for slug in GPT_5_6_PROMPT_POLICY_SLUGS {
+    for slug in LOCAL_PROMPT_POLICY_SLUGS {
         let model = models
             .iter()
             .find(|model| model["slug"].as_str() == Some(slug))
@@ -297,15 +297,15 @@ fn bundled_gpt_5_6_catalog_defers_prompt_to_local_policy() {
 }
 
 #[test]
-fn bundled_gpt_5_6_models_match_prompt_policy_registration() {
+fn bundled_local_policy_models_match_prompt_policy_registration() {
     let response = crate::bundled_models_response().expect("bundled models.json should parse");
     let bundled_slugs = response
         .models
         .iter()
         .map(|model| model.slug.as_str())
-        .filter(|slug| slug.starts_with("gpt-5.6-"))
+        .filter(|slug| *slug == "gpt-6-astra" || slug.starts_with("gpt-5.6-"))
         .collect::<BTreeSet<_>>();
-    let registered_slugs = GPT_5_6_PROMPT_POLICY_SLUGS
+    let registered_slugs = LOCAL_PROMPT_POLICY_SLUGS
         .iter()
         .copied()
         .collect::<BTreeSet<_>>();
@@ -316,7 +316,7 @@ fn bundled_gpt_5_6_models_match_prompt_policy_registration() {
 #[test]
 fn behavior_identical_instruction_templates_are_removed() {
     let response = crate::bundled_models_response().expect("bundled models.json should parse");
-    for slug in GPT_5_6_PROMPT_POLICY_SLUGS
+    for slug in LOCAL_PROMPT_POLICY_SLUGS
         .iter()
         .copied()
         .chain(std::iter::once("gpt-5.2"))

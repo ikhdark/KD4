@@ -61,17 +61,3 @@ pub(crate) fn config_layer_to_api(layer: ConfigLayer) -> ApiConfigLayer {
         disabled_reason: layer.disabled_reason,
     }
 }
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn internal_api_visibility_is_minimal() {
-        let source = include_str!("config_layer.rs");
-        let crate_visible_declaration = ["pub(crate)", " fn config_layer_source_to_api"].concat();
-
-        assert!(
-            !source.contains(&crate_visible_declaration),
-            "module-local config conversion helper must remain private"
-        );
-    }
-}

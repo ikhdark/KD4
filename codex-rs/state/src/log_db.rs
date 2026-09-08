@@ -1051,10 +1051,4 @@ mod tests {
             .expect("flush task completes")
             .expect("flush task succeeds");
     }
-
-    #[test]
-    fn log_flushing_stays_on_the_concrete_layer() {
-        let removed_trait = ["trait Log", "Writer"].concat();
-        assert!(!include_str!("log_db.rs").contains(&removed_trait));
-    }
 }

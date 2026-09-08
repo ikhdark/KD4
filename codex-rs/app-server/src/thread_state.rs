@@ -742,22 +742,6 @@ mod tests {
     use codex_utils_absolute_path::AbsolutePathBuf;
     use pretty_assertions::assert_eq;
 
-    #[test]
-    fn internal_api_visibility_is_minimal() {
-        let source = include_str!("thread_state.rs");
-        let obsolete_declaration = ["fn", " set_experimental_raw_events"].concat();
-        let obsolete_in_flight_order = ["in_flight_task", "_order"].concat();
-
-        assert!(
-            !source.contains(&obsolete_declaration),
-            "single-use thread-state mutator must remain removed"
-        );
-        assert!(
-            !source.contains(&obsolete_in_flight_order),
-            "unused in-flight task ordering state must remain removed"
-        );
-    }
-
     #[tokio::test]
     async fn connection_ids_for_thread_captures_both_views_together() {
         let manager = ThreadStateManager::new();

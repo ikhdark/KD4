@@ -139,14 +139,6 @@ fn validation_commands_do_not_clear_generic_mutation_revision() {
 }
 
 #[test]
-fn mutation_revision_does_not_build_discarded_tracker_path_sets() {
-    let source = include_str!("turn_diff_tracker.rs");
-
-    assert!(source.contains("fn record_mutation(&mut self)"));
-    assert!(!source.contains("paths_touched_by_delta"));
-}
-
-#[test]
 fn failed_or_timed_out_mutators_still_create_unknown_mutation_state() {
     for timed_out in [false, true] {
         let mut tracker = TurnDiffTracker::new();

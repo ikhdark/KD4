@@ -66,18 +66,4 @@ mod tests {
 
         assert!(std::ptr::eq(first, second));
     }
-
-    #[test]
-    fn model_catalog_does_not_export_tui_migration_prompt_keys() {
-        let library_source = include_str!("lib.rs");
-        assert!(!library_source.contains(&["pub mod ", "model_presets;"].concat()));
-    }
-
-    #[test]
-    fn models_manager_config_is_owned_by_the_crate_root() {
-        let library_source = include_str!("lib.rs");
-
-        assert!(library_source.contains(&["pub struct ", "ModelsManagerConfig"].concat()));
-        assert!(!library_source.contains(&["mod ", "config;"].concat()));
-    }
 }

@@ -12,14 +12,6 @@ use super::CodexHomeUserInstructionsProvider;
 use super::DEFAULT_AGENTS_MD_FILENAME;
 use super::LOCAL_AGENTS_MD_FILENAME;
 
-#[test]
-fn instruction_provider_implementation_lives_at_the_crate_root() {
-    let source = include_str!("lib.rs");
-    let obsolete_module = ["mod instruc", "tions;"].concat();
-
-    assert!(!source.contains(&obsolete_module));
-}
-
 fn provider(home: &TempDir) -> CodexHomeUserInstructionsProvider {
     CodexHomeUserInstructionsProvider::new(
         AbsolutePathBuf::try_from(home.path().to_path_buf()).expect("absolute temp dir"),

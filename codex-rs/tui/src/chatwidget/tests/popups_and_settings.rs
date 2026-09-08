@@ -3088,6 +3088,21 @@ async fn model_selection_popup_snapshot() {
 }
 
 #[tokio::test]
+async fn astra_reasoning_picker_uses_its_supported_efforts() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-6-astra")).await;
+    set_chatgpt_auth(&mut chat);
+    let preset = get_available_model(&chat, "gpt-6-astra");
+    assert!(preset.is_default);
+    chat.open_reasoning_popup(preset);
+    let popup = render_bottom_popup(&chat, /*width*/ 100);
+    for effort in ["Low", "Medium", "High", "Extra high", "Max", "Ultra"] {
+        assert!(popup.contains(effort), "missing {effort}: {popup}");
+    }
+    assert!(!popup.contains("None"), "{popup}");
+    assert!(!popup.contains("Minimal"), "{popup}");
+}
+
+#[tokio::test]
 async fn personality_selection_popup_snapshot() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
     chat.thread_id = Some(ThreadId::new());

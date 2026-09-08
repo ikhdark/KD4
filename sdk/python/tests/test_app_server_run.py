@@ -18,20 +18,7 @@ from app_server_helpers import (
 )
 
 from openai_codex import AsyncCodex, Codex
-from openai_codex._run import _agent_message_item_from_thread_item
-from openai_codex.generated.v2_all import AgentMessageThreadItem, MessagePhase, ThreadItem
-
-
-def test_agent_message_mapping_requires_generated_thread_item_root() -> None:
-    agent_message = AgentMessageThreadItem(
-        id="message-1",
-        text="hello",
-        type="agentMessage",
-    )
-
-    assert _agent_message_item_from_thread_item(ThreadItem(root=agent_message)) is agent_message
-    with pytest.raises(AttributeError):
-        _agent_message_item_from_thread_item(agent_message)  # type: ignore[arg-type]
+from openai_codex.generated.v2_all import MessagePhase
 
 
 def test_sync_thread_run_uses_mock_responses(
@@ -158,158 +145,52 @@ def test_async_thread_run_uses_mock_responses(
     asyncio.run(scenario())
 
 
-def test_sync_turn_result_uses_last_unknown_phase_message(tmp_path) -> None:
-    """TurnResult should use the last unknown-phase agent message as final text."""
-    with AppServerHarness(tmp_path) as harness:
-        harness.responses.enqueue_sse(
-            sse(
-                [
-                    ev_response_created("items-last"),
-                    ev_assistant_message("msg-items-first", "First message"),
-                    ev_assistant_message("msg-items-second", "Second message"),
-                    ev_completed("items-last"),
-                ]
-            )
-        )
-
-        with Codex(config=harness.app_server_config()) as codex:
-            result = codex.thread_start().run("case: last unknown phase wins")
-
-    assert {
-        "final_response": result.final_response,
-        "agent_messages": agent_message_texts_from_items(result.items),
-    } == {
-        "final_response": "Second message",
-        "agent_messages": ["First message", "Second message"],
-    }
-
-
-def test_sync_turn_result_preserves_empty_last_message(tmp_path) -> None:
-    """TurnResult should preserve an empty final agent message instead of skipping it."""
-    with AppServerHarness(tmp_path) as harness:
-        harness.responses.enqueue_sse(
-            sse(
-                [
-                    ev_response_created("items-empty"),
-                    ev_assistant_message("msg-items-nonempty", "First message"),
-                    ev_assistant_message("msg-items-empty", ""),
-                    ev_completed("items-empty"),
-                ]
-            )
-        )
-
-        with Codex(config=harness.app_server_config()) as codex:
-            result = codex.thread_start().run("case: empty last message")
-
-    assert {
-        "final_response": result.final_response,
-        "agent_messages": agent_message_texts_from_items(result.items),
-    } == {
-        "final_response": "",
-        "agent_messages": ["First message", ""],
-    }
-
-
-def test_sync_turn_result_does_not_promote_commentary_only_to_final(tmp_path) -> None:
-    """TurnResult final_response should stay unset when app-server marks only commentary."""
-    with AppServerHarness(tmp_path) as harness:
-        harness.responses.enqueue_sse(
-            sse(
-                [
-                    ev_response_created("items-commentary"),
-                    assistant_message_with_phase(
-                        "msg-items-commentary",
-                        "Commentary",
-                        MessagePhase.commentary,
-                    ),
-                    ev_completed("items-commentary"),
-                ]
-            )
-        )
-
-        with Codex(config=harness.app_server_config()) as codex:
-            result = codex.thread_start().run("case: commentary only")
-
-    assert {
-        "final_response": result.final_response,
-        "agent_messages": agent_message_texts_from_items(result.items),
-    } == {
-        "final_response": None,
-        "agent_messages": ["Commentary"],
-    }
-
-
-def test_async_turn_result_uses_last_unknown_phase_message(tmp_path) -> None:
-    """Async TurnResult should use the last unknown-phase agent message."""
-
-    async def scenario() -> None:
-        """Run one async result-mapping case against a pinned app-server."""
-        with AppServerHarness(tmp_path) as harness:
-            harness.responses.enqueue_sse(
-                sse(
-                    [
-                        ev_response_created("async-items-last"),
-                        ev_assistant_message(
-                            "msg-async-items-first",
-                            "First async message",
-                        ),
-                        ev_assistant_message(
-                            "msg-async-items-second",
-                            "Second async message",
-                        ),
-                        ev_completed("async-items-last"),
-                    ]
-                )
-            )
-
-            async with AsyncCodex(config=harness.app_server_config()) as codex:
-                result = await (await codex.thread_start()).run("case: async last unknown phase")
-
-        assert {
-            "final_response": result.final_response,
-            "agent_messages": agent_message_texts_from_items(result.items),
-        } == {
-            "final_response": "Second async message",
-            "agent_messages": ["First async message", "Second async message"],
-        }
-
-    asyncio.run(scenario())
-
-
-def test_async_turn_result_does_not_promote_commentary_only_to_final(
-    tmp_path,
+@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
+@pytest.mark.parametrize(
+    ("messages", "expected_final"),
+    [
+        ([("First message", None), ("Second message", None)], "Second message"),
+        ([("First message", None), ("", None)], ""),
+        ([("Commentary", MessagePhase.commentary)], None),
+        (
+            [("Commentary", MessagePhase.commentary), ("Final answer", MessagePhase.final_answer)],
+            "Final answer",
+        ),
+    ],
+    ids=["last-message", "empty-last-message", "commentary-only", "final-answer"],
+)
+def test_turn_result_selects_final_response_through_app_server(
+    tmp_path, asynchronous, messages, expected_final
 ) -> None:
-    """Async TurnResult final_response should stay unset for commentary-only output."""
+    async def run_async(harness):
+        async with AsyncCodex(config=harness.app_server_config()) as codex:
+            thread = await codex.thread_start()
+            return await thread.run("choose final answer")
 
-    async def scenario() -> None:
-        """Run one async commentary mapping case against a pinned app-server."""
-        with AppServerHarness(tmp_path) as harness:
-            harness.responses.enqueue_sse(
-                sse(
-                    [
-                        ev_response_created("async-items-commentary"),
-                        assistant_message_with_phase(
-                            "msg-async-items-commentary",
-                            "Async commentary",
-                            MessagePhase.commentary,
-                        ),
-                        ev_completed("async-items-commentary"),
-                    ]
-                )
+    with AppServerHarness(tmp_path) as harness:
+        events = [ev_response_created("result-mapping")]
+        for index, (text, phase) in enumerate(messages):
+            item_id = f"msg-{index}"
+            events.append(
+                ev_assistant_message(item_id, text)
+                if phase is None
+                else assistant_message_with_phase(item_id, text, phase)
             )
+        events.append(ev_completed("result-mapping"))
+        harness.responses.enqueue_sse(sse(events))
 
-            async with AsyncCodex(config=harness.app_server_config()) as codex:
-                result = await (await codex.thread_start()).run("case: async commentary only")
+        if asynchronous:
+            result = asyncio.run(run_async(harness))
+        else:
+            with Codex(config=harness.app_server_config()) as codex:
+                result = codex.thread_start().run("choose final answer")
 
-        assert {
-            "final_response": result.final_response,
-            "agent_messages": agent_message_texts_from_items(result.items),
-        } == {
-            "final_response": None,
-            "agent_messages": ["Async commentary"],
-        }
-
-    asyncio.run(scenario())
+    assert result.final_response == expected_final
+    assert [
+        (item.root.text, item.root.phase)
+        for item in result.items
+        if item.root.type == "agentMessage"
+    ] == messages
 
 
 def test_thread_run_raises_when_real_app_server_reports_failed_turn(tmp_path) -> None:
@@ -328,51 +209,3 @@ def test_thread_run_raises_when_real_app_server_reports_failed_turn(tmp_path) ->
             thread = codex.thread_start()
             with pytest.raises(RuntimeError, match="boom from mock model"):
                 thread.run("trigger failure")
-
-
-def test_final_answer_phase_survives_real_app_server_mapping(tmp_path) -> None:
-    """TurnResult should use the final-answer item emitted by app-server."""
-    with AppServerHarness(tmp_path) as harness:
-        harness.responses.enqueue_sse(
-            sse(
-                [
-                    ev_response_created("phase-1"),
-                    {
-                        **ev_assistant_message("msg-commentary", "Commentary"),
-                        "item": {
-                            **ev_assistant_message("msg-commentary", "Commentary")["item"],
-                            "phase": MessagePhase.commentary.value,
-                        },
-                    },
-                    {
-                        **ev_assistant_message("msg-final", "Final answer"),
-                        "item": {
-                            **ev_assistant_message("msg-final", "Final answer")["item"],
-                            "phase": MessagePhase.final_answer.value,
-                        },
-                    },
-                    ev_completed("phase-1"),
-                ]
-            )
-        )
-
-        with Codex(config=harness.app_server_config()) as codex:
-            result = codex.thread_start().run("choose final answer")
-
-    assert {
-        "final_response": result.final_response,
-        "items": [
-            {
-                "text": item.root.text,
-                "phase": None if item.root.phase is None else item.root.phase.value,
-            }
-            for item in result.items
-            if item.root.type == "agentMessage"
-        ],
-    } == {
-        "final_response": "Final answer",
-        "items": [
-            {"text": "Commentary", "phase": MessagePhase.commentary.value},
-            {"text": "Final answer", "phase": MessagePhase.final_answer.value},
-        ],
-    }

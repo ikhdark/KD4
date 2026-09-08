@@ -24,11 +24,9 @@ from codex_package.targets import resolve_input_path
 
 
 class TargetMetadataTest(unittest.TestCase):
-    def test_target_spec_is_slotted_and_precomputes_binary_names(self) -> None:
+    def test_target_spec_names_windows_runtime_binaries(self) -> None:
         spec = TARGET_SPECS["x86_64-pc-windows-msvc"]
 
-        self.assertFalse(hasattr(spec, "__dict__"))
-        self.assertFalse(hasattr(spec, "exe_suffix"))
         self.assertEqual(spec.rg_name, "rg.exe")
         self.assertEqual(spec.code_mode_host_name, "codex-code-mode-host.exe")
 
@@ -48,12 +46,6 @@ class TargetMetadataTest(unittest.TestCase):
                 self.assertIn(release.target, install_ps1)
                 self.assertIn("codex-package-", install_ps1)
                 self.assertIn(release.platform_label, install_ps1)
-
-    def test_release_targets_do_not_expose_retired_npm_assets(self) -> None:
-        for release in RELEASE_TARGETS.values():
-            with self.subTest(target=release.target):
-                self.assertFalse(hasattr(release, "npm_tag"))
-                self.assertFalse(hasattr(release, "legacy_npm_asset"))
 
     def test_npm_targets_are_canonical_binary_target_metadata(self) -> None:
         self.assertEqual(set(NPM_TARGETS), set(BINARY_TARGETS))

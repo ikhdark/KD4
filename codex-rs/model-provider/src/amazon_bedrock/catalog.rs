@@ -3,6 +3,7 @@ use codex_model_provider_info::AMAZON_BEDROCK_GPT_5_5_MODEL_ID;
 use codex_model_provider_info::AMAZON_BEDROCK_GPT_5_6_LUNA_MODEL_ID;
 use codex_model_provider_info::AMAZON_BEDROCK_GPT_5_6_SOL_MODEL_ID;
 use codex_model_provider_info::AMAZON_BEDROCK_GPT_5_6_TERRA_MODEL_ID;
+use codex_model_provider_info::AMAZON_BEDROCK_GPT_6_ASTRA_MODEL_ID;
 use codex_models_manager::bundled_models_response;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelsResponse;
@@ -16,6 +17,7 @@ const GPT_5_4_OPENAI_MODEL_ID: &str = "gpt-5.4";
 pub(crate) fn static_model_catalog() -> ModelsResponse {
     with_default_only_service_tier(ModelsResponse {
         models: vec![
+            astra_bedrock_model(),
             gpt_5_bedrock_model(
                 GPT_5_5_OPENAI_MODEL_ID,
                 AMAZON_BEDROCK_GPT_5_5_MODEL_ID,
@@ -55,6 +57,23 @@ pub(crate) fn with_default_only_service_tier(mut catalog: ModelsResponse) -> Mod
         model.default_service_tier = None;
     }
     catalog
+}
+
+fn astra_bedrock_model() -> ModelInfo {
+    let mut model = bundled_openai_model("gpt-6-astra");
+    model.slug = AMAZON_BEDROCK_GPT_6_ASTRA_MODEL_ID.to_string();
+    model.display_name = "GPT-6 Astra".to_string();
+    model.priority = -1;
+    // Bedrock uses Responses and direct tools, without Codex-only Ultra effort.
+    model.use_responses_lite = false;
+    model.tool_mode = None;
+    // Bedrock cannot accept the response items used by multi-agent V2.
+    model.multi_agent_version = Some(codex_protocol::protocol::MultiAgentVersion::V1);
+    model.web_search_tool_type = codex_protocol::openai_models::WebSearchToolType::Text;
+    model
+        .supported_reasoning_levels
+        .retain(|level| level.effort != ReasoningEffort::Ultra);
+    model
 }
 
 fn gpt_5_bedrock_model(
@@ -117,6 +136,7 @@ mod tests {
                 .map(|model| model.slug.as_str())
                 .collect::<Vec<_>>(),
             vec![
+                AMAZON_BEDROCK_GPT_6_ASTRA_MODEL_ID,
                 AMAZON_BEDROCK_GPT_5_5_MODEL_ID,
                 AMAZON_BEDROCK_GPT_5_4_MODEL_ID,
                 AMAZON_BEDROCK_GPT_5_6_SOL_MODEL_ID,
@@ -130,7 +150,11 @@ mod tests {
     fn gpt_5_bedrock_models_use_bedrock_context_window() {
         let catalog = static_model_catalog();
 
-        for model in catalog.models {
+        for model in catalog
+            .models
+            .into_iter()
+            .filter(|model| model.slug != AMAZON_BEDROCK_GPT_6_ASTRA_MODEL_ID)
+        {
             assert_eq!(
                 (model.context_window, model.max_context_window),
                 (

@@ -644,21 +644,6 @@ async fn combined_exec_cancellation_waits_inline_for_every_source() {
     );
 }
 
-#[test]
-fn direct_exec_does_not_register_a_process_wide_ctrl_c_listener() {
-    let source = include_str!("exec.rs");
-    let consume_output = source
-        .split("async fn consume_output(")
-        .nth(1)
-        .and_then(|tail| {
-            tail.split("async fn await_captured_output_until_deadline(")
-                .next()
-        })
-        .expect("consume_output source");
-
-    assert!(!consume_output.contains("tokio::signal::ctrl_c"));
-}
-
 #[tokio::test]
 async fn exec_full_buffer_capture_ignores_expiration() -> Result<()> {
     let command = vec![

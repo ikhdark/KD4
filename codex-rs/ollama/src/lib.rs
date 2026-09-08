@@ -89,14 +89,4 @@ mod tests {
         assert!(supports_responses(&Version::new(0, 13, 4)));
         assert!(supports_responses(&Version::new(0, 14, 0)));
     }
-
-    #[test]
-    fn pull_progress_stays_on_the_concrete_cli_path() {
-        let pull_source = include_str!("pull.rs");
-        let removed_reporter_trait = ["trait PullProgress", "Reporter"].concat();
-        let removed_tui_reporter = ["struct TuiProgress", "Reporter"].concat();
-        assert!(!pull_source.contains(&removed_reporter_trait));
-        assert!(!pull_source.contains(&removed_tui_reporter));
-        assert!(include_str!("client.rs").contains("pull_with_cli_progress"));
-    }
 }

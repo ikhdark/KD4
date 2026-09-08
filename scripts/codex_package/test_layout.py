@@ -16,35 +16,6 @@ from codex_package.targets import TARGET_SPECS
 
 
 class CopyFileForStagingTest(unittest.TestCase):
-    def test_requested_hardlink_still_copies_to_isolate_staging(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            src = root / "src.exe"
-            dest = root / "dest.exe"
-            src.write_text("binary", encoding="utf-8")
-
-            with (
-                mock.patch.object(layout.os, "link") as link,
-                mock.patch.object(layout.shutil, "copyfile") as copyfile,
-            ):
-                layout.copy_file_for_staging(src, dest, prefer_hardlink=True)
-
-            link.assert_not_called()
-            copyfile.assert_called_once_with(src, dest)
-
-    def test_copy_does_not_attempt_hardlink(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            src = root / "src.exe"
-            dest = root / "dest.exe"
-            src.write_text("binary", encoding="utf-8")
-
-            with mock.patch.object(layout.os, "link", side_effect=OSError) as link:
-                layout.copy_file_for_staging(src, dest, prefer_hardlink=True)
-
-            self.assertEqual(dest.read_text(encoding="utf-8"), "binary")
-            link.assert_not_called()
-
     def test_reuse_package_dir_removes_all_residue(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             package_dir = Path(temp_dir) / "package"
@@ -107,7 +78,7 @@ class CopyFileForStagingTest(unittest.TestCase):
             chmod.assert_called_once_with(failed_path, layout.stat.S_IWRITE)
             retry.assert_called_once_with(failed_path)
 
-    def test_package_layout_copies_ripgrep(self) -> None:
+    def test_package_layout_stages_independent_runtime_binaries(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             package_dir = root / "package"
@@ -116,32 +87,36 @@ class CopyFileForStagingTest(unittest.TestCase):
                 entrypoint_bin=root / "codex",
                 code_mode_host_bin=root / "codex-code-mode-host",
                 rg_bin=root / "rg",
-                codex_command_runner_bin=None,
-                codex_windows_sandbox_setup_bin=None,
+                codex_command_runner_bin=root / "codex-command-runner",
+                codex_windows_sandbox_setup_bin=root / "codex-windows-sandbox-setup",
             )
-            for path in (
-                inputs.entrypoint_bin,
-                inputs.code_mode_host_bin,
-                inputs.rg_bin,
-            ):
-                path.write_text("bin", encoding="utf-8")
+            binaries = {
+                "bin/codex.exe": inputs.entrypoint_bin,
+                "bin/codex-code-mode-host.exe": inputs.code_mode_host_bin,
+                "codex-path/rg.exe": inputs.rg_bin,
+                "codex-resources/codex-command-runner.exe": inputs.codex_command_runner_bin,
+                "codex-resources/codex-windows-sandbox-setup.exe": inputs.codex_windows_sandbox_setup_bin,
+            }
+            for source in binaries.values():
+                source.write_bytes(source.name.encode())
 
-            with mock.patch.object(layout, "copy_executable") as copy_executable:
-                layout.build_package_dir(
-                    package_dir,
-                    "1.2.3",
-                    PACKAGE_VARIANTS["codex"],
-                    TARGET_SPECS["x86_64-pc-windows-msvc"],
-                    inputs,
-                )
+            layout.build_package_dir(
+                package_dir,
+                "1.2.3",
+                PACKAGE_VARIANTS["codex"],
+                TARGET_SPECS["x86_64-pc-windows-msvc"],
+                inputs,
+            )
 
-        rg_calls = [
-            call
-            for call in copy_executable.call_args_list
-            if call.args[0] == inputs.rg_bin
-        ]
-        self.assertEqual(len(rg_calls), 1)
-        self.assertIs(rg_calls[0].kwargs["prefer_hardlink"], True)
+            for relative_path, source in binaries.items():
+                with self.subTest(binary=relative_path):
+                    staged = package_dir / relative_path
+                    original = source.name.encode()
+                    self.assertEqual(staged.read_bytes(), original)
+                    staged.write_bytes(b"edited staged binary")
+                    self.assertEqual(source.read_bytes(), original)
+                    source.write_bytes(b"rebuilt source binary")
+                    self.assertEqual(staged.read_bytes(), b"edited staged binary")
 
     def test_package_validation_rejects_stale_version_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

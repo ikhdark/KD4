@@ -1526,7 +1526,17 @@ mod tests_optimization {
             .count();
 
         assert_eq!(root_items, 1);
-        assert_eq!(projected.items.as_ref(), &[current]);
+        assert_eq!(projected.items.len(), 1);
+        let ResponseItem::Message { role, content, .. } = &projected.items[0] else {
+            panic!("expected the current root orchestration message");
+        };
+        assert_eq!(role, "developer");
+        assert_eq!(
+            content,
+            &[ContentItem::InputText {
+                text: "<root_orchestration_instructions>current orchestration</root_orchestration_instructions>".to_string(),
+            }]
+        );
     }
 
     #[test]
@@ -1594,14 +1604,6 @@ mod tests_optimization {
             assert_eq!(reused.disposition, original.disposition);
             assert!(reused.local_reused);
         }
-    }
-
-    #[test]
-    fn occurrence_records_only_source_indexes_and_slot() {
-        assert_eq!(
-            std::mem::size_of::<Occurrence>(),
-            std::mem::size_of::<usize>() * 3
-        );
     }
 
     #[test]

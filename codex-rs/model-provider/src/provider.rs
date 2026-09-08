@@ -1068,6 +1068,7 @@ mod tests {
         assert_eq!(
             models,
             vec![
+                ("openai.gpt-6-astra", "GPT-6 Astra"),
                 ("openai.gpt-5.5", "GPT-5.5"),
                 ("openai.gpt-5.4", "GPT-5.4"),
                 ("openai.gpt-5.6-sol", "GPT-5.6 Sol"),
@@ -1087,7 +1088,34 @@ mod tests {
             .find(|preset| preset.is_default)
             .expect("Bedrock catalog should have a default model");
 
-        assert_eq!(default_model.model, "openai.gpt-5.5");
+        assert_eq!(default_model.model, "openai.gpt-6-astra");
+        let astra = manager
+            .get_model_info(
+                &default_model.model,
+                &codex_models_manager::ModelsManagerConfig::default(),
+            )
+            .await;
+        assert!(!astra.used_fallback_model_metadata);
+        assert!(!astra.use_responses_lite);
+        assert_eq!(astra.tool_mode, None);
+        assert_eq!(
+            astra.multi_agent_version,
+            Some(codex_protocol::protocol::MultiAgentVersion::V1)
+        );
+        assert_eq!(astra.context_window, Some(272_000));
+        assert_eq!(astra.max_context_window, Some(872_000));
+        assert_eq!(
+            astra.base_instructions,
+            codex_protocol::models::BASE_INSTRUCTIONS_DEFAULT.trim()
+        );
+        assert!(astra.supported_reasoning_levels.iter().all(|preset| {
+            !matches!(
+                preset.effort,
+                codex_protocol::openai_models::ReasoningEffort::None
+                    | codex_protocol::openai_models::ReasoningEffort::Minimal
+                    | codex_protocol::openai_models::ReasoningEffort::Ultra
+            )
+        }));
     }
 
     #[tokio::test]

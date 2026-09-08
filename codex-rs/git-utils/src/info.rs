@@ -1035,18 +1035,6 @@ mod tests {
 
     use std::process::Command as StdCommand;
 
-    #[test]
-    fn git_info_is_protocol_owned() {
-        let info = GitInfo {
-            commit_hash: None,
-            branch: Some("main".to_string()),
-            repository_url: None,
-        };
-        let protocol_info: codex_protocol::protocol::GitInfo = info;
-
-        assert_eq!(protocol_info.branch.as_deref(), Some("main"));
-    }
-
     fn run_git(cwd: &Path, args: &[&str]) -> String {
         let output = StdCommand::new("git")
             .args(args)

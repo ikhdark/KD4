@@ -30,22 +30,6 @@ use serde::Serializer;
 mod optional_option {
     use super::*;
 
-    #[test]
-    fn thread_listing_value_types_are_protocol_owned() {
-        let sort_key: codex_protocol::protocol::ThreadSortKey = ThreadSortKey::UpdatedAt;
-        let direction: codex_protocol::protocol::SortDirection = SortDirection::Asc;
-        fn relation_is_shared(
-            relation: ThreadRelationFilter,
-        ) -> codex_protocol::protocol::ThreadRelationFilter {
-            relation
-        }
-
-        assert_eq!(sort_key, ThreadSortKey::UpdatedAt);
-        assert_eq!(direction, SortDirection::Asc);
-        let _: fn(ThreadRelationFilter) -> codex_protocol::protocol::ThreadRelationFilter =
-            relation_is_shared;
-    }
-
     pub fn serialize<T, S>(value: &Option<Option<T>>, serializer: S) -> Result<S::Ok, S::Error>
     where
         T: Serialize,

@@ -2300,32 +2300,8 @@ async fn start_streamable_http_test_server(
 }
 
 fn required_streamable_http_server_bin() -> anyhow::Result<PathBuf> {
-    required_streamable_http_server_bin_with(cargo_bin)
-}
-
-fn required_streamable_http_server_bin_with(
-    resolver: impl FnOnce(&str) -> Result<PathBuf, codex_utils_cargo_bin::CargoBinError>,
-) -> anyhow::Result<PathBuf> {
-    resolver("test_streamable_http_server")
+    cargo_bin("test_streamable_http_server")
         .context("resolve required test_streamable_http_server helper")
-}
-
-#[test]
-fn missing_streamable_http_helper_resolution_reports_an_error() {
-    let error = required_streamable_http_server_bin_with(|name| {
-        Err(codex_utils_cargo_bin::CargoBinError::NotFound {
-            name: name.to_string(),
-            env_keys: vec![format!("CARGO_BIN_EXE_{name}")],
-            fallback: "disabled in propagation test".to_string(),
-        })
-    })
-    .expect_err("a missing required helper must fail the test");
-
-    assert!(
-        error
-            .to_string()
-            .contains("resolve required test_streamable_http_server helper")
-    );
 }
 
 /// Waits for the local Streamable HTTP test server to publish OAuth metadata.

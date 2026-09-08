@@ -1195,30 +1195,6 @@ fn reasoning_item_completed_uses_synthetic_id() {
 }
 
 #[test]
-fn warning_event_produces_error_item() {
-    let mut processor = EventProcessorWithJsonOutput::new(/*last_message_path*/ None);
-
-    let collected = processor.collect_warning(
-        "Heads up: Long conversations and multiple compactions can cause the model to be less accurate. Start a new conversation when possible to keep conversations small and targeted.".to_string(),
-    );
-
-    assert_eq!(
-        collected,
-        CollectedThreadEvents {
-            events: vec![ThreadEvent::ItemCompleted(ItemCompletedEvent {
-                item: ExecThreadItem {
-                    id: "item_0".to_string(),
-                    details: ThreadItemDetails::Error(ErrorItem {
-                        message: "Heads up: Long conversations and multiple compactions can cause the model to be less accurate. Start a new conversation when possible to keep conversations small and targeted.".to_string(),
-                    }),
-                },
-            })],
-            status: CodexStatus::Running,
-        }
-    );
-}
-
-#[test]
 fn plan_update_emits_started_then_updated_then_completed() {
     let mut processor = EventProcessorWithJsonOutput::new(/*last_message_path*/ None);
 

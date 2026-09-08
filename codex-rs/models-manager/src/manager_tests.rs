@@ -2075,6 +2075,123 @@ fn bundled_models_json_roundtrips() {
     );
 }
 
+#[tokio::test]
+async fn astra_remote_refresh_keeps_fork_prompt_and_server_capabilities() {
+    let codex_home = tempdir().expect("temp dir");
+    let mut astra = remote_model("gpt-6-astra", "Remote Astra", 0);
+    astra.context_window = Some(400_000);
+    astra.max_context_window = Some(872_000);
+    let manager = openai_manager_for_tests(
+        codex_home.path().to_path_buf(),
+        TestModelsEndpoint::new(vec![vec![astra]]),
+    );
+    manager
+        .list_models(RefreshStrategy::Online, DEFAULT_HTTP_CLIENT_FACTORY)
+        .await
+        .expect("refresh models");
+    let info = manager
+        .get_model_info("gpt-6-astra", &ModelsManagerConfig::default())
+        .await;
+    assert_eq!(info.context_window, Some(400_000));
+    assert_eq!(
+        info.base_instructions,
+        codex_protocol::models::BASE_INSTRUCTIONS_DEFAULT.trim()
+    );
+    assert!(!info.used_fallback_model_metadata);
+}
+
+#[tokio::test]
+async fn astra_is_the_bundled_default_with_runtime_capabilities_and_local_instructions() {
+    use codex_protocol::openai_models::ToolMode;
+    use codex_protocol::protocol::MultiAgentVersion;
+
+    let codex_home = tempdir().expect("temp dir");
+    let manager = openai_manager_for_tests_with_auth(
+        codex_home.path().to_path_buf(),
+        TestModelsEndpoint::without_refresh(Vec::new()),
+        None,
+    );
+    let models = manager
+        .list_models(RefreshStrategy::Offline, DEFAULT_HTTP_CLIENT_FACTORY)
+        .await
+        .expect("bundled models");
+    let astra = &models[0];
+    assert_eq!(astra.model, "gpt-6-astra");
+    assert!(astra.is_default && astra.show_in_picker);
+    assert_eq!(astra.default_reasoning_effort, ReasoningEffort::Low);
+    assert_eq!(
+        astra
+            .supported_reasoning_efforts
+            .iter()
+            .map(|preset| preset.effort.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            ReasoningEffort::Low,
+            ReasoningEffort::Medium,
+            ReasoningEffort::High,
+            ReasoningEffort::XHigh,
+            ReasoningEffort::Max,
+            ReasoningEffort::Ultra
+        ]
+    );
+    assert_eq!(
+        manager
+            .get_default_model(
+                &None,
+                false,
+                RefreshStrategy::Offline,
+                DEFAULT_HTTP_CLIENT_FACTORY
+            )
+            .await
+            .expect("default model"),
+        "gpt-6-astra"
+    );
+    assert_eq!(
+        manager
+            .get_default_model(
+                &Some("gpt-5.6-sol".to_string()),
+                false,
+                RefreshStrategy::Offline,
+                DEFAULT_HTTP_CLIENT_FACTORY
+            )
+            .await
+            .expect("explicit model"),
+        "gpt-5.6-sol"
+    );
+
+    for slug in ["gpt-6-astra", "gpt-6-astra-preview", "openai/gpt-6-astra"] {
+        let model = manager
+            .get_model_info(slug, &ModelsManagerConfig::default())
+            .await;
+        assert!(!model.used_fallback_model_metadata);
+        assert_eq!(model.tool_mode, Some(ToolMode::CodeModeOnly));
+        assert_eq!(model.multi_agent_version, Some(MultiAgentVersion::V2));
+        assert!(model.use_responses_lite && model.supports_parallel_tool_calls);
+        assert!(model.supports_image_detail_original && model.supports_search_tool);
+        assert_eq!(
+            (model.context_window, model.max_context_window),
+            (Some(272_000), Some(872_000))
+        );
+        assert_eq!(
+            model.get_model_instructions(None),
+            codex_protocol::models::BASE_INSTRUCTIONS_DEFAULT.trim()
+        );
+        assert_eq!(model.service_tiers[0].id, "priority");
+    }
+    let overridden = manager
+        .get_model_info(
+            "gpt-6-astra",
+            &ModelsManagerConfig {
+                model_context_window: Some(1_050_000),
+                base_instructions: Some("user instructions".to_string()),
+                ..Default::default()
+            },
+        )
+        .await;
+    assert_eq!(overridden.context_window, Some(872_000));
+    assert_eq!(overridden.get_model_instructions(None), "user instructions");
+}
+
 #[test]
 fn bundled_api_models_advertise_none_reasoning_effort() {
     let response = crate::bundled_models_response()

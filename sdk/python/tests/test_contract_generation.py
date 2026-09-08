@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -36,18 +37,34 @@ def _snapshot_targets(root: Path) -> dict[str, dict[str, bytes] | bytes | None]:
     return {str(rel_path): _snapshot_target(root, rel_path) for rel_path in GENERATED_TARGETS}
 
 
-def test_generated_files_are_up_to_date():
-    """Regenerating from the fork-local app-server schema should leave no drift."""
+def test_generation_replaces_stale_artifacts_with_current_fork_contracts(tmp_path):
+    """Run the real CLI against stale outputs without rewriting the checkout."""
     before = _snapshot_targets(ROOT)
+    staged_sdk = tmp_path / "sdk" / "python"
+    shutil.copytree(ROOT / "src", staged_sdk / "src", ignore=shutil.ignore_patterns("__pycache__"))
+    shutil.copytree(
+        ROOT / "scripts", staged_sdk / "scripts", ignore=shutil.ignore_patterns("__pycache__")
+    )
+    shutil.copy2(ROOT / "pyproject.toml", staged_sdk / "pyproject.toml")
+    schema_path = Path("codex-rs/app-server-protocol/schema/json")
+    shutil.copytree(ROOT.parents[1] / schema_path, tmp_path / schema_path)
+
+    generated = staged_sdk / "src" / "openai_codex" / "generated"
+    for name in ("__init__.py", "v2_all.py", "notification_registry.py", "abandoned.py"):
+        (generated / name).write_text("# stale artifact\n")
+    api_path = staged_sdk / "src" / "openai_codex" / "api.py"
+    api_path.write_text(
+        api_path.read_text().replace("def thread_start(", "def stale_thread_start(")
+    )
 
     subprocess.run(
         [sys.executable, "scripts/update_sdk_artifacts.py", "generate-types"],
-        cwd=ROOT,
+        cwd=staged_sdk,
         check=True,
+        timeout=120,
     )
 
-    after = _snapshot_targets(ROOT)
-    assert before == after, "Generated files drifted after regeneration"
+    assert before == _snapshot_targets(staged_sdk), "Generated files drifted after regeneration"
 
 
 def test_typed_jsonrpc_error_payloads_are_generated() -> None:

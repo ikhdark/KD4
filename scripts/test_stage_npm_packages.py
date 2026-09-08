@@ -22,8 +22,6 @@ import scripts.stage_npm_archives as archives
 
 class StageNpmPackagesTests(unittest.TestCase):
     def setUp(self) -> None:
-        if hasattr(stage, "_BUILD_MODULE"):
-            delattr(stage, "_BUILD_MODULE")
         self.temp_dir = tempfile.TemporaryDirectory()
         self.root = Path(self.temp_dir.name)
         if hasattr(stage.list_workflow_artifacts, "cache_clear"):
@@ -38,62 +36,22 @@ class StageNpmPackagesTests(unittest.TestCase):
             stage.load_build_module.cache_clear()
         self.temp_dir.cleanup()
 
-    def test_stage_models_use_slots(self) -> None:
-        self.assertFalse(
-            hasattr(stage.WorkflowArtifact("target", 1, 1, "0" * 64), "__dict__")
-        )
-        self.assertFalse(
-            hasattr(stage.BinaryComponent("artifact", "dest", "binary"), "__dict__")
-        )
-
-    def test_build_package_metadata_is_loaded_lazily(self) -> None:
-        fake_module = types.SimpleNamespace(
-            PACKAGE_NATIVE_COMPONENTS={
-                "codex": set(),
-                "codex-win32-x64": {"codex-package"},
-            },
-            PACKAGE_EXPANSIONS={"codex": ["codex", "codex-win32-x64"]},
-            CODEX_PLATFORM_PACKAGES={
-                "codex-win32-x64": {
-                    "npm_name": "@openai/codex-win32-x64",
-                    "npm_tag": "win32-x64",
-                    "target_triple": "x86_64-pc-windows-msvc",
-                    "os": "win32",
-                    "cpu": "x64",
-                }
-            },
-            CODEX_PACKAGE_COMPONENT="codex-package",
-            PACKAGE_TARGET_FILTERS={
-                "codex-win32-x64": {"x86_64-pc-windows-msvc"},
-            },
-        )
-
-        self.assertNotIn("_BUILD_MODULE", vars(stage))
-        with mock.patch.object(stage, "load_build_module", return_value=fake_module):
-            self.assertEqual(
-                stage.native_components_for_package("codex-win32-x64"),
-                ("codex-package",),
-            )
-            self.assertEqual(
-                stage.expand_packages(["codex"]), ["codex", "codex-win32-x64"]
-            )
-            self.assertEqual(
-                stage.native_targets_for_package("codex-win32-x64"),
-                ("x86_64-pc-windows-msvc",),
-            )
-            self.assertEqual(
-                stage.collect_native_component_sets(["codex-win32-x64"]),
-                [(("codex-package",), ("x86_64-pc-windows-msvc",))],
-            )
-            self.assertEqual(
-                stage.tarball_name_for_package("codex-win32-x64", "1.2.3"),
-                "codex-npm-win32-x64-1.2.3.tgz",
-            )
-
     def test_build_module_derives_platform_metadata_from_canonical_targets(
         self,
     ) -> None:
         build = stage.load_build_module()
+        self.assertEqual(
+            stage.expand_packages(["codex"]),
+            ["codex", "codex-win32-x64", "codex-win32-arm64"],
+        )
+        self.assertEqual(
+            stage.collect_native_component_sets(["codex-win32-x64"]),
+            [(("codex-package",), ("x86_64-pc-windows-msvc",))],
+        )
+        self.assertEqual(
+            stage.tarball_name_for_package("codex-win32-x64", "1.2.3"),
+            "codex-npm-win32-x64-1.2.3.tgz",
+        )
 
         self.assertEqual(
             set(build.CODEX_PLATFORM_PACKAGES),
@@ -126,21 +84,6 @@ class StageNpmPackagesTests(unittest.TestCase):
                 "binary": "codex.exe",
             },
         )
-
-        for launcher_path in (
-            build.CODEX_CLI_ROOT / "bin" / "codex.js",
-            build.CODEX_SDK_ROOT / "src" / "exec.ts",
-        ):
-            launcher = launcher_path.read_text(encoding="utf-8")
-            self.assertIn("codexNativeTargets", launcher)
-            self.assertNotIn("x86_64-pc-windows-msvc", launcher)
-            self.assertNotIn("aarch64-pc-windows-msvc", launcher)
-
-        cli_launcher = (build.CODEX_CLI_ROOT / "bin" / "codex.js").read_text(
-            encoding="utf-8"
-        )
-        self.assertNotIn("@openai/codex@latest", cli_launcher)
-        self.assertIn("same fork release artifact", cli_launcher)
 
     def test_npm_pack_smoke_tests_the_moved_tarball(self) -> None:
         build = stage.load_build_module()

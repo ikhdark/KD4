@@ -657,41 +657,23 @@ mod tests {
     }
 
     #[test]
-    fn janitor_skips_dirs_without_lock_file() -> std::io::Result<()> {
+    fn janitor_removes_only_directories_with_unlocked_lock_files() -> std::io::Result<()> {
         let root = tempfile::tempdir()?;
-        let dir = root.path().join("no-lock");
-        fs::create_dir(&dir)?;
-
-        janitor_cleanup(root.path())?;
-
-        assert!(dir.exists());
-        Ok(())
-    }
-
-    #[test]
-    fn janitor_skips_dirs_with_held_lock() -> std::io::Result<()> {
-        let root = tempfile::tempdir()?;
-        let dir = root.path().join("locked");
-        fs::create_dir(&dir)?;
-        let lock_file = create_lock(&dir)?;
+        let lockless = root.path().join("no-lock");
+        let locked = root.path().join("locked");
+        let stale = root.path().join("stale");
+        for dir in [&lockless, &locked, &stale] {
+            fs::create_dir(dir)?;
+        }
+        let lock_file = create_lock(&locked)?;
         lock_file.try_lock()?;
+        create_lock(&stale)?;
 
         janitor_cleanup(root.path())?;
 
-        assert!(dir.exists());
-        Ok(())
-    }
-
-    #[test]
-    fn janitor_removes_dirs_with_unlocked_lock() -> std::io::Result<()> {
-        let root = tempfile::tempdir()?;
-        let dir = root.path().join("stale");
-        fs::create_dir(&dir)?;
-        create_lock(&dir)?;
-
-        janitor_cleanup(root.path())?;
-
-        assert!(!dir.exists());
+        assert!(lockless.exists());
+        assert!(locked.exists());
+        assert!(!stale.exists());
         Ok(())
     }
 }

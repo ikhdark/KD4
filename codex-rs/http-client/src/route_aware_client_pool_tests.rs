@@ -65,14 +65,6 @@ async fn streams_request_bodies_without_exposing_reqwest_body() {
     assert!(requests[0].ends_with("\r\n\r\nhello"));
 }
 
-#[test]
-fn route_aware_pool_source_has_no_legacy_custom_ca_escape_hatch() {
-    let source = include_str!("route_aware_client_pool.rs");
-
-    assert!(!source.contains("with_legacy_custom_ca_fallback"));
-    assert!(!source.contains("build_with_transport_default_proxy_and_custom_ca_fallback"));
-}
-
 #[tokio::test]
 async fn invalid_custom_ca_is_rejected_for_every_proxy_policy() {
     const CHILD_POLICY_ENV: &str = "CODEX_HTTP_CLIENT_POOL_INVALID_CA_TEST_POLICY";

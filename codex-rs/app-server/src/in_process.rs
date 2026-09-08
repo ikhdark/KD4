@@ -834,7 +834,7 @@ mod tests {
     use tempfile::TempDir;
 
     async fn build_test_config(codex_home: &Path) -> Config {
-        match ConfigBuilder::default()
+        let mut config = match ConfigBuilder::default()
             .codex_home(codex_home.to_path_buf())
             .build()
             .await
@@ -846,7 +846,13 @@ mod tests {
             )
             .await
             .expect("default config should load"),
-        }
+        };
+        // Transport tests do not need marketplace sync spawning background Git processes.
+        config
+            .features
+            .disable(codex_features::Feature::Plugins)
+            .expect("test config should allow disabling plugins");
+        config
     }
 
     async fn start_test_client_with_capacity(
@@ -1123,23 +1129,5 @@ mod tests {
             .await
             .expect("blocked delivery should be released by shutdown")
             .expect("delivery task should join cleanly");
-    }
-
-    #[test]
-    fn client_handle_exposes_commands_only_through_sender() {
-        let source = include_str!("in_process.rs");
-        let handle_impl = source
-            .split_once("impl InProcessClientHandle {")
-            .expect("handle implementation should exist")
-            .1
-            .split_once("/// Starts an in-process app-server runtime")
-            .expect("handle implementation should end before start")
-            .0;
-
-        assert!(!handle_impl.contains("pub async fn request("));
-        assert!(!handle_impl.contains("pub fn notify("));
-        assert!(!handle_impl.contains("pub fn respond_to_server_request("));
-        assert!(!handle_impl.contains("pub fn fail_server_request("));
-        assert!(handle_impl.contains("pub fn sender("));
     }
 }

@@ -174,6 +174,61 @@ async fn response_body_for_remote_model(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn astra_default_completes_a_turn_with_its_bundled_runtime_settings() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = responses::start_mock_server().await;
+    let response_mock = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("astra-response"),
+            ev_assistant_message("astra-message", "done"),
+            ev_completed("astra-response"),
+        ]),
+    )
+    .await;
+    let test = test_codex()
+        .with_config(|config| {
+            config.model = None;
+            config.model_reasoning_effort = None;
+        })
+        .build(&server)
+        .await?;
+    assert_eq!(test.session_configured.model, "gpt-6-astra");
+    test.submit_turn("Say done.").await?;
+    let body = response_mock.single_request().body_json();
+    assert_eq!(body["model"], "gpt-6-astra");
+    // The fork's orientation phase selects High over the catalog's Low default.
+    assert_eq!(body["reasoning"]["effort"], "high");
+    assert_eq!(body["text"]["verbosity"], "low");
+    assert!(body.get("instructions").is_none());
+    assert!(body.get("tools").is_none());
+    let input = body["input"].as_array().expect("Responses Lite input");
+    assert!(input.iter().any(|item| {
+        item["role"] == "developer"
+            && item["content"][0]["text"]
+                == codex_protocol::models::BASE_INSTRUCTIONS_DEFAULT.trim()
+    }));
+    let additional_tools = input
+        .iter()
+        .find(|item| item["type"] == "additional_tools")
+        .expect("Responses Lite tool definitions");
+    let tools = tool_names(additional_tools);
+    assert!(
+        tools
+            .iter()
+            .any(|name| name == codex_code_mode::PUBLIC_TOOL_NAME),
+        "{tools:?}"
+    );
+    assert!(
+        tools
+            .iter()
+            .any(|name| name == codex_code_mode::WAIT_TOOL_NAME),
+        "{tools:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_tool_mode_selector_overrides_feature_flags() -> Result<()> {
     skip_if_no_network!(Ok(()));
 

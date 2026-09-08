@@ -532,17 +532,6 @@ mod tests {
     use std::string::ToString;
     use tempfile::tempdir;
 
-    #[test]
-    fn unverified_parser_is_private_to_invocation_module() {
-        let invocation_source = include_str!("invocation.rs");
-        let public_signature = ["pub fn maybe_parse_apply_", "patch("].concat();
-        assert!(!invocation_source.contains(&public_signature));
-
-        let crate_source = include_str!("lib.rs");
-        let public_reexport = ["pub use invocation::maybe_parse_apply_", "patch;"].concat();
-        assert!(!crate_source.contains(&public_reexport));
-    }
-
     /// Helper to construct a patch with the given body.
     fn wrap_patch(body: &str) -> String {
         format!("*** Begin Patch\n{body}\n*** End Patch")
@@ -779,32 +768,17 @@ PATCH"#,
         }
     }
 
-    #[tokio::test]
-    async fn test_powershell_accepts_canonical_posix_heredoc() {
+    #[test]
+    fn test_powershell_variants_accept_canonical_posix_heredoc() {
         let script = heredoc_script("");
-        assert_match_args_with_cwd(
+        let cwd = PathUri::parse("file:///C:/windows").expect("valid Windows test cwd");
+        for args in [
             args_powershell(&script),
-            &PathUri::parse("file:///C:/windows").expect("valid Windows test cwd"),
-            /*expected_workdir*/ None,
-        );
-    }
-    #[tokio::test]
-    async fn test_powershell_no_profile_accepts_canonical_posix_heredoc() {
-        let script = heredoc_script("");
-        assert_match_args_with_cwd(
             args_powershell_no_profile(&script),
-            &PathUri::parse("file:///C:/windows").expect("valid Windows test cwd"),
-            /*expected_workdir*/ None,
-        );
-    }
-    #[tokio::test]
-    async fn test_pwsh_accepts_canonical_posix_heredoc() {
-        let script = heredoc_script("");
-        assert_match_args_with_cwd(
             args_pwsh(&script),
-            &PathUri::parse("file:///C:/windows").expect("valid Windows test cwd"),
-            /*expected_workdir*/ None,
-        );
+        ] {
+            assert_match_args_with_cwd(args, &cwd, /*expected_workdir*/ None);
+        }
     }
 
     #[tokio::test]

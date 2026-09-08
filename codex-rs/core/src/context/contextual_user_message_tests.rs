@@ -139,25 +139,7 @@ fn ignores_regular_user_text() {
 }
 
 #[test]
-fn legacy_warning_recognizers_are_owned_by_contextual_user_message() {
-    let owner_source = include_str!("contextual_user_message.rs");
-    let module_source = include_str!("mod.rs");
-
-    for name in [
-        "LegacyApplyPatchExecCommandWarning",
-        "LegacyModelMismatchWarning",
-        "LegacyUnifiedExecProcessLimitWarning",
-    ] {
-        assert!(owner_source.contains(&format!("pub(crate) struct {name};")));
-    }
-    for module in [
-        "legacy_apply_patch_exec_command_warning",
-        "legacy_model_mismatch_warning",
-        "legacy_unified_exec_process_limit_warning",
-    ] {
-        assert!(!module_source.contains(&format!("mod {module};")));
-    }
-
+fn legacy_compaction_warnings_are_recognized() {
     for text in [
         "Warning: apply_patch was requested via exec_command. Use the apply_patch tool instead of exec_command.",
         "Warning: Your account was flagged for potentially high-risk cyber activity.",

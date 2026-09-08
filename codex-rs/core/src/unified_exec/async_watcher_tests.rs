@@ -29,7 +29,7 @@ use crate::unified_exec::head_tail_buffer::HeadTailBuffer;
 use codex_protocol::protocol::ToolExecutionId;
 
 #[tokio::test]
-async fn exit_before_watcher_registration_is_observed_once() {
+async fn process_exit_before_async_watcher_registration_is_observed_once() {
     let ledger = CommandExecutionLedger::default();
     let command_execution_id = ledger.allocate_execution_id();
     let parent_tool_execution_id = ToolExecutionId("tool-execution-watcher".to_string());

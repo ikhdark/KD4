@@ -4497,6 +4497,13 @@
                 "null"
               ]
             },
+            "executionId": {
+              "description": "Unique dispatch execution id used by timing and lifecycle records.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "exitCode": {
               "description": "The command's exit code.",
               "format": "int32",
@@ -4508,8 +4515,29 @@
             "id": {
               "type": "string"
             },
+            "parentCallId": {
+              "description": "Model-visible exec call that owns a nested code-mode command.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "parentCellId": {
+              "description": "Stable code-mode cell that issued the nested command.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "processId": {
               "description": "Identifier for the underlying PTY process (when available).",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "runtimeToolCallId": {
+              "description": "Runtime invocation id within the owning code-mode cell.",
               "type": [
                 "string",
                 "null"
@@ -6067,6 +6095,7 @@
         },
         "attributableRecoveryGenerationCount": {
           "default": 0,
+          "description": "Tool-result generations immediately following an observed `read_tool_output` recovery transaction. This is independent of whether the recovered projection was truncated again.",
           "format": "uint32",
           "minimum": 0.0,
           "type": "integer"
@@ -6412,6 +6441,7 @@
         },
         "truncationInducedContinuationCount": {
           "default": 0,
+          "description": "Tool-result generations immediately following provider-visible output that actually omitted or truncated canonical tool information.",
           "format": "uint32",
           "minimum": 0.0,
           "type": "integer"
@@ -7189,6 +7219,13 @@
             "null"
           ]
         },
+        "fixedPrefixReuseEligible": {
+          "description": "Whether this logical request exactly matched the preceding stable prompt prefix under the same prompt-cache identity.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
         "generationIndex": {
           "default": 0,
           "description": "Zero-based logical generation owning this physical provider attempt.",
@@ -7254,6 +7291,13 @@
             "$ref": "#/definitions/TurnTimingProgressKind"
           },
           "type": "array"
+        },
+        "promptCacheKeyFingerprint": {
+          "description": "Stable SHA-256 fingerprint of the prompt cache key sent to the provider. The raw key is intentionally not persisted in timing diagnostics.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "reasoningOutputTokens": {
           "default": 0,

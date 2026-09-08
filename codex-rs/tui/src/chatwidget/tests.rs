@@ -232,18 +232,6 @@ fn next_goal_draft(
 
 mod app_server;
 
-#[test]
-fn chatwidget_does_not_retain_write_only_session_header_state() {
-    let chatwidget = include_str!("../chatwidget.rs");
-    let constructor = include_str!("constructor.rs");
-    let settings = include_str!("settings.rs");
-
-    assert!(!chatwidget.contains("mod session_header;"));
-    assert!(!chatwidget.contains("session_header: SessionHeader"));
-    assert!(!constructor.contains("SessionHeader::new"));
-    assert!(!settings.contains("self.session_header.set_model"));
-}
-
 mod approval_requests;
 mod composer_submission;
 #[path = "tests/config_errors_tests.rs"]

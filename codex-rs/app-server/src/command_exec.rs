@@ -1130,23 +1130,7 @@ mod tests {
     }
 
     #[test]
-    fn command_argv_validation_is_centralized_in_request_processors() {
-        for source in [
-            include_str!("request_processors/command_exec_processor.rs"),
-            include_str!("request_processors/process_exec_processor.rs"),
-        ] {
-            assert_eq!(source.matches("validate_command_argv(").count(), 1);
-            assert!(!source.contains("command must not be empty"));
-        }
-
-        let command_exec_source = include_str!("command_exec.rs");
-        let process_exec_source = include_str!("request_processors/process_exec_processor.rs");
-        assert!(!command_exec_source.contains(&["trait InternalProcessId", "Ext"].concat()));
-        assert!(!process_exec_source.contains(&["struct ProcessExec", "Manager"].concat()));
-    }
-
-    #[test]
-    fn terminal_size_validation_is_shared_by_process_apis() {
+    fn terminal_size_conversion_rejects_zero_dimensions() {
         let size = PtyTerminalSize {
             rows: 40,
             cols: 120,
@@ -1162,10 +1146,6 @@ mod tests {
         assert_eq!(
             error.message,
             "process size rows and cols must be greater than 0"
-        );
-        assert!(
-            !include_str!("request_processors/process_exec_processor.rs")
-                .contains("fn terminal_size_from_protocol")
         );
     }
 

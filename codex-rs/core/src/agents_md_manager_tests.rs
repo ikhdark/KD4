@@ -361,7 +361,7 @@ async fn same_size_same_metadata_rewrite_refreshes_project_instructions() {
 }
 
 #[tokio::test]
-async fn repository_stable_context_detects_same_session_provenance_replacement() {
+async fn repository_stable_context_refreshes_when_instruction_source_changes() {
     let root = tempfile::tempdir().expect("workspace");
     let agents_path = root.path().join("AGENTS.md");
     fs::write(&agents_path, "stable instructions").expect("write AGENTS.md");
@@ -374,7 +374,7 @@ async fn repository_stable_context_detects_same_session_provenance_replacement()
         .await
         .stable_context
         .expect("first stable context");
-    fs::remove_file(agents_path).expect("remove AGENTS.md");
+    fs::remove_file(&agents_path).expect("remove AGENTS.md");
     fs::write(root.path().join("WORKFLOW.md"), "stable instructions")
         .expect("write fallback instructions");
     config.project_doc_fallback_filenames = vec!["WORKFLOW.md".to_string()];
@@ -386,9 +386,22 @@ async fn repository_stable_context_detects_same_session_provenance_replacement()
         .expect("replacement stable context");
 
     assert_ne!(first.identity, replacement.identity);
-    assert_eq!(first.rendered, replacement.rendered);
+    assert_eq!(
+        first.rendered.as_ref(),
+        format!(
+            "## AGENTS.md instructions from {}\n\nstable instructions",
+            agents_path.display()
+        )
+    );
+    assert_eq!(
+        replacement.rendered.as_ref(),
+        format!(
+            "## AGENTS.md instructions from {}\n\nstable instructions",
+            root.path().join("WORKFLOW.md").display()
+        )
+    );
     assert!(!replacement.reused);
-    assert!(replacement.semantic_replacement);
+    assert!(!replacement.semantic_replacement);
 }
 
 #[tokio::test]

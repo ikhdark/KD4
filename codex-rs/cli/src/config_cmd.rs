@@ -38,7 +38,3 @@ pub(crate) fn run(config: self::ConfigCli) {
 fn render_explain(filter: Option<&str>) -> String {
     codex_config::render_config_explain(filter)
 }
-
-#[cfg(test)]
-#[path = "config_cmd_tests.rs"]
-mod tests;

@@ -1,0 +1,10 @@
+C:\Users\kuh\Desktop\kd4\codex-rs\codex-rs\target\lanes\suite-cleanup\debug\deps\fs_extra-daa93263b5cf9185.d: C:\Users\kuh\scoop\persist\rustup\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\fs_extra-1.3.0\src\lib.rs C:\Users\kuh\scoop\persist\rustup\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\fs_extra-1.3.0\src\error.rs C:\Users\kuh\scoop\persist\rustup\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\fs_extra-1.3.0\src\file.rs C:\Users\kuh\scoop\persist\rustup\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\fs_extra-1.3.0\src\dir.rs
+
+C:\Users\kuh\Desktop\kd4\codex-rs\codex-rs\target\lanes\suite-cleanup\debug\deps\libfs_extra-daa93263b5cf9185.rlib: C:\Users\kuh\scoop\persist\rustup\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\fs_extra-1.3.0\src\lib.rs C:\Users\kuh\scoop\persist\rustup\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\fs_extra-1.3.0\src\error.rs C:\Users\kuh\scoop\persist\rustup\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\fs_extra-1.3.0\src\file.rs C:\Users\kuh\scoop\persist\rustup\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\fs_extra-1.3.0\src\dir.rs
+
+C:\Users\kuh\Desktop\kd4\codex-rs\codex-rs\target\lanes\suite-cleanup\debug\deps\libfs_extra-daa93263b5cf9185.rmeta: C:\Users\kuh\scoop\persist\rustup\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\fs_extra-1.3.0\src\lib.rs C:\Users\kuh\scoop\persist\rustup\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\fs_extra-1.3.0\src\error.rs C:\Users\kuh\scoop\persist\rustup\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\fs_extra-1.3.0\src\file.rs C:\Users\kuh\scoop\persist\rustup\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\fs_extra-1.3.0\src\dir.rs
+
+C:\Users\kuh\scoop\persist\rustup\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\fs_extra-1.3.0\src\lib.rs:
+C:\Users\kuh\scoop\persist\rustup\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\fs_extra-1.3.0\src\error.rs:
+C:\Users\kuh\scoop\persist\rustup\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\fs_extra-1.3.0\src\file.rs:
+C:\Users\kuh\scoop\persist\rustup\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\fs_extra-1.3.0\src\dir.rs:

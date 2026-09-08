@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import asyncio
-from pathlib import Path
-from typing import Any
+import sys
 
 import pytest
+from app_server_harness import AppServerHarness
 
 import openai_codex.api as public_api_module
 from openai_codex.api import (
@@ -13,26 +13,36 @@ from openai_codex.api import (
     Codex,
     Sandbox,
 )
-from openai_codex.generated.v2_all import TurnStartParams
+from openai_codex.client import CodexClient, CodexConfig
 from openai_codex.models import InitializeResponse
 
-ROOT = Path(__file__).resolve().parents[1]
 
+@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
+def test_public_client_derives_metadata_from_legacy_initialize_response(asynchronous: bool) -> None:
+    script = """
+import json
+import sys
+for line in sys.stdin:
+    request = json.loads(line)
+    if request.get("method") == "initialize":
+        print(json.dumps({"id": request["id"], "result": {"userAgent": "codex-cli/1.2.3"}}), flush=True)
+"""
+    config = CodexConfig(launch_args_override=(sys.executable, "-u", "-c", script))
 
-def _approval_settings(params: list[Any]) -> list[dict[str, object]]:
-    """Return serialized approval settings from captured Pydantic params."""
-    return [
-        {
-            key: value
-            for key, value in param.model_dump(
-                by_alias=True,
-                exclude_none=True,
-                mode="json",
-            ).items()
-            if key in {"approvalPolicy", "approvalsReviewer"}
-        }
-        for param in params
-    ]
+    async def async_metadata():
+        async with AsyncCodex(config=config) as codex:
+            return codex.metadata
+
+    if asynchronous:
+        metadata = asyncio.run(async_metadata())
+    else:
+        with Codex(config=config) as codex:
+            metadata = codex.metadata
+
+    assert metadata.userAgent == "codex-cli/1.2.3"
+    assert metadata.serverInfo is not None
+    assert metadata.serverInfo.name == "codex-cli"
+    assert metadata.serverInfo.version == "1.2.3"
 
 
 def test_codex_init_failure_closes_client(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -95,6 +105,8 @@ def test_async_codex_initializes_only_once_under_concurrency() -> None:
         start_calls = 0
         initialize_calls = 0
         ready = asyncio.Event()
+        release_initialization = asyncio.Event()
+        second_started = asyncio.Event()
 
         async def fake_start() -> None:
             nonlocal start_calls
@@ -104,7 +116,7 @@ def test_async_codex_initializes_only_once_under_concurrency() -> None:
             nonlocal initialize_calls
             initialize_calls += 1
             ready.set()
-            await asyncio.sleep(0.02)
+            await release_initialization.wait()
             return InitializeResponse.model_validate(
                 {
                     "userAgent": "codex-cli/1.2.3",
@@ -120,84 +132,112 @@ def test_async_codex_initializes_only_once_under_concurrency() -> None:
         codex._client.initialize = fake_initialize  # type: ignore[method-assign]
         codex._client.model_list = fake_model_list  # type: ignore[method-assign]
 
-        await asyncio.gather(codex.models(), codex.models())
+        async def second_request():
+            second_started.set()
+            return await codex.models()
+
+        first = asyncio.create_task(codex.models())
+        await ready.wait()
+        second = asyncio.create_task(second_request())
+        await second_started.wait()
+        release_initialization.set()
+        await asyncio.gather(first, second)
 
         assert start_calls == 1
         assert initialize_calls == 1
 
-    asyncio.run(scenario())
+    asyncio.run(asyncio.wait_for(scenario(), timeout=5))
 
 
-def _approval_mode_turn_params(approval_mode: ApprovalMode) -> TurnStartParams:
-    """Build real generated turn params from one public approval mode."""
-    approval_policy, approvals_reviewer = public_api_module._approval_mode_settings(approval_mode)
-    return TurnStartParams(
-        thread_id="thread-1",
-        input=[],
-        approval_policy=approval_policy,
-        approvals_reviewer=approvals_reviewer,
-    )
+@pytest.mark.parametrize(
+    ("approval_mode", "approval_settings"),
+    [
+        (ApprovalMode.deny_all, {"approvalPolicy": "never"}),
+        (
+            ApprovalMode.auto_review,
+            {"approvalPolicy": "on-request", "approvalsReviewer": "auto_review"},
+        ),
+    ],
+    ids=["deny-all", "auto-review"],
+)
+@pytest.mark.parametrize(
+    ("sandbox", "thread_sandbox", "turn_sandbox"),
+    [
+        (Sandbox.read_only, "read-only", {"type": "readOnly", "networkAccess": False}),
+        (
+            Sandbox.workspace_write,
+            "workspace-write",
+            {
+                "type": "workspaceWrite",
+                "networkAccess": False,
+                "writableRoots": [],
+                "excludeSlashTmp": False,
+                "excludeTmpdirEnvVar": False,
+            },
+        ),
+        (Sandbox.full_access, "danger-full-access", {"type": "dangerFullAccess"}),
+    ],
+    ids=["read-only", "workspace-write", "full-access"],
+)
+def test_public_presets_reach_thread_and_turn_requests(
+    tmp_path, monkeypatch, approval_mode, approval_settings, sandbox, thread_sandbox, turn_sandbox
+) -> None:
+    requests = []
+    write_message = CodexClient._write_message
 
+    def capture_request(self, payload, **kwargs):
+        requests.append(payload)
+        return write_message(self, payload, **kwargs)
 
-def test_approval_modes_serialize_to_expected_start_params() -> None:
-    """ApprovalMode should map to the app-server params sent for new work."""
-    assert {
-        mode.value: _approval_settings([_approval_mode_turn_params(mode)])[0]
-        for mode in ApprovalMode
-    } == {
-        "deny_all": {"approvalPolicy": "never"},
-        "auto_review": {
-            "approvalPolicy": "on-request",
-            "approvalsReviewer": "auto_review",
-        },
-    }
+    monkeypatch.setattr(CodexClient, "_write_message", capture_request)
+    with AppServerHarness(tmp_path) as harness:
+        harness.responses.enqueue_assistant_message("presets accepted", response_id="presets")
+        with Codex(config=harness.app_server_config()) as codex:
+            thread = codex.thread_start(approval_mode=approval_mode, sandbox=sandbox)
+            result = thread.run("use these presets", approval_mode=approval_mode, sandbox=sandbox)
 
-
-def test_unknown_approval_mode_is_rejected() -> None:
-    """Invalid approval modes should fail before params are constructed."""
-    with pytest.raises(ValueError, match="deny_all, auto_review"):
-        public_api_module._approval_mode_settings("allow_all")  # type: ignore[arg-type]
-
-
-def test_sandbox_presets_serialize_for_threads_and_turns() -> None:
-    """One public sandbox enum should map to both stable wire representations."""
-    assert {
-        sandbox.name: public_api_module._sandbox_mode(sandbox).value for sandbox in Sandbox
-    } == {
-        "read_only": "read-only",
-        "workspace_write": "workspace-write",
-        "full_access": "danger-full-access",
-    }
-    assert {
-        sandbox.name: public_api_module._sandbox_policy(sandbox).model_dump(
-            by_alias=True,
-            mode="json",
-        )
-        for sandbox in Sandbox
-    } == {
-        "read_only": {"networkAccess": False, "type": "readOnly"},
-        "workspace_write": {
-            "excludeSlashTmp": False,
-            "excludeTmpdirEnvVar": False,
-            "networkAccess": False,
-            "type": "workspaceWrite",
-            "writableRoots": [],
-        },
-        "full_access": {"type": "dangerFullAccess"},
-    }
-
-
-def test_raw_sandbox_strings_are_rejected() -> None:
-    """Callers should use the discoverable enum rather than memorizing values."""
-    with pytest.raises(ValueError, match="Sandbox\\.workspace_write"):
-        public_api_module._sandbox_mode("workspace")  # type: ignore[arg-type]
-
-
-def test_retry_examples_compare_status_with_enum() -> None:
-    for path in (
-        ROOT / "examples" / "10_error_handling_and_retry" / "sync.py",
-        ROOT / "examples" / "10_error_handling_and_retry" / "async.py",
+    assert result.final_response == "presets accepted"
+    for method, sandbox_key, expected_sandbox in (
+        ("thread/start", "sandbox", thread_sandbox),
+        ("turn/start", "sandboxPolicy", turn_sandbox),
     ):
-        source = path.read_text()
-        assert '== "failed"' not in source
-        assert "TurnStatus.failed" in source
+        params = [request["params"] for request in requests if request["method"] == method]
+        assert len(params) == 1, method
+        assert {
+            key: value
+            for key, value in params[0].items()
+            if key in {"approvalPolicy", "approvalsReviewer", sandbox_key}
+        } == {**approval_settings, sandbox_key: expected_sandbox}
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"approval_mode": "allow_all"}, "deny_all, auto_review"),
+        ({"sandbox": "workspace"}, r"Sandbox\.workspace_write"),
+    ],
+    ids=["unknown-approval-mode", "raw-sandbox-string"],
+)
+def test_invalid_public_presets_are_rejected_before_sending_requests(
+    tmp_path, monkeypatch, kwargs, message
+) -> None:
+    with AppServerHarness(tmp_path) as harness:
+        with Codex(config=harness.app_server_config()) as codex:
+            thread = codex.thread_start()
+            requests = []
+            write_message = codex._client._write_message
+
+            def capture_request(payload, **options):
+                requests.append(payload)
+                return write_message(payload, **options)
+
+            monkeypatch.setattr(codex._client, "_write_message", capture_request)
+            for operation in (
+                lambda: codex.thread_start(**kwargs),
+                lambda: codex.thread_resume(thread.id, **kwargs),
+                lambda: codex.thread_fork(thread.id, **kwargs),
+                lambda: thread.run("invalid presets", **kwargs),
+            ):
+                with pytest.raises(ValueError, match=message):
+                    operation()
+            assert requests == []

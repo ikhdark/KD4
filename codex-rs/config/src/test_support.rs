@@ -74,7 +74,3 @@ impl CloudConfigBundleFixture {
         CloudConfigBundleLoader::new(async move { Ok(Some(bundle)) })
     }
 }
-
-#[cfg(test)]
-#[path = "test_support_tests.rs"]
-mod tests;

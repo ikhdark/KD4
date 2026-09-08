@@ -52,7 +52,7 @@ fn script_run_detection_excludes_python_c() {
 }
 
 #[test]
-fn skill_doc_read_detection_matches_absolute_path() {
+fn skill_doc_read_detection_matches_absolute_paths_in_read_commands() {
     let skill_doc_path = test_path_buf("/tmp/skill-test/SKILL.md").abs();
     let normalized_skill_doc_path = canonicalize_if_exists(&skill_doc_path);
     let skill = test_skill_metadata(skill_doc_path);
@@ -62,42 +62,26 @@ fn skill_doc_read_detection_matches_absolute_path() {
         ..Default::default()
     };
 
-    let tokens = vec![
-        "cat".to_string(),
-        test_path_display("/tmp/skill-test/SKILL.md"),
-        "|".to_string(),
-        "head".to_string(),
-    ];
-    let found = detect_skill_doc_read(&outcome, &tokens, &test_path_buf("/tmp").abs());
-
-    assert_eq!(
-        found.map(|value| value.name),
-        Some("test-skill".to_string())
-    );
-}
-
-#[test]
-fn skill_doc_read_detection_matches_shared_read_parser() {
-    let skill_doc_path = test_path_buf("/tmp/skill-test/SKILL.md").abs();
-    let normalized_skill_doc_path = canonicalize_if_exists(&skill_doc_path);
-    let skill = test_skill_metadata(skill_doc_path);
-    let outcome = SkillLoadOutcome {
-        implicit_skills_by_scripts_dir: Arc::new(HashMap::new()),
-        implicit_skills_by_doc_path: Arc::new(HashMap::from([(normalized_skill_doc_path, skill)])),
-        ..Default::default()
-    };
-
-    let tokens = vec![
-        "nl".to_string(),
-        "-ba".to_string(),
-        test_path_display("/tmp/skill-test/SKILL.md"),
-    ];
-    let found = detect_skill_doc_read(&outcome, &tokens, &test_path_buf("/tmp").abs());
-
-    assert_eq!(
-        found.map(|value| value.name),
-        Some("test-skill".to_string())
-    );
+    for tokens in [
+        vec![
+            "cat".to_string(),
+            test_path_display("/tmp/skill-test/SKILL.md"),
+            "|".to_string(),
+            "head".to_string(),
+        ],
+        vec![
+            "nl".to_string(),
+            "-ba".to_string(),
+            test_path_display("/tmp/skill-test/SKILL.md"),
+        ],
+    ] {
+        let found = detect_skill_doc_read(&outcome, &tokens, &test_path_buf("/tmp").abs());
+        assert_eq!(
+            found.map(|value| value.name),
+            Some("test-skill".to_string()),
+            "command: {tokens:?}"
+        );
+    }
 }
 
 #[test]

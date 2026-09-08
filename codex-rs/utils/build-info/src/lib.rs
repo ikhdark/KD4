@@ -16,15 +16,15 @@ pub struct BuildInfo {
 
 impl BuildInfo {
     pub fn current() -> Self {
-        Self {
-            version: CODEX_VERSION,
-            commit: option_env!("CODEX_BUILD_COMMIT")
-                .or(option_env!("GIT_COMMIT"))
-                .unwrap_or("unknown"),
-            dirty: option_env!("CODEX_BUILD_DIRTY").unwrap_or("unknown"),
-            profile: option_env!("CODEX_BUILD_PROFILE").unwrap_or_else(default_build_profile),
-            built: option_env!("CODEX_BUILD_TIMESTAMP").unwrap_or("unknown"),
-        }
+        Self::from_values(
+            CODEX_VERSION,
+            option_env!("CODEX_BUILD_COMMIT"),
+            option_env!("GIT_COMMIT"),
+            option_env!("CODEX_BUILD_DIRTY"),
+            option_env!("CODEX_BUILD_PROFILE"),
+            option_env!("CODEX_BUILD_TIMESTAMP"),
+            cfg!(debug_assertions),
+        )
     }
 
     #[doc(hidden)]
@@ -63,22 +63,29 @@ impl BuildInfo {
     }
 }
 
-const fn default_build_profile() -> &'static str {
-    if cfg!(debug_assertions) {
-        "debug"
-    } else {
-        "release"
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::BuildInfo;
     use super::CODEX_VERSION;
 
     #[test]
-    fn current_uses_the_authoritative_embedded_version() {
-        assert_eq!(BuildInfo::current().version, CODEX_VERSION);
+    fn current_reports_embedded_metadata() {
+        assert_eq!(
+            BuildInfo::current(),
+            BuildInfo {
+                version: CODEX_VERSION,
+                commit: option_env!("CODEX_BUILD_COMMIT")
+                    .or(option_env!("GIT_COMMIT"))
+                    .unwrap_or("unknown"),
+                dirty: option_env!("CODEX_BUILD_DIRTY").unwrap_or("unknown"),
+                profile: option_env!("CODEX_BUILD_PROFILE").unwrap_or(if cfg!(debug_assertions) {
+                    "debug"
+                } else {
+                    "release"
+                }),
+                built: option_env!("CODEX_BUILD_TIMESTAMP").unwrap_or("unknown"),
+            }
+        );
     }
 
     #[test]
@@ -112,8 +119,14 @@ mod tests {
             }
         );
         assert_eq!(
-            BuildInfo::from_values("1.2.3", None, None, None, None, None, true).profile,
-            "debug"
+            BuildInfo::from_values("1.2.3", None, None, None, None, None, true),
+            BuildInfo {
+                version: "1.2.3",
+                commit: "unknown",
+                dirty: "unknown",
+                profile: "debug",
+                built: "unknown",
+            }
         );
     }
 }

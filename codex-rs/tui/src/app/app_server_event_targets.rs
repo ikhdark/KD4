@@ -329,25 +329,4 @@ mod tests {
 
         assert_eq!(target, ServerNotificationThreadTarget::Thread(thread_id));
     }
-
-    #[test]
-    fn notification_dispatch_omits_retired_variants() {
-        let dispatch_sources = [
-            include_str!("app_server_event_targets.rs"),
-            include_str!("../chatwidget/protocol.rs"),
-        ];
-        let retired_variants = [
-            concat!("FileChange", "OutputDelta"),
-            concat!("Context", "Compacted"),
-        ];
-
-        for retired_variant in retired_variants {
-            assert!(
-                dispatch_sources
-                    .iter()
-                    .all(|source| !source.contains(retired_variant)),
-                "retired notification variant remains in TUI dispatch: {retired_variant}"
-            );
-        }
-    }
 }

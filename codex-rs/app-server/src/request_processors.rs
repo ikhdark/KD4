@@ -608,23 +608,6 @@ mod tiny_module_collapse_tests {
             "failed to validate environment selections: Fatal error: environment registry unavailable"
         );
     }
-
-    #[test]
-    fn request_processors_do_not_keep_a_single_error_forwarding_module() {
-        let obsolete_declaration = ["mod request_", "errors;"].concat();
-        assert!(!include_str!("request_processors.rs").contains(&obsolete_declaration));
-    }
-
-    #[test]
-    fn app_server_does_not_keep_single_child_or_conversion_forwarders() {
-        let app_server_lib = include_str!("lib.rs");
-        let obsolete_auth_module = ["mod auth_", "mode;"].concat();
-        let obsolete_config_module = ["mod con", "fig;"].concat();
-
-        assert!(!app_server_lib.contains(&obsolete_auth_module));
-        assert!(!app_server_lib.contains(&obsolete_config_module));
-        assert!(app_server_lib.contains("mod external_agent_config;"));
-    }
 }
 
 fn resolve_runtime_workspace_roots(workspace_roots: Vec<AbsolutePathBuf>) -> Vec<AbsolutePathBuf> {

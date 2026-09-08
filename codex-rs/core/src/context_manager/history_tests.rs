@@ -2377,66 +2377,56 @@ fn sampling_preparation_projects_stable_context_but_generic_preparation_fails_op
         "# AGENTS.md instructions for /repo\n\n<INSTRUCTIONS>\nold\n</INSTRUCTIONS>";
     let current_repository =
         "# AGENTS.md instructions for /repo\n\n<INSTRUCTIONS>\ncurrent\n</INSTRUCTIONS>";
-    let history = create_history_with_items(vec![
-        user_input_text_msg(old_repository),
-        user_input_text_msg("dynamic request"),
-        user_input_text_msg(current_repository),
-    ]);
+    let workspace = crate::git_workspace::GitWorkspaceCache::new();
 
-    let generic = history
-        .clone()
-        .prepare_for_prompt(&default_input_modalities());
-    let sampled = history
-        .prepare_for_sampling_prompt(&default_input_modalities(), StableContextTarget::Sampling);
+    for replace_history in [false, true] {
+        let mut old = user_input_text_msg(old_repository);
+        let mut current = user_input_text_msg(current_repository);
+        crate::stable_context::mark_trusted_stable_context_item(&mut old);
+        crate::stable_context::mark_trusted_stable_context_item(&mut current);
+        let dynamic = user_input_text_msg("dynamic request or compaction checkpoint");
+        let items = vec![old, dynamic.clone(), current];
+        let mut history = ContextManager::new();
+        if replace_history {
+            history.replace(items.clone());
+        } else {
+            history.record_items(items.iter(), TruncationPolicy::Tokens(10_000));
+        }
 
-    assert_eq!(generic.items().len(), 3);
-    assert!(generic.stable_context_manifest().fail_open());
-    assert_eq!(sampled.items().len(), 2);
-    assert!(sampled.stable_context_manifest().projection_enabled());
-    assert!(
-        !sampled
-            .items()
-            .contains(&user_input_text_msg(old_repository))
-    );
-    assert!(
-        sampled
-            .items()
-            .contains(&user_input_text_msg(current_repository))
-    );
-}
+        let generic = history
+            .clone()
+            .prepare_for_prompt(&default_input_modalities());
+        assert_eq!(generic.items(), items.as_slice());
+        assert!(generic.stable_context_manifest().fail_open());
 
-#[test]
-fn sampling_projection_reconstructs_current_variant_after_history_replacement() {
-    let old_repository =
-        "# AGENTS.md instructions for /repo\n\n<INSTRUCTIONS>\nold\n</INSTRUCTIONS>";
-    let current_repository =
-        "# AGENTS.md instructions for /repo\n\n<INSTRUCTIONS>\ncurrent\n</INSTRUCTIONS>";
-    let mut history = ContextManager::new();
-    history.replace(vec![
-        user_input_text_msg(old_repository),
-        user_input_text_msg("compaction checkpoint summary"),
-        user_input_text_msg(current_repository),
-    ]);
-
-    let sampled = history
-        .prepare_for_sampling_prompt(&default_input_modalities(), StableContextTarget::Sampling);
-
-    assert_eq!(sampled.items().len(), 2);
-    assert!(
-        !sampled
-            .items()
-            .contains(&user_input_text_msg(old_repository))
-    );
-    assert!(
-        sampled
-            .items()
-            .contains(&user_input_text_msg(current_repository))
-    );
-    assert!(
-        sampled
-            .items()
-            .contains(&user_input_text_msg("compaction checkpoint summary"))
-    );
+        for completed_tool_projection in [false, true] {
+            let sampled = if completed_tool_projection {
+                history
+                    .clone()
+                    .prepare_for_sampling_prompt_with_completed_tool_projection(
+                        &default_input_modalities(),
+                        StableContextTarget::Sampling,
+                        None,
+                        &workspace,
+                    )
+            } else {
+                history
+                    .clone()
+                    .prepare_for_sampling_prompt_with_workspace_freshness(
+                        &default_input_modalities(),
+                        StableContextTarget::Sampling,
+                        None,
+                        &workspace,
+                    )
+            };
+            assert_eq!(
+                sampled.items(),
+                &[user_input_text_msg(current_repository), dynamic.clone()],
+                "replace_history={replace_history}, completed_tool_projection={completed_tool_projection}"
+            );
+            assert!(sampled.stable_context_manifest().projection_enabled());
+        }
+    }
 }
 
 #[test]

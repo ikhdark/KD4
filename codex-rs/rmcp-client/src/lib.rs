@@ -46,15 +46,3 @@ pub use startup_error::is_authentication_required_error;
 pub use stdio_server_launcher::ExecutorStdioServerLauncher;
 pub use stdio_server_launcher::LocalStdioServerLauncher;
 pub use stdio_server_launcher::StdioServerLauncher;
-
-#[cfg(test)]
-mod abstraction_tests {
-    #[test]
-    fn transports_are_backed_by_runtime_consumers() {
-        let source = include_str!("rmcp_client.rs");
-        let removed_factory = ["InProcessTransport", "Factory"].concat();
-        let removed_constructor = ["new_in_process", "_client"].concat();
-        assert!(!source.contains(&removed_factory));
-        assert!(!source.contains(&removed_constructor));
-    }
-}

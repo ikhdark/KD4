@@ -47,18 +47,6 @@ use codex_protocol::protocol::UserMessageEvent;
 const NO_SOURCE_FILTER: &[SessionSource] = &[];
 const TEST_PROVIDER: &str = "test-provider";
 
-#[test]
-fn deprecated_find_conversation_path_alias_is_removed() {
-    let crate_root = include_str!("lib.rs");
-    assert!(!crate_root.contains("find_conversation_path_by_id_str"));
-}
-
-#[test]
-fn deprecated_state_db_module_alias_is_removed() {
-    let crate_root = include_str!("lib.rs");
-    assert!(!crate_root.contains("pub use state_integration as state_db"));
-}
-
 fn provider_vec(providers: &[&str]) -> Vec<String> {
     providers
         .iter()

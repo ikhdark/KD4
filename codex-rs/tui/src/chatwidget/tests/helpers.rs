@@ -20,6 +20,8 @@ pub(super) async fn test_config() -> Config {
     config.cwd = PathBuf::from(test_path_display("/tmp/project")).abs();
     config.config_layer_stack = ConfigLayerStack::default().into();
     config.startup_warnings.clear();
+    // Keep unrelated UI snapshots stable when the bundled default changes.
+    config.model = Some("gpt-5.6-sol".to_string());
     config
 }
 
@@ -816,6 +818,10 @@ pub(super) fn begin_exec_with_source(
         command: codex_shell_command::parse_command::shlex_join(&command),
         cwd: chat.config.cwd.clone().into(),
         process_id: None,
+        parent_call_id: None,
+        parent_cell_id: None,
+        runtime_tool_call_id: None,
+        execution_id: None,
         source,
         status: AppServerCommandExecutionStatus::InProgress,
         command_actions,
@@ -839,6 +845,10 @@ pub(super) fn begin_unified_exec_startup(
         command: codex_shell_command::parse_command::shlex_join(&command),
         cwd: chat.config.cwd.clone().into(),
         process_id: Some(process_id.to_string()),
+        parent_call_id: None,
+        parent_cell_id: None,
+        runtime_tool_call_id: None,
+        execution_id: None,
         source: ExecCommandSource::UnifiedExecStartup,
         status: AppServerCommandExecutionStatus::InProgress,
         command_actions: Vec::new(),
@@ -1058,6 +1068,10 @@ pub(super) fn end_exec(
         command,
         cwd,
         process_id,
+        parent_call_id,
+        parent_cell_id,
+        runtime_tool_call_id,
+        execution_id,
         source,
         command_actions,
         ..
@@ -1072,6 +1086,10 @@ pub(super) fn end_exec(
             command,
             cwd,
             process_id,
+            parent_call_id,
+            parent_cell_id,
+            runtime_tool_call_id,
+            execution_id,
             source,
             status: if exit_code == 0 {
                 AppServerCommandExecutionStatus::Completed

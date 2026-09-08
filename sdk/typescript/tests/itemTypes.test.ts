@@ -1,13 +1,17 @@
 import { expect, it } from "@jest/globals";
 
+import type { CodexExec } from "../src/exec";
+import type { ThreadEvent } from "../src/events";
+import { Thread } from "../src/thread";
 import type {
   CommandExecutionItem,
   FileChangeItem,
   McpToolCallItem,
   WebSearchAction,
+  WebSearchItem,
 } from "../src/items";
 
-it("represents every audited exec item edge", () => {
+it("preserves nullable outcomes and search actions through the event stream", async () => {
   const command: CommandExecutionItem = {
     id: "command",
     type: "command_execution",
@@ -39,12 +43,34 @@ it("represents every audited exec item edge", () => {
     { type: "other" },
   ];
 
-  expect([command.status, patch.status, mcp.result, actions.length]).toEqual([
-    "declined",
-    "in_progress",
-    null,
-    4,
-  ]);
+  const searches: WebSearchItem[] = actions.map((action, index) => ({
+    id: `search-${index}`,
+    type: "web_search",
+    query: "codex",
+    action,
+  }));
+  const events: ThreadEvent[] = [
+    { type: "item.completed", item: command },
+    { type: "item.started", item: patch },
+    { type: "item.started", item: mcp },
+    ...searches.map((item) => ({ type: "item.completed" as const, item })),
+  ];
+  const exec = {
+    async *run(): AsyncGenerator<string> {
+      for (const event of events) {
+        yield JSON.stringify(event);
+      }
+    },
+  } as unknown as CodexExec;
+  const thread = new Thread(exec, {}, {});
+
+  const streamed = await thread.runStreamed("search and run tools");
+  const received = [];
+  for await (const event of streamed.events) {
+    received.push(event);
+  }
+  expect(received).toEqual(events);
+  expect((await thread.run("search and run tools")).items).toEqual([command, ...searches]);
 });
 
 // @ts-expect-error exit_code is required even while it is null.

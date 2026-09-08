@@ -168,12 +168,4 @@ mod tests {
             )
         );
     }
-
-    #[test]
-    fn implementation_lives_at_the_crate_root() {
-        let source = include_str!("lib.rs");
-        let obsolete_module = ["mod sandbox_", "summary;"].concat();
-
-        assert!(!source.contains(&obsolete_module));
-    }
 }

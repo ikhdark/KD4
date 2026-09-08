@@ -20,7 +20,6 @@ use codex_app_server_protocol::RateLimitReachedType;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequest;
 use std::time::SystemTime;
-use std::time::UNIX_EPOCH;
 
 impl App {
     pub(super) fn refresh_mcp_startup_expected_servers_from_config(&mut self) {
@@ -246,10 +245,11 @@ impl App {
         }
 
         if let ServerRequest::CurrentTimeRead { request_id, .. } = &request {
-            let response = current_time_read_response(SystemTime::now()).and_then(|response| {
-                serde_json::to_value(response)
-                    .map_err(|err| format!("failed to serialize current time response: {err}"))
-            });
+            let response =
+                CurrentTimeReadResponse::try_from(SystemTime::now()).and_then(|response| {
+                    serde_json::to_value(response)
+                        .map_err(|err| format!("failed to serialize current time response: {err}"))
+                });
             match response {
                 Ok(response) => {
                     if let Err(err) = app_server_client
@@ -358,16 +358,6 @@ impl App {
     }
 }
 
-fn current_time_read_response(now: SystemTime) -> Result<CurrentTimeReadResponse, String> {
-    let seconds = now
-        .duration_since(UNIX_EPOCH)
-        .map_err(|err| format!("system time is before the Unix epoch: {err}"))?
-        .as_secs();
-    let current_time_at = i64::try_from(seconds)
-        .map_err(|_| "current Unix time does not fit in an i64".to_string())?;
-    Ok(CurrentTimeReadResponse { current_time_at })
-}
-
 fn chatgpt_auth_tokens_refresh_response(
     auth: &crate::local_chatgpt_auth::LocalChatgptAuth,
     params: &ChatgptAuthTokensRefreshParams,
@@ -390,7 +380,6 @@ mod tests {
     use crate::local_chatgpt_auth::LocalChatgptAuth;
     use codex_app_server_protocol::ChatgptAuthTokensRefreshReason;
     use pretty_assertions::assert_eq;
-    use std::time::Duration;
 
     fn refresh_params(previous_account_id: Option<&str>) -> ChatgptAuthTokensRefreshParams {
         ChatgptAuthTokensRefreshParams {
@@ -405,14 +394,6 @@ mod tests {
             chatgpt_account_id: "workspace-1".to_string(),
             chatgpt_plan_type: Some("business".to_string()),
         }
-    }
-
-    #[test]
-    fn current_time_response_uses_whole_unix_seconds() {
-        let response = current_time_read_response(UNIX_EPOCH + Duration::from_millis(12_345))
-            .expect("post-epoch time should produce a response");
-
-        assert_eq!(response.current_time_at, 12);
     }
 
     #[test]

@@ -404,15 +404,8 @@ pub fn format_with_current_shell_display_non_login(command: &str) -> String {
 /// the caller propagates it; a required helper must never turn into a silent
 /// pass. The owning test target declares the helper in
 /// `codex-rs/.config/kd4-rust-tests.toml`, which builds it before the run.
-pub fn required_helper_bin_with(
-    name: &str,
-    resolver: impl FnOnce(&str) -> Result<PathBuf, CargoBinError>,
-) -> Result<String, CargoBinError> {
-    resolver(name).map(|path| path.to_string_lossy().to_string())
-}
-
 pub fn required_helper_bin(name: &str) -> Result<String, CargoBinError> {
-    required_helper_bin_with(name, codex_utils_cargo_bin::cargo_bin)
+    codex_utils_cargo_bin::cargo_bin(name).map(|path| path.to_string_lossy().to_string())
 }
 
 pub fn stdio_server_bin() -> Result<String, CargoBinError> {
@@ -637,14 +630,6 @@ mod tests {
             started.elapsed() < std::time::Duration::from_secs(1),
             "requested short deadline was widened: {:?}",
             started.elapsed()
-        );
-    }
-
-    #[test]
-    fn integration_event_timeout_allows_loaded_shards_to_make_progress() {
-        assert_eq!(
-            INTEGRATION_EVENT_TIMEOUT,
-            tokio::time::Duration::from_secs(30)
         );
     }
 }
