@@ -51,7 +51,7 @@ pub(super) fn evaluate_main_module(
     Ok(None)
 }
 
-fn is_exit_exception(
+pub(super) fn is_exit_exception(
     scope: &mut v8::PinScope<'_, '_>,
     exception: v8::Local<'_, v8::Value>,
 ) -> bool {

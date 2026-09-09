@@ -63,11 +63,9 @@ impl Provider {
         if let Some(params) = &self.query_params
             && !params.is_empty()
         {
-            let qs = params
-                .iter()
-                .map(|(k, v)| format!("{k}={v}"))
-                .collect::<Vec<_>>()
-                .join("&");
+            let qs = url::form_urlencoded::Serializer::new(String::new())
+                .extend_pairs(params)
+                .finish();
             url.push('?');
             url.push_str(&qs);
         }

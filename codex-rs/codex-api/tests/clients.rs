@@ -319,6 +319,42 @@ data: {"id":"resp-1","output":[{"type":"message","role":"assistant","content":[{
 }
 
 #[tokio::test]
+async fn responses_client_preserves_configured_query_parameters() -> Result<()> {
+    let state = RecordingState::default();
+    let transport = RecordingTransport::new(state.clone());
+    let mut provider = provider("openai");
+    provider.query_params = Some(std::collections::HashMap::from([
+        ("token".to_string(), "a+b&scope=admin#tail".to_string()),
+        ("project name".to_string(), "café / 100%".to_string()),
+    ]));
+    let client = ResponsesClient::new(transport, provider, Arc::new(NoAuth));
+    let _stream = client
+        .stream(
+            serde_json::json!({"model": "gpt-test"}),
+            HeaderMap::new(),
+            Compression::None,
+            None,
+        )
+        .await?;
+
+    let requests = state.take_stream_requests();
+    assert_eq!(requests.len(), 1);
+    let url = url::Url::parse(&requests[0].url)?;
+    assert_eq!(url.path(), "/v1/responses");
+    assert_eq!(url.fragment(), None);
+    assert_eq!(
+        url.query_pairs()
+            .into_owned()
+            .collect::<std::collections::HashMap<_, _>>(),
+        std::collections::HashMap::from([
+            ("token".to_string(), "a+b&scope=admin#tail".to_string()),
+            ("project name".to_string(), "café / 100%".to_string()),
+        ])
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn responses_client_uses_responses_path() -> Result<()> {
     let state = RecordingState::default();
     let transport = RecordingTransport::new(state.clone());

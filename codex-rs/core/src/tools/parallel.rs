@@ -1211,10 +1211,20 @@ impl ToolCallRuntime {
             source_path_observations,
             workspace_gate_guard,
         } = input;
+        let mut history_response = ResponseItem::from(response.clone());
+        if let ResponseItem::FunctionCallOutput { output, .. }
+        | ResponseItem::CustomToolCallOutput { output, .. } = &mut history_response
+        {
+            // Fingerprint the same bounded payload that conversation history stores.
+            *output = crate::context_manager::truncate_function_output_payload(
+                output,
+                turn.model_info.truncation_policy.into(),
+            );
+        }
         let Some(observation) =
             crate::tool_history::WorkspaceEvidenceObservation::from_response_item_with_freshness(
                 revision,
-                &ResponseItem::from(response.clone()),
+                &history_response,
                 source_dependencies,
                 captured_current,
             )
@@ -1239,15 +1249,17 @@ impl ToolCallRuntime {
         let Some(collector) = &self.sampling_request_signals else {
             return;
         };
-        if result.source_dependencies.is_none() {
-            let classification = crate::tool_history::classify_workspace_tool_call(
-                result.tool_name.name.as_str(),
-                result.payload,
-                self.step_context.turn.config.cwd.as_path(),
-            );
-            result.source_dependencies = classification
-                .observes_workspace
-                .then_some(classification.source_dependencies);
+        let classification = crate::tool_history::classify_workspace_tool_call(
+            result.tool_name.name.as_str(),
+            result.payload,
+            self.step_context.turn.config.cwd.as_path(),
+        );
+        if !classification.observes_workspace {
+            // Generic output projection also carries an empty dependency set
+            // for non-workspace tools. It is not an unscoped repository read.
+            result.source_dependencies = None;
+        } else if result.source_dependencies.is_none() {
+            result.source_dependencies = Some(classification.source_dependencies);
         }
         collector.record_code_mode_result(result);
         collector.record_accepted_deterministic_continuation_receipts(receipts);
@@ -1606,12 +1618,22 @@ impl ToolCallRuntime {
                             Some(&response.payload),
                             self.step_context.turn.config.cwd.as_path(),
                         );
+                    let code_mode_exec = crate::tools::code_mode::is_exec_tool_name(&owner_tool_name);
                     let source_dependencies_override = owner_key.as_deref().and_then(|owner_key| {
                         signal_collector.as_ref().and_then(|collector| {
                             collector.code_mode_source_dependencies(owner_key)
                         })
                     })
-                    .or_else(|| response.projected_source_dependencies().cloned());
+                    .or_else(|| {
+                        // A completed cell's nested observations are authoritative.
+                        // Generic projection of the carrier cannot distinguish
+                        // no repository reads from an unscoped repository read.
+                        if code_mode_exec && owner_key.is_some() && signal_collector.is_some() {
+                            None
+                        } else {
+                            response.projected_source_dependencies().cloned()
+                        }
+                    });
                     // Ordinary tool results install their canonical projection in the
                     // registry, where this phase is already recorded. Cancellation
                     // owns a synthesized terminal result and intentionally bypasses
@@ -1622,7 +1644,6 @@ impl ToolCallRuntime {
                     let projection_started = Instant::now();
                     let response = response.into_response();
                     evidence_timing.record_output_projection(projection_started.elapsed());
-                    let code_mode_exec = crate::tools::code_mode::is_exec_tool_name(&owner_tool_name);
                     let (workspace_revision_before, evidence_classification) =
                         if code_mode_exec {
                             match source_dependencies_override.as_ref() {

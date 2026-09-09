@@ -114,6 +114,51 @@ mod tests {
     }
 
     #[test]
+    fn augment_tool_definition_preserves_intersection_grouping() {
+        let schema = json!({
+            "allOf": [
+                {
+                    "anyOf": [
+                        {
+                            "type": "object",
+                            "properties": { "city": { "type": "string" } },
+                            "required": ["city"]
+                        },
+                        {
+                            "type": "object",
+                            "properties": { "zip": { "type": "string" } },
+                            "required": ["zip"]
+                        }
+                    ]
+                },
+                {
+                    "type": "object",
+                    "properties": { "country": { "type": "string" } },
+                    "required": ["country"]
+                }
+            ]
+        });
+        let definition = ToolDefinition {
+            name: "lookup".to_string(),
+            tool_name: ToolName::plain("lookup"),
+            description: "Look up an address.".to_string(),
+            kind: CodeModeToolKind::Function,
+            input_schema: Some(schema.clone()),
+            output_schema: Some(schema),
+        };
+
+        // Country is required for both city and zip variants. Without grouping,
+        // TypeScript's intersection precedence makes it optional for city.
+        let address = "({ city: string; } | { zip: string; }) & ({ country: string; })";
+        assert_eq!(
+            augment_tool_definition(definition).description,
+            format!(
+                "Look up an address.\n\nexec tool declaration:\n```ts\ndeclare const tools: {{ lookup(args: {address}, options?: {{ timeout_ms?: number }}): Promise<{address}>; }};\n```"
+            )
+        );
+    }
+
+    #[test]
     fn augment_tool_definition_includes_property_descriptions_as_comments() {
         let definition = ToolDefinition {
             name: "weather_tool".to_string(),

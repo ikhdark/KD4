@@ -5,6 +5,7 @@ mod timers;
 mod value;
 
 use std::collections::HashMap;
+use std::ops::ControlFlow;
 use std::panic::AssertUnwindSafe;
 use std::panic::catch_unwind;
 use std::sync::Arc;
@@ -511,9 +512,16 @@ fn run_runtime(
                 }
             }
             RuntimeCommand::TimeoutFired { id } => {
-                if let Err(runtime_error) = timers::invoke_timeout_callback(scope, id) {
-                    capture_scope_send_error(scope, &event_tx, Some(runtime_error));
-                    return;
+                match timers::invoke_timeout_callback(scope, id) {
+                    Ok(ControlFlow::Continue(())) => {}
+                    Ok(ControlFlow::Break(())) => {
+                        capture_scope_send_error(scope, &event_tx, None);
+                        return;
+                    }
+                    Err(runtime_error) => {
+                        capture_scope_send_error(scope, &event_tx, Some(runtime_error));
+                        return;
+                    }
                 }
             }
         }

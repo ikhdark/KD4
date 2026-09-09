@@ -180,6 +180,73 @@ async fn synchronous_exit_returns_successfully() {
 }
 
 #[tokio::test]
+async fn timer_exit_returns_successfully() {
+    let service = InProcessCodeModeSession::new();
+    let response = execute(
+        &service,
+        ExecuteRequest {
+            source: r#"
+await new Promise(() => setTimeout(() => {
+    text("before");
+    store("timer-exit", "saved");
+    exit();
+    text("after");
+}, 1));
+text("after await");
+"#
+            .to_string(),
+            yield_time_ms: None,
+            ..execute_request("")
+        },
+    )
+    .await;
+
+    assert_eq!(
+        response,
+        RuntimeResponse::Result {
+            cell_id: cell_id("1"),
+            content_items: vec![FunctionCallOutputContentItem::InputText {
+                text: "before".to_string(),
+            }],
+            error_text: None,
+        }
+    );
+    let stored = execute(
+        &service,
+        ExecuteRequest {
+            source: r#"text(load("timer-exit"));"#.to_string(),
+            yield_time_ms: None,
+            ..execute_request("")
+        },
+    )
+    .await;
+    assert_eq!(result_text(&stored), "saved");
+}
+
+#[tokio::test]
+async fn timer_throwing_exit_sentinel_remains_an_error() {
+    let service = InProcessCodeModeSession::new();
+    let response = execute(
+        &service,
+        ExecuteRequest {
+            source: r#"await new Promise(() => setTimeout(() => { throw "__codex_code_mode_exit__"; }, 1));"#.to_string(),
+            yield_time_ms: None,
+            ..execute_request("")
+        },
+    )
+    .await;
+
+    assert_eq!(
+        response,
+        RuntimeResponse::Result {
+            cell_id: cell_id("1"),
+            content_items: Vec::new(),
+            error_text: Some("__codex_code_mode_exit__".to_string()),
+        }
+    );
+}
+
+#[tokio::test]
 async fn compact_tool_discovery_resolves_one_exact_description() {
     let service = InProcessCodeModeSession::new();
     let response = execute(

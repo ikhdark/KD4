@@ -1,6 +1,7 @@
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::collections::HashMap;
+use std::ops::ControlFlow;
 use std::sync::mpsc as std_mpsc;
 use std::thread;
 use std::time::Duration;
@@ -8,6 +9,7 @@ use std::time::Instant;
 
 use super::RuntimeCommand;
 use super::RuntimeState;
+use super::module_loader::is_exit_exception;
 use super::value::value_to_error_text;
 
 pub(super) struct ScheduledTimeout {
@@ -162,7 +164,7 @@ pub(super) fn clear_timeout(
 pub(super) fn invoke_timeout_callback(
     scope: &mut v8::PinScope<'_, '_>,
     timeout_id: u64,
-) -> Result<(), String> {
+) -> Result<ControlFlow<()>, String> {
     let callback = {
         let state = scope
             .get_slot_mut::<RuntimeState>()
@@ -170,7 +172,7 @@ pub(super) fn invoke_timeout_callback(
         state.pending_timeouts.remove(&timeout_id)
     };
     let Some(callback) = callback else {
-        return Ok(());
+        return Ok(ControlFlow::Continue(()));
     };
 
     let tc = std::pin::pin!(v8::TryCatch::new(scope));
@@ -179,13 +181,18 @@ pub(super) fn invoke_timeout_callback(
     let receiver = v8::undefined(&tc).into();
     let _ = callback.call(&tc, receiver, &[]);
     if tc.has_caught() {
+        if let Some(exception) = tc.exception()
+            && is_exit_exception(&mut tc, exception)
+        {
+            return Ok(ControlFlow::Break(()));
+        }
         return Err(tc
             .exception()
             .map(|exception| value_to_error_text(&mut tc, exception))
             .unwrap_or_else(|| "unknown code mode exception".to_string()));
     }
 
-    Ok(())
+    Ok(ControlFlow::Continue(()))
 }
 fn timeout_id_from_args(
     scope: &mut v8::PinScope<'_, '_>,

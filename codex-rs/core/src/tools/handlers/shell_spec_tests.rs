@@ -4,8 +4,7 @@ use std::collections::BTreeMap;
 
 fn exec_command_guidance_description() -> String {
     format!(
-        "\n\n{}\n\n{}\n\n{}",
-        KD4_VALIDATION_COMMAND_GUIDANCE,
+        "\n\n{}\n\n{}",
         rg_search_admission_guidance(),
         filesystem_safety_guidance()
     )
@@ -13,8 +12,7 @@ fn exec_command_guidance_description() -> String {
 
 fn shell_command_guidance_description() -> String {
     format!(
-        "\n\n{}\n\n{}\n\n{}",
-        KD4_VALIDATION_COMMAND_GUIDANCE,
+        "\n\n{}\n\n{}",
         rg_search_admission_guidance(),
         windows_shell_guidance()
     )
@@ -78,7 +76,7 @@ fn command_validation_context_is_lean_and_strict() {
 }
 
 #[test]
-fn token_efficiency_command_tools_explain_validation_proof_metadata() {
+fn command_tools_allow_batched_inspection_and_optional_validation_metadata() {
     for tool in [
         create_exec_command_tool(CommandToolOptions {
             allow_login_shell: true,
@@ -93,15 +91,32 @@ fn token_efficiency_command_tools_explain_validation_proof_metadata() {
         let description = tool["description"]
             .as_str()
             .expect("command tool description");
-        assert!(description.contains("For direct validation proof"));
-        assert!(description.contains("`kind: \"argv\"`"));
-        assert!(description.contains("`validation.covered_paths`"));
-        assert!(description.contains("may run, but is not recorded as proof"));
-
+        assert!(!description.contains("not recorded as proof"));
+        assert!(!description.contains("Omit redundant defaults"));
+        let script_field = if tool["name"] == "exec_command" {
+            "cmd"
+        } else {
+            "command"
+        };
+        let script_description = tool["parameters"]["properties"][script_field]["description"]
+            .as_str()
+            .expect("script description");
+        assert!(
+            script_description
+                .contains("Read-only inspection may be batched in a single script call.")
+        );
+        assert!(script_description.contains("you may use `kind: \"argv\"`"));
         assert_eq!(
             tool["parameters"]["properties"]["validation"]["description"],
-            KD4_VALIDATION_COMMAND_GUIDANCE
+            "Optional validation scope metadata."
         );
+        let validator =
+            jsonschema::validator_for(&tool["parameters"]).expect("command schema should compile");
+        let mut arguments = json!({});
+        arguments[script_field] = json!("python -m unittest -q");
+        assert!(validator.is_valid(&arguments));
+        arguments["validation"] = json!({"covered_paths": ["src"]});
+        assert!(validator.is_valid(&arguments));
     }
 }
 
@@ -113,7 +128,7 @@ fn exec_command_tool_matches_expected_spec() {
     });
 
     let description = format!(
-        "Runs a command, returning output or a session ID for ongoing interaction. Omit redundant defaults such as tty: false, force_fresh: false, yield_time_ms: 2000, and absent optional metadata. Keep explicit workdir, environment, validation, permissions, and login: false when they affect the invocation; omitted login follows configuration. For commands needing no shell interpretation, use program and args (kind: argv) instead of subprocess launchers or quoting wrappers. Use kind: powershell_script with script_body for PowerShell semantics. Keep pipelines, redirections, and shell expansion in script form.{}",
+        "Runs a command, returning output or a session ID for ongoing interaction. For commands needing no shell interpretation, you may use program and args (kind: argv). Read-only inspection may be batched in a single script call. Use kind: powershell_script with script_body for PowerShell semantics. Keep pipelines, redirections, and shell expansion in script form.{}",
         exec_command_guidance_description()
     );
 
@@ -121,7 +136,7 @@ fn exec_command_tool_matches_expected_spec() {
         (
             "cmd".to_string(),
             JsonSchema::string(Some(
-                "Legacy shell script to execute. Use this only when shell semantics are required, including PowerShell cmdlets, variables or interpolation, pipelines or redirection, here-docs, compound statements, shell builtins, and `.cmd`/`.bat` semantics. When a standalone native executable and separated arguments are already known, use `kind: \"argv\"` with `program` and `args` instead; do not serialize them into this string field. This includes Git (`git`), ripgrep (`rg`), Cargo (`cargo`), Node (`node`), Python (`python`), and KD4 helper executables such as `kds`. Examples: `git` with `[\"status\", \"--short\"]`; `rg` with `[\"--files\"]`; `cargo` with `[\"test\", \"-p\", \"codex-core\"]`; `node` with `[\"script.js\"]`; `python` with `[\"-m\", \"pytest\"]`; `kds` with `[\"--help\"]`. Arbitrary command strings remain shell scripts and must not be heuristically split. For complex PowerShell, prefer `kind: \"powershell_script\"`. If shell inspection is necessary, keep read-only PowerShell to direct cmdlet pipelines without variables, loops, or script blocks so it can remain outside the repository mutation lane."
+                "Shell script to execute. Read-only inspection may be batched in a single script call. For a standalone native executable with known arguments, you may use `kind: \"argv\"` with `program` and `args`. Keep pipelines, redirection, shell expansion, compound statements, builtins, and `.cmd`/`.bat` semantics in script form. Arbitrary command strings remain shell scripts and must not be heuristically split. For complex PowerShell, prefer `kind: \"powershell_script\"`. Keep read-only PowerShell to direct cmdlet pipelines when possible; variables, loops, or script blocks may require the repository mutation lane."
                     .to_string(),
             )),
         ),
@@ -396,7 +411,7 @@ Examples of valid command strings:
         (
             "command".to_string(),
             JsonSchema::string(Some(
-                "Legacy shell script to execute. Use this only when shell semantics are required, including PowerShell cmdlets, variables or interpolation, pipelines or redirection, here-docs, compound statements, shell builtins, and `.cmd`/`.bat` semantics. When a standalone native executable and separated arguments are already known, use `kind: \"argv\"` with `program` and `args` instead; do not serialize them into this string field. This includes Git (`git`), ripgrep (`rg`), Cargo (`cargo`), Node (`node`), Python (`python`), and KD4 helper executables such as `kds`. Examples: `git` with `[\"status\", \"--short\"]`; `rg` with `[\"--files\"]`; `cargo` with `[\"test\", \"-p\", \"codex-core\"]`; `node` with `[\"script.js\"]`; `python` with `[\"-m\", \"pytest\"]`; `kds` with `[\"--help\"]`. Arbitrary command strings remain shell scripts and must not be heuristically split. For complex PowerShell, prefer `kind: \"powershell_script\"`. If shell inspection is necessary, keep read-only PowerShell to direct cmdlet pipelines without variables, loops, or script blocks so it can remain outside the repository mutation lane."
+                "Shell script to execute. Read-only inspection may be batched in a single script call. For a standalone native executable with known arguments, you may use `kind: \"argv\"` with `program` and `args`. Keep pipelines, redirection, shell expansion, compound statements, builtins, and `.cmd`/`.bat` semantics in script form. Arbitrary command strings remain shell scripts and must not be heuristically split. For complex PowerShell, prefer `kind: \"powershell_script\"`. Keep read-only PowerShell to direct cmdlet pipelines when possible; variables, loops, or script blocks may require the repository mutation lane."
                     .to_string(),
             )),
         ),

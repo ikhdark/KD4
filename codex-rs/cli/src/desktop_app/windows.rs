@@ -23,7 +23,10 @@ pub async fn run_windows_app_open_or_install(
     let download_url = download_url_override
         .as_deref()
         .unwrap_or(CODEX_WINDOWS_INSTALLER_URL);
-    if open_url(download_url).await.is_err() && download_url_override.is_none() {
+    if let Err(error) = open_url(download_url).await {
+        if download_url_override.is_some() {
+            return Err(error);
+        }
         open_url(CODEX_MICROSOFT_STORE_WEB_URL).await?;
     }
     eprintln!("After installing Codex Desktop, open workspace {display_workspace}.");
@@ -50,7 +53,7 @@ async fn open_url(url: &str) -> anyhow::Result<()> {
     let status = Command::new("powershell.exe")
         .arg("-NoProfile")
         .arg("-Command")
-        .arg("& { param($target) Start-Process -FilePath $target }")
+        .arg("& { param($target) try { Start-Process -FilePath $target -ErrorAction Stop } catch { Write-Error $_; exit 1 } }")
         .arg(url)
         .status()
         .await
@@ -85,8 +88,19 @@ fn display_workspace_path(workspace: &Path) -> String {
 mod tests {
     use super::codex_new_thread_url;
     use super::display_workspace_path;
+    use super::open_url;
     use pretty_assertions::assert_eq;
     use std::path::Path;
+
+    #[tokio::test]
+    async fn open_url_reports_a_launch_failure() {
+        let temp_dir = tempfile::tempdir().expect("create temporary directory");
+        let missing_executable = temp_dir.path().join("missing-installer.exe");
+        let error = open_url(&missing_executable.to_string_lossy())
+            .await
+            .expect_err("a nonexistent installer must not be reported as opened");
+        assert!(error.to_string().contains("failed to open"));
+    }
 
     #[test]
     fn display_workspace_path_removes_windows_extended_prefix() {

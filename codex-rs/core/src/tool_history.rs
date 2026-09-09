@@ -1015,6 +1015,40 @@ impl ToolHistoryState {
             ))
         });
 
+        // Seeing a result once does not make its source or contract details
+        // dispensable to later generations. Compact consumed results only
+        // when the existing aggregate tool-result budget is under pressure.
+        let raw_results_fit = admission_candidates
+            .iter()
+            .filter_map(|candidate| {
+                candidate.structured_tokens.or_else(|| {
+                    let tracked = self.candidates.get(&candidate.call_id)?;
+                    Some(
+                        usize::try_from(
+                            tracked
+                                .derived
+                                .bounded_model_output_tokens
+                                .saturating_add(tracked.preserved_non_text_tokens),
+                        )
+                        .unwrap_or(usize::MAX),
+                    )
+                })
+            })
+            .fold(0usize, usize::saturating_add)
+            <= MODEL_VISIBLE_TOOL_RESULT_TOKEN_BUDGET;
+        let newest_unconsumed_non_text_item = admission_candidates
+            .iter()
+            .filter(|admission| {
+                self.candidates
+                    .get(&admission.call_id)
+                    .is_some_and(|candidate| {
+                        candidate.preserved_non_text_tokens > 0
+                            && candidate.consumed_by_generation.is_none()
+                    })
+            })
+            .map(|admission| admission.item_index.0)
+            .max();
+
         #[derive(Debug)]
         enum AdmissionRepresentation {
             Raw,
@@ -1162,8 +1196,13 @@ impl ToolHistoryState {
                 .then(|| candidate.artifact_pin())
                 .flatten();
 
-            let decision = if raw_tokens <= remaining_raw_tokens {
-                if candidate.consumed_by_generation.is_some()
+            // A newly returned image cannot be represented by a text receipt.
+            // Preserve the newest such result through its first exposure, even
+            // when its encoded size alone exceeds the shared history budget.
+            let preserve_newest_non_text = Some(item_index) == newest_unconsumed_non_text_item;
+            let decision = if raw_tokens <= remaining_raw_tokens || preserve_newest_non_text {
+                if !raw_results_fit
+                    && candidate.consumed_by_generation.is_some()
                     && let Some((receipt_id, text, receipt_tokens)) = savings_receipt
                     && receipt_tokens <= raw_tokens
                     && receipt_tokens <= remaining_tokens
@@ -1421,14 +1460,37 @@ impl ToolHistoryState {
                 if revision_matches && output_matches {
                     continue;
                 }
-                let reason = if observation.is_some_and(|observation| {
-                    !observation.source_dependencies.is_empty()
-                        && !observation.source_dependencies_current
-                }) {
-                    "a source dependency changed after this tool result was captured; rerun the tool before relying on it"
+                let (reason_code, reason) = if observation.is_none() {
+                    (
+                        "missing_observation",
+                        "no workspace observation was recorded for this tool result; rerun the tool before relying on it",
+                    )
+                } else if observation
+                    .is_some_and(|observation| !observation.source_dependencies_current)
+                {
+                    (
+                        "source_dependency_changed",
+                        "a source dependency changed after this tool result was captured; rerun the tool before relying on it",
+                    )
+                } else if !output_matches {
+                    (
+                        "output_mismatch",
+                        "the tool output does not match its recorded workspace observation; rerun the tool before relying on it",
+                    )
                 } else {
-                    "the repository identity is unavailable or changed after this tool result was captured; rerun the tool before relying on it"
+                    (
+                        "workspace_identity_changed",
+                        "the repository identity is unavailable or changed after this tool result was captured; rerun the tool before relying on it",
+                    )
                 };
+                tracing::debug!(
+                    call_id,
+                    origin_call_id,
+                    reason_code,
+                    revision_matches,
+                    output_matches,
+                    "invalidating stale workspace evidence"
+                );
                 Some((call_id.to_string(), reason))
             };
             let Some((call_id, reason)) = replacement else {
@@ -2730,7 +2792,7 @@ pub(crate) fn tool_search_receipt_item(
         .filter_map(tool_search_result_identity)
         .collect::<Vec<_>>();
     let total_identity_count = ordered_tool_identities.len();
-    let arguments = compact_tool_search_arguments(arguments);
+    let mut arguments = compact_tool_search_arguments(arguments);
 
     loop {
         let complete = status == "completed" && omitted_result_count.unwrap_or(0) == 0;
@@ -2774,10 +2836,20 @@ pub(crate) fn tool_search_receipt_item(
         if tokens <= RECEIPT_MAX_TOKENS {
             return Some((receipt_item, tokens));
         }
-        if ordered_tool_identities.is_empty() {
-            return None;
+        if ordered_tool_identities.pop().is_some() {
+            continue;
         }
-        ordered_tool_identities.pop();
+        // Per-field preview limits do not bound their combined receipt. Drop
+        // the largest remaining preview while retaining its exact input hash.
+        let compact = arguments.as_object_mut()?;
+        let key = ["query", "namespace", "limit", "cursor"]
+            .into_iter()
+            .filter(|key| compact.contains_key(*key))
+            .max_by_key(|key| compact[*key].to_string().len())?;
+        let value = compact.remove(key)?;
+        compact
+            .entry(format!("{key}_sha256"))
+            .or_insert_with(|| serde_json::Value::String(sha256(value.to_string().as_bytes())));
     }
 }
 
@@ -2984,8 +3056,12 @@ fn workspace_call_observes_from_arguments(arguments: Option<&serde_json::Value>)
     let Some(command) = dependency_command(arguments) else {
         return true;
     };
-    !crate::turn_diff_tracker::command_may_mutate(&command)
-        && !crate::turn_diff_tracker::command_reads_repository_history(&command)
+    // An uncertain command can read repository files. Only a known writer
+    // can skip observation; mutation tracking still handles uncertain writes.
+    !matches!(
+        crate::turn_diff_tracker::command_mutation(&command, None),
+        crate::turn_diff_tracker::CommandMutation::KnownMutation { .. }
+    ) && !crate::turn_diff_tracker::command_reads_repository_history(&command)
 }
 
 pub(crate) fn source_dependencies_for_tool_call(

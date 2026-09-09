@@ -1,5 +1,23 @@
 #!/usr/bin/env python3
-"""Run a minimal paired live-agent benchmark for KD4 versus official upstream C."""
+"""Run a paired live-agent benchmark between two binaries or configurations.
+
+For a configuration ablation, point both variants at the same binary and clean
+source revision. Add these options to the usual provenance/output arguments:
+
+    --fork-label direct-on --upstream-label direct-off
+    --fork-config features.direct_runtime=true
+    --upstream-config features.direct_runtime=false
+    --experiment-feature direct_runtime
+
+Overrides are repeatable boolean feature assignments. Pin shared features on
+both sides and change one feature at a time. The experiment label records intent;
+it does not itself toggle a feature or prove isolation. Runtime defaults and tool
+surface parity still require inspection of the builds being compared.
+
+modelWaitPerGeneration summarizes each eligible run's modelWaitMs divided by
+its logicalGenerationCount. It remains null without paired timing/count data;
+it is not a ratio of aggregate means or a measurement of inference alone.
+"""
 
 from __future__ import annotations
 
@@ -426,15 +444,15 @@ _REQUIRED_TEST_PATTERN = re.compile(
 # redirection (`2>&1`) is part of that redirection, not a separator: splitting
 # there left a dangling `2>` that read as a file-opening write and truncated the
 # required-test match.
-_SHELL_SEGMENT = re.compile(r"(?:&&|\|\||[;|]|(?<!>)&)")
+_SHELL_SEGMENT = re.compile(r"(?:\r?\n|&&|\|\||[;|]|(?<!>)&)")
 # The same separators with the operator captured, so a matched required-test
 # segment can be checked against what runs after it.
-_SHELL_SEGMENT_CAPTURE = re.compile(r"(&&|\|\||[;|]|(?<!>)&)")
+_SHELL_SEGMENT_CAPTURE = re.compile(r"(\r?\n|&&|\|\||[;|]|(?<!>)&)")
 # Separators that unconditionally replace the exit code of the command before
 # them: a `||` fallback, a `;` sequel, and a backgrounding `&`. `&&` preserves
 # a failure, and `|` is the accepted output idiom above whose propagation
 # depends on shell configuration the harness cannot see.
-_EXIT_MASKING_SEPARATORS = frozenset({"||", ";", "&"})
+_EXIT_MASKING_SEPARATORS = frozenset({"||", ";", "&", "\n", "\r\n"})
 
 # `command_display_string` joins the executed argv, so a command the agent ran
 # through a shell arrives as `bash -lc <script>` rather than as the script. Every
@@ -632,6 +650,9 @@ _TEST_RUNNER_PATTERN = re.compile(
 # opening a file, is excluded, and `(?!&)` alone is enough to do that.
 _REDIRECTION_PATTERN = re.compile(r"(?<![<>])\d*>>?(?!&)")
 _IN_PLACE_EDIT_PATTERN = re.compile(r"(?i)(?:^|\s)(?:sed|perl)\s+[^|;&]*-i\b")
+_POWERSHELL_HERE_STRING_PATTERN = re.compile(
+    r"(?ms)@'\r?\n.*?^\s*'@|@\"\r?\n.*?^\s*\"@"
+)
 
 
 _DIAGNOSTIC_PATTERNS: dict[str, tuple[tuple[str, str], ...]] = {
@@ -672,6 +693,18 @@ _DIAGNOSTIC_PATTERNS: dict[str, tuple[tuple[str, str], ...]] = {
         ("patch mismatch", "a patch mismatch was reported"),
     ),
 }
+
+
+# These are reported symptoms, not proof that the runtime invalidated evidence.
+# Inspect only the final answer, so quoted source and tool output do not count.
+_FINAL_VERIFICATION_COMPLAINT = re.compile(
+    r"\b(?:unverified|unverifiable)\b"
+    r"|\b(?:cannot|can't|could not|couldn't|unable to)\s+(?:independently\s+)?verify\b"
+    r"|\b(?:tool|workspace|repository|verification|test|command|evidence|results?|outputs?)"
+    r"\b[^\n.!?]{0,120}\bstale\b"
+    r"|\bstale(?:\s+\w+){0,3}\s+(?:results?|outputs?|evidence)\b",
+    re.IGNORECASE,
+)
 
 
 def sha256(path: Path) -> str:
@@ -1327,6 +1360,39 @@ def terminate_process(process: subprocess.Popen[str]) -> None:
             setattr(process, "_kd4_windows_job", None)
 
 
+CONFIG_ABLATION_FEATURES = (
+    "unified_exec",
+    "shell_tool",
+    "direct_runtime",
+    "known_delta_store",
+    "deferred_executor",
+    "current_time_reminder",
+)
+
+
+def validate_config_overrides(overrides: list[str] | tuple[str, ...]) -> list[str]:
+    """Keep feature experiments separate from the pinned benchmark conditions."""
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for override in overrides:
+        key, separator, value = override.partition("=")
+        key, value = key.strip(), value.strip()
+        if (
+            not separator
+            or key not in {f"features.{feature}" for feature in CONFIG_ABLATION_FEATURES}
+            or value not in {"true", "false"}
+        ):
+            raise ValueError(
+                "config overrides must be features.KEY=true|false, where KEY is one of: "
+                + ", ".join(CONFIG_ABLATION_FEATURES)
+            )
+        if key in seen:
+            raise ValueError(f"duplicate config override: {key}")
+        seen.add(key)
+        normalized.append(f"{key}={value}")
+    return normalized
+
+
 def build_agent_command(
     *,
     binary: Path,
@@ -1336,8 +1402,10 @@ def build_agent_command(
     personality: str,
     code_mode: str,
     task: BenchmarkTask = DEFAULT_BENCHMARK_TASK,
+    config_overrides: tuple[str, ...] | list[str] = (),
 ) -> list[str]:
     code_mode_enabled = "true" if code_mode == "enabled" else "false"
+    overrides = validate_config_overrides(config_overrides)
     return [
         str(binary),
         "exec",
@@ -1355,6 +1423,7 @@ def build_agent_command(
         'approval_policy="never"',
         "-c",
         f"features.code_mode={code_mode_enabled}",
+        *[argument for override in overrides for argument in ("-c", override)],
         "--sandbox",
         "danger-full-access",
         "-C",
@@ -1380,8 +1449,12 @@ def shell_script_payloads(command: str) -> list[str]:
     same execution, so every command predicate is evaluated against both forms.
     Nested wrappers are unwrapped until a non-wrapper leader is reached.
     """
-    payloads = [command]
-    current = command
+    # PowerShell here-string bodies are data. Removing them before tokenizing
+    # also prevents quotes inside inline Python from prematurely ending the
+    # outer `-Command "..."` token, while preserving the pipeline and any
+    # newline-separated command that follows the terminator.
+    current = _POWERSHELL_HERE_STRING_PATTERN.sub("''", command)
+    payloads = [current]
     for _ in range(4):
         tokens = _tokenize(current)
         if len(tokens) < 3:
@@ -3011,6 +3084,7 @@ def stream_derived_rounds(events: list[dict[str, Any]]) -> dict[str, Any]:
 def classify_diagnostics(
     *,
     observed_text: str,
+    final_message: str | None = None,
     timed_out: bool,
     exit_code: int,
     terminal_event: str | None,
@@ -3025,6 +3099,14 @@ def classify_diagnostics(
         signals = [signal for needle, signal in patterns if needle in lowered]
         if signals:
             diagnostics.append({"category": category, "signals": sorted(set(signals))})
+
+    if final_message and (match := _FINAL_VERIFICATION_COMPLAINT.search(final_message)):
+        diagnostics.append(
+            {
+                "category": "final_verification_complaint",
+                "signals": [f"final answer reports: {match.group(0)}"],
+            }
+        )
 
     execution_signals: list[str] = []
     if command_execution_failures:
@@ -3080,6 +3162,7 @@ def _run_agent_impl(
     timeout_seconds: int,
     task: BenchmarkTask,
     _process_holder: list[subprocess.Popen[str]],
+    config_overrides: tuple[str, ...] | list[str] = (),
 ) -> dict[str, Any]:
     with tempfile.TemporaryDirectory(
         prefix=f"kd4-live-{task.task_id}-{label}-{repetition}-"
@@ -3099,6 +3182,7 @@ def _run_agent_impl(
             personality=personality,
             code_mode=code_mode,
             task=task,
+            config_overrides=config_overrides,
         )
         env = os.environ.copy()
         env["CODEX_HOME"] = str(home)
@@ -3458,6 +3542,7 @@ def _run_agent_impl(
         )
         diagnostics = classify_diagnostics(
             observed_text=diagnostic_text,
+            final_message=final_message,
             timed_out=timed_out,
             exit_code=exit_code,
             terminal_event=terminal_event,
@@ -3522,6 +3607,7 @@ def _run_agent_impl(
         )
         return {
             "variant": label,
+            "configOverrides": list(config_overrides),
             "repetition": repetition,
             "taskId": task.task_id,
             "taskShape": task.shape,
@@ -3613,6 +3699,7 @@ def run_agent(
     auth_source: Path,
     timeout_seconds: int,
     task: BenchmarkTask = DEFAULT_BENCHMARK_TASK,
+    config_overrides: tuple[str, ...] | list[str] = (),
 ) -> dict[str, Any]:
     """Run one agent with unconditional process-tree cleanup."""
     processes: list[subprocess.Popen[str]] = []
@@ -3629,6 +3716,7 @@ def run_agent(
             timeout_seconds=timeout_seconds,
             task=task,
             _process_holder=processes,
+            config_overrides=validate_config_overrides(config_overrides),
         )
     finally:
         for process in processes:
@@ -4247,6 +4335,13 @@ def summarize(runs: list[dict[str, Any]]) -> dict[str, Any]:
         for run in runs
         if (value := _run_metric(run, "logicalGenerationCount")) is not None
     ]
+    model_wait_per_generation = [
+        wait / generations
+        for run in runs
+        if (wait := _run_metric(run, "modelWaitMs")) is not None
+        and (generations := _run_metric(run, "logicalGenerationCount")) is not None
+        and generations > 0
+    ]
     total_tokens = [
         int(value)
         for run in runs
@@ -4342,6 +4437,7 @@ def summarize(runs: list[dict[str, Any]]) -> dict[str, Any]:
         "successfulTtfo": distribution(ttfo),
         "wallClock": distribution(wall_clock),
         "modelWait": distribution(model_wait),
+        "modelWaitPerGeneration": distribution(model_wait_per_generation),
         "continuationCount": count_distribution(continuations),
         "timingInstrumentation": {
             "available": timing_status == "available",
@@ -4350,6 +4446,7 @@ def summarize(runs: list[dict[str, Any]]) -> dict[str, Any]:
             "unavailableRuns": len(runs) - timing_available_runs,
             "metrics": [
                 "modelWait",
+                "modelWaitPerGeneration",
                 "continuationCount",
                 "latencyExplanation.instrumentedRuntime",
             ],
@@ -4984,6 +5081,7 @@ def attribution_scope(*, repetitions: int) -> dict[str, Any]:
 
 
 ABLATION_FEATURES = (
+    *CONFIG_ABLATION_FEATURES,
     "reasoning_governor",
     "wait_draining",
     "code_mode_admission",
@@ -5214,6 +5312,10 @@ def build_regression_gate(
 
 
 def make_report(args: argparse.Namespace) -> dict[str, Any]:
+    config_overrides = {
+        "currentFork": validate_config_overrides(getattr(args, "fork_config", [])),
+        "upstreamC": validate_config_overrides(getattr(args, "upstream_config", [])),
+    }
     fork_binary = args.fork_binary.resolve()
     upstream_binary = args.upstream_binary.resolve()
     fork_root = args.fork_root.resolve()
@@ -5294,6 +5396,7 @@ def make_report(args: argparse.Namespace) -> dict[str, Any]:
                     auth_source=auth_source,
                     timeout_seconds=args.timeout_seconds,
                     task=task,
+                    config_overrides=config_overrides[role],
                 )
                 require_binary_sha256(binary, expected_binary_sha256, label)
                 runs[role] = run
@@ -5457,9 +5560,11 @@ def make_report(args: argparse.Namespace) -> dict[str, Any]:
             "experiment": {
                 "feature": getattr(args, "experiment_feature", None),
                 "gateMode": gate_mode,
+                "configOverrides": config_overrides,
                 "featureIsolation": (
-                    "one declared ablation per report; source and binary hashes bind "
-                    "the assigned conditions"
+                    "one declared ablation per report; source and binary hashes and "
+                    "explicit config overrides record the assigned conditions, not "
+                    "the resolved feature defaults or model-visible tool surface"
                 ),
             },
             "comparisonLabels": {
@@ -5782,7 +5887,19 @@ def parse_args() -> argparse.Namespace:
         "--auth-source", type=Path, default=Path.home() / ".codex" / "auth.json"
     )
     parser.add_argument("--output", type=Path)
-    parser.add_argument("--model", default="gpt-5.6-sol")
+    for role in ("fork", "upstream"):
+        parser.add_argument(
+            f"--{role}-config",
+            action="append",
+            default=[],
+            metavar="features.KEY=true|false",
+            help=(
+                "repeatable per-variant feature override; supported keys: "
+                + ", ".join(CONFIG_ABLATION_FEATURES)
+                + ". Use the same binary for both variants to isolate configuration."
+            ),
+        )
+    parser.add_argument("--model", default="gpt-6-astra")
     parser.add_argument("--reasoning-effort", default="high")
     parser.add_argument("--personality", default="pragmatic")
     parser.add_argument(
@@ -5808,6 +5925,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--repetitions", type=int, default=10)
     parser.add_argument("--timeout-seconds", type=int, default=600)
     args = parser.parse_args()
+    try:
+        args.fork_config = validate_config_overrides(args.fork_config)
+        args.upstream_config = validate_config_overrides(args.upstream_config)
+    except ValueError as error:
+        parser.error(str(error))
     if args.fork_label == args.upstream_label:
         parser.error(
             "--fork-label and --upstream-label must differ; identical labels make "

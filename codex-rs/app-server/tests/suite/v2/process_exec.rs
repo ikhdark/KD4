@@ -55,6 +55,61 @@ async fn read_process_spawn_response_before_events(
 }
 
 #[tokio::test]
+#[cfg(windows)]
+async fn process_spawn_applies_environment_overrides_case_insensitively() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
+    create_config_toml(codex_home.path(), &server.uri(), "never")?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .with_env_overrides(&[
+            ("Codex_Process_Unset", Some("inherited")),
+            ("Codex_Process_Replace", Some("inherited")),
+            ("Codex_Process_Keep", Some("preserved")),
+        ])
+        .build()
+        .await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let request_id = mcp
+        .send_process_spawn_request(ProcessSpawnParams {
+            env: Some(HashMap::from([
+                ("CODEX_PROCESS_UNSET".to_string(), None),
+                (
+                    "CODEX_PROCESS_REPLACE".to_string(),
+                    Some("replacement".to_string()),
+                ),
+            ])),
+            ..process_spawn_params(
+                "env-case".to_string(),
+                codex_home.path(),
+                vec![
+                    "powershell.exe".to_string(),
+                    "-NoProfile".to_string(),
+                    "-NonInteractive".to_string(),
+                    "-Command".to_string(),
+                    concat!(
+                        "if (Test-Path Env:Codex_Process_Unset) { exit 42 }; ",
+                        "[Console]::Write($env:Codex_Process_Replace + '|' + ",
+                        "$env:Codex_Process_Keep)",
+                    )
+                    .to_string(),
+                ],
+            )?
+        })
+        .await?;
+    let response = read_process_spawn_response_before_events(&mut mcp, request_id).await?;
+    assert_eq!(response.result, serde_json::json!({}));
+    let exited = read_process_exited(&mut mcp).await?;
+    assert_eq!(exited.process_handle, "env-case");
+    assert_eq!(exited.exit_code, 0);
+    assert_eq!(exited.stdout, "replacement|preserved");
+    assert_eq!(exited.stderr, "");
+    Ok(())
+}
+
+#[tokio::test]
 async fn process_spawn_returns_before_exit_and_emits_exit_notification() -> Result<()> {
     let codex_home = TempDir::new()?;
     let (_server, mut mcp) = initialized_mcp(codex_home.path()).await?;

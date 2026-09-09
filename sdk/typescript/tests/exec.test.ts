@@ -88,6 +88,40 @@ function newlineFreeStderrOverCap(): Buffer {
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 describe("CodexExec", () => {
+  it("rejects the public turn when the child closes stdin before accepting the prompt", async () => {
+    const { Codex } = await import("../src/codex");
+    spawnMock.mockClear();
+    const child = new FakeChildProcess();
+    const inputError = Object.assign(new Error("write EPIPE"), { code: "EPIPE" });
+    spawnMock.mockReturnValue(child as unknown as child_process.ChildProcess);
+    setImmediate(() => {
+      child.stdin.destroy(inputError);
+      child.stdout.end();
+      child.stderr.end();
+      child.emit("exit", 0, null);
+    });
+
+    const codex = new Codex({ codexPathOverride: "codex" });
+    await expect(codex.startThread().run("unread prompt")).rejects.toThrow(inputError);
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("preserves the child failure when it exits during a large prompt write", async () => {
+    const { Codex } = await import("../src/codex");
+    spawnMock.mockImplementationOnce((_file, _args, options) =>
+      _actualChildProcess.spawn(
+        process.execPath,
+        ["-e", "process.stderr.write('prompt rejected'); process.exit(2)"],
+        options,
+      ),
+    );
+
+    const thread = new Codex({ codexPathOverride: process.execPath }).startThread();
+    await expect(thread.run("x".repeat(8 * 1024 * 1024))).rejects.toThrow(
+      "Codex Exec exited with code 2: prompt rejected",
+    );
+  });
+
   it("rejects when exit happens before stdout closes", async () => {
     const { CodexExec } = await import("../src/exec");
     const child = createEarlyExitChild();

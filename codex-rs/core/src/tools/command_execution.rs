@@ -2318,6 +2318,77 @@ mod tests {
         }
     }
     #[tokio::test]
+    async fn rg_pattern_file_changes_invalidate_cached_misses() {
+        use crate::tools::handlers::command_search::classify_rg_search_narrowing;
+        use crate::tools::handlers::command_search::observe_rg_search_scope_state;
+
+        for pattern_args in [
+            vec!["-f", "patterns.txt"],
+            vec!["--file", "patterns.txt"],
+            vec!["-fpatterns.txt"],
+            vec!["--file=patterns.txt"],
+        ] {
+            let fixture = tempfile::tempdir().unwrap();
+            let root = fixture.path();
+            std::fs::create_dir(root.join("src")).unwrap();
+            std::fs::write(root.join("src/example.txt"), "present\n").unwrap();
+            std::fs::write(root.join("patterns.txt"), "absent\n").unwrap();
+            let command = std::iter::once("rg")
+                .chain(pattern_args.iter().copied())
+                .chain(std::iter::once("src"))
+                .map(ToString::to_string)
+                .collect::<Vec<_>>();
+            let run_search = || {
+                std::process::Command::new("rg")
+                    .args(&command[1..])
+                    .current_dir(root)
+                    .output()
+                    .expect("run ripgrep")
+            };
+            let classify = || {
+                classify_rg_search_narrowing(&command, None, root, root)
+                    .unwrap()
+                    .expect("rg search")
+            };
+            let mut before = classify();
+            observe_rg_search_scope_state(&mut before).await;
+            assert!(before.scope_state_identity.is_some());
+            let attempt =
+                CommandAttemptKey::new("exec_command", "local", root.to_string_lossy(), &command)
+                    .with_search_narrowing("turn-a", "repo-a", Some(before));
+            let ledger = CommandExecutionLedger::default();
+            ledger.begin_attempt(&attempt, false).await.unwrap();
+            let miss = run_search();
+            assert_eq!(miss.status.code(), Some(1));
+            assert!(miss.stdout.is_empty());
+            ledger
+                .record_exit(&attempt, miss.status.code().unwrap())
+                .await;
+            ledger
+                .begin_attempt(&attempt, false)
+                .await
+                .expect_err("unchanged pattern-file miss should be cached");
+
+            std::fs::write(root.join("patterns.txt"), "present\n").unwrap();
+            let actual = run_search();
+            assert_eq!(actual.status.code(), Some(0));
+            assert!(
+                String::from_utf8(actual.stdout)
+                    .unwrap()
+                    .contains("present")
+            );
+            let mut after = classify();
+            observe_rg_search_scope_state(&mut after).await;
+            assert!(after.scope_state_identity.is_some());
+            let updated = attempt.with_search_narrowing("turn-b", "repo-a", Some(after));
+            ledger
+                .begin_attempt(&updated, false)
+                .await
+                .expect("changed pattern file must admit a search that now has a match");
+        }
+    }
+
+    #[tokio::test]
     async fn audit189_rg_classifier_drives_narrowing_ledger_for_real_commands() {
         use crate::shell::ShellType;
         use crate::tools::handlers::command_search::classify_rg_search_narrowing;

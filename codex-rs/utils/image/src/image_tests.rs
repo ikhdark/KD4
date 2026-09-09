@@ -103,6 +103,25 @@ async fn returns_original_image_when_within_bounds() {
     }
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn current_thread_runtime_loads_prompt_image() {
+    let image = ImageBuffer::from_pixel(48, 24, Rgba([11u8, 22, 33, 255]));
+    let original_bytes = image_bytes(&image, ImageFormat::Png);
+
+    for _ in 0..2 {
+        let encoded = load_for_prompt_bytes(
+            Path::new("current-thread-image.png"),
+            original_bytes.clone(),
+            PromptImageMode::Original,
+        )
+        .expect("process image on a current-thread runtime");
+
+        assert_eq!((encoded.width, encoded.height), (48, 24));
+        assert_eq!(encoded.mime, "image/png");
+        assert_eq!(encoded.bytes.as_ref(), original_bytes);
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn downscales_large_image() {
     for (format, mime) in [

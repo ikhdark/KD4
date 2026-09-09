@@ -1,5 +1,6 @@
 version = 1
 policy-pack = ["kd4@1"]
+all-profiles = true
 
 # KD4's local Windows quality gate. Paths are relative to this Cargo workspace.
 # Preserve the registry's warn/deny defaults; overriding the global default
@@ -13,7 +14,7 @@ generic-instantiation-uncertain = "warn"
 
 # Normal runtime and the only optional workspace feature (code-mode/Cargo.toml).
 # Trusted loading provides build-script outputs and procedural macro expansion.
-# Use --all-profiles to analyze both; --profile windows selects normal features.
+# Both profiles run by default; --profile windows selects normal features.
 [[analysis-profile]]
 name = "windows"
 target = "x86_64-pc-windows-msvc"
@@ -41,9 +42,8 @@ history = true
 base-ref = "HEAD"
 minimum-dependency-changes = 2
 ignored-max-commits = 100
-# Mutation execution requires a separate bounded test run; ordinary analysis
-# must not rewrite KD4's source or silently execute a workspace-wide test suite.
-mutation = false
+# Run bounded mutation trials for changed code in an isolated workspace copy.
+mutation = true
 mutation-limit = 8
 test-attributes = ["test", "tokio::test", "async_std::test", "rstest", "test_case"]
 oracle-macros = [

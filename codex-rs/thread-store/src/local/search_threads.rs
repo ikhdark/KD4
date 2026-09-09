@@ -191,10 +191,7 @@ fn cursor_from_thread_search_item(
             .or(item.item.updated_at.as_deref())
             .or(item.item.created_at.as_deref())?,
     };
-    match sort_key {
-        ThreadSortKey::RecencyAt => parse_cursor(&format!("{timestamp}|{}", item.item.thread_id?)),
-        ThreadSortKey::CreatedAt | ThreadSortKey::UpdatedAt => parse_cursor(timestamp),
-    }
+    parse_cursor(&format!("{timestamp}|{}", item.item.thread_id?))
 }
 
 async fn set_thread_search_result_names(

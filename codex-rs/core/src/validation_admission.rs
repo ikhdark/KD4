@@ -396,6 +396,9 @@ pub(crate) enum ValidationClassification {
     Validation {
         leaves: Vec<ValidationCommandDescriptor>,
         has_unclassified_targets: bool,
+        // A compound command's exit code does not establish which validation
+        // stages executed or whether an earlier failure was masked.
+        exit_code_is_authoritative: bool,
     },
     Opaque,
 }
@@ -447,6 +450,7 @@ pub(crate) fn prohibited_skip_for_classification(
         ValidationClassification::Validation {
             leaves,
             has_unclassified_targets,
+            ..
         } => {
             if explicitly_tagged && *has_unclassified_targets && authorization.has_any_denial() {
                 Some(ValidationSkippedToolOutput::prohibited(None))
@@ -598,14 +602,19 @@ fn combine_validation_classifications(
     let mut leaves = Vec::new();
     let mut has_unclassified_targets = false;
     let mut saw_opaque = false;
+    let mut command_count = 0;
+    let mut exit_code_is_authoritative = true;
     for classification in classifications {
+        command_count += 1;
         match classification {
             ValidationClassification::Validation {
                 leaves: mut found,
                 has_unclassified_targets: found_unclassified,
+                exit_code_is_authoritative: found_authoritative,
             } => {
                 leaves.append(&mut found);
                 has_unclassified_targets |= found_unclassified;
+                exit_code_is_authoritative &= found_authoritative;
             }
             ValidationClassification::Opaque => saw_opaque = true,
             ValidationClassification::NonValidation => {}
@@ -621,6 +630,9 @@ fn combine_validation_classifications(
         ValidationClassification::Validation {
             leaves,
             has_unclassified_targets: has_unclassified_targets || saw_opaque,
+            exit_code_is_authoritative: command_count == 1
+                && exit_code_is_authoritative
+                && !saw_opaque,
         }
     }
 }
@@ -787,6 +799,7 @@ fn classification_from_operations(
                 .map(|operation| ValidationCommandDescriptor { operation })
                 .collect(),
             has_unclassified_targets,
+            exit_code_is_authoritative: !has_unclassified_targets,
         }
     }
 }

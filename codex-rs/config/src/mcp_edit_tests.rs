@@ -7,6 +7,49 @@ use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
 #[tokio::test]
+async fn mcp_server_edits_preserve_empty_tool_allowlists() -> anyhow::Result<()> {
+    for merge in [false, true] {
+        let codex_home = tempfile::tempdir()?;
+        let config_path = codex_home.path().join(CONFIG_TOML_FILE);
+        std::fs::write(
+            &config_path,
+            r#"
+[mcp_servers.restricted]
+command = "restricted-server"
+enabled_tools = []
+"#,
+        )?;
+        let added: McpServerConfig = toml::from_str("command = 'added-server'")?;
+        let mut servers = if merge {
+            BTreeMap::new()
+        } else {
+            load_global_mcp_servers(codex_home.path()).await?
+        };
+        servers.insert("added".to_string(), added);
+        let builder = ConfigEditsBuilder::new(codex_home.path());
+        let builder = if merge {
+            builder.merge_mcp_servers(&servers)
+        } else {
+            builder.replace_mcp_servers(&servers)
+        };
+
+        builder.apply().await?;
+
+        let stored: TomlValue = toml::from_str(&std::fs::read_to_string(&config_path)?)?;
+        assert_eq!(
+            stored["mcp_servers"]["restricted"].get("enabled_tools"),
+            Some(&TomlValue::Array(Vec::new())),
+            "empty allowlist must remain explicit (merge={merge})"
+        );
+        let reloaded = load_global_mcp_servers(codex_home.path()).await?;
+        assert_eq!(reloaded.len(), 2);
+        assert_eq!(reloaded["restricted"].enabled_tools, Some(Vec::new()));
+        assert_eq!(reloaded["added"].enabled_tools, None);
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn config_editors_reject_invalid_toml_without_overwriting_it() -> anyhow::Result<()> {
     let temp = tempfile::tempdir()?;
     let config_path = temp.path().join(CONFIG_TOML_FILE);

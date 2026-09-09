@@ -105,7 +105,19 @@ pub(crate) fn update_spawn_authorization_from_text(turn_context: &TurnContext, t
 
 fn parse_spawn_authorization_directive(clause: &str) -> Option<SpawnAuthorizationDirective> {
     let clause = clause.trim().to_ascii_lowercase();
-    if clause.is_empty() || clause.contains('?') || clause.contains(['\'', '"', '`']) {
+    // Apostrophes inside words are not quotation delimiters: contractions can revoke
+    // authorization, and possessives can appear in otherwise direct requests.
+    let contains_quote = clause
+        .char_indices()
+        .any(|(index, character)| match character {
+            '\'' => {
+                !clause[..index].ends_with(char::is_alphanumeric)
+                    || !clause[index + 1..].starts_with(char::is_alphanumeric)
+            }
+            '"' | '`' => true,
+            _ => false,
+        });
+    if clause.is_empty() || clause.contains('?') || contains_quote {
         return None;
     }
     let normalized = clause.strip_prefix("please ").unwrap_or(&clause).trim();
@@ -162,6 +174,7 @@ mod tests {
             "Spawn a child and continue",
             "Delegate this work to agents",
             "Parallelize with multiple agents",
+            "Use subagents to inspect the user's code",
         ] {
             assert_eq!(
                 parse_spawn_authorization_directive(request),
@@ -177,6 +190,11 @@ mod tests {
             "Audit multi-agent spawning behavior",
             "Explain how spawn authorization works",
             "Find checks that affect agents",
+            "'Use subagents'",
+            "\"Use subagents\"",
+            "`Use subagents`",
+            "Explain 'use subagents'",
+            "Don't use 'subagents'",
         ] {
             assert_eq!(
                 parse_spawn_authorization_directive(request),
@@ -188,10 +206,17 @@ mod tests {
 
     #[test]
     fn explicit_denial_revokes_spawn_authority() {
-        assert_eq!(
-            parse_spawn_authorization_directive("Do not use subagents for this task"),
-            Some(SpawnAuthorizationDirective::Deny)
-        );
+        for request in [
+            "Do not use subagents for this task",
+            "Don't use subagents for this task",
+            "Please don't use subagents for the user's task",
+        ] {
+            assert_eq!(
+                parse_spawn_authorization_directive(request),
+                Some(SpawnAuthorizationDirective::Deny),
+                "{request:?}"
+            );
+        }
     }
 
     #[test]

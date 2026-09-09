@@ -146,9 +146,14 @@ impl std::error::Error for WorkspaceCommandError {}
 
 /// Executes non-interactive workspace commands through the active TUI app-server session.
 ///
-/// Implementations decide where the workspace lives. Callers provide argv/cwd/env and should not
-/// branch on local versus remote execution.
+/// Implementations decide where the workspace lives. Callers provide argv/cwd/env and may access
+/// paths directly only when `has_local_filesystem` is true; otherwise they must use the executor.
 pub(crate) trait WorkspaceCommandExecutor: Send + Sync {
+    /// Whether workspace paths refer to this process's filesystem.
+    fn has_local_filesystem(&self) -> bool {
+        false
+    }
+
     /// Runs a workspace command and returns captured output or an app-server request error.
     ///
     /// Callers should treat errors as infrastructure failures and should treat successful output
@@ -176,6 +181,10 @@ impl AppServerWorkspaceCommandRunner {
 }
 
 impl WorkspaceCommandExecutor for AppServerWorkspaceCommandRunner {
+    fn has_local_filesystem(&self) -> bool {
+        matches!(self.request_handle, AppServerRequestHandle::InProcess(_))
+    }
+
     /// Sends the command as a one-off app-server `command/exec` request.
     ///
     /// The request is non-tty, does not stream stdin/stdout/stderr, and uses the caller's timeout

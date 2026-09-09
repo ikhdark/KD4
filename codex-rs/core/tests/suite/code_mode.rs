@@ -622,6 +622,98 @@ async fn run_code_mode_turn_with_rmcp_config(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn code_mode_preserves_read_history_until_its_source_changes() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = responses::start_mock_server().await;
+    let test = test_codex()
+        .with_config(|config| {
+            let _ = config.features.enable(Feature::CodeMode);
+            config.completed_tool_history_projection = true;
+        })
+        .build(&server)
+        .await?;
+    let contract = format!(
+        "{}Reject non-ASCII input with ValueError.\n",
+        "Contract details required while implementing the following source change.\n".repeat(40)
+    );
+    fs::write(test.cwd_path().join("contract.txt"), &contract)?;
+    fs::write(test.cwd_path().join("unrelated.txt"), "before\n")?;
+    let unrelated_patch =
+        "*** Begin Patch\n*** Update File: unrelated.txt\n@@\n-before\n+after\n*** End Patch\n";
+    let later_unrelated_patch =
+        "*** Begin Patch\n*** Update File: unrelated.txt\n@@\n-after\n+later\n*** End Patch\n";
+    let source_patch = "*** Begin Patch\n*** Update File: contract.txt\n@@\n-Reject non-ASCII input with ValueError.\n+Accept non-ASCII input.\n*** End Patch\n";
+    let scripts = [
+        format!(
+            r#"const result = await tools.exec_command({{kind: "script", cmd: "Get-Content contract.txt", max_output_tokens: 5000, yield_time_ms: 30000}});
+await tools.apply_patch({unrelated_patch:?});
+text(result.result?.selected_text ?? result.output);"#
+        ),
+        "text('Continue implementing the contract.');".to_string(),
+        format!("text(await tools.apply_patch({later_unrelated_patch:?}));"),
+        format!("text(await tools.apply_patch({source_patch:?}));"),
+    ];
+    let mut requests = Vec::new();
+    for (index, script) in scripts.iter().enumerate() {
+        requests.push(
+            responses::mount_sse_once(
+                &server,
+                sse(vec![
+                    ev_response_created(&format!("resp-{index}")),
+                    ev_custom_tool_call(&format!("call-{index}"), "exec", script),
+                    ev_completed(&format!("resp-{index}")),
+                ]),
+            )
+            .await,
+        );
+    }
+    let final_request = responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_assistant_message("done", "done"),
+            ev_completed("final"),
+        ]),
+    )
+    .await;
+    test.submit_turn("Read the contract, update the unrelated file, then change the contract.")
+        .await?;
+
+    // Check the actual subsequent model requests, including after consumption
+    // and after an exact mutation to a different source dependency.
+    for (index, request) in requests.iter().enumerate().skip(1) {
+        let output = custom_tool_output_last_non_empty_text(&request.single_request(), "call-0")
+            .expect("the original read must remain available to the model");
+        assert_eq!(output.trim(), contract.trim(), "model request {index}");
+    }
+    let stale = custom_tool_output_last_non_empty_text(&final_request.single_request(), "call-0")
+        .expect("changed source must leave a freshness notice");
+    assert!(
+        stale.contains(r#""stale_workspace_evidence":true"#),
+        "{stale}"
+    );
+    assert!(!stale.contains("Reject non-ASCII"));
+    let final_request = final_request.single_request();
+    assert_eq!(
+        custom_tool_output_last_non_empty_text(&final_request, "call-1").as_deref(),
+        Some("Continue implementing the contract.")
+    );
+    let patch_output = custom_tool_output_last_non_empty_text(&final_request, "call-2")
+        .expect("the unrelated patch result must remain visible");
+    assert!(patch_output.contains("Success. Updated the following files:"));
+    assert!(patch_output.contains("unrelated.txt"));
+    assert!(!patch_output.contains("stale_workspace_evidence"));
+    assert_eq!(
+        fs::read_to_string(test.cwd_path().join("unrelated.txt"))?,
+        "later\n"
+    );
+    assert!(
+        fs::read_to_string(test.cwd_path().join("contract.txt"))?
+            .ends_with("Accept non-ASCII input.\n")
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_can_return_exec_command_output() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -654,24 +746,21 @@ text(JSON.stringify(result));
     let request = second_mock.single_request();
     let output = custom_tool_output_last_non_empty_text(&request, "call-1")
         .expect("code-mode output should contain the serialized nested result");
-    let stale_workspace_evidence = output.contains(r#""stale_workspace_evidence":true"#);
-    if !stale_workspace_evidence {
-        let result: Value = serde_json::from_str(&output)?;
-        assert!(
-            result
-                .get("chunk_id")
-                .and_then(Value::as_str)
-                .is_some_and(|chunk_id| !chunk_id.is_empty()),
-            "{result}"
-        );
-        assert_eq!(
-            result.get("output").and_then(Value::as_str),
-            Some("code_mode_exec_marker")
-        );
-        assert_eq!(result.get("exit_code").and_then(Value::as_i64), Some(0));
-        assert!(result.get("wall_time_seconds").is_some(), "{result}");
-        assert!(result.get("session_id").is_none(), "{result}");
-    }
+    let result: Value = serde_json::from_str(&output)?;
+    assert!(
+        result
+            .get("chunk_id")
+            .and_then(Value::as_str)
+            .is_some_and(|chunk_id| !chunk_id.is_empty()),
+        "{result}"
+    );
+    assert_eq!(
+        result.get("output").and_then(Value::as_str),
+        Some("code_mode_exec_marker")
+    );
+    assert_eq!(result.get("exit_code").and_then(Value::as_i64), Some(0));
+    assert!(result.get("wall_time_seconds").is_some(), "{result}");
+    assert!(result.get("session_id").is_none(), "{result}");
 
     Ok(())
 }
@@ -1506,7 +1595,7 @@ const result = await tools.exec_command({
 });
 const output = result.result?.selected_text ?? result.output;
 const resultVariableWasTruncated = output.includes("tokens truncated") || output.includes("[omitted before retained middle]");
-text(`Variable truncated: ${resultVariableWasTruncated ? "True" : "False"}. Variable: ${output}`);
+text(`Variable: ${output}\nVariable truncated: ${resultVariableWasTruncated ? "True" : "False"}.`);
 "#,
         TOKEN_POLICY_TEST_MODEL,
         |config| {
@@ -1525,14 +1614,8 @@ text(`Variable truncated: ${resultVariableWasTruncated ? "True" : "False"}. Vari
         "expected configured history cap to truncate the emitted value, got {} bytes",
         output.len()
     );
-    let stale_workspace_evidence = output.contains(r#""stale_workspace_evidence":true"#);
-    assert!(
-        stale_workspace_evidence || output.contains("Variable truncated: True."),
-        "{output}"
-    );
-    if !stale_workspace_evidence {
-        assert_output_has_truncation_marker(&output);
-    }
+    assert!(output.contains("Variable truncated: True."), "{output}");
+    assert_output_has_truncation_marker(&output);
 
     Ok(())
 }
@@ -1564,14 +1647,8 @@ text(`Variable truncated: ${resultVariableWasTruncated ? "True" : "False"}. Vari
     let request = second_mock.single_request();
     let output = custom_tool_output_last_non_empty_text(&request, "call-1")
         .expect("code-mode output should contain the emitted value");
-    let stale_workspace_evidence = output.contains(r#""stale_workspace_evidence":true"#);
-    assert!(
-        stale_workspace_evidence || output.contains("Variable truncated: True."),
-        "{output}"
-    );
-    if !stale_workspace_evidence {
-        assert_output_has_truncation_marker(&output);
-    }
+    assert!(output.contains("Variable truncated: True."), "{output}");
+    assert_output_has_truncation_marker(&output);
 
     Ok(())
 }
@@ -1593,7 +1670,7 @@ const result = await tools.exec_command({
 });
 const output = result.result?.selected_text ?? result.output;
 const resultVariableWasTruncated = output.includes("tokens truncated") || output.includes("[omitted before retained middle]");
-text(`Variable truncated: ${resultVariableWasTruncated ? "True" : "False"}. Variable: ${output}`);
+text(`Variable: ${output}\nVariable truncated: ${resultVariableWasTruncated ? "True" : "False"}.`);
 "#,
         TOKEN_POLICY_TEST_MODEL,
         |config| {
@@ -1612,14 +1689,8 @@ text(`Variable truncated: ${resultVariableWasTruncated ? "True" : "False"}. Vari
         "expected configured history cap to truncate the emitted value, got {} bytes",
         output.len()
     );
-    let stale_workspace_evidence = output.contains(r#""stale_workspace_evidence":true"#);
-    assert!(
-        stale_workspace_evidence || output.contains("Variable truncated: True."),
-        "{output}"
-    );
-    if !stale_workspace_evidence {
-        assert_output_has_truncation_marker(&output);
-    }
+    assert!(output.contains("Variable truncated: True."), "{output}");
+    assert_output_has_truncation_marker(&output);
 
     Ok(())
 }
@@ -3044,27 +3115,20 @@ async fn code_mode_replaces_malformed_image() -> Result<()> {
 
     let req = second_mock.single_request();
     let items = custom_tool_output_items(&req, "call-1");
-    let (_, success) = custom_tool_output_body_and_success(&req, "call-1");
-    assert_ne!(
-        success,
-        Some(true),
-        "malformed image unexpectedly succeeded"
+    assert_eq!(items.len(), 2);
+    assert!(text_item(&items, 0).starts_with("Script completed"));
+    assert_eq!(
+        items[1],
+        serde_json::json!({
+            "type": "input_text",
+            "text": "image content omitted because it could not be processed"
+        })
     );
-    let output = items
-        .iter()
-        .filter_map(|item| item.get("text").and_then(Value::as_str))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let stale_workspace_evidence = output.contains(r#""stale_workspace_evidence":true"#);
-    if !stale_workspace_evidence {
-        assert!(output.starts_with("Script failed\nWall time "), "{output}");
-        assert!(output.contains("Script error:"), "{output}");
-        assert!(
-            output
-                .contains("Tool call failed: invalid image output. Pass a base64 data URI instead"),
-            "{output}"
-        );
-    }
+    assert!(
+        !items
+            .iter()
+            .any(|item| item.get("type").and_then(Value::as_str) == Some("input_image"))
+    );
 
     Ok(())
 }
@@ -3328,9 +3392,8 @@ async fn code_mode_can_apply_patch_via_nested_tool() -> Result<()> {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(
-        (output.contains("Success. Updated the following files:") && output.contains(file_name))
-            || output.contains(r#""stale_workspace_evidence":true"#),
-        "nested apply_patch output should report the update or its intentional invalidation: {output}"
+        output.contains("Success. Updated the following files:") && output.contains(file_name),
+        "nested apply_patch output should report the update: {output}"
     );
 
     let file_path = test.cwd_path().join(file_name);

@@ -211,9 +211,7 @@ fn serialize_mcp_server_table(config: &McpServerConfig) -> TomlTable {
             AppToolApproval::Approve => "approve",
         });
     }
-    if let Some(enabled_tools) = &config.enabled_tools
-        && !enabled_tools.is_empty()
-    {
+    if let Some(enabled_tools) = &config.enabled_tools {
         entry["enabled_tools"] = array_from_strings(enabled_tools);
     }
     if let Some(disabled_tools) = &config.disabled_tools

@@ -39,6 +39,89 @@ fn recency_cursor_includes_thread_id_tie_breaker() {
 }
 
 #[tokio::test]
+async fn search_threads_pages_through_equal_timestamps() {
+    let home = TempDir::new().expect("temp dir");
+    let config = test_config(home.path());
+    let runtime = codex_state::StateRuntime::init(
+        home.path().to_path_buf(),
+        config.default_model_provider_id.clone(),
+    )
+    .await
+    .expect("state db should initialize");
+    runtime
+        .mark_backfill_complete(None)
+        .await
+        .expect("backfill should be complete");
+    let timestamp = "2025-01-03T12:30:00Z"
+        .parse::<chrono::DateTime<Utc>>()
+        .expect("timestamp");
+    let mut thread_ids = Vec::new();
+    for value in [501, 502] {
+        let uuid = Uuid::from_u128(value);
+        let thread_id = ThreadId::from_string(&uuid.to_string()).expect("thread id");
+        let path =
+            write_session_file(home.path(), "2025-01-03T12-30-00", uuid).expect("session file");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open rollout")
+            .set_modified(std::time::SystemTime::from(timestamp))
+            .expect("set equal rollout timestamps");
+        let builder =
+            codex_state::ThreadMetadataBuilder::new(thread_id, path, timestamp, SessionSource::Cli);
+        let mut metadata = builder.build(config.default_model_provider_id.as_str());
+        metadata.preview = Some("Hello from user".to_string());
+        runtime
+            .upsert_thread_preserving_timestamps(&metadata)
+            .await
+            .expect("insert thread metadata");
+        thread_ids.push(thread_id);
+    }
+
+    for state_db in [None, Some(runtime.clone())] {
+        let store = LocalThreadStore::new(config.clone(), state_db);
+        for sort_key in [
+            ThreadSortKey::CreatedAt,
+            ThreadSortKey::UpdatedAt,
+            ThreadSortKey::RecencyAt,
+        ] {
+            for sort_direction in [SortDirection::Asc, SortDirection::Desc] {
+                let mut params = SearchThreadsParams {
+                    page_size: 1,
+                    cursor: None,
+                    sort_key,
+                    sort_direction,
+                    allowed_sources: Vec::new(),
+                    archived: false,
+                    search_term: "Hello from user".to_string(),
+                };
+                let first = store
+                    .search_threads(params.clone())
+                    .await
+                    .expect("first page");
+                assert_eq!(first.items.len(), 1);
+                params.cursor = Some(first.next_cursor.expect("another match remains"));
+                let second = store.search_threads(params).await.expect("second page");
+                assert_eq!(
+                    second.items.len(),
+                    1,
+                    "equal-timestamp match must not be skipped"
+                );
+                let mut found = vec![
+                    first.items[0].thread.thread_id,
+                    second.items[0].thread.thread_id,
+                ];
+                found.sort_by_key(ToString::to_string);
+                assert_eq!(found, thread_ids);
+                assert!(second.next_cursor.is_none());
+                assert_eq!(first.items[0].snippet, "Hello from user");
+                assert_eq!(second.items[0].snippet, "Hello from user");
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn search_threads_falls_back_to_legacy_name_for_default_sqlite_title() {
     let home = TempDir::new().expect("temp dir");
     let config = test_config(home.path());

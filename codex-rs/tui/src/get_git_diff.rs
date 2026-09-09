@@ -109,24 +109,26 @@ pub(crate) async fn get_git_diff(
     let fallback_deadline = tokio::time::Instant::now() + DIFF_COMMAND_TIMEOUT;
     let mut untracked_budget_used = 0_u64;
     for file in files_to_diff {
-        match render_local_untracked_file(
-            cwd,
-            file,
-            MAX_UNTRACKED_TOTAL_BYTES.saturating_sub(untracked_budget_used),
-        ) {
-            Ok(Some((diff, bytes))) => {
+        match runner.has_local_filesystem().then(|| {
+            render_local_untracked_file(
+                cwd,
+                file,
+                MAX_UNTRACKED_TOTAL_BYTES.saturating_sub(untracked_budget_used),
+            )
+        }) {
+            Some(Ok(Some((diff, bytes)))) => {
                 untracked_budget_used = untracked_budget_used.saturating_add(bytes);
                 untracked_diff.push_str(&diff);
                 continue;
             }
-            Ok(None) => {
+            Some(Ok(None)) => {
                 untracked_diff.push_str(&format!(
                     "# Untracked file diff omitted because it exceeds the bounded read budget: {}\n",
                     escaped_path_for_notice(file)
                 ));
                 continue;
             }
-            Err(_) => {}
+            Some(Err(_)) | None => {}
         }
 
         let Some(file_arg) = file.to_str() else {
@@ -152,8 +154,8 @@ pub(crate) async fn get_git_diff(
             MAX_UNTRACKED_FILE_BYTES.min(remaining_response_budget.saturating_sub(1)) as usize;
 
         // Remote workspace runners do not expose a file-read API. Preserve the existing
-        // executor-backed Git path when the file is not locally readable rather than widening
-        // that contract or making remote `/diff` incomplete.
+        // executor-backed Git path for remote workspaces and locally unreadable files rather than
+        // widening that contract or making remote `/diff` incomplete.
         let args = [
             "diff",
             "--no-textconv",
@@ -691,8 +693,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unreadable_untracked_file_uses_executor_git_fallback_without_helpers() {
-        let cwd = PathBuf::from("/workspace");
+    async fn remote_untracked_file_ignores_readable_local_shadow_without_helpers() {
+        let tempdir = tempfile::tempdir().expect("create local shadow directory");
+        let cwd = tempdir.path().to_path_buf();
+        fs::write(cwd.join("new.txt"), "local-only contents\n").expect("write local shadow file");
         let runner = FakeRunner::new(vec![
             response(
                 git_command(
@@ -1437,6 +1441,10 @@ mod tests {
             ),
         ]);
 
+        let runner = FakeRunner {
+            has_local_filesystem: true,
+            ..runner
+        };
         let result = get_git_diff(&runner, &cwd)
             .await
             .expect("render local diff");
@@ -1564,6 +1572,7 @@ mod tests {
     struct FakeRunner {
         responses: Mutex<VecDeque<FakeResponse>>,
         commands: Mutex<Vec<WorkspaceCommand>>,
+        has_local_filesystem: bool,
     }
 
     impl FakeRunner {
@@ -1571,6 +1580,7 @@ mod tests {
             Self {
                 responses: Mutex::new(responses.into()),
                 commands: Mutex::new(Vec::new()),
+                has_local_filesystem: false,
             }
         }
 
@@ -1585,6 +1595,10 @@ mod tests {
     }
 
     impl WorkspaceCommandExecutor for FakeRunner {
+        fn has_local_filesystem(&self) -> bool {
+            self.has_local_filesystem
+        }
+
         fn run(
             &self,
             command: WorkspaceCommand,

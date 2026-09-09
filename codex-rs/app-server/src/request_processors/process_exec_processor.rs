@@ -142,6 +142,11 @@ impl ProcessExecRequestProcessor {
         let mut env = std::env::vars().collect::<HashMap<_, _>>();
         if let Some(env_overrides) = env_overrides {
             for (key, value) in env_overrides {
+                // Windows treats environment names as case-insensitive. Remove
+                // the inherited spelling before applying either an unset or a
+                // replacement, so duplicate spellings cannot win during spawn.
+                #[cfg(windows)]
+                env.retain(|inherited_key, _| !inherited_key.eq_ignore_ascii_case(&key));
                 match value {
                     Some(value) => {
                         env.insert(key, value);

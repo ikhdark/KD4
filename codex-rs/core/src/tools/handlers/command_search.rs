@@ -73,7 +73,7 @@ pub(crate) fn classify_rg_search_with_repository(
     let mut query_identities = Vec::new();
     let mut search_identities = Vec::new();
     let mut all_targets = Vec::new();
-    let mut explicit_ignore_files = Vec::new();
+    let mut explicit_input_files = Vec::new();
     let mut owner_scopes = Vec::new();
     let mut repository_wide = false;
     for argv in &rg_commands {
@@ -104,7 +104,7 @@ pub(crate) fn classify_rg_search_with_repository(
             }
         }
         all_targets.extend(targets.iter().cloned());
-        explicit_ignore_files.extend(rg_ignore_file_paths(argv, cwd));
+        explicit_input_files.extend(rg_input_file_paths(argv, cwd));
         search_identities.push(format!(
             "{}\u{1d}{query_identity}\u{1d}{}",
             program_name(&argv[0]),
@@ -123,7 +123,7 @@ pub(crate) fn classify_rg_search_with_repository(
     repository_wide |= owner_scopes.len() > 1;
     let scope_identity = path_scope_identity(&all_targets);
     let parent_scope_identity = parent_scope_identity(&all_targets, &repository_root);
-    let state_paths = search_state_paths(&all_targets, &explicit_ignore_files, &repository_root);
+    let state_paths = search_state_paths(&all_targets, &explicit_input_files, &repository_root);
     Ok(Some((
         repository_root,
         RgSearchNarrowing {
@@ -198,11 +198,11 @@ pub(crate) async fn observe_rg_search_scope_state(search: &mut RgSearchNarrowing
 
 fn search_state_paths(
     targets: &[PathBuf],
-    explicit_ignore_files: &[PathBuf],
+    explicit_input_files: &[PathBuf],
     repository_root: &Path,
 ) -> Vec<PathBuf> {
     let mut paths = targets.to_vec();
-    paths.extend(explicit_ignore_files.iter().cloned());
+    paths.extend(explicit_input_files.iter().cloned());
     paths.push(repository_root.join(".git").join("info").join("exclude"));
     for target in targets {
         let mut ancestor = if target.is_dir() {
@@ -228,15 +228,26 @@ fn search_state_paths(
     paths
 }
 
-fn rg_ignore_file_paths(argv: &[String], cwd: &Path) -> Vec<PathBuf> {
+fn rg_input_file_paths(argv: &[String], cwd: &Path) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     let mut index = 1usize;
     while let Some(argument) = argv.get(index) {
-        let value = if argument == "--ignore-file" {
+        if argument == "--" {
+            break;
+        }
+        // Pattern files affect matches even when they are outside the searched
+        // paths, just as explicit ignore files do.
+        let value = if matches!(argument.as_str(), "--ignore-file" | "-f" | "--file") {
             index = index.saturating_add(1);
             argv.get(index).map(String::as_str)
+        } else if rg_option_consumes_next(argument) {
+            index = index.saturating_add(2);
+            continue;
         } else {
-            argument.strip_prefix("--ignore-file=")
+            argument
+                .strip_prefix("--ignore-file=")
+                .or_else(|| argument.strip_prefix("--file="))
+                .or_else(|| argument.strip_prefix("-f"))
         };
         if let Some(value) = value {
             let path = Path::new(value);

@@ -52,7 +52,12 @@ fn render_json_schema_to_typescript_inner(
                 let rendered = variants
                     .iter()
                     .map(|variant| {
-                        render_json_schema_to_typescript_inner(variant, root, active_refs)
+                        // A variant can render as a union, including through a
+                        // local reference. Preserve its grouping because `&`
+                        // binds more tightly than `|` in TypeScript.
+                        let rendered =
+                            render_json_schema_to_typescript_inner(variant, root, active_refs);
+                        format!("({rendered})")
                     })
                     .collect::<Vec<_>>();
                 if !rendered.is_empty() {

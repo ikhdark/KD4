@@ -10,6 +10,7 @@ use tokio::sync::MutexGuard;
 
 /// A minimal LRU cache protected by a Tokio mutex.
 /// Calls outside a Tokio runtime are no-ops.
+/// On a current-thread runtime, contended calls bypass the cache instead of blocking.
 pub struct BlockingLruCache<K, V> {
     inner: Mutex<LruCache<K, V>>,
 }
@@ -88,6 +89,7 @@ where
     }
 
     /// Provides direct access to the cache guard when a Tokio runtime is available.
+    /// Returns `None` on contention if the runtime cannot support blocking.
     pub fn blocking_lock(&self) -> Option<MutexGuard<'_, LruCache<K, V>>> {
         lock_if_runtime(&self.inner)
     }
@@ -97,8 +99,14 @@ fn lock_if_runtime<K, V>(m: &Mutex<LruCache<K, V>>) -> Option<MutexGuard<'_, Lru
 where
     K: Eq + Hash,
 {
-    tokio::runtime::Handle::try_current().ok()?;
-    Some(tokio::task::block_in_place(|| m.blocking_lock()))
+    let runtime = tokio::runtime::Handle::try_current().ok()?;
+    if runtime.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
+        Some(tokio::task::block_in_place(|| m.blocking_lock()))
+    } else {
+        // Blocking here can prevent the task holding the mutex from progressing,
+        // and block_in_place panics on a current-thread runtime.
+        m.try_lock().ok()
+    }
 }
 
 /// Computes the SHA-1 digest of `bytes`.
@@ -127,6 +135,36 @@ mod tests {
         assert!(cache.get(&"first").is_none());
         cache.insert("first", /*value*/ 1);
         assert_eq!(cache.get(&"first"), Some(1));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn current_thread_runtime_stores_and_retrieves_values() {
+        let cache = BlockingLruCache::new(NonZeroUsize::new(2).expect("capacity"));
+
+        assert_eq!(cache.get_or_insert_with("first", || 1), 1);
+        assert_eq!(cache.get_or_insert_with("first", || 2), 1);
+        assert_eq!(cache.insert("first", 3), Some(1));
+        assert_eq!(cache.get(&"first"), Some(3));
+        assert_eq!(cache.remove(&"first"), Some(3));
+        assert_eq!(cache.get(&"first"), None);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn current_thread_runtime_skips_contended_cache_without_mutating_it() {
+        let cache = BlockingLruCache::new(NonZeroUsize::new(2).expect("capacity"));
+        cache.insert("first", 1);
+        let guard = cache.blocking_lock().expect("uncontended cache");
+
+        assert_eq!(cache.get_or_insert_with("first", || 2), 2);
+        assert_eq!(cache.insert("second", 3), None);
+        assert_eq!(cache.remove(&"first"), None);
+        cache.clear();
+        assert_eq!(cache.with_mut(|inner| inner.put("third", 4)), None);
+
+        drop(guard);
+        assert_eq!(cache.get(&"first"), Some(1));
+        assert_eq!(cache.get(&"second"), None);
+        assert_eq!(cache.get(&"third"), None);
     }
 
     #[tokio::test(flavor = "multi_thread")]

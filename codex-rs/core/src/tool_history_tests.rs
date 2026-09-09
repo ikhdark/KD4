@@ -344,6 +344,38 @@ fn untracked_legacy_workspace_evidence_fails_closed() {
         .project_with_workspace_identity(canonical, Some(&workspace_identity("current")));
     let (_, output) = textual_output_identity(&projection.items[1]).expect("stale output");
     assert!(output.contains("\"stale_workspace_evidence\":true"));
+    assert!(output.contains("no workspace observation was recorded"));
+    assert!(!output.contains("repository identity"));
+}
+
+#[test]
+fn workspace_evidence_output_mismatch_does_not_claim_the_repository_changed() {
+    let call_id = "changed-output";
+    let captured = workspace_identity("captured");
+    let output = text_output(call_id, "original file contents".to_string());
+    let mut state = ToolHistoryState::default();
+    state.register_workspace_evidence(
+        WorkspaceEvidenceObservation::from_response_item(
+            Some(captured.clone()),
+            &output,
+            BTreeSet::new(),
+        )
+        .expect("text evidence observation"),
+    );
+    let canonical = Arc::from([
+        function_call(call_id),
+        text_output(call_id, "different output".to_string()),
+    ]);
+    let projection = state.project_with_workspace_identity(canonical, Some(&captured));
+    let (_, output) = textual_output_identity(&projection.items[1]).expect("stale output");
+    let notice: serde_json::Value = serde_json::from_str(output).expect("freshness notice");
+    assert_eq!(notice["stale_workspace_evidence"], true);
+    assert_eq!(notice["rerun"]["force_fresh"], true);
+    assert_eq!(
+        notice["reason"],
+        "the tool output does not match its recorded workspace observation; rerun the tool before relying on it"
+    );
+    assert!(!output.contains("different output"));
 }
 
 #[test]
@@ -936,6 +968,27 @@ fn confirmed_performance_workspace_classification_runs_inline_without_runtime_ha
 }
 
 #[test]
+fn workspace_evidence_observes_uncertain_commands_and_scopes_powershell_reads() {
+    for command in ["Get-Content contract.txt", "custom-inspector src"] {
+        let payload = ToolPayload::Function {
+            arguments: serde_json::json!({"kind": "script", "cmd": command}).to_string(),
+        };
+        let classification =
+            classify_workspace_tool_call("exec_command", &payload, Path::new("/repo"));
+        assert!(classification.observes_workspace, "{command}");
+        if command.starts_with("Get-Content") {
+            assert_eq!(
+                classification.source_dependencies,
+                BTreeSet::from([SourceDependencyV1::new(
+                    Path::new("/repo/contract.txt"),
+                    false
+                )])
+            );
+        }
+    }
+}
+
+#[test]
 fn mutation_boundary_repository_history_reads_and_writers_skip_full_workspace_evidence() {
     for args in [
         serde_json::json!(["-C", ".", "log", "-1"]),
@@ -998,7 +1051,16 @@ fn completed_tool_history_receipt_lifecycle_keeps_canonical_history_unchanged() 
     ));
     let projection = state.project(Arc::clone(&canonical));
 
-    assert!(projection.unreplaced_items.is_empty());
+    let (fallback_call_id, fallback_output) =
+        textual_output_identity(&projection.unreplaced_items[0])
+            .expect("fallback must retain a recovery handle");
+    let pin: serde_json::Value =
+        serde_json::from_str(fallback_output).expect("fallback artifact pin");
+    assert_eq!(fallback_call_id, call_id);
+    assert_eq!(pin["kind"], "tool_history_artifact_pin");
+    assert_eq!(pin["artifact_id"], "artifact-1");
+    assert_eq!(pin["bytes"], 96_000);
+    assert_eq!(pin["sha256"], sha256(b"canonical artifact"));
     assert_eq!(projection.substitutions.len(), 1);
     assert_eq!(projection.substitutions[0].item_index, 0);
     assert_eq!(projection.substitutions[0].call_id, call_id);
@@ -1143,7 +1205,24 @@ fn tool_history_admission_bounds_aggregate_first_exposure_and_consumes_receipts(
     state.register(candidate("call-2", second));
 
     let projection = state.project(Arc::clone(&canonical));
-    assert_eq!(projection.unreplaced_items.len(), 1);
+    assert_eq!(projection.unreplaced_items.len(), 2);
+    assert!(
+        projection
+            .unreplaced_items
+            .iter()
+            .filter_map(textual_output_identity)
+            .map(|(_, output)| approx_token_count(output))
+            .sum::<usize>()
+            <= MODEL_VISIBLE_TOOL_RESULT_TOKEN_BUDGET
+    );
+    assert_eq!(
+        projection
+            .unreplaced_items
+            .iter()
+            .filter_map(output_call_id)
+            .collect::<Vec<_>>(),
+        vec!["call-1", "call-2"]
+    );
     assert!(
         projection
             .items
@@ -1265,19 +1344,71 @@ fn token_backfire_tool_history_pressure_keeps_every_result_recoverable() {
 fn tool_history_admission_preserves_newest_unconsumed_non_text_content() {
     let call_id = "image-call";
     let output = "small text".to_string();
+    let images = vec![FunctionCallOutputContentItem::InputImage {
+        image_url: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==".to_string(),
+        detail: None,
+    }; 300];
     let mut image_candidate = candidate(call_id, output.clone());
     image_candidate.preserved_non_text_tokens =
-        MODEL_VISIBLE_TOOL_RESULT_TOKEN_BUDGET.saturating_add(1) as u64;
+        approx_token_count(&serde_json::to_string(&images).expect("serialize image content"))
+            as u64;
+    assert!(
+        image_candidate.preserved_non_text_tokens > MODEL_VISIBLE_TOOL_RESULT_TOKEN_BUDGET as u64
+    );
+    let mut content = vec![FunctionCallOutputContentItem::InputText { text: output }];
+    content.extend(images);
+    let canonical: Arc<[ResponseItem]> = Arc::from([
+        function_call(call_id),
+        ResponseItem::FunctionCallOutput {
+            id: None,
+            call_id: call_id.to_string(),
+            output: FunctionCallOutputPayload::from_content_items(content),
+            internal_chat_message_metadata_passthrough: None,
+        },
+    ]);
     let mut state = ToolHistoryState::default();
     state.register(image_candidate);
 
-    let projection = state.project(Arc::from([
-        function_call(call_id),
-        text_output(call_id, output),
-    ]));
+    let projection = state.project(Arc::clone(&canonical));
 
-    assert_eq!(projection.items.len(), 2);
-    assert_eq!(projection.unreplaced_items.len(), 2);
+    assert_eq!(projection.items, canonical);
+    assert_eq!(projection.unreplaced_items, canonical);
+    assert!(projection.substitutions.is_empty());
+}
+
+#[test]
+fn tool_history_keeps_consumed_contract_details_when_all_results_fit() {
+    let call_id = "read-contract";
+    let output = format!(
+        "{}\nReject non-ASCII input with ValueError; inventory total must be 5.",
+        "Source and contract details needed for the subsequent edit.\n".repeat(60)
+    );
+    let canonical: Arc<[ResponseItem]> = Arc::from([
+        function_call(call_id),
+        text_output(call_id, output.clone()),
+        named_function_call("read-tests", "non_workspace_operation"),
+        text_output(
+            "read-tests",
+            "Three tests exercise the contract.".to_string(),
+        ),
+    ]);
+    let mut state = ToolHistoryState::default();
+    state.register(candidate(call_id, output.clone()));
+    assert_eq!(state.project(Arc::clone(&canonical)).items, canonical);
+    assert!(state.mark_consumed(
+        &canonical,
+        ModelGenerationId {
+            turn_id: "turn-1".to_string(),
+            ordinal: 1,
+        },
+    ));
+
+    let projection = state.project(Arc::clone(&canonical));
+    assert_eq!(projection.items, canonical);
+    assert_eq!(
+        textual_output_identity(&projection.items[1]),
+        Some((call_id, output.as_str()))
+    );
     assert!(projection.substitutions.is_empty());
 }
 
@@ -1409,6 +1540,7 @@ fn tool_search_receipt_caps_all_argument_fields_and_binds_semantics() {
         "limit": ["large".repeat(20_000)],
         "cursor": "c".repeat(20_000),
     });
+    let original_arguments = arguments.clone();
 
     let projection = ToolHistoryState::default().project(Arc::from(pair));
     let receipt = projection
@@ -1418,10 +1550,12 @@ fn tool_search_receipt_caps_all_argument_fields_and_binds_semantics() {
         .expect("bounded search receipt");
     let rendered = serde_json::to_string(&receipt).expect("serialize receipt");
     assert!(approx_token_count(&rendered) <= RECEIPT_MAX_TOKENS);
-    assert!(receipt.arguments.get("query_sha256").is_some());
-    assert!(receipt.arguments.get("namespace_sha256").is_some());
-    assert!(receipt.arguments.get("limit_sha256").is_some());
-    assert!(receipt.arguments.get("cursor_sha256").is_some());
+    for key in ["query", "namespace", "limit", "cursor"] {
+        assert_eq!(
+            receipt.arguments[format!("{key}_sha256")],
+            sha256(original_arguments[key].to_string().as_bytes())
+        );
+    }
 
     let mut changed = receipt.clone();
     changed.status = "failed".to_string();
@@ -1524,7 +1658,13 @@ fn tool_history_admission_supersedes_identical_results_with_latest_pair() {
 
     let projection = state.project(Arc::clone(&canonical));
     assert_eq!(canonical.len(), 4);
-    assert!(projection.unreplaced_items.is_empty());
+    assert_eq!(projection.unreplaced_items.len(), 2);
+    assert!(
+        projection
+            .unreplaced_items
+            .iter()
+            .all(|item| item_call_id(item) == Some("call-2"))
+    );
     assert_eq!(projection.items.len(), 2);
     assert!(
         projection
@@ -1665,9 +1805,10 @@ fn mcp_content_item_receipt_preserves_non_text_modalities() {
 #[test]
 fn mcp_multi_text_content_is_canonicalized_and_receipted_without_losing_modalities() {
     let call_id = "mcp-multi-text";
-    let first = "first section\n".repeat(400);
-    let second = "second section\n".repeat(400);
+    let first = "first section\n".repeat(2_000);
+    let second = "second section\n".repeat(2_000);
     let bounded = format!("{first}\n{second}");
+    assert!(approx_token_count(&bounded) > MODEL_VISIBLE_TOOL_RESULT_TOKEN_BUDGET);
     let canonical: Arc<[ResponseItem]> = Arc::from([ResponseItem::FunctionCallOutput {
         id: None,
         call_id: call_id.to_string(),

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -401,6 +402,35 @@ def render_report(text: str) -> str:
         self.assertFalse(comparison["headToHeadComparable"])
         self.assertEqual(comparison["unavailableVariants"], ["official-upstream"])
 
+    def test_model_wait_per_generation_uses_paired_run_values(self) -> None:
+        first = _gate_run(modelWaitMs=120.0)
+        second = _gate_run(modelWaitMs=120.0)
+        second["latencyExplanation"]["instrumentedRuntime"]["counters"][
+            "logicalGenerationCount"
+        ] = 4
+        no_count = _run(outcome_correct=True, task_contract_compliant=True)
+        no_wait = _gate_run(modelWaitMs=None)
+        zero_count = _gate_run()
+        zero_count["latencyExplanation"]["instrumentedRuntime"]["counters"][
+            "logicalGenerationCount"
+        ] = 0
+
+        summary = benchmark.summarize([first, second, no_count, no_wait, zero_count])
+        self.assertEqual(
+            summary["modelWaitPerGeneration"],
+            {
+                "count": 2,
+                "averageMs": 45.0,
+                "medianMs": 45.0,
+                "p90Ms": 60.0,
+                "minMs": 30.0,
+                "maxMs": 60.0,
+            },
+        )
+        self.assertIsNone(
+            benchmark.summarize([no_count, no_wait, zero_count])["modelWaitPerGeneration"]
+        )
+
     def test_comparison_latency_explanation_states_the_measured_mechanism(self) -> None:
         fork = {
             "successfulCompletionTime": {"medianMs": 100_000.0},
@@ -512,6 +542,33 @@ def render_report(text: str) -> str:
             },
         )
 
+    def test_final_verification_complaints_are_separate_from_runtime_markers(self) -> None:
+        for final_message, expected in (
+            ("Tool results were rejected as stale workspace evidence.", True),
+            ("Tests passed, but the results are unverified.", True),
+            ("Verification is unverifiable in this session.", True),
+            ("I could not independently verify the changes.", True),
+            ("Fixed the stale cache bug. Tests passed.", False),
+            ("Implemented and verified. All tests passed.", False),
+            (None, False),
+        ):
+            with self.subTest(final_message=final_message):
+                diagnostics = benchmark.classify_diagnostics(
+                    observed_text="source fixture contains unverified and unverifiable",
+                    final_message=final_message,
+                    timed_out=False,
+                    exit_code=0,
+                    terminal_event="turn.completed",
+                    invalid_json_lines=0,
+                    verifier_passed=True,
+                    required_test_passed=True,
+                    command_execution_failures=0,
+                )
+                self.assertEqual(
+                    [diagnostic["category"] for diagnostic in diagnostics],
+                    ["final_verification_complaint"] if expected else [],
+                )
+
     def test_exact_source_state_rejects_dirty_contents(self) -> None:
         with tempfile.TemporaryDirectory(prefix="kd4-live-source-test-") as temp:
             root = Path(temp)
@@ -574,6 +631,10 @@ def render_report(text: str) -> str:
             'bash -lc "python -m unittest -q"',
             "bash -lc 'python -m unittest -q'",
             'powershell.exe -NoProfile -Command "cd repo; python -m unittest -q"',
+            (
+                "pwsh -Command \"@'\nassert 2 > 1\n'@ | python -\n"
+                "python -m unittest -q\""
+            ),
             'cmd.exe /c "python -m unittest -q"',
         )
         rejected = (
@@ -601,12 +662,20 @@ def render_report(text: str) -> str:
             "python -m unittest -q; exit $?",
             "python -m unittest -q; exit $LASTEXITCODE",
             'bash -lc "python -m unittest -q; exit $?"',
+            (
+                "pwsh -Command \"@'\nassert 2 > 1\n'@ | python -\n"
+                "python -m unittest -q\""
+            ),
             "python -m unittest -q; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
         )
         masked = (
             "python -m unittest -q || true",
             "python -m unittest -q; echo done",
             "python -m unittest -q; exit 0",
+            (
+                "pwsh -Command \"python -m unittest -q\n"
+                "@'\nassert 2 > 1\n'@ | python -\""
+            ),
             'bash -lc "python -m unittest -q || true"',
             "python -m unittest -q && echo done",
             "python -m unittest -q 2>&1 | tail -5",
@@ -651,6 +720,12 @@ def render_report(text: str) -> str:
             'bash -lc "echo x > duration.py"': ("mutation", True),
             "sed -i 's/a/b/' duration.py": ("mutation", True),
             'echo ">"': ("inspection", False),
+            (
+                "pwsh -Command \"@'\nassert 2 > 1\n'@ | python -\""
+            ): ("other", False),
+            (
+                "pwsh -Command \"@'\nassert 2 > 1\n'@ > duration.py\""
+            ): ("mutation", True),
             "some-unknown-tool --run": ("other", False),
         }
 
@@ -1665,6 +1740,10 @@ def render_report(text: str) -> str:
             ],
             "toolCallTimingOverflow": 0,
         }
+        final_message = (
+            "Implemented the fix. " * 40
+            + "Tool results were rejected as stale workspace evidence; verification is unverified."
+        )
         events = [
             {"type": "thread.started", "thread_id": "thread_0"},
             {"type": "turn.started"},
@@ -1687,7 +1766,7 @@ def render_report(text: str) -> str:
             ],
             {
                 "type": "item.completed",
-                "item": {"id": "item_2", "type": "agent_message", "text": "done"},
+                "item": {"id": "item_2", "type": "agent_message", "text": final_message},
             },
             {"type": "turn.completed", "usage": {}, "timing": timing},
         ]
@@ -1697,6 +1776,8 @@ def render_report(text: str) -> str:
             stub = temp_root / "stub_agent.py"
             stub.write_text(
                 "import json, sys\n"
+                "from pathlib import Path\n"
+                f"Path(sys.argv[1], 'duration.py').write_text({benchmark.CORRECT_IMPLEMENTATION!r}, encoding='utf-8')\n"
                 f"for event in {events!r}:\n"
                 "    print(json.dumps(event), flush=True)\n",
                 encoding="utf-8",
@@ -1708,7 +1789,9 @@ def render_report(text: str) -> str:
             with mock.patch.object(
                 benchmark,
                 "build_agent_command",
-                return_value=[sys.executable, str(stub)],
+                side_effect=lambda **kwargs: [
+                    sys.executable, str(stub), str(kwargs["workspace"])
+                ],
             ):
                 run = benchmark.run_agent(
                     binary=Path(sys.executable),
@@ -1723,6 +1806,18 @@ def render_report(text: str) -> str:
                 )
 
         self.assertEqual(run["terminalEvent"], "turn.completed")
+        self.assertTrue(run["outcomeCorrect"], run["failureReasons"])
+        self.assertTrue(run["taskContractCompliant"])
+        self.assertNotIn("unverified", run["finalMessage"])
+        self.assertIn(
+            "final_verification_complaint",
+            [diagnostic["category"] for diagnostic in run["diagnostics"]],
+        )
+        summary = benchmark.summarize([run])
+        self.assertEqual(summary["outcomeCorrectness"]["ratePercent"], 100.0)
+        self.assertEqual(
+            summary["diagnosticCategoryCounts"]["final_verification_complaint"], 1
+        )
         self.assertEqual(run["actualCommandCount"], 2)
         self.assertEqual(run["continuationCount"], 1)
         trace = run["turnTrace"]
@@ -2404,11 +2499,14 @@ def render_report(text: str) -> str:
         self.assertEqual(even["currentForkFirst"], 2)
         self.assertTrue(even["balanced"])
 
-    def test_parse_args_defaults_to_ten_and_rejects_odd_repetitions(self) -> None:
+    def test_parse_args_defaults_and_rejects_odd_repetitions(self) -> None:
         with mock.patch.object(
             sys, "argv", ["kd4_live_agent_benchmark.py", "--self-test"]
         ):
-            self.assertEqual(benchmark.parse_args().repetitions, 10)
+            args = benchmark.parse_args()
+            self.assertEqual(args.model, "gpt-6-astra")
+            self.assertEqual(args.reasoning_effort, "high")
+            self.assertEqual(args.repetitions, 10)
         with (
             mock.patch.object(
                 sys,
@@ -2423,6 +2521,123 @@ def render_report(text: str) -> str:
             self.assertRaises(SystemExit),
         ):
             benchmark.parse_args()
+
+    def test_config_ablation_cli_launches_and_records_each_variants_overrides(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="kd4-live-config-") as temp:
+            root = Path(temp)
+            source = root / "source"
+            source.mkdir()
+            revision = benchmark.create_fixture(source)
+            binary = root / "codex.exe"
+            binary.write_bytes(b"same-build-for-both-conditions")
+            auth = root / "auth.json"
+            auth.write_text("{}", encoding="utf-8")
+            output = root / "report.json"
+            stub = root / "agent.py"
+            stub.write_text(
+                "import json, sys\n"
+                "receipt = {'configs': [sys.argv[i + 1] for i, arg in "
+                "enumerate(sys.argv) if arg == '-c'], "
+                f"'promptMatches': sys.argv[-1] == {benchmark.TASK_PROMPT!r}}}\n"
+                "print(json.dumps({'type': 'item.completed', 'item': {"
+                "'id': 'answer', 'type': 'agent_message', "
+                "'text': json.dumps(receipt)}}), flush=True)\n"
+                "print(json.dumps({'type': 'turn.completed', 'usage': {}}), flush=True)\n",
+                encoding="utf-8",
+            )
+            argv = [
+                "kd4_live_agent_benchmark.py",
+                "--fork-binary", str(binary),
+                "--upstream-binary", str(binary),
+                "--fork-root", str(source),
+                "--upstream-root", str(source),
+                "--fork-revision", revision,
+                "--upstream-revision", revision,
+                "--fork-build-command", "test fixture",
+                "--auth-source", str(auth),
+                "--output", str(output),
+                "--tasks", "duration_parser",
+                "--repetitions", "2",
+                "--gate-mode", "off",
+                "--experiment-feature", "direct_runtime",
+                "--fork-config", "features.direct_runtime=true",
+                "--fork-config", "features.current_time_reminder=false",
+                "--upstream-config", "features.direct_runtime=false",
+                "--upstream-config", "features.current_time_reminder=false",
+            ]
+            spawn = benchmark.spawn_owned_process
+
+            def launch_stub(command, **kwargs):
+                # Replace only the external agent, retaining the real command
+                # builder, subprocess lifecycle, stream reader, and report writer.
+                if command[0] != str(binary):
+                    return spawn(command, **kwargs)
+                return spawn([sys.executable, str(stub), *command[1:]], **kwargs)
+
+            with (
+                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(sys, "stdout", StringIO()),
+                mock.patch.object(benchmark, "spawn_owned_process", side_effect=launch_stub),
+            ):
+                benchmark.main()
+            report = json.loads(output.read_text(encoding="utf-8"))
+
+        expected = {
+            "currentFork": [
+                "features.direct_runtime=true",
+                "features.current_time_reminder=false",
+            ],
+            "upstreamC": [
+                "features.direct_runtime=false",
+                "features.current_time_reminder=false",
+            ],
+        }
+        self.assertEqual(report["methodology"]["experiment"]["configOverrides"], expected)
+        pairs = report["results"]["pairs"]
+        self.assertEqual(len(pairs), 2)
+        self.assertEqual(pairs[0]["order"], "upstreamC,currentFork")
+        self.assertEqual(pairs[1]["order"], "currentFork,upstreamC")
+        for pair in pairs:
+            for role, overrides in expected.items():
+                run = pair[role]
+                received = json.loads(run["finalMessage"])
+                self.assertEqual(received["configs"], [
+                    'model_reasoning_effort="high"',
+                    'personality="pragmatic"',
+                    'approval_policy="never"',
+                    "features.code_mode=true",
+                    *overrides,
+                ])
+                self.assertEqual(run["configOverrides"], overrides)
+                self.assertTrue(received["promptMatches"])
+                # The stub never edited or tested: successful process completion
+                # and an experiment label must not certify the task.
+                self.assertFalse(run["outcomeCorrect"])
+                self.assertFalse(run["taskContractCompliant"])
+
+    def test_invalid_config_override_is_rejected_before_launch_or_report(self) -> None:
+        for overrides in (
+            ["model=other-model"],
+            ["features.code_mode=false"],
+            ["features.direct_runtime=1"],
+            ["features.typo=true"],
+            ["features.direct_runtime=true", "features.direct_runtime=false"],
+        ):
+            with self.subTest(overrides=overrides), tempfile.TemporaryDirectory() as temp:
+                output = Path(temp) / "report.json"
+                argv = ["benchmark", "--output", str(output)]
+                for override in overrides:
+                    argv.extend(["--fork-config", override])
+                with (
+                    mock.patch.object(sys, "argv", argv),
+                    mock.patch.object(sys, "stderr", StringIO()),
+                    mock.patch.object(benchmark, "spawn_owned_process") as spawn,
+                    self.assertRaises(SystemExit) as raised,
+                ):
+                    benchmark.main()
+                self.assertEqual(raised.exception.code, 2)
+                spawn.assert_not_called()
+                self.assertFalse(output.exists())
 
     def test_report_aborts_when_a_binary_changes_mid_benchmark(self) -> None:
         """A rebuild between runs must not be attributed to the measured binary.

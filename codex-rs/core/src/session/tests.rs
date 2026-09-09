@@ -13171,6 +13171,84 @@ async fn steer_input_rejects_non_regular_turns() {
 }
 
 #[tokio::test]
+async fn steer_input_revokes_spawn_authorization_with_contracted_denial() {
+    let (sess, mut tc, _rx) = make_session_and_context_with_rx().await;
+    Arc::get_mut(&mut tc)
+        .expect("unique turn context")
+        .multi_agent_version = codex_protocol::protocol::MultiAgentVersion::V2;
+    sess.spawn_task(
+        Arc::clone(&tc),
+        Vec::new(),
+        NeverEndingTask {
+            kind: TaskKind::Regular,
+            listen_to_cancellation_token: true,
+        },
+    )
+    .await;
+
+    for (text, expected_authorized) in [
+        ("'Use subagents'", false),
+        ("Use subagents to inspect the user's code", true),
+        ("Don't use subagents", false),
+    ] {
+        sess.steer_input(
+            vec![UserInput::Text {
+                text: text.to_string(),
+                text_elements: Vec::new(),
+            }],
+            Default::default(),
+            Some(&tc.sub_id),
+            None,
+            None,
+        )
+        .await
+        .expect("steering should be accepted");
+        assert_eq!(
+            super::multi_agents::spawn_is_authorized(&tc),
+            expected_authorized,
+            "{text:?}"
+        );
+    }
+
+    let error = crate::tools::handlers::multi_agents_v2::SpawnAgentHandler::default()
+        .handle(ToolInvocation {
+            session: Arc::clone(&sess),
+            step_context: StepContext::for_test(Arc::clone(&tc)),
+            cancellation_token: CancellationToken::new(),
+            tracker: Arc::new(Mutex::new(TurnDiffTracker::default())),
+            call_id: "revoked-spawn".to_string(),
+            tool_name: codex_tools::ToolName::plain("spawn_agent"),
+            source: ToolCallSource::Direct,
+            payload: ToolPayload::Function {
+                arguments: json!({
+                    "message": "inspect this repo",
+                    "task_name": "revoked"
+                })
+                .to_string(),
+            },
+        })
+        .await
+        .err()
+        .expect("spawn must be rejected after the user's denial");
+    assert_eq!(
+        error,
+        FunctionCallError::RespondToModel(
+            "spawn_agent: this turn is in explicit-request-only mode and the user did not explicitly authorize spawning agents"
+                .to_string(),
+        )
+    );
+    assert!(!sess.services.agent_control.has_live_agents());
+    assert!(
+        !sess
+            .services
+            .agent_control
+            .task_coordinator()
+            .has_bindings()
+    );
+    sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
+}
+
+#[tokio::test]
 async fn steer_input_returns_active_turn_id() {
     let (sess, tc, _rx) = make_session_and_context_with_rx().await;
     let input = vec![TurnInput::UserInput {

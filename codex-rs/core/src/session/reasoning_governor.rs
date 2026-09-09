@@ -621,8 +621,7 @@ impl SamplingRequestSignalCollector {
         let live_process_poll = tool_name_matches(tool_name, "write_stdin");
         let direct_code_mode_exec = crate::tools::code_mode::is_exec_tool_name(tool_name);
         let (action_identity, structured_action) = action_identities(tool_name, payload);
-        let validation = is_validation_invocation(tool_name, payload);
-        let validation_proof = validation && has_validation_proof_context(payload);
+        let (validation, validation_proof) = validation_invocation_status(tool_name, payload);
         let final_verification = is_final_diff_status_invocation(tool_name, payload);
         let mutation = is_mutation_tool(tool_name);
         let replayable_action = structured_action.as_ref().is_some_and(|action| {
@@ -863,8 +862,7 @@ impl SamplingRequestSignalCollector {
         outcome.canonical_artifact_required = canonical_artifact_required;
         outcome.nested_in_code_mode = true;
         let structured_action = structured_action_identity(tool_name, payload);
-        let validation = is_validation_invocation(tool_name, payload);
-        let validation_proof = validation && has_validation_proof_context(payload);
+        let (validation, validation_proof) = validation_invocation_status(tool_name, payload);
         let final_verification = is_final_diff_status_invocation(tool_name, payload);
         let mutation = is_mutation_tool(tool_name);
         let evidence_identity = outcome
@@ -955,9 +953,9 @@ impl SamplingRequestSignalCollector {
         outcome.nested_in_code_mode = true;
         let structured_action =
             payload.and_then(|payload| structured_action_identity(tool_name, payload));
-        let validation =
-            payload.is_some_and(|payload| is_validation_invocation(tool_name, payload));
-        let validation_proof = validation && payload.is_some_and(has_validation_proof_context);
+        let (validation, validation_proof) = payload
+            .map(|payload| validation_invocation_status(tool_name, payload))
+            .unwrap_or_default();
         let final_verification =
             payload.is_some_and(|payload| is_final_diff_status_invocation(tool_name, payload));
         let mutation = payload.is_some_and(|_| is_mutation_tool(tool_name));
@@ -1739,6 +1737,11 @@ fn structured_action_identity_from_canonical(
     payload: &ToolPayload,
     canonical: &CanonicalToolAction,
 ) -> Option<StructuredActionIdentity> {
+    // Fresh execution must bypass both replay lookup and storage, including
+    // consecutive calls that all explicitly request force_fresh.
+    if canonical.value.get("force_fresh").and_then(Value::as_bool) == Some(true) {
+        return None;
+    }
     let class = source_invocation_class_from_canonical(tool_name, payload, canonical);
     let action =
         serde_json::to_string(&(tool_name, canonical.identity_payload.as_deref()?)).ok()?;
@@ -1968,15 +1971,15 @@ fn canonical_tool_payload(action: &CanonicalToolAction) -> Value {
     })
 }
 
-fn is_validation_invocation(tool_name: &ToolName, payload: &ToolPayload) -> bool {
+fn validation_invocation_status(tool_name: &ToolName, payload: &ToolPayload) -> (bool, bool) {
     if !is_validation_tool(tool_name) {
-        return false;
+        return (false, false);
     }
     let ToolPayload::Function { arguments } = payload else {
-        return false;
+        return (false, false);
     };
     let Ok(arguments) = serde_json::from_str::<Value>(arguments) else {
-        return false;
+        return (false, false);
     };
     let script_field = if tool_name_matches(tool_name, "shell_command") {
         "command"
@@ -2002,38 +2005,16 @@ fn is_validation_invocation(tool_name: &ToolName, payload: &ToolPayload) -> bool
         args.as_deref(),
         script_body,
     ) else {
-        return false;
+        return (false, false);
     };
-    matches!(
-        classify_validation(&invocation),
-        ValidationClassification::Validation { leaves, .. } if !leaves.is_empty()
-    )
-}
-
-fn has_validation_proof_context(payload: &ToolPayload) -> bool {
-    let ToolPayload::Function { arguments } = payload else {
-        return false;
-    };
-    let Ok(arguments) = serde_json::from_str::<Value>(arguments) else {
-        return false;
-    };
-    if arguments.get("kind").and_then(Value::as_str) != Some("argv") {
-        return false;
+    match classify_validation(&invocation) {
+        ValidationClassification::Validation {
+            leaves,
+            exit_code_is_authoritative,
+            ..
+        } if !leaves.is_empty() => (true, exit_code_is_authoritative),
+        _ => (false, false),
     }
-    let Some(validation) = arguments.get("validation") else {
-        return false;
-    };
-    let Ok(validation) = serde_json::from_value::<
-        codex_protocol::validation::ValidationCommandContext,
-    >(validation.clone()) else {
-        return false;
-    };
-
-    !validation.covered_paths.is_empty()
-        && validation
-            .covered_paths
-            .iter()
-            .all(|path| is_normalized_repository_relative_validation_scope(path))
 }
 
 fn is_final_diff_status_invocation(tool_name: &ToolName, payload: &ToolPayload) -> bool {
@@ -2112,25 +2093,6 @@ fn final_diff_status_script_is_read_only(script: &str) -> bool {
         }
     }
     saw_diff && saw_status
-}
-
-fn is_normalized_repository_relative_validation_scope(path: &str) -> bool {
-    if path == "." {
-        return true;
-    }
-    if path.is_empty()
-        || path.trim() != path
-        || path.contains('\\')
-        || path.starts_with('/')
-        || path.starts_with('~')
-        || path.ends_with('/')
-        || path.contains("//")
-        || path.as_bytes().get(1) == Some(&b':')
-    {
-        return false;
-    }
-    path.split('/')
-        .all(|component| !component.is_empty() && !matches!(component, "." | ".."))
 }
 
 fn is_wait_tool(tool_name: &ToolName) -> bool {
@@ -3401,12 +3363,7 @@ mod tests {
     fn validation_proof_payload() -> ToolPayload {
         ToolPayload::Function {
             arguments: serde_json::json!({
-                "kind": "argv",
-                "program": "cargo",
-                "args": ["test", "-p", "codex-core", "focused"],
-                "validation": {
-                    "covered_paths": ["codex-rs/core/src"],
-                },
+                "cmd": "python -m unittest -q",
             })
             .to_string(),
         }
@@ -4699,70 +4656,233 @@ mod tests {
     }
 
     #[test]
-    fn recognized_validation_without_explicit_scope_is_execution_not_proof() {
-        let mut governor = SamplingReasoningGovernor::new(None);
-        let baselines = governor.baselines(0);
-        let settled_state = settled(0);
-        let collector = governor.collector(&baselines);
-        record_invocation_result(
-            &collector,
-            ToolName::plain("exec_command"),
-            ToolPayload::Function {
-                arguments: r#"{"cmd":"cargo test -p codex-core focused"}"#.to_string(),
-            },
-            "untagged-validation",
-            ToolOutputOutcome::Success,
-        );
-        collector.record_child_runtime(25);
-        governor.settle(&baselines, &collector, &settled_state);
+    fn recognized_validation_records_proof_across_shapes_without_required_metadata() {
+        for (tool, arguments) in [
+            ("exec_command", json!({"cmd": "python -m unittest -q"})),
+            (
+                "exec_command",
+                json!({"kind": "script", "cmd": "python -m unittest -q"}),
+            ),
+            (
+                "exec_command",
+                json!({"kind": "argv", "program": "python", "args": ["-m", "unittest", "-q"]}),
+            ),
+            (
+                "exec_command",
+                json!({"program": "python", "args": ["-m", "unittest", "-q"]}),
+            ),
+            (
+                "exec_command",
+                json!({"kind": "powershell_script", "script_body": "python -m unittest -q"}),
+            ),
+            ("shell_command", json!({"command": "python -m unittest -q"})),
+            (
+                "exec_command",
+                json!({"cmd": "python -m unittest -q", "validation": {"covered_paths": ["src"]}}),
+            ),
+        ] {
+            let mut governor = SamplingReasoningGovernor::new(None);
+            let baselines = governor.baselines(0);
+            let settled_state = settled(0);
+            let collector = governor.collector(&baselines);
+            record_invocation_result(
+                &collector,
+                ToolName::plain(tool),
+                ToolPayload::Function {
+                    arguments: arguments.to_string(),
+                },
+                "validation",
+                ToolOutputOutcome::Success,
+            );
+            collector.record_child_runtime(25);
+            governor.settle(&baselines, &collector, &settled_state);
 
-        assert_eq!(
-            collector.executed_validation_summary(),
-            ExecutedValidationSummary {
-                count: 1,
-                duration_ms: 25,
-            }
-        );
-        assert_ne!(
-            governor
-                .evaluate_convergence(&baselines, &collector, &settled_state)
-                .continuation,
-            ContinuationDisposition::TerminalCompletionRequired,
-            "recognized execution without explicit scoped metadata is not validation proof"
-        );
+            assert_eq!(
+                collector.executed_validation_summary(),
+                ExecutedValidationSummary {
+                    count: 1,
+                    duration_ms: 25
+                },
+                "{tool}: {arguments}"
+            );
+            let decision = governor.evaluate_convergence(&baselines, &collector, &settled_state);
+            assert_eq!(
+                decision.continuation,
+                ContinuationDisposition::TerminalCompletionRequired,
+                "{tool}: {arguments}"
+            );
+            assert!(decision.directive.is_none());
+            assert!(!decision.proven_loop_activated);
+        }
     }
 
     #[test]
-    fn validation_proof_context_requires_direct_argv_and_normalized_repo_scope() {
-        assert!(has_validation_proof_context(&validation_proof_payload()));
-
-        for arguments in [
-            serde_json::json!({
-                "cmd": "cargo test -p codex-core focused",
-                "validation": {"covered_paths": ["codex-rs/core/src"]},
-            }),
-            serde_json::json!({
-                "kind": "argv",
-                "program": "cargo",
-                "args": ["test"],
-                "validation": {"covered_paths": ["C:/repo/src"]},
-            }),
-            serde_json::json!({
-                "kind": "argv",
-                "program": "cargo",
-                "args": ["test"],
-                "validation": {"covered_paths": ["src/../src"]},
-            }),
-            serde_json::json!({
-                "kind": "argv",
-                "program": "cargo",
-                "args": ["test"],
-                "validation": {"covered_paths": []},
-            }),
+    fn masked_or_skipped_validation_cannot_terminalize_or_replay_success() {
+        let temp = tempfile::tempdir().expect("validation fixture");
+        std::fs::write(
+            temp.path().join("test_failing.py"),
+            "import unittest\nclass Failing(unittest.TestCase):\n    def test_failure(self):\n        self.fail('validation review sentinel')\n",
+        )
+        .expect("write failing unittest");
+        let python = if cfg!(windows) { "python" } else { "python3" };
+        let shell = if cfg!(windows) { "pwsh" } else { "sh" };
+        let shell_flags: &[&str] = if cfg!(windows) {
+            &["-NoProfile", "-Command"]
+        } else {
+            &["-c"]
+        };
+        for (script, failure_visible) in [
+            (format!("{python} -m unittest -q; exit 0"), true),
+            (
+                format!("{python} -c \"pass\" || {python} -m unittest -q"),
+                false,
+            ),
         ] {
-            assert!(!has_validation_proof_context(&ToolPayload::Function {
-                arguments: arguments.to_string(),
-            }));
+            let output = std::process::Command::new(shell)
+                .args(shell_flags)
+                .arg(&script)
+                .current_dir(temp.path())
+                .output()
+                .expect("execute validation fixture");
+            assert!(
+                output.status.success(),
+                "compound command masks test outcome"
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&output.stderr).contains("validation review sentinel"),
+                failure_visible,
+                "{script}"
+            );
+            let mut wrapper_args = shell_flags
+                .iter()
+                .map(|arg| arg.to_string())
+                .collect::<Vec<_>>();
+            wrapper_args.push(script.clone());
+            for arguments in [
+                json!({"cmd": script}),
+                json!({"kind": "argv", "program": shell, "args": wrapper_args}),
+                json!({"kind": "powershell_script", "script_body": script}),
+            ] {
+                for nested in [false, true] {
+                    let mut governor = SamplingReasoningGovernor::new(None);
+                    let baselines = governor.baselines(0);
+                    let collector = governor.collector(&baselines);
+                    let payload = ToolPayload::Function {
+                        arguments: arguments.to_string(),
+                    };
+                    if nested {
+                        collector.record_code_mode_result(CodeModeToolResult {
+                            cell_id: "compound-validation",
+                            tool_name: &ToolName::plain("exec_command"),
+                            payload: &payload,
+                            source_dependencies: None,
+                            outcome_context: ToolOutputOutcomeContext::new(
+                                ToolOutputOutcome::Success,
+                            ),
+                            signal: None,
+                            result: &json!({"exit_code": output.status.code()}),
+                            canonical_artifact_required: false,
+                        });
+                    } else {
+                        record_invocation_result(
+                            &collector,
+                            ToolName::plain("exec_command"),
+                            payload.clone(),
+                            "compound-validation",
+                            ToolOutputOutcome::Success,
+                        );
+                    }
+                    governor.settle(&baselines, &collector, &settled(0));
+                    assert_ne!(
+                        governor
+                            .evaluate_convergence(&baselines, &collector, &settled(0))
+                            .continuation,
+                        ContinuationDisposition::TerminalCompletionRequired,
+                        "{arguments}; nested={nested}"
+                    );
+                    let next = governor.collector(&governor.baselines(0));
+                    let replay = next.register_deterministic_tool_call(
+                        &ToolName::plain("exec_command"),
+                        &payload,
+                        "repeat-compound",
+                    );
+                    assert!(
+                        replay
+                            .replayed_success
+                            .and_then(|guard| guard.response_for_call("repeat-compound"))
+                            .is_none()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn metadata_cannot_turn_non_validation_commands_into_proof() {
+        for command in [
+            "git status --short",
+            "echo 'python -m unittest -q'",
+            "unknown-test-runner",
+        ] {
+            let mut governor = SamplingReasoningGovernor::new(None);
+            let baselines = governor.baselines(0);
+            let settled_state = settled(0);
+            let collector = governor.collector(&baselines);
+            record_invocation_result(
+                &collector,
+                ToolName::plain("exec_command"),
+                ToolPayload::Function {
+                    arguments: json!({
+                        "cmd": command,
+                        "validation": {"covered_paths": ["src"]},
+                    })
+                    .to_string(),
+                },
+                "not-validation",
+                ToolOutputOutcome::Success,
+            );
+            governor.settle(&baselines, &collector, &settled_state);
+            assert_eq!(collector.executed_validation_summary().count, 0);
+            assert_ne!(
+                governor
+                    .evaluate_convergence(&baselines, &collector, &settled_state)
+                    .continuation,
+                ContinuationDisposition::TerminalCompletionRequired,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_code_mode_validation_without_metadata_requires_successful_completion() {
+        for outcome in [
+            ToolOutputOutcome::Success,
+            ToolOutputOutcome::Failure,
+            ToolOutputOutcome::Skipped,
+        ] {
+            let mut governor = SamplingReasoningGovernor::new(None);
+            let baselines = governor.baselines(0);
+            let settled_state = settled(0);
+            let collector = governor.collector(&baselines);
+            collector.record_code_mode_result(CodeModeToolResult {
+                cell_id: "validation-cell",
+                tool_name: &ToolName::plain("exec_command"),
+                payload: &validation_proof_payload(),
+                source_dependencies: None,
+                outcome_context: ToolOutputOutcomeContext::new(outcome),
+                signal: None,
+                result: &json!({"exit_code": if outcome == ToolOutputOutcome::Success { 0 } else { 1 }}),
+                canonical_artifact_required: false,
+            });
+            governor.settle(&baselines, &collector, &settled_state);
+            assert_eq!(
+                governor
+                    .evaluate_convergence(&baselines, &collector, &settled_state)
+                    .continuation
+                    == ContinuationDisposition::TerminalCompletionRequired,
+                outcome == ToolOutputOutcome::Success,
+                "{outcome:?}"
+            );
         }
     }
 
@@ -4983,6 +5103,43 @@ mod tests {
                 .continuation,
             ContinuationDisposition::TerminalCompletionRequired
         );
+    }
+
+    #[test]
+    fn repeated_force_fresh_calls_never_return_a_replayed_response() {
+        for arguments in [
+            json!({"kind": "argv", "program": "rg", "args": ["--files", "src"], "force_fresh": true}),
+            json!({"cmd": "python -m unittest -q", "force_fresh": true}),
+        ] {
+            let mut governor = SamplingReasoningGovernor::new(None);
+            let payload = ToolPayload::Function {
+                arguments: arguments.to_string(),
+            };
+            for call_id in ["fresh-1", "fresh-2", "fresh-3"] {
+                let baselines = governor.baselines(0);
+                let collector = governor.collector(&baselines);
+                let registration = collector.register_deterministic_tool_call(
+                    &ToolName::plain("exec_command"),
+                    &payload,
+                    call_id,
+                );
+                assert!(
+                    registration
+                        .replayed_success
+                        .and_then(|guard| guard.response_for_call(call_id))
+                        .is_none(),
+                    "{call_id} must execute instead of returning cached output: {arguments}"
+                );
+                collector.record_response_result(
+                    registration.ordinal,
+                    ToolOutputOutcomeContext::new(ToolOutputOutcome::Success),
+                    None,
+                    &successful_tool_response(call_id, "fresh result"),
+                    false,
+                );
+                governor.settle(&baselines, &collector, &settled(0));
+            }
+        }
     }
 
     #[test]
