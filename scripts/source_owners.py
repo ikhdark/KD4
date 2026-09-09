@@ -307,8 +307,11 @@ def load_and_validate(
     manifest_path: Path,
     root: Path | None = None,
     owner_ids: list[str] | None = None,
+    *,
+    raw: bytes | None = None,
 ) -> tuple[dict, str]:
-    raw = manifest_path.read_bytes()
+    if raw is None:
+        raw = manifest_path.read_bytes()
     digest = hashlib.sha256(raw).hexdigest()
     manifest = tomllib.loads(raw.decode("utf-8"))
     errors = _schema_errors(manifest)
@@ -670,13 +673,15 @@ def _snapshot_file_signature(path: Path) -> tuple[str, int, int, int, int, int] 
     )
 
 
-def _read_snapshot_file(path: Path) -> tuple[bytes | None, bool]:
+def _read_snapshot_file(path: Path) -> tuple[bytes | None, int, int]:
     """Read a stable regular file, reusing only an identity-keyed observation."""
     global _snapshot_cache_bytes
+    reads = 0
+    bytes_read = 0
 
     before = _snapshot_file_signature(path)
     if before is None:
-        return None, False
+        return None, reads, bytes_read
     with _snapshot_cache_lock:
         cached = _snapshot_cache.get(before)
     if cached is not None:
@@ -685,30 +690,34 @@ def _read_snapshot_file(path: Path) -> tuple[bytes | None, bool]:
         # trusting the metadata-keyed entry so the cache never returns stale
         # source bytes; an equal payload still avoids downstream reprocessing.
         try:
+            reads += 1
             observed_contents = path.read_bytes()
+            bytes_read += len(observed_contents)
         except OSError:
-            return None, False
+            return None, reads, bytes_read
         if _snapshot_file_signature(path) == before and observed_contents == cached:
             with _snapshot_cache_lock:
                 if before in _snapshot_cache:
                     _snapshot_cache.move_to_end(before)
-            return cached, False
+            return cached, reads, bytes_read
         contents = observed_contents
     else:
         contents = None
     for _ in range(2):
         if contents is None:
             try:
+                reads += 1
                 contents = path.read_bytes()
+                bytes_read += len(contents)
             except OSError:
-                return None, False
+                return None, reads, bytes_read
         after = _snapshot_file_signature(path)
         if after == before:
             break
         before = after
         contents = None
         if before is None:
-            return None, True
+            return None, reads, bytes_read
     else:
         raise OSError(f"file changed while snapshotting: {path}")
     assert contents is not None
@@ -725,7 +734,7 @@ def _read_snapshot_file(path: Path) -> tuple[bytes | None, bool]:
             ):
                 _, evicted = _snapshot_cache.popitem(last=False)
                 _snapshot_cache_bytes -= len(evicted)
-    return contents, True
+    return contents, reads, bytes_read
 
 
 def repository_revision(root: Path, manifest_digest: str, manifest: dict) -> str:
@@ -756,6 +765,8 @@ def _query_graph(
     root: Path,
     owner_ids: list[str] | None,
     max_relationships: int | None,
+    *,
+    refresh_sources: bool = True,
 ) -> dict:
     owners_by_id = {owner["id"]: owner for owner in manifest["owners"]}
     selected_ids = sorted(set(owner_ids or owners_by_id))
@@ -811,7 +822,9 @@ def _query_graph(
         )
     return {
         "schema_version": SCHEMA_VERSION,
-        "repository_revision": repository_revision(root, digest, manifest),
+        "repository_revision": (
+            repository_revision(root, digest, manifest) if refresh_sources else None
+        ),
         "manifest_sha256": digest,
         "status": "partial" if omitted_relationships else "complete",
         "owners": selected_owners,
@@ -894,15 +907,18 @@ def _architecture_index_is_usable(index: object, digest: str) -> bool:
     return True
 
 
-def load_architecture_index(index_path: Path, digest: str, root: Path) -> dict | None:
+def load_architecture_index(
+    index_path: Path, digest: str, root: Path, *, refresh_sources: bool = True
+) -> dict | None:
     try:
         candidate = json.loads(index_path.read_text(encoding="utf-8"))
     except (FileNotFoundError, OSError, UnicodeError, json.JSONDecodeError):
         return None
     if not _architecture_index_is_usable(candidate, digest):
         return None
-    candidate["repository_revision"] = repository_revision(
-        root, digest, _manifest_projection_from_graph(candidate)
+    candidate["repository_revision"] = (
+        repository_revision(root, digest, _manifest_projection_from_graph(candidate))
+        if refresh_sources else None
     )
     return candidate
 
@@ -1006,6 +1022,7 @@ def _relationship_rank_key(
     }.get(relationship.get("provenance", ""), 0)
     return (
         -kind_priority,
+        -bool(relationship.get("behavioral_contracts")),
         -overlap,
         -provenance_priority,
         -selected_endpoint_count,
@@ -1079,6 +1096,7 @@ def _slice_source_snapshot(
         paths.update(item["path"] for item in relationship["evidence"])
     for owner in owners:
         paths.update(entry["path"] for entry in owner.get("primary_entries", []))
+        paths.update(owner.get("contracts", owner.get("configuration", [])))
         paths.update(owner.get("tests", []))
         paths.update(owner.get("generated_mirrors", []))
         for invariant in owner.get("invariants", []):
@@ -1095,15 +1113,14 @@ def _slice_source_snapshot(
         except ValueError:
             digest.update(b"\0missing-or-not-a-file\0")
             continue
-        contents, was_read = _read_snapshot_file(candidate)
+        contents, reads, source_bytes = _read_snapshot_file(candidate)
+        files_read += reads
+        bytes_read += source_bytes
         if contents is None:
             digest.update(b"\0missing-or-not-a-file\0")
             continue
         digest.update(b"\0file\0")
         digest.update(contents)
-        if was_read:
-            files_read += 1
-            bytes_read += len(contents)
     return digest.hexdigest(), files_read, bytes_read
 
 
@@ -1123,7 +1140,9 @@ def architecture_slice(
             f"max_relationships must be between 1 and {MAX_SLICE_RELATIONSHIPS}"
         )
     if graph is None:
-        graph = _query_graph(manifest, digest, root, owner_ids, max_relationships=None)
+        graph = _query_graph(
+            manifest, digest, root, owner_ids, max_relationships=None, refresh_sources=False
+        )
         selected = {owner["id"]: owner for owner in manifest["owners"]}
     else:
         graph = _select_index_graph(graph, owner_ids, max_relationships=None)
@@ -1150,6 +1169,18 @@ def architecture_slice(
         target_id = relationship["target"].removeprefix("owner:")
         involved = set(selected_ids) & {source_id, target_id}
         facet = CATEGORY_FACETS[relationship["category"]]
+        # Prefer an exact scenario tied to an existing semantic contract over
+        # filename proximity. This is declared evidence to read, not proof that
+        # the test is sufficient; no source crawl or second test index is needed.
+        scenario_contracts = []
+        if relationship["kind"] == "validated_by" and any(
+            item.get("symbol") for item in relationship["evidence"]
+        ):
+            for invariant in selected.get(source_id, {}).get("invariants", []):
+                if invariant["kind"] == "semantic" and relationship["target"] in {
+                    f"path:{path}" for path in invariant.get("tests", [])
+                }:
+                    scenario_contracts.append(invariant["statement"])
         coverage[facet].update(involved or {source_id})
         facets[facet].append(
             {
@@ -1163,6 +1194,11 @@ def architecture_slice(
                     "exact"
                     if relationship["confidence"] == "compiler_resolved"
                     else "declared"
+                ),
+                **(
+                    {"behavioral_contracts": scenario_contracts}
+                    if scenario_contracts
+                    else {}
                 ),
             }
         )
@@ -1276,10 +1312,23 @@ def architecture_slice(
 
     ranking_limitation = (
         "Relationships are ordered within each facet by facet-specific kind, "
-        "focus-term overlap, provenance, and selected-owner directness."
+        "declared behavioral scenario, focus-term overlap, provenance, and selected-owner directness. "
+        "Inspect the selected scenario's normal entry point and asserted effect; declarations do not prove test quality."
     )
+    test_facet = output["tests_and_contracts"]
+    test_facet["representative_scenario"] = next(
+        (item for item in test_facet["relationships"] if item.get("behavioral_contracts")),
+        None,
+    )
+    test_facet["focused_validation"] = [
+        validation
+        for owner in selected_owners
+        for validation in owner.get("validation", [])
+        if validation.get("role") == "focused_tests"
+    ]
     return {
-        "snapshot": f"{graph['repository_revision']}:{digest}:{source_snapshot}",
+        "snapshot": f"slice-v2:{','.join(selected_ids)}:manifest:{digest}:sources:{source_snapshot}",
+        "freshness_scope": "selected owners and their incoming/outgoing relationship evidence",
         **output,
         "truncated": graph["status"] != "complete" or omitted_relationships > 0,
         "omitted_relationships": omitted_relationships,
@@ -1289,6 +1338,7 @@ def architecture_slice(
             ranking_limitation,
         ],
         "metrics": {
+            "scope": "slice source reads and manifest bytes; excludes index loading and validation",
             "tool_calls": 1,
             "files_read": files_read + 1,
             "bytes_read": bytes_read + manifest_bytes_read,
@@ -1495,11 +1545,11 @@ def main() -> int:
             manifest_bytes = args.manifest.read_bytes()
             digest = hashlib.sha256(manifest_bytes).hexdigest()
             cached_graph = load_architecture_index(
-                args.architecture_index, digest, root
+                args.architecture_index, digest, root, refresh_sources=args.command != "slice"
             )
             if cached_graph is None:
                 manifest, digest = load_and_validate(
-                    args.manifest, root, owner_ids=args.owners
+                    args.manifest, root, owner_ids=args.owners, raw=manifest_bytes
                 )
             else:
                 manifest = None

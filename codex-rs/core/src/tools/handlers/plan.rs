@@ -60,6 +60,7 @@ impl PlanToolOutput {
 #[derive(Default)]
 struct PlanCommitBoundaryHook {
     reached: Notify,
+    cancellation_observed: Notify,
     release: Notify,
 }
 
@@ -92,14 +93,24 @@ impl PlanCommitBoundaryHook {
 }
 
 #[cfg(test)]
-async fn pause_at_plan_commit_boundary(call_id: &str) {
+// Pauses scheduling only; the real runtime token observes its normal abort path.
+async fn pause_at_plan_commit_boundary(
+    call_id: &str,
+    cancellation_token: &tokio_util::sync::CancellationToken,
+) {
     let hook = PLAN_COMMIT_BOUNDARY_HOOKS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .remove(call_id);
     if let Some(hook) = hook {
         hook.reached.notify_one();
-        hook.release.notified().await;
+        tokio::select! {
+            _ = hook.release.notified() => {},
+            _ = cancellation_token.cancelled() => {
+                hook.cancellation_observed.notify_one();
+                hook.release.notified().await;
+            }
+        }
     }
 }
 
@@ -195,7 +206,7 @@ impl PlanHandler {
             ));
         }
         #[cfg(test)]
-        pause_at_plan_commit_boundary(&_call_id).await;
+        pause_at_plan_commit_boundary(&_call_id, &cancellation_token).await;
 
         let update = session.services.plan_store.update(requested_args).await;
         match update.effect {
@@ -222,6 +233,10 @@ impl PlanHandler {
 
 impl CoreToolRuntime for PlanHandler {
     fn waits_for_runtime_cancellation(&self) -> bool {
+        true
+    }
+
+    fn cancellation_requires_commit_barrier(&self) -> bool {
         true
     }
 }

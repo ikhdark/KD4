@@ -133,18 +133,44 @@ async fn deferred_capability_revision_depends_only_on_provenance_and_schema() {
 
 #[tokio::test]
 async fn serialized_tool_manifest_cache_invalidates_on_activation_revision() {
-    let (_session, turn) = make_session_and_context().await;
-    let router = ToolRouter::from_parts_with_warnings_and_identity(
-        ToolRegistry::empty_for_test(),
-        Vec::new(),
-        Vec::new(),
-        ToolExposureIdentity::default(),
+    let (_session, mut turn) = make_session_and_context().await;
+    turn.model_info.supports_search_tool = true;
+    let turn = Arc::new(turn);
+    let step_context = StepContext::for_test(Arc::clone(&turn));
+    let dynamic_tools = vec![DynamicToolSpec::Function(DynamicToolFunctionSpec {
+        name: "activate_manifest_tool".to_string(),
+        description: "Visible after activation.".to_string(),
+        input_schema: json!({"type": "object", "properties": {}}),
+        defer_loading: true,
+    })];
+    let router = ToolRouter::from_context(
+        step_context.as_ref(),
+        ToolRouterParams {
+            tool_suggest_candidates: None,
+            deferred_mcp_tools: None,
+            mcp_tools: None,
+            extension_tool_executors: Vec::new(),
+            dynamic_tools: &dynamic_tools,
+            exposure_identity: Default::default(),
+        },
+        &Default::default(),
     );
 
     let first = router.tool_manifest(&turn);
+    let exposes_tool = |manifest: &codex_protocol::protocol::ToolManifestItem| {
+        manifest.manifest.as_ref().expect("full manifest")["model_visible"]
+            .as_array()
+            .expect("model-visible tools")
+            .iter()
+            .any(|tool| tool["type"] == "function" && tool["name"] == "activate_manifest_tool")
+    };
+    assert!(!exposes_tool(&first));
+    turn.refresh_deferred_tool_capabilities(router.deferred_tool_capability_revisions());
+    turn.activate_deferred_tools([ToolName::plain("activate_manifest_tool")]);
     let second = router.tool_manifest(&turn);
-    assert_eq!(first, second);
-    assert_eq!(turn.deferred_tool_activation_revision(), 0);
+    assert_ne!(first.hash, second.hash);
+    assert!(exposes_tool(&second));
+    assert_eq!(turn.deferred_tool_activation_revision(), 1);
 }
 
 #[tokio::test]
@@ -158,6 +184,7 @@ async fn unchanged_rollout_tool_manifest_uses_a_compact_reference() {
     );
 
     let definition = router.tool_manifest_for_rollout(&turn, None);
+    assert_eq!(definition, router.tool_manifest_for_rollout(&turn, None));
     let reference = router.tool_manifest_for_rollout(&turn, Some(definition.hash.as_str()));
 
     assert!(definition.manifest.is_some());

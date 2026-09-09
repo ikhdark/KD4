@@ -142,9 +142,14 @@ pub(crate) trait CoreToolRuntime: ToolExecutor<ToolInvocation> {
         )
     }
 
-    /// Whether cancellation should let the handler finish teardown before the
-    /// host returns an aborted tool response.
+    /// Whether cancellation should notify the handler and supervise its teardown.
     fn waits_for_runtime_cancellation(&self) -> bool {
+        false
+    }
+
+    /// Whether an admitted state commit must finish before an aborted response.
+    /// Unlike general teardown, this work has a consumer-visible ordering contract.
+    fn cancellation_requires_commit_barrier(&self) -> bool {
         false
     }
 
@@ -1082,6 +1087,10 @@ impl ToolRegistry {
     pub(crate) fn waits_for_runtime_cancellation(&self, name: &ToolName) -> Option<bool> {
         let tool = self.tool(name)?;
         Some(tool.waits_for_runtime_cancellation())
+    }
+
+    pub(crate) fn cancellation_requires_commit_barrier(&self, name: &ToolName) -> Option<bool> {
+        Some(self.tool(name)?.cancellation_requires_commit_barrier())
     }
 
     pub(crate) fn owns_unified_exec_processes(&self, name: &ToolName) -> Option<bool> {

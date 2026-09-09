@@ -18,15 +18,15 @@ use crate::tools::context::boxed_tool_output;
 use crate::tools::handlers::apply_granted_turn_permissions_uri;
 use crate::tools::handlers::apply_patch::intercept_apply_patch;
 use crate::tools::handlers::command_preflight::preflight_invocation_for_runtime;
-use crate::tools::handlers::command_search::classify_rg_search_narrowing;
 use crate::tools::handlers::command_search::classify_rg_search_narrowing_without_native_scope;
+use crate::tools::handlers::command_search::classify_rg_search_with_repository;
 use crate::tools::handlers::command_search::observe_rg_search_scope_state;
 use crate::tools::handlers::command_shape::CommandInvocation;
 use crate::tools::handlers::command_shape::powershell_script_failure_advisory;
 use crate::tools::handlers::normalize_and_validate_additional_permissions;
 use crate::tools::handlers::parse_arguments;
 use crate::tools::handlers::parse_arguments_with_base_path;
-use crate::tools::handlers::resolve_repository_root;
+use crate::tools::handlers::resolve_search_repository_root;
 use crate::tools::handlers::resolve_tool_environment;
 use crate::tools::handlers::rewrite_function_command_invocation;
 use crate::tools::hook_names::HookToolName;
@@ -427,20 +427,19 @@ impl ExecCommandHandler {
                 }),
             }
         };
-        let search_narrowing = if validation_launch.is_none() {
+        let search_narrowing = if validation_launch.is_none() && !environment_is_remote {
             if let Some(native_cwd) = native_cwd.as_ref() {
-                let repository_root = resolve_repository_root(native_cwd.as_path());
-                let mut search = classify_rg_search_narrowing(
+                let mut search = classify_rg_search_with_repository(
                     &resolved_command.safety_command,
                     resolved_command.preflight_shell_type,
                     native_cwd.as_path(),
-                    &repository_root,
+                    || resolve_search_repository_root(native_cwd.as_path()),
                 )
                 .map_err(FunctionCallError::RespondToModel)?;
-                if let Some(search) = search.as_mut() {
+                if let Some((_, search)) = search.as_mut() {
                     observe_rg_search_scope_state(search).await;
                 }
-                search.map(|search| (repository_root.to_string_lossy().into_owned(), search))
+                search.map(|(root, search)| (root.to_string_lossy().into_owned(), search))
             } else {
                 classify_rg_search_narrowing_without_native_scope(
                     &resolved_command.safety_command,

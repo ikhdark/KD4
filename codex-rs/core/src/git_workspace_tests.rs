@@ -151,26 +151,132 @@ async fn create_clean_git_repo() -> (TempDir, AbsolutePathBuf) {
     (temp_dir, repo)
 }
 
-#[test]
-fn ordinary_workspace_identity_does_not_request_patch_or_content_materialization() {
-    let args = workspace_generation_status_args();
-
-    assert!(args.contains(&"status"));
-    assert!(args.contains(&"--porcelain=v2"));
-    for expensive_arg in ["diff", "--patch", "--binary", "ls-files", "hash-object"] {
-        assert!(!args.contains(&expensive_arg));
+#[tokio::test]
+async fn ordinary_workspace_identity_accepts_256_paths_and_rejects_257() {
+    let (_temp, repo) = create_clean_git_repo().await;
+    for index in 0..255 {
+        std::fs::write(repo.join(format!("untracked-{index}.txt")), b"").unwrap();
     }
+    assert!(
+        capture_workspace_evidence_identity(repo.as_path())
+            .await
+            .is_some()
+    );
+    std::fs::write(repo.join("path-256.txt"), b"").unwrap();
+    assert!(
+        capture_workspace_evidence_identity(repo.as_path())
+            .await
+            .is_some()
+    );
+    std::fs::write(repo.join("path-257.txt"), b"").unwrap();
+    assert!(
+        capture_workspace_evidence_identity(repo.as_path())
+            .await
+            .is_none()
+    );
+}
+
+#[test]
+fn workspace_content_capture_stops_between_chunks_and_preserves_sha256() {
+    let control = WorkspaceCaptureControl {
+        deadline: Instant::now() + Duration::from_secs(5),
+        cancellation: CancellationToken::new(),
+    };
+    let mut buffer = [0; 1024];
+    let content = vec![42; 8193];
+    assert_eq!(
+        hash_workspace_content(&mut content.as_slice(), 8193, &mut buffer, &control),
+        Some((format!("{:x}", Sha256::digest(&content)), 8193))
+    );
+    assert_eq!(
+        hash_workspace_content(&mut &b""[..], 0, &mut buffer, &control),
+        Some((format!("{:x}", Sha256::digest(b"")), 0))
+    );
+    assert!(hash_workspace_content(&mut content.as_slice(), 8192, &mut buffer, &control).is_none());
+    struct CancelAfterRead<'a> {
+        reads: usize,
+        token: &'a CancellationToken,
+    }
+    impl Read for CancelAfterRead<'_> {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            self.reads += 1;
+            buffer.fill(1);
+            self.token.cancel();
+            Ok(buffer.len())
+        }
+    }
+    let mut reader = CancelAfterRead {
+        reads: 0,
+        token: &control.cancellation,
+    };
+    assert!(hash_workspace_content(&mut reader, 8193, &mut buffer, &control).is_none());
+    assert_eq!(reader.reads, 1, "cancellation must prevent the next read");
 }
 
 #[tokio::test]
-async fn workspace_generation_capture_has_one_absolute_deadline() {
-    let result = within_workspace_generation_deadline(
-        Duration::from_millis(10),
-        std::future::pending::<()>(),
+async fn workspace_identity_distinguishes_deletion_recreation_and_rename() {
+    let (_temp, repo) = create_clean_git_repo().await;
+    let initial = capture_workspace_evidence_identity(repo.as_path())
+        .await
+        .unwrap();
+    std::fs::remove_file(repo.join("README.md")).unwrap();
+    let deleted = capture_workspace_evidence_identity(repo.as_path())
+        .await
+        .unwrap();
+    assert_ne!(initial, deleted);
+    std::fs::write(repo.join("README.md"), "recreated\n").unwrap();
+    let recreated = capture_workspace_evidence_identity(repo.as_path())
+        .await
+        .unwrap();
+    assert_ne!(deleted, recreated);
+    run_git(repo.as_path(), &["mv", "README.md", "renamed.md"]).await;
+    let renamed = capture_workspace_evidence_identity(repo.as_path())
+        .await
+        .unwrap();
+    assert_ne!(recreated, renamed);
+    assert!(repo.join("renamed.md").exists());
+    let stale_deletion = capture_workspace_metadata(
+        repo.to_path_buf(),
+        vec![WorkspaceGenerationPath {
+            path: "renamed.md".to_string(),
+            deleted: true,
+        }],
+        WorkspaceCaptureControl {
+            deadline: Instant::now() + Duration::from_secs(5),
+            cancellation: CancellationToken::new(),
+        },
     )
     .await;
+    assert!(
+        stale_deletion.is_none(),
+        "a recreated path cannot inherit a deleted identity"
+    );
+}
 
-    assert!(result.is_err());
+#[test]
+fn nul_status_reader_handles_split_renames_conflicts_and_limits() {
+    let status = b"2 R. N... 100644 100644 100644 a b R100 renamed\0? false-untracked\0u UU N... 100644 100644 100644 100644 a b c conflict\0? real-untracked\0";
+    for chunk_size in [1, 7, status.len()] {
+        let mut reader = WorkspaceStatusReader::new();
+        for chunk in status.chunks(chunk_size) {
+            reader.push(chunk).unwrap();
+        }
+        let (bytes, paths) = reader.finish().unwrap();
+        assert_eq!(bytes, status);
+        assert_eq!(
+            paths
+                .iter()
+                .map(|path| path.path.as_str())
+                .collect::<Vec<_>>(),
+            ["conflict", "real-untracked", "renamed"]
+        );
+    }
+    let mut reader = WorkspaceStatusReader::new();
+    for index in 0..256 {
+        reader.push(format!("? {index}\0").as_bytes()).unwrap();
+    }
+    reader.push(b"? 0\0").unwrap();
+    assert!(reader.push(b"? path-257\0").is_none());
 }
 
 #[tokio::test]
@@ -852,6 +958,90 @@ async fn workspace_evidence_identity_excludes_codex_eval_artifacts() {
         .expect("second identity");
 
     assert_eq!(second, first);
+}
+
+#[tokio::test]
+async fn cancelling_a_waiter_preserves_live_capture_and_last_waiter_releases_it() {
+    let (_temp, repo) = create_clean_git_repo().await;
+    let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
+    let pause = cache.pause_next_workspace_evidence_capture();
+    let first_cache = Arc::clone(&cache);
+    let first_repo = repo.clone();
+    let first = tokio::spawn(async move {
+        first_cache
+            .workspace_evidence_identity(first_repo.as_path())
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(10), pause.wait_until_started())
+        .await
+        .unwrap();
+    let joined = cache.workspace_evidence_waiter_joined.notified();
+    let second_cache = Arc::clone(&cache);
+    let second_repo = repo.clone();
+    let second = tokio::spawn(async move {
+        second_cache
+            .workspace_evidence_identity(second_repo.as_path())
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(10), joined)
+        .await
+        .unwrap();
+    first.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+    {
+        let captures = cache.in_flight_workspace_evidence.lock().unwrap();
+        assert_eq!(captures.len(), 1);
+        assert!(
+            !captures
+                .values()
+                .next()
+                .unwrap()
+                .interest
+                .cancellation
+                .is_cancelled()
+        );
+    }
+    pause.release();
+    assert!(second.await.unwrap().is_some());
+    assert_eq!(cache.workspace_evidence_capture_count(), 1);
+
+    let pause = cache.pause_next_workspace_evidence_capture();
+    let abandoned_cache = Arc::clone(&cache);
+    let abandoned_repo = repo.clone();
+    let abandoned = tokio::spawn(async move {
+        abandoned_cache
+            .workspace_evidence_identity(abandoned_repo.as_path())
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(10), pause.wait_until_started())
+        .await
+        .unwrap();
+    let token = cache
+        .in_flight_workspace_evidence
+        .lock()
+        .unwrap()
+        .values()
+        .next()
+        .unwrap()
+        .interest
+        .cancellation
+        .clone();
+    abandoned.abort();
+    assert!(abandoned.await.unwrap_err().is_cancelled());
+    assert!(token.is_cancelled());
+    assert!(
+        cache
+            .in_flight_workspace_evidence
+            .lock()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        cache
+            .workspace_evidence_identity(repo.as_path())
+            .await
+            .is_some()
+    );
 }
 
 #[tokio::test]

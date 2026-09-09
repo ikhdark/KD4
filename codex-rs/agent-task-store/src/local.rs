@@ -1512,6 +1512,7 @@ LIMIT 1
         let mut seen_calls = HashSet::new();
         let mut validation_summaries = HashSet::new();
         let mut successful_call_epochs = Vec::new();
+        let mut successful_calls = std::collections::HashMap::new();
         for call_id in &draft.validation_call_ids {
             if !seen_calls.insert(call_id.as_str()) {
                 invalid_calls.push(call_id.clone());
@@ -1549,6 +1550,7 @@ LIMIT 1
                 validation_summaries.insert(call.command_summary);
                 if let Some(end_epoch) = call.evidence.end_epoch {
                     successful_call_epochs.push((call_id.clone(), end_epoch));
+                    successful_calls.insert(call_id.as_str(), end_epoch);
                 }
             }
         }
@@ -1561,6 +1563,19 @@ LIMIT 1
             return Err(StoreError::ValidationCallStatusInvalid {
                 call_ids: invalid_statuses,
             });
+        }
+        for result in &draft.criterion_results {
+            if let Some(reference) = &result.evidence_ref
+                && (result.status != crate::CriterionStatus::Passed
+                    || reference.workspace_id != assignment.workspace_id
+                    || successful_calls.get(reference.call_id.as_str())
+                        != Some(&reference.evidence_epoch))
+            {
+                return Err(StoreError::CriterionResultsInvalid(format!(
+                    "criterion {} must reference its workspace and an owned successful validation in this receipt at the recorded epoch",
+                    result.criterion_id
+                )));
+            }
         }
         let running_call_ids = sqlx::query_scalar::<_, String>(
             "SELECT call_id FROM validation_calls WHERE attempt_id = ? AND status = ? ORDER BY call_id",
@@ -1976,6 +1991,7 @@ LIMIT 1
         let criterion_results = effective_criteria(&assignment, attempt.amendment.as_ref())
             .iter()
             .map(|criterion| crate::CriterionResult {
+                evidence_ref: None,
                 criterion_id: criterion.id.clone(),
                 status: CriterionStatus::NotRun,
                 evidence: None,
@@ -2596,6 +2612,7 @@ LIMIT 1
         let criterion_results = effective_criteria(&assignment, attempt.amendment.as_ref())
             .iter()
             .map(|criterion| crate::CriterionResult {
+                evidence_ref: None,
                 criterion_id: criterion.id.clone(),
                 status: CriterionStatus::NotRun,
                 evidence: None,

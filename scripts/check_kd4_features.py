@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import ast
 import json
+import os
 import re
 import subprocess
 from collections import Counter
@@ -15,6 +16,11 @@ from pathlib import Path
 from typing import Any
 
 import tomllib
+
+if __package__:
+    from scripts import rust_test_runner
+else:
+    import rust_test_runner
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MANIFEST_FILE_NAME = "kd4_features.toml"
@@ -68,12 +74,165 @@ class CheckResult:
         }
 
 
+def _verification_route(
+    verification: dict[str, Any],
+    repo_root: Path,
+    rust_manifest: rust_test_runner.Manifest | None = None,
+) -> str:
+    """Accept only a single test selector in its declared source owner/binary."""
+    command = verification.get("command")
+    symbol = verification.get("symbol")
+    if not isinstance(symbol, str) or not re.fullmatch(
+        r"[A-Za-z_][A-Za-z_0-9]*", symbol
+    ):
+        raise ValueError("verification symbol must be one test function name")
+    if not isinstance(command, list) or not all(
+        isinstance(arg, str) for arg in command
+    ):
+        raise ValueError("verification command must be an argument array")
+    source, error = _safe_repo_path(repo_root, verification.get("path"))
+    if error or source is None:
+        raise ValueError(error or "missing source")
+    if source.suffix == ".py":
+        module = (
+            source.relative_to(repo_root).with_suffix("").as_posix().replace("/", ".")
+        )
+        tree = ast.parse(source.read_text(encoding="utf-8"))
+        selectors = {
+            f"{module}.{node.name}.{symbol}"
+            for node in tree.body
+            if isinstance(node, ast.ClassDef)
+            if any(
+                isinstance(item, ast.FunctionDef) and item.name == symbol
+                for item in node.body
+            )
+        }
+        if (
+            len(command) == 4
+            and re.fullmatch(r"python(?:3(?:\.\d+)?)?(?:\.exe)?", Path(command[0]).name)
+            and command[1:3] == ["-m", "unittest"]
+            and command[3] in selectors
+        ):
+            return "unittest"
+        raise ValueError(
+            "Python verification must select the declared module, class and test with unittest"
+        )
+    cargo_path = next(
+        (
+            parent / "Cargo.toml"
+            for parent in source.parents
+            if parent.is_relative_to(repo_root) and (parent / "Cargo.toml").is_file()
+        ),
+        None,
+    )
+    if cargo_path is None:
+        raise ValueError("Rust verification source has no Cargo owner")
+    cargo = tomllib.loads(cargo_path.read_text(encoding="utf-8"))
+    package = cargo["package"]["name"]
+    relative = source.relative_to(cargo_path.parent)
+    selector = ["--lib"]
+    if relative.parts[0] == "tests":
+        if len(relative.parts) == 2:
+            selector = ["--test", source.stem]
+        else:
+            # Existing suite aggregators register their first module explicitly.
+            candidates = [
+                p
+                for p in (cargo_path.parent / "tests").glob("*.rs")
+                if re.search(
+                    r"\bmod\s+" + re.escape(relative.parts[1]) + r"\s*;",
+                    p.read_text(encoding="utf-8"),
+                )
+            ]
+            if len(candidates) != 1:
+                raise ValueError(
+                    "verification source must resolve to one integration test binary"
+                )
+            selector = ["--test", candidates[0].stem]
+    else:
+        for binary in cargo.get("bin", []):
+            if binary.get("path") == relative.as_posix():
+                selector = ["--bin", binary["name"]]
+    if (
+        len(command) != 6
+        or command[:3] != ["python", "scripts/rust_test_runner.py", "run-gate"]
+        or command[4:] != ["--profile", "fast"]
+    ):
+        raise ValueError(
+            "Rust verification must use a named exact-test gate in scripts/rust_test_runner.py"
+        )
+    if rust_manifest is None:
+        rust_manifest = rust_test_runner.Manifest.load(
+            repo_root / "codex-rs/.config/kd4-rust-tests.toml"
+        )
+    gate = rust_manifest.gates.get(command[3])
+    if gate is None or len(gate.steps) != 1:
+        raise ValueError("capability gate must name one test target")
+    step = gate.steps[0]
+    target = rust_manifest.targets[step.target]
+    if target.selection_args() != ["-p", package, *selector]:
+        raise ValueError(
+            "capability gate must select the declared source's package and test binary"
+        )
+    if not any(test.split("::")[-1] == symbol for test in step.tests):
+        raise ValueError("capability gate must require the declared test symbol")
+    return "nextest"
+
+
+@dataclass
+class _TestOutcome:
+    symbol: str
+    route: str
+    selector: str
+    passed: set[str]
+    skipped: bool = False
+    failed: bool = False
+    zero_tests: bool = False
+
+    def observe(self, line: str) -> None:
+        line = re.sub(r"\x1b\[[0-9;]*m", "", line).strip()
+        self.zero_tests |= bool(
+            re.search(r"\b(?:running 0 tests|Ran 0 tests|0 tests run)\b", line)
+        )
+        identity = status = None
+        if self.route == "unittest":
+            match = re.fullmatch(r"(\w+) \(([^)]+)\)(?: .*?)? \.\.\. (.+)", line)
+            if match and match[1] == self.symbol:
+                qualified = (
+                    match[2]
+                    if match[2].endswith("." + self.symbol)
+                    else match[2] + "." + self.symbol
+                )
+                if qualified == self.selector:
+                    identity, status = qualified, match[3]
+        if identity is None or identity.split("::")[-1].split(".")[-1] != self.symbol:
+            return
+        if status in {"ok", "PASS"}:
+            self.passed.add(identity)
+        elif status and status.startswith(("skipped", "ignored", "SKIP")):
+            self.skipped = True
+        else:
+            self.failed = True
+
+    def verdict(self, returncode: int) -> str:
+        if returncode or self.failed:
+            return "failed"
+        if self.skipped:
+            return "skipped"
+        if len(self.passed) == 1:
+            return "passed"
+        if len(self.passed) > 1:
+            return "ambiguous_test_identity"
+        return "zero_tests" if self.zero_tests else "not_executed"
+
+
 def execute_runtime_verification(
     manifest_path: Path,
     *,
     feature_id: str | None,
     repo_root: Path,
     quiet: bool = False,
+    outcomes: list[dict[str, Any]] | None = None,
 ) -> int:
     """Execute one selected, or every enabled, runtime verification command."""
     try:
@@ -102,50 +261,154 @@ def execute_runtime_verification(
                 f"runtime verification feature must resolve exactly once: {feature_id!r}"
             )
         return 2
-    for feature in matching:
-        current_feature_id = feature.get("id")
-        verification = feature.get("runtime_verification")
-        command = (
-            verification.get("command") if isinstance(verification, dict) else None
-        )
-        if (
-            not isinstance(current_feature_id, str)
-            or not isinstance(command, list)
-            or not command
-            or not all(isinstance(argument, str) and argument for argument in command)
-        ):
-            if not quiet:
-                print(
-                    "feature has no executable enabled runtime verification: "
-                    f"{current_feature_id!r}"
+    # Resolve every route before executing anything. Rust uses the same gate
+    # runner as `just core-gate`; compatible Python selectors share one process.
+    rust_manifest = None
+    rust_features = []
+    python_groups: dict[str, list[dict[str, Any]]] = {}
+    try:
+        for feature in matching:
+            verification = feature.get("runtime_verification")
+            if not isinstance(feature.get("id"), str) or not isinstance(
+                verification, dict
+            ):
+                raise TypeError("feature has no executable runtime verification")
+            if (
+                str(verification.get("path", "")).endswith(".rs")
+                and rust_manifest is None
+            ):
+                rust_manifest = rust_test_runner.Manifest.load(
+                    repo_root / "codex-rs/.config/kd4-rust-tests.toml"
                 )
-            return 2
-
-        execution_root = repo_root / "codex-rs" if command[0] == "cargo" else repo_root
+            route = _verification_route(verification, repo_root, rust_manifest)
+            if route == "nextest":
+                rust_features.append(feature)
+            else:
+                python_groups.setdefault(verification["command"][0], []).append(feature)
+    except (
+        TypeError,
+        ValueError,
+        OSError,
+        KeyError,
+        SyntaxError,
+        rust_test_runner.RunnerError,
+    ) as exc:
         if not quiet:
-            print(
-                f"KD4 RUNTIME VERIFICATION [{current_feature_id}]: {' '.join(command)}"
+            print(f"invalid runtime verification: {exc}")
+        return 2
+
+    if rust_features:
+        gates = list(
+            dict.fromkeys(
+                feature["runtime_verification"]["command"][3]
+                for feature in rust_features
             )
+        )
         try:
-            completed = subprocess.run(
-                command,
-                cwd=execution_root,
-                check=False,
-                **(
-                    {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
-                    if quiet
-                    else {}
+            assert rust_manifest is not None
+            cwd = repo_root / "codex-rs"
+            metadata = rust_test_runner.load_metadata(cwd=cwd)
+            runner = rust_test_runner.RustTestRunner(
+                rust_manifest,
+                metadata,
+                cwd=cwd,
+                profile="fast",
+                target_dir=rust_test_runner._resolve_target_dir(
+                    None, metadata, cwd=cwd
                 ),
             )
+            # Exact selectors and the same execution's outcomes supply proof;
+            # feature verification must not add a preliminary test discovery run.
+            completed = runner.run_gates(gates, quiet=quiet, discover=False)
+        except (rust_test_runner.RunnerError, OSError) as exc:
+            for feature in rust_features:
+                if outcomes is not None:
+                    outcomes.append(
+                        {
+                            "feature_id": feature["id"],
+                            "outcome": getattr(exc, "outcome", "failed"),
+                            "test_identities": [],
+                            "returncode": 2,
+                            "evidence_kind": feature["runtime_verification"]["kind"],
+                            "error": str(exc),
+                        }
+                    )
+            if not quiet:
+                print(f"KD4 RUNTIME VERIFICATION failed: {exc}")
+            return 2
+        for feature in rust_features:
+            verification = feature["runtime_verification"]
+            if outcomes is not None:
+                outcomes.append(
+                    {
+                        "feature_id": feature["id"],
+                        "outcome": "passed",
+                        "test_identities": completed[verification["command"][3]],
+                        "returncode": 0,
+                        "evidence_kind": verification["kind"],
+                    }
+                )
+            if not quiet:
+                print(f"KD4 TEST RESULT [{feature['id']}]: passed")
+
+    for interpreter, features in python_groups.items():
+        observers = {
+            feature["runtime_verification"]["command"][3]: _TestOutcome(
+                feature["runtime_verification"]["symbol"],
+                "unittest",
+                feature["runtime_verification"]["command"][3],
+                set(),
+            )
+            for feature in features
+        }
+        command = [interpreter, "-m", "unittest", "-v", *observers]
+        if not quiet:
+            for feature in features:
+                print(
+                    f"KD4 RUNTIME VERIFICATION [{feature['id']}]: {' '.join(command)}"
+                )
+        try:
+            with subprocess.Popen(
+                command,
+                cwd=repo_root,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env={**os.environ, "INSTA_UPDATE": "no"},
+            ) as process:
+                assert process.stdout is not None
+                for line in process.stdout:
+                    for observer in observers.values():
+                        observer.observe(line)
+                    if not quiet:
+                        print(line, end="")
+                returncode = process.wait()
         except OSError as exc:
             if not quiet:
-                print(
-                    "runtime verification could not start for "
-                    f"{current_feature_id!r}: {exc}"
-                )
+                print(f"runtime verification could not start: {exc}")
             return 2
-        if completed.returncode != 0:
-            return completed.returncode
+        failed = False
+        for feature in features:
+            verification = feature["runtime_verification"]
+            outcome = observers[verification["command"][3]]
+            verdict = outcome.verdict(returncode)
+            if outcomes is not None:
+                outcomes.append(
+                    {
+                        "feature_id": feature["id"],
+                        "outcome": verdict,
+                        "test_identities": sorted(outcome.passed),
+                        "returncode": returncode,
+                        "evidence_kind": verification["kind"],
+                    }
+                )
+            if not quiet:
+                print(f"KD4 TEST RESULT [{feature['id']}]: {verdict}")
+            failed |= verdict != "passed"
+        if failed:
+            return returncode or 1
     return 0
 
 
@@ -614,6 +877,7 @@ def _validate_runtime_verification(
     repo_root: Path,
     findings: list[Finding],
     text_cache: dict[Path, str],
+    rust_manifest_cache: dict[Path, rust_test_runner.Manifest],
 ) -> bool:
     if not isinstance(verification, dict):
         findings.append(
@@ -672,7 +936,6 @@ def _validate_runtime_verification(
         not isinstance(command, list)
         or not command
         or not all(isinstance(argument, str) and argument for argument in command)
-        or not any(symbol in argument for argument in command)
     ):
         findings.append(
             Finding(
@@ -708,6 +971,28 @@ def _validate_runtime_verification(
             )
         )
         return False
+    try:
+        rust_manifest = None
+        if path.suffix == ".rs":
+            manifest_path = repo_root / "codex-rs/.config/kd4-rust-tests.toml"
+            if manifest_path not in rust_manifest_cache:
+                rust_manifest_cache[manifest_path] = rust_test_runner.Manifest.load(
+                    manifest_path
+                )
+            rust_manifest = rust_manifest_cache[manifest_path]
+        _verification_route(verification, repo_root, rust_manifest)
+    except (
+        ValueError,
+        OSError,
+        KeyError,
+        SyntaxError,
+        rust_test_runner.RunnerError,
+    ) as exc:
+        findings.append(
+            Finding("error", "invalid-runtime-verification", str(exc), feature_id)
+        )
+        return False
+
     if path.suffix.lower() == ".py":
         try:
             module = ast.parse(text)
@@ -1161,6 +1446,7 @@ def validate_manifest(
     status_counts: Counter[str] = Counter()
     runtime_status_counts: Counter[str] = Counter()
     text_cache: dict[Path, str] = {}
+    rust_manifest_cache: dict[Path, rust_test_runner.Manifest] = {}
     feature_registry_cache: dict[str, dict[str, bool] | None] = {}
     project_config_cache: dict[str, object] = {}
     owner_cache: dict[str, dict[str, Any]] | None = None
@@ -1418,6 +1704,7 @@ def validate_manifest(
                     repo_root=repo_root,
                     findings=findings,
                     text_cache=text_cache,
+                    rust_manifest_cache=rust_manifest_cache,
                 )
         if status == "orphaned":
             findings.append(
@@ -1475,6 +1762,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--json", action="store_true", help="Emit one JSON result object."
     )
     parser.add_argument(
+        "--static-only",
+        action="store_true",
+        help="Check declared evidence presence without executing tests.",
+    )
+    parser.add_argument(
         "--run-runtime-verification",
         metavar="FEATURE_ID",
         help="Execute only this feature's declared runtime test instead of every enabled runtime test.",
@@ -1490,6 +1782,29 @@ def main(argv: Sequence[str] | None = None) -> int:
     result = validate_manifest(
         manifest_path, repo_root=args.repo_root, strict=args.strict
     )
+    outcomes: list[dict[str, Any]] = []
+    if args.static_only:
+        if args.run_runtime_verification:
+            raise SystemExit(
+                "--static-only cannot be combined with --run-runtime-verification"
+            )
+        if args.json:
+            payload = result.to_json()
+            payload.update(
+                staticEvidence="present" if result.ok else "invalid",
+                runtimeVerification="not_run",
+                runtimeVerificationExitCode=None,
+            )
+            print(json.dumps(payload, sort_keys=True))
+        else:
+            print(
+                f"KD4 DECLARED EVIDENCE: {'PRESENT' if result.ok else 'INVALID'}; runtime tests not run"
+            )
+            for finding in result.findings:
+                print(
+                    f"[{finding.level}] [{finding.feature_id}] {finding.code}: {finding.message}"
+                )
+        return 0 if result.ok else 1
     if args.json:
         runtime_exit_code = (
             execute_runtime_verification(
@@ -1497,12 +1812,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                 feature_id=args.run_runtime_verification,
                 repo_root=args.repo_root,
                 quiet=True,
+                outcomes=outcomes,
             )
             if result.ok
             else None
         )
         payload = result.to_json()
         payload["runtimeVerificationExitCode"] = runtime_exit_code
+        payload["runtimeVerificationResults"] = outcomes
+        payload["staticEvidence"] = "present" if result.ok else "invalid"
         payload["ok"] = result.ok and runtime_exit_code == 0
         print(json.dumps(payload, sort_keys=True))
         return 1 if runtime_exit_code is None else runtime_exit_code
@@ -1512,7 +1830,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"{status}={count}" for status, count in result.status_counts.items()
         )
         print(
-            f"KD4 FEATURE CHECK {verdict}: {result.feature_count} feature(s); {counts}; "
+            f"KD4 DECLARED EVIDENCE {verdict}: {result.feature_count} feature(s); {counts}; "
             f"runtime={result.runtime_status_counts}"
         )
         for finding in result.findings:

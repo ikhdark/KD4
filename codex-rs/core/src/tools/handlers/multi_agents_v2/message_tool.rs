@@ -39,7 +39,8 @@ impl MessageDeliveryMode {
 #[serde(deny_unknown_fields)]
 /// Input for the MultiAgentV2 `send_message` tool.
 pub(crate) struct SendMessageArgs {
-    pub(crate) target: String,
+    pub(crate) target: Option<String>,
+    pub(crate) targets: Option<Vec<String>>,
     pub(crate) message: String,
 }
 
@@ -74,14 +75,52 @@ impl SendMessageHandler {
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
         let arguments = function_arguments(invocation.payload.clone())?;
         let args: SendMessageArgs = parse_arguments(&arguments)?;
-        handle_message_string_tool(
-            invocation,
-            MessageDeliveryMode::QueueOnly,
-            args.target,
-            args.message,
-        )
-        .await
-        .map(boxed_tool_output)
+        match (args.target, args.targets) {
+            (Some(target), None) => handle_message_string_tool(
+                invocation,
+                MessageDeliveryMode::QueueOnly,
+                target,
+                args.message,
+            )
+            .await
+            .map(boxed_tool_output),
+            (None, Some(targets)) if !targets.is_empty() => {
+                let message = message_content(args.message)?;
+                // Each recipient uses the same resolution, session boundary, and queue-only
+                // delivery as the legacy call. A failure must not hide other outcomes.
+                let outcomes = futures::future::join_all(targets.into_iter().enumerate().map(
+                    |(index, target)| {
+                        let mut recipient_invocation = invocation.clone();
+                        recipient_invocation.call_id = format!("{}:{index}", invocation.call_id);
+                        let message = message.clone();
+                        async move {
+                            match handle_message_string_tool(
+                                recipient_invocation,
+                                MessageDeliveryMode::QueueOnly,
+                                target.clone(),
+                                message,
+                            )
+                            .await
+                            {
+                                Ok(_) => serde_json::json!({"target": target, "status": "queued"}),
+                                Err(error) => serde_json::json!({
+                                    "target": target, "status": "failed", "error": error.to_string()
+                                }),
+                            }
+                        }
+                    },
+                ))
+                .await;
+                let success = outcomes.iter().all(|outcome| outcome["status"] == "queued");
+                Ok(boxed_tool_output(FunctionToolOutput::from_text(
+                    serde_json::json!({"recipients": outcomes}).to_string(),
+                    Some(success),
+                )))
+            }
+            _ => Err(FunctionCallError::RespondToModel(
+                "Provide exactly one of `target` or a non-empty `targets` list.".to_string(),
+            )),
+        }
     }
 }
 

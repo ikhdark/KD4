@@ -299,7 +299,8 @@ fn arbitrary_script_runners_fail_closed_as_possible_mutations() {
         );
     }
 
-    assert!(!command_may_mutate(&[
+    // Test runners execute user code and may write workspace files.
+    assert!(command_may_mutate(&[
         "python".into(),
         "-m".into(),
         "pytest".into(),
@@ -872,6 +873,133 @@ async fn repeated_updates_only_rerender_the_touched_path() {
     }
 
     assert_eq!(tracker.rendered_diff_count(), 42);
+}
+
+#[tokio::test]
+async fn bulk_patch_deletion_batches_index_modes_and_preserves_executable_mode() {
+    let dir = tempdir().unwrap();
+    let git = |args: &[&str]| {
+        assert!(
+            Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+    };
+    git(&["init", "--quiet"]);
+    let mut patch = "*** Begin Patch\n".to_owned();
+    for index in 0..130 {
+        fs::write(dir.path().join(format!("file-{index}.txt")), "original\n").unwrap();
+        patch.push_str(&format!("*** Delete File: file-{index}.txt\n"));
+    }
+    git(&["add", "."]);
+    git(&["update-index", "--chmod=+x", "file-0.txt"]);
+    patch.push_str("*** End Patch\n");
+    let mut tracker = tracker_with_root(dir.path());
+    let delta = apply_verified_patch(dir.path(), &patch).await;
+    let missing = tracker.missing_mode_paths("", &delta);
+    PATCH_MODE_QUERY_COUNT.with(|count| count.set(0));
+    let modes = resolve_patch_index_modes(dir.path(), missing).await;
+    assert_eq!(PATCH_MODE_QUERY_COUNT.with(std::cell::Cell::get), 3);
+    tracker.set_patch_modes("", modes);
+    tracker.track_delta("", &delta);
+    let diff = tracker.take_unified_diff_if_changed().unwrap();
+    assert_eq!(diff.matches("diff --git ").count(), 130);
+    assert_eq!(diff.matches("deleted file mode 100755").count(), 1);
+    assert_eq!(diff.matches("deleted file mode 100644").count(), 129);
+    assert!(!dir.path().join("file-0.txt").exists());
+}
+
+#[tokio::test]
+async fn repeated_patch_updates_reuse_the_baseline_blob_identity() {
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("hot.txt"), "baseline\n").unwrap();
+    let mut tracker = tracker_with_root(dir.path());
+    let mut prior = "baseline".to_owned();
+    GIT_BLOB_HASH_COUNT.with(|count| count.set(0));
+    for index in 0..8 {
+        let next = format!("revision {index}");
+        let delta = apply_verified_patch(
+            dir.path(),
+            &format!(
+                "*** Begin Patch\n*** Update File: hot.txt\n@@\n-{prior}\n+{next}\n*** End Patch"
+            ),
+        )
+        .await;
+        tracker.track_delta("", &delta);
+        assert_eq!(
+            GIT_BLOB_HASH_COUNT.with(std::cell::Cell::get),
+            index + 2,
+            "hash the baseline once and each new content revision once"
+        );
+        let diff = tracker.take_unified_diff_if_changed().unwrap();
+        assert!(diff.contains(&format!(
+            "index {}..{}",
+            git_blob_sha1_hex("baseline\n"),
+            git_blob_sha1_hex(&format!("{next}\n"))
+        )));
+        prior = next;
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn patches_keep_case_distinct_paths_independent_across_renames() {
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("Foo.rs"), "upper\n").unwrap();
+    fs::write(dir.path().join("foo.rs"), "lower\n").unwrap();
+    let mut tracker = tracker_with_root(dir.path());
+    let edit = apply_verified_patch(dir.path(), "*** Begin Patch\n*** Update File: Foo.rs\n@@\n-upper\n+UPPER\n*** Update File: foo.rs\n@@\n-lower\n+LOWER\n*** End Patch").await;
+    tracker.track_delta("", &edit);
+    let diff = tracker.take_unified_diff_if_changed().unwrap();
+    assert!(diff.contains("--- a/Foo.rs\n+++ b/Foo.rs"));
+    assert!(diff.contains("--- a/foo.rs\n+++ b/foo.rs"));
+    let rename = apply_verified_patch(dir.path(), "*** Begin Patch\n*** Update File: Foo.rs\n*** Move to: Renamed.rs\n@@\n-UPPER\n+renamed\n*** End Patch").await;
+    tracker.track_delta("", &rename);
+    let diff = tracker.take_unified_diff_if_changed().unwrap();
+    assert!(diff.contains("--- a/Foo.rs\n+++ b/Renamed.rs"));
+    assert!(diff.contains("--- a/foo.rs\n+++ b/foo.rs"));
+    assert_eq!(
+        fs::read_to_string(dir.path().join("foo.rs")).unwrap(),
+        "LOWER\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn tracking_keys_preserve_non_utf8_native_paths() {
+    use std::os::unix::ffi::OsStrExt;
+    let first = Path::new(std::ffi::OsStr::from_bytes(b"file-\xff"));
+    let second = Path::new(std::ffi::OsStr::from_bytes(b"file-\xfe"));
+    let first_key = TrackedPath::new("local", first);
+    let second_key = TrackedPath::new("local", second);
+    assert_ne!(first_key, second_key);
+    assert_eq!(first_key.path.as_os_str().as_bytes(), b"file-\xff");
+    let mut contents = HashMap::new();
+    contents.insert(first_key, "first");
+    contents.insert(second_key, "second");
+    assert_eq!(contents.len(), 2);
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_tracking_aliases_preserve_display_spelling() {
+    let plain = TrackedPath::new("local", Path::new(r"C:\Workspace\src\Mixed.rs"));
+    let alias = TrackedPath::new("local", Path::new(r"\\?\c:\workspace\src\mixed.rs"));
+    assert_eq!(plain, alias);
+    assert_eq!(plain.path, PathBuf::from(r"C:\Workspace\src\Mixed.rs"));
+    let tracker = TurnDiffTracker::with_environment_display_roots([(
+        "local".to_owned(),
+        PathBuf::from(r"c:\workspace"),
+    )]);
+    assert_eq!(tracker.display_path(&plain), "src/Mixed.rs");
+    assert_ne!(plain, TrackedPath::new("other", &alias.path));
+    assert_eq!(
+        TrackedPath::new("local", Path::new(r"C:\Workspace\Édit.rs")),
+        TrackedPath::new("local", Path::new(r"c:\workspace\édit.rs"))
+    );
 }
 
 #[test]

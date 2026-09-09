@@ -454,6 +454,12 @@ impl ToolRouter {
             .unwrap_or(false)
     }
 
+    pub fn tool_cancellation_requires_commit_barrier(&self, call: &ToolCall) -> bool {
+        self.registry
+            .cancellation_requires_commit_barrier(&call.tool_name)
+            .unwrap_or(false)
+    }
+
     #[instrument(level = "trace", skip_all, err)]
     pub fn build_tool_call(item: ResponseItem) -> Result<Option<ToolCall>, ToolCallBuildError> {
         match item {

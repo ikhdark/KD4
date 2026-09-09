@@ -305,11 +305,13 @@ pub async fn submit_thread_settings(
     use codex_protocol::protocol::EventMsg;
     use codex_protocol::protocol::Op;
     use tokio::time::Duration;
-    use tokio::time::timeout;
+    use tokio::time::Instant;
+    use tokio::time::timeout_at;
 
     let submission_id = codex.submit(Op::ThreadSettings { thread_settings }).await?;
+    let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        let ev = timeout(Duration::from_secs(10), codex.next_event())
+        let ev = timeout_at(deadline, codex.next_event())
             .await
             .expect("timeout waiting for thread settings update")
             .expect("stream ended unexpectedly");
@@ -352,22 +354,49 @@ pub async fn wait_for_event_with_timeout<F>(
 where
     F: FnMut(&codex_protocol::protocol::EventMsg) -> bool,
 {
-    loop {
-        let ev = event_before_deadline(wait_time, codex.next_event())
-            .await
-            .expect("timeout waiting for event")
-            .expect("stream ended unexpectedly");
-        if predicate(&ev.msg) {
-            return ev.msg;
-        }
-    }
+    wait_for_event_envelope_with_timeout(codex, |ev| predicate(&ev.msg), wait_time)
+        .await
+        .msg
 }
 
-async fn event_before_deadline<T>(
+/// Preserve operation IDs for scenarios with multiple submissions or objects.
+pub async fn wait_for_event_envelope_with_timeout<F>(
+    codex: &CodexThread,
+    predicate: F,
     wait_time: tokio::time::Duration,
-    event: impl std::future::Future<Output = T>,
-) -> Result<T, tokio::time::error::Elapsed> {
-    tokio::time::timeout(wait_time, event).await
+) -> codex_protocol::protocol::Event
+where
+    F: FnMut(&codex_protocol::protocol::Event) -> bool,
+{
+    event_before_deadline(
+        wait_time,
+        || async { codex.next_event().await.expect("stream ended unexpectedly") },
+        predicate,
+    )
+    .await
+    .expect("timeout waiting for event")
+}
+
+async fn event_before_deadline<T, N, E, P>(
+    wait_time: tokio::time::Duration,
+    mut next_event: N,
+    mut predicate: P,
+) -> Result<T, tokio::time::error::Elapsed>
+where
+    N: FnMut() -> E,
+    E: std::future::Future<Output = T>,
+    P: FnMut(&T) -> bool,
+{
+    let deadline = tokio::time::Instant::now() + wait_time;
+    tokio::time::timeout_at(deadline, async {
+        loop {
+            let event = next_event().await;
+            if predicate(&event) {
+                return event;
+            }
+        }
+    })
+    .await
 }
 
 pub fn sandbox_env_var() -> &'static str {
@@ -555,22 +584,18 @@ pub mod fs_wait {
     }
 }
 
+/// Legacy name retained for callers; a missing prerequisite fails instead of
+/// reporting a successful test that never exercised its behavioral path.
 #[macro_export]
 macro_rules! skip_if_no_network {
     () => {{
         if ::std::env::var($crate::sandbox_network_env_var()).is_ok() {
-            println!(
-                "Skipping test because it cannot execute when network is disabled in a Codex sandbox."
-            );
-            return;
+            panic!("Behavior unverified: required network access is unavailable in this sandbox.");
         }
     }};
     ($return_value:expr $(,)?) => {{
         if ::std::env::var($crate::sandbox_network_env_var()).is_ok() {
-            println!(
-                "Skipping test because it cannot execute when network is disabled in a Codex sandbox."
-            );
-            return $return_value;
+            panic!("Behavior unverified: required network access is unavailable in this sandbox.");
         }
     }};
 }
@@ -596,8 +621,6 @@ macro_rules! skip_if_test_condition {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::future::pending;
-    use std::time::Instant;
 
     #[test]
     fn host_path_fixture_uses_host_convention() {
@@ -620,16 +643,36 @@ mod tests {
 
     #[tokio::test]
     async fn event_waiter_honors_requested_deadline() {
-        let wait_time = tokio::time::Duration::from_millis(10);
-        let started = Instant::now();
+        use codex_protocol::protocol::Event;
+        use codex_protocol::protocol::EventMsg;
+        use tokio::time::Duration;
 
-        let result = event_before_deadline(wait_time, pending::<()>()).await;
-
+        // Only the event source is substituted; the production wait/match loop runs.
+        let mut observed = 0;
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            event_before_deadline(
+                Duration::from_millis(20),
+                || async {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    Event {
+                        id: "unrelated-operation".into(),
+                        msg: EventMsg::ShutdownComplete,
+                    }
+                },
+                |event| {
+                    observed += 1;
+                    event.id == "submitted-operation"
+                        && matches!(event.msg, EventMsg::ShutdownComplete)
+                },
+            ),
+        )
+        .await
+        .expect("unrelated events must not renew the total deadline");
         assert!(result.is_err());
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(1),
-            "requested short deadline was widened: {:?}",
-            started.elapsed()
+            observed > 0,
+            "the waiter must reject an event of the right kind from the wrong operation"
         );
     }
 }

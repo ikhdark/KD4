@@ -137,7 +137,7 @@ impl ParsedFunctionArguments {
             return None;
         }
         Some(match &self.value {
-            Ok(value) => serde_json::from_value(value.as_ref().clone()).map_err(|err| {
+            Ok(value) => T::deserialize(value.as_ref()).map_err(|err| {
                 FunctionCallError::RespondToModel(format!(
                     "failed to parse function arguments: {err}"
                 ))
@@ -194,8 +194,19 @@ where
     })
 }
 
+pub(crate) fn resolve_search_repository_root(cwd: &Path) -> PathBuf {
+    #[cfg(test)]
+    let _ = SEARCH_ROOT_DISCOVERIES.try_with(|count| count.set(count.get() + 1));
+    resolve_repository_root(cwd)
+}
+
 pub(crate) fn resolve_repository_root(cwd: &Path) -> PathBuf {
     resolve_repository_root_with(cwd, get_git_repo_root)
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static SEARCH_ROOT_DISCOVERIES: std::cell::Cell<usize>;
 }
 
 fn resolve_repository_root_with(
@@ -499,6 +510,95 @@ fn permissions_are_preapproved(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn ordinary_exec_and_shell_handlers_skip_search_discovery_but_track_mutations() {
+        use crate::session::step_context::StepContext;
+        use crate::tools::context::{ToolCallSource, ToolInvocation, ToolPayload};
+        use crate::turn_diff_tracker::TurnDiffTracker;
+        use codex_tools::ToolExecutor;
+        use std::sync::Arc;
+        for shell_handler in [false, true] {
+            let (session, mut turn) = crate::session::tests::make_session_and_context().await;
+            turn.permission_profile = codex_protocol::models::PermissionProfile::Disabled;
+            let temp = tempfile::tempdir().unwrap();
+            let payload = ToolPayload::Function { arguments: serde_json::json!({
+                "kind": "argv", "program": "python",
+                "args": ["-c", "from pathlib import Path; Path('mutation-probe').write_text('observed'); print('root-discovery-probe')"],
+                "workdir": temp.path(),
+            }).to_string() };
+            let turn = Arc::new(turn);
+            let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
+            let invocation = ToolInvocation {
+                session: session.into(),
+                step_context: StepContext::for_test(turn),
+                cancellation_token: tokio_util::sync::CancellationToken::new(),
+                tracker: Arc::clone(&tracker),
+                call_id: "root-discovery-probe".to_owned(),
+                tool_name: codex_tools::ToolName::plain(if shell_handler {
+                    "shell_command"
+                } else {
+                    "exec_command"
+                }),
+                source: ToolCallSource::Direct,
+                payload: payload.clone(),
+            };
+            super::SEARCH_ROOT_DISCOVERIES
+                .scope(std::cell::Cell::new(0), async {
+                    let output = if shell_handler {
+                        super::ShellCommandHandler::default()
+                            .handle(invocation)
+                            .await
+                    } else {
+                        super::ExecCommandHandler::default()
+                            .handle(invocation)
+                            .await
+                    }
+                    .expect("ordinary command executes");
+                    assert_eq!(super::SEARCH_ROOT_DISCOVERIES.with(std::cell::Cell::get), 0);
+                    assert!(
+                        output
+                            .code_mode_result(&payload)
+                            .to_string()
+                            .contains("root-discovery-probe")
+                    );
+                })
+                .await;
+            assert_eq!(
+                std::fs::read_to_string(temp.path().join("mutation-probe")).unwrap(),
+                "observed"
+            );
+            assert!(tracker.lock().await.current_mutation_revision() > 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn cached_argument_parse_preserves_owned_data_and_rewritten_input() {
+        #[derive(serde::Deserialize, Debug, PartialEq)]
+        struct Args {
+            script: String,
+            args: Vec<String>,
+        }
+        let script = "echo payload\n".repeat(10_000);
+        let raw = serde_json::json!({"script": script, "args": ["relative/path", "two words"]})
+            .to_string();
+        super::with_parsed_function_arguments(
+            Some(super::ParsedFunctionArguments::from_raw(&raw)),
+            async {
+                for _ in 0..2 {
+                    let parsed: Args = super::parse_arguments(&raw).unwrap();
+                    assert_eq!(parsed.script, script);
+                    assert_eq!(parsed.args, ["relative/path", "two words"]);
+                }
+                let rewritten = r#"{"script":"changed","args":[]}"#;
+                let parsed: Args = super::parse_arguments(rewritten).unwrap();
+                assert_eq!(parsed.script, "changed");
+                assert!(parsed.args.is_empty());
+                assert!(super::parse_arguments::<Args>(r#"{"script":7,"args":[]}"#).is_err());
+            },
+        )
+        .await;
+    }
+
     use super::EffectiveAdditionalPermissions;
     use super::implicit_granted_permissions;
     use super::normalize_and_validate_additional_permissions;

@@ -873,6 +873,25 @@ pub struct CriterionResult {
     pub criterion_id: String,
     pub status: CriterionStatus,
     pub evidence: Option<String>,
+    /// Narrative evidence remains readable, but does not establish execution proof.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_ref: Option<CriterionEvidenceRef>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CriterionEvidenceKind {
+    /// A successful recorded execution; does not imply a test or runtime boundary passed.
+    ValidationExecution,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CriterionEvidenceRef {
+    pub call_id: String,
+    pub workspace_id: String,
+    pub evidence_epoch: u64,
+    pub kind: CriterionEvidenceKind,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1202,6 +1221,86 @@ pub struct AgentTask {
     #[serde(default)]
     pub integration_handoffs: Vec<IsolationHandoff>,
     pub observations: Vec<RuntimeObservation>,
+}
+
+impl AgentTask {
+    /// Projects already loaded receipt/call state; never performs IO or upgrades prose.
+    pub fn completion_evidence_summary(&self) -> String {
+        let Some(receipt) = &self.receipt else {
+            return "No sealed completion receipt; behavior unverified.".to_string();
+        };
+        let calls: std::collections::HashMap<_, _> = self
+            .validation_calls
+            .iter()
+            .map(|call| (call.call_id.as_str(), call))
+            .collect();
+        let mut summary = format!(
+            "Recorded task status: {:?}. Changes recorded: {}.\n",
+            receipt.status,
+            receipt.declared_changes.len()
+        );
+        for result in receipt.criterion_results.iter().take(4) {
+            let evidence = result.evidence_ref.as_ref().filter(|reference| {
+                reference.workspace_id == self.assignment.workspace_id
+                    && receipt.validation_call_ids.contains(&reference.call_id)
+                    && calls.get(reference.call_id.as_str()).is_some_and(|call| {
+                        call.attempt_id == receipt.attempt_id
+                            && call.status == ValidationCallStatus::Succeeded
+                            && call.evidence.end_epoch == Some(reference.evidence_epoch)
+                    })
+            });
+            let status = match (result.status, evidence) {
+                (CriterionStatus::NotRun, _) => "not run",
+                (CriterionStatus::Failed, _) => "reported failed",
+                (CriterionStatus::Passed, Some(reference))
+                    if reference.evidence_epoch == self.workspace_status.epoch =>
+                {
+                    "supported by a successful validation execution (test coverage not established)"
+                }
+                (CriterionStatus::Passed, Some(_)) => {
+                    "prior validation recorded; freshness unverified"
+                }
+                (CriterionStatus::Passed, None) => "reported complete; behavior unverified",
+            };
+            // IDs are exact when shown. Oversized IDs remain available in the receipt.
+            let id = if result.criterion_id.len() <= 128 {
+                &result.criterion_id
+            } else {
+                "[criterion ID omitted]"
+            };
+            summary.push_str(&format!("{id}: {status}.\n"));
+        }
+        if receipt.criterion_results.len() > 4 {
+            summary.push_str(&format!(
+                "{} more criterion results in the receipt.\n",
+                receipt.criterion_results.len() - 4
+            ));
+        }
+        if receipt.criterion_results.is_empty() {
+            summary.push_str("No criterion evidence recorded; behavior unverified.\n");
+        }
+        match self.isolation_handoff.as_ref().map(|handoff| handoff.state) {
+            Some(IsolationHandoffState::Ready) => {
+                summary.push_str("Integration: patch ready, not integrated.\n")
+            }
+            Some(IsolationHandoffState::Claimed) => {
+                summary.push_str("Integration: claimed, not integrated.\n")
+            }
+            Some(IsolationHandoffState::Integrated) => {
+                summary.push_str("Integration: recorded as integrated.\n")
+            }
+            None if self.assignment.workspace_strategy == WorkspaceStrategy::Isolated => {
+                summary.push_str("Integration: unverified.\n")
+            }
+            None => summary.push_str("Workspace: shared.\n"),
+        }
+        summary.push_str(&format!(
+            "Blockers: {}. Risks: {}. Running Desktop build: not established by this receipt.",
+            receipt.blockers.len(),
+            receipt.risks.len()
+        ));
+        summary
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

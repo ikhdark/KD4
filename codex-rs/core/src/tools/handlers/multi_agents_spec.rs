@@ -195,6 +195,13 @@ pub fn create_send_input_tool_v1() -> ToolSpec {
 pub fn create_send_message_tool() -> ToolSpec {
     let properties = BTreeMap::from([
         (
+            "targets".to_string(),
+            JsonSchema::array(
+                JsonSchema::string(None),
+                Some("Explicit recipients for the same message. Supply either target or a non-empty targets list; each recipient returns queued or failed.".to_string()),
+            ),
+        ),
+        (
             "target".to_string(),
             JsonSchema::string(Some(
                 "Relative or canonical task name to message (from spawn_agent).".to_string(),
@@ -211,13 +218,13 @@ pub fn create_send_message_tool() -> ToolSpec {
 
     ToolSpec::Function(ResponsesApiTool {
         name: "send_message".to_string(),
-        description: "Send a message to an existing agent. The message will be delivered promptly. Does not trigger a new turn."
+        description: "Queue an informational update for an existing agent, or the same update for explicit targets. Delivered promptly without starting a new turn. Do not request acknowledgment just to confirm receipt. Use followup_task for new assignments, corrections requiring action, or urgent work that must start."
             .to_string(),
         strict: false,
         defer_loading: None,
         parameters: JsonSchema::object(
             properties,
-            Some(vec!["target".to_string(), "message".to_string()]),
+            Some(vec!["message".to_string()]),
             Some(false.into()),
         ),
         output_schema: None,
@@ -244,7 +251,7 @@ pub fn create_followup_task_tool() -> ToolSpec {
 
     ToolSpec::Function(ResponsesApiTool {
         name: "followup_task".to_string(),
-        description: "Send a follow-up task to an existing non-root target agent and trigger a turn if it is idle. If the target is already running, deliver the task promptly at message boundaries while sampling, or after the pending tool call completes."
+        description: "Send a new assignment, correction requiring action, or urgent intervention to an existing non-root agent; trigger a turn if idle. If running, deliver promptly at message boundaries while sampling, or after the pending tool call completes. Use send_message for informational updates that need no new turn; ask for clarification when needed."
             .to_string(),
         strict: false,
         defer_loading: None,

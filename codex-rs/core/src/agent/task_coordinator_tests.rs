@@ -180,6 +180,7 @@ async fn terminal_emission_uses_the_reserved_event_at_the_recorder_boundary() {
                 status: AgentStatusClaim::NeedsMain,
                 summary: "agent stopped without completing".to_string(),
                 criterion_results: vec![CriterionResult {
+                    evidence_ref: None,
                     criterion_id: "criterion".to_string(),
                     status: CriterionStatus::NotRun,
                     evidence: None,

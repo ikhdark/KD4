@@ -87,7 +87,7 @@ owner = "codex-rs/ext/extension-api"
 summary = "Reuse ToolContributor, ToolLifecycleContributor, and ContextContributor before adding KD4-only hooks."
 upstream_equivalent = "codex extension-api contributor registry"
 config_keys = []
-runtime_verification = { kind = "contract_test", path = "codex-rs/ext/extension-api/tests/registry.rs", symbol = "build_round_trips_every_contributor_category", command = ["cargo", "test", "-p", "codex-extension-api", "build_round_trips_every_contributor_category"] }
+runtime_verification = { kind = "contract_test", path = "codex-rs/ext/extension-api/tests/registry.rs", symbol = "build_round_trips_every_contributor_category", command = ["python", "scripts/rust_test_runner.py", "run-gate", "capability-extension-boundary-core", "--profile", "fast"] }
 
 [[features.evidence]]
 kind = "entrypoint"
@@ -130,15 +130,15 @@ version = 2
 status = "enabled"
 capability_kind = "runtime"
 owner = "codex-rs/core"
-summary = "Explicit legacy, script, argv, and internally encoded PowerShell command shapes."
+summary = "Script and argv command shapes with untagged legacy compatibility; explicitly tagged legacy input is rejected."
 upstream_equivalent = "partial"
 config_keys = []
-runtime_verification = { kind = "contract_test", path = "codex-rs/core/src/tools/handlers/command_shape_tests.rs", symbol = "tagged_script_and_legacy_shapes_are_explicit", command = ["just", "core-test-fast", "core_lib", "-E", "test(tagged_script_and_legacy_shapes_are_explicit)"] }
+runtime_verification = { kind = "contract_test", path = "codex-rs/core/src/tools/handlers/command_shape_tests.rs", symbol = "tagged_script_is_canonical_and_tagged_legacy_is_rejected", command = ["python", "scripts/rust_test_runner.py", "run-gate", "capability-structured-command-execution", "--profile", "fast"] }
 
 [[features.evidence]]
 kind = "entrypoint"
 path = "codex-rs/core/src/tools/handlers/command_shape.rs"
-contains = "CommandKind::Legacy | CommandKind::Script"
+contains = "CommandKind::Script =>"
 
 [[features.evidence]]
 kind = "registration"
@@ -158,7 +158,7 @@ contains = "CommandInvocation::from_parts"
 [[features.evidence]]
 kind = "test"
 path = "codex-rs/core/src/tools/handlers/command_shape_tests.rs"
-contains = "tagged_script_and_legacy_shapes_are_explicit"
+contains = "tagged_script_is_canonical_and_tagged_legacy_is_rejected"
 
 [[features]]
 id = "command-preflight"
@@ -169,7 +169,7 @@ owner = "codex-rs/core"
 summary = "Active preflight with one bounded read-only equivalent repair and rejection-only mutating commands."
 upstream_equivalent = "none"
 config_keys = []
-runtime_verification = { kind = "contract_test", path = "codex-rs/core/src/tools/handlers/command_preflight_tests.rs", symbol = "never_repairs_mutating_command_flag_typos", command = ["just", "core-test-fast", "core_lib", "-E", "test(never_repairs_mutating_command_flag_typos)"] }
+runtime_verification = { kind = "contract_test", path = "codex-rs/core/src/tools/handlers/command_preflight_tests.rs", symbol = "never_repairs_mutating_command_flag_typos", command = ["python", "scripts/rust_test_runner.py", "run-gate", "capability-command-preflight", "--profile", "fast"] }
 
 [[features.evidence]]
 kind = "entrypoint"
@@ -184,7 +184,7 @@ contains = "preflight_invocation_with_equivalent_repair_async("
 [[features.evidence]]
 kind = "registration"
 path = "codex-rs/core/src/tools/handlers/unified_exec/exec_command.rs"
-contains = "preflight_invocation_with_equivalent_repair_async("
+contains = "preflight_invocation_for_runtime("
 
 [[features.evidence]]
 kind = "test"
@@ -200,7 +200,7 @@ owner = "codex-rs/core"
 summary = "Bounded failure-focused output on classic and unified execution paths."
 upstream_equivalent = "partial"
 config_keys = []
-runtime_verification = { kind = "contract_test", path = "codex-rs/core/src/tools/shell_output_summary_tests.rs", symbol = "failed_output_keeps_exact_error_lines", command = ["just", "core-test-fast", "core_lib", "-E", "test(failed_output_keeps_exact_error_lines)"] }
+runtime_verification = { kind = "contract_test", path = "codex-rs/core/src/tools/shell_output_summary_tests.rs", symbol = "failed_output_keeps_exact_error_lines", command = ["python", "scripts/rust_test_runner.py", "run-gate", "capability-shell-output-summary", "--profile", "fast"] }
 
 [[features.evidence]]
 kind = "entrypoint"
@@ -231,7 +231,7 @@ owner = "codex-rs/core"
 summary = "Session-bounded command fingerprints with repair accounting and third-identical-failure prevention."
 upstream_equivalent = "none"
 config_keys = []
-runtime_verification = { kind = "contract_test", path = "codex-rs/core/src/tools/command_execution.rs", symbol = "input_state_determined_failure_blocks_exact_retry_but_freshness_bypasses", command = ["just", "core-test-fast", "core_lib", "-E", "test(input_state_determined_failure_blocks_exact_retry_but_freshness_bypasses)"] }
+runtime_verification = { kind = "contract_test", path = "codex-rs/core/src/tools/command_execution.rs", symbol = "input_state_determined_failure_blocks_exact_retry_but_freshness_bypasses", command = ["python", "scripts/rust_test_runner.py", "run-gate", "capability-command-attempt-ledger", "--profile", "fast"] }
 
 [[features.evidence]]
 kind = "entrypoint"
@@ -267,7 +267,7 @@ owner = "codex-rs/core"
 summary = "Addressable full raw command output streamed before bounded transcript retention or model summarization, including background completion."
 upstream_equivalent = "none"
 config_keys = []
-runtime_verification = { kind = "contract_test", path = "codex-rs/core/src/tools/handlers/unified_exec_tests.rs", symbol = "foreground_output_artifact_retains_bytes_beyond_transcript_cap", command = ["just", "core-test-fast", "core_lib", "-E", "test(foreground_output_artifact_retains_bytes_beyond_transcript_cap)"] }
+runtime_verification = { kind = "contract_test", path = "codex-rs/core/src/tools/handlers/unified_exec_tests.rs", symbol = "foreground_output_artifact_retains_bytes_beyond_transcript_cap", command = ["python", "scripts/rust_test_runner.py", "run-gate", "capability-command-output-artifacts", "--profile", "fast"] }
 
 [[features.evidence]]
 kind = "entrypoint"
@@ -287,7 +287,7 @@ contains = "create_raw_output_artifact("
 [[features.evidence]]
 kind = "registration"
 path = "codex-rs/core/src/unified_exec/process.rs"
-contains = "RawOutputArtifactWriter::open(raw_output_artifact.as_ref()).await"
+contains = "RawOutputArtifactWriter::open(Some(&task_state)).await"
 
 [[features.evidence]]
 kind = "test"
@@ -308,7 +308,7 @@ owner = "codex-rs/shell-command"
 summary = "Explicit PowerShell paths win, otherwise pwsh is preferred with Windows PowerShell compatibility fallback."
 upstream_equivalent = "partial"
 config_keys = []
-runtime_verification = { kind = "contract_test", path = "codex-rs/shell-command/src/shell_detect.rs", symbol = "powershell_resolver_prefers_pwsh_then_compatibility_host", command = ["cargo", "test", "-p", "codex-shell-command", "powershell_resolver_prefers_pwsh_then_compatibility_host"] }
+runtime_verification = { kind = "contract_test", path = "codex-rs/shell-command/src/shell_detect.rs", symbol = "powershell_resolver_prefers_pwsh_then_compatibility_host", command = ["python", "scripts/rust_test_runner.py", "run-gate", "capability-preferred-powershell-host", "--profile", "fast"] }
 
 [[features.evidence]]
 kind = "entrypoint"
@@ -359,7 +359,7 @@ owner = "codex-rs/app-server"
 summary = "Build, install, runtime, and KD4 watermark metadata at initialization."
 upstream_equivalent = "partial"
 config_keys = []
-runtime_verification = { kind = "integration_test", path = "codex-rs/app-server/tests/suite/v2/initialize.rs", symbol = "initialize_response_includes_local_runtime_metadata", command = ["cargo", "test", "-p", "codex-app-server", "initialize_response_includes_local_runtime_metadata"] }
+runtime_verification = { kind = "integration_test", path = "codex-rs/app-server/tests/suite/v2/initialize.rs", symbol = "initialize_response_includes_local_runtime_metadata", command = ["python", "scripts/rust_test_runner.py", "run-gate", "capability-app-server-runtime-provenance", "--profile", "fast"] }
 generated_artifacts = [
   "codex-rs/app-server-protocol/schema/json/v1/InitializeResponse.json",
   "codex-rs/app-server-protocol/schema/typescript/ServerRuntimeInfo.ts",
@@ -419,7 +419,7 @@ owner = "codex-rs/core"
 summary = "Cached and diversified discovery of deferred core and extension tools."
 upstream_equivalent = "partial"
 config_keys = []
-runtime_verification = { kind = "contract_test", path = "codex-rs/core/src/tools/spec_plan_tests.rs", symbol = "tool_search_cache_rebuilds_when_deferred_sources_change", command = ["just", "core-test-fast", "core_lib", "-E", "test(tool_search_cache_rebuilds_when_deferred_sources_change)"] }
+runtime_verification = { kind = "contract_test", path = "codex-rs/core/src/tools/spec_plan_tests.rs", symbol = "tool_search_cache_rebuilds_when_deferred_sources_change", command = ["python", "scripts/rust_test_runner.py", "run-gate", "capability-tool-search-routing", "--profile", "fast"] }
 
 [[features.evidence]]
 kind = "entrypoint"
@@ -450,7 +450,7 @@ owner = "codex-rs/config"
 summary = "Human-readable configuration reference exposed through codex config explain."
 upstream_equivalent = "none"
 config_keys = []
-runtime_verification = { kind = "contract_test", path = "codex-rs/cli/src/main.rs", symbol = "config_explain_parses_optional_filter", command = ["cargo", "test", "-p", "codex-cli", "config_explain_parses_optional_filter"] }
+runtime_verification = { kind = "contract_test", path = "codex-rs/cli/src/main.rs", symbol = "config_explain_parses_optional_filter", command = ["python", "scripts/rust_test_runner.py", "run-gate", "capability-config-explain", "--profile", "fast"] }
 
 [[features.evidence]]
 kind = "entrypoint"
@@ -507,7 +507,7 @@ owner = "codex-rs/agent-task-store"
 summary = "Nonblocking workspace revision and path-event tracking, advisory claims, best-effort mutation evidence, validation singleflight, lifecycle quiescence, and versioned isolated-worktree handoffs."
 upstream_equivalent = "none"
 config_keys = []
-runtime_verification = { kind = "contract_test", path = "codex-rs/agent-task-store/src/tests.rs", symbol = "completed_receipt_rejects_workspace_change_after_validation", command = ["cargo", "test", "-p", "codex-agent-task-store", "completed_receipt_rejects_workspace_change_after_validation"] }
+runtime_verification = { kind = "contract_test", path = "codex-rs/agent-task-store/src/tests.rs", symbol = "completed_receipt_rejects_workspace_change_after_validation", command = ["python", "scripts/rust_test_runner.py", "run-gate", "capability-shared-worktree-reliability", "--profile", "fast"] }
 
 [[features.evidence]]
 kind = "module"
@@ -553,3 +553,23 @@ contains = "completed_receipt_rejects_workspace_change_after_validation"
 kind = "test"
 path = "codex-rs/core/src/tools/events.rs"
 contains = "shell_and_unified_exec_finalize_typed_mutation_evidence"
+
+[[features]]
+id = "validation-authorization"
+version = 1
+status = "disabled"
+capability_kind = "runtime"
+owner = "codex-rs/core"
+summary = "Inactive in production: turn initialization disables directive-based validation admission; test-only activation does not establish enforcement."
+upstream_equivalent = "none"
+config_keys = []
+
+[[features.evidence]]
+kind = "entrypoint"
+path = "codex-rs/core/src/session/turn_context.rs"
+contains = "crate::validation_admission::ValidationAuthorization::default()"
+
+[[features.evidence]]
+kind = "test"
+path = "codex-rs/core/src/validation_admission.rs"
+contains = "production_turn_keeps_validation_authorization_inactive"

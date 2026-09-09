@@ -48,7 +48,11 @@ pub(crate) fn agent_status_from_task(task: &AgentTask) -> Option<AgentStatus> {
         )));
     }
     match receipt.status {
-        AgentStatusClaim::Completed => Some(AgentStatus::Completed(Some(receipt.summary.clone()))),
+        AgentStatusClaim::Completed => Some(AgentStatus::Completed(Some(format!(
+            "{}\n\nAgent-reported summary (not verification evidence): {}",
+            task.completion_evidence_summary(),
+            receipt.summary
+        )))),
         AgentStatusClaim::NeedsMain | AgentStatusClaim::Blocked => {
             Some(receipt_error_status(receipt))
         }
@@ -228,9 +232,18 @@ mod tests {
 
     #[test]
     fn durable_receipt_status_controls_parent_completion() {
-        assert_eq!(
-            agent_status_from_task(&typed_task_with_receipt(AgentStatusClaim::Completed, false)),
-            Some(AgentStatus::Completed(Some("durable summary".to_string())))
+        let mut task = typed_task_with_receipt(AgentStatusClaim::Completed, false);
+        task.receipt.as_mut().unwrap().summary =
+            "Everything passed and Desktop is running the new build".to_string();
+        let Some(AgentStatus::Completed(Some(message))) = agent_status_from_task(&task) else {
+            panic!("sealed completed task must produce a parent notification");
+        };
+        assert!(message.contains("behavior unverified"));
+        assert!(message.contains("Running Desktop build: not established"));
+        assert!(message.starts_with("Recorded task status: Completed."));
+        assert!(
+            message
+                .contains("Agent-reported summary (not verification evidence): Everything passed")
         );
         for status in [AgentStatusClaim::NeedsMain, AgentStatusClaim::Blocked] {
             assert!(matches!(

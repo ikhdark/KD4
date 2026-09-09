@@ -23,6 +23,8 @@
 - Do not communicate with other agents from different sessions.
 - Do not over-engineer implementations.
 - Partial wiring of implemented code is forbidden, this is non-negotiable. End to end wiring is mandatory.
+- After a full suite run, rerun only tests affected by a fix.
+- Add no new frameworks, redesigns, cleanup projects, or extra acceptance checks unless a confirmed failure requires them.
 
 ### Validation
 *All three of the following are mandatory*
@@ -31,7 +33,7 @@
 3. If you find a test that does not follow this policy, fix it.
 
 If you need a more detailed verison:
-- For behavior changes, add or update tests that directly exercise the changed behavior and prove it is reachable through the real integration or runtime path. A single test may prove both. Do not rely only on helper-level tests or implementation-detail assertions. For documentation-only changes, run the nearest relevant existing validation instead of creating a test.
+- For behavior changes, identify the normal entry point, input, expected observable result, and a plausible incorrect implementation the test rejects. Strengthen the nearest sufficient scenario with independent contract expectations and consumer-visible effects, including forbidden side effects on failure. Use normal registration for wiring claims; doubles may replace external dependencies, not the behavior under test. Run the existing narrow target/filter and report the behavior proved; unavailable prerequisites are unverified. For documentation-only changes, run the nearest relevant existing validation instead of creating a test.
 
 - If blocked by tests, do not repeat, simply finish the full task then report blocked by tests.
 
@@ -46,7 +48,14 @@ If you need a more detailed verison:
   `python scripts/source_owners.py slice --owner <owner-id> --focus "<task
 description>" --max-relationships 32`. Require an untruncated result with no
   omitted relationships or material unknowns, then read its exact evidence
-  locations. Read the broad map only when no owner matches or the slice leaves
+  locations. Use its representative scenario and focused validation to replace
+  broad test searches; confirm the scenario enters through the normal boundary
+  and asserts an effect. Examples: the inventory benchmark independently expects
+  `TOTAL: 5`; its duration verifier distinguishes `1s` from `1 s` and ASCII from
+  non-ASCII digits. Plan rejection checks absent stored state and cancellation
+  checks absent updates; model-override scenarios inspect the actual config file
+  after shutdown. Reuse these proof patterns, not their incidental setup.
+  Read the broad map only when no owner matches or the slice leaves
   an unresolved boundary.
 - [`SOURCEMAP.md`](SOURCEMAP.md) owns repository inventory, runtime entrypoints,
   package and Rust-domain routing, `codex-rs` edit and upstream-sync

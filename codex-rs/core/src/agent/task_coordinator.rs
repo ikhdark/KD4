@@ -490,6 +490,7 @@ impl AgentTaskCoordinator {
                 .acceptance_criteria
                 .iter()
                 .map(|criterion| CriterionResult {
+                    evidence_ref: None,
                     criterion_id: criterion.id.clone(),
                     status: CriterionStatus::NotRun,
                     evidence: None,

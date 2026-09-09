@@ -1153,6 +1153,29 @@ async fn emit_patch_end(
         .await;
 
     if let Some(tracker) = ctx.turn_diff_tracker {
+        let patch_modes = match &tracker_update {
+            TurnDiffTrackerUpdate::Track {
+                environment_id,
+                delta,
+            } => match evidence_cwd.as_ref() {
+                Some(root) => {
+                    let environment_id = environment_id.as_deref().unwrap_or_default();
+                    let (root, paths) = {
+                        let guard = tracker.lock().await;
+                        (
+                            guard
+                                .patch_mode_root(environment_id)
+                                .unwrap_or(root.as_path())
+                                .to_path_buf(),
+                            guard.missing_mode_paths(environment_id, delta),
+                        )
+                    };
+                    crate::turn_diff_tracker::resolve_patch_index_modes(&root, paths).await
+                }
+                None => HashMap::new(),
+            },
+            _ => HashMap::new(),
+        };
         let unified_diff = {
             let mut guard = tracker.lock().await;
             match tracker_update {
@@ -1160,6 +1183,10 @@ async fn emit_patch_end(
                     environment_id,
                     delta,
                 } => {
+                    guard.set_patch_modes(
+                        environment_id.as_deref().unwrap_or_default(),
+                        patch_modes,
+                    );
                     guard.track_delta(environment_id.as_deref().unwrap_or_default(), delta);
                     guard.take_unified_diff_if_changed()
                 }
@@ -1703,6 +1730,11 @@ mod tests {
                 "workspace-reuse".to_string(),
                 &repo,
             )
+            .await;
+        session
+            .services
+            .command_execution
+            .observe_repository_revision("workspace-reuse-turn", 0)
             .await;
         let before_hash = session
             .services

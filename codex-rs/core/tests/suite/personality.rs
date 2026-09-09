@@ -170,16 +170,21 @@ async fn config_personality_some_adds_developer_personality_spec() -> anyhow::Re
 
     let server = start_mock_server().await;
     let resp_mock = mount_sse_once(&server, sse_completed("resp-1")).await;
-    let mut builder = test_codex().with_model("gpt-5.4").with_config(|config| {
-        config
-            .features
-            .enable(Feature::Personality)
-            .expect("test config should allow feature update");
-        config.personality = Some(Personality::Friendly);
-    });
+    // The mock replaces only model transport; real configuration, template resolution,
+    // session submission, and outbound request assembly remain under test.
+    let mut builder = test_codex()
+        .with_model("gpt-5.6-sol")
+        .with_config(|config| {
+            config
+                .features
+                .enable(Feature::Personality)
+                .expect("test config should allow feature update");
+            config.personality = Some(Personality::Friendly);
+        });
     let test = builder.build(&server).await?;
 
-    test.codex
+    let submission_id = test
+        .codex
         .submit(read_only_text_turn(
             &test,
             "hello",
@@ -188,10 +193,24 @@ async fn config_personality_some_adds_developer_personality_spec() -> anyhow::Re
         ))
         .await?;
 
-    wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    core_test_support::wait_for_event_envelope_with_timeout(
+        &test.codex,
+        |ev| ev.id == submission_id && matches!(ev.msg, EventMsg::TurnComplete(_)),
+        Duration::from_secs(1),
+    )
+    .await;
 
     let request = resp_mock.single_request();
     let instructions_text = request.instructions_text();
+    // Delivery is the contract here; these assertions cannot prove model obedience.
+    assert_eq!(
+        instructions_text,
+        codex_protocol::models::BASE_INSTRUCTIONS_DEFAULT.trim()
+    );
+    assert!(
+        instructions_text.contains("one plausible incorrect implementation the test would reject")
+    );
+    assert!(!instructions_text.contains("{{ personality }}"));
 
     assert!(
         !instructions_text.contains(LOCAL_FRIENDLY_TEMPLATE),

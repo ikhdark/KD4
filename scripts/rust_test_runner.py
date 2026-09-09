@@ -6,13 +6,15 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
-import tomllib
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping, Sequence
+from typing import Any
 
+import tomllib
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CODEX_RS_ROOT = REPO_ROOT / "codex-rs"
@@ -27,6 +29,10 @@ RUST_MIN_STACK_BYTES = "8388608"
 
 class RunnerError(RuntimeError):
     """Raised when a declared test contract cannot be honored."""
+
+    def __init__(self, message: str, *, outcome: str = "failed") -> None:
+        super().__init__(message)
+        self.outcome = outcome
 
 
 @dataclass(frozen=True)
@@ -50,7 +56,7 @@ class Target:
         if self.selector_kind == "lib":
             args.append("--lib")
         else:
-            args.extend(["--test", self.selector_value or ""])
+            args.extend([f"--{self.selector_kind}", self.selector_value or ""])
         return args
 
 
@@ -59,6 +65,7 @@ class GateStep:
     target: str
     filterset: str | None
     tests: tuple[str, ...]
+    helpers: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -76,7 +83,7 @@ class Manifest:
     gates: Mapping[str, Gate]
 
     @classmethod
-    def load(cls, path: Path) -> "Manifest":
+    def load(cls, path: Path) -> Manifest:
         try:
             with path.open("rb") as manifest_file:
                 raw = tomllib.load(manifest_file)
@@ -85,7 +92,7 @@ class Manifest:
         return cls.from_data(raw)
 
     @classmethod
-    def from_data(cls, raw: Any) -> "Manifest":
+    def from_data(cls, raw: Any) -> Manifest:
         root = _require_table(raw, "manifest")
         _reject_unknown(root, {"version", "helpers", "targets", "gates"}, "manifest")
 
@@ -130,17 +137,16 @@ class Manifest:
             table = _require_table(value, f"targets.{target_name}")
             _reject_unknown(
                 table,
-                {"package", "lib", "test", "helpers"},
+                {"package", "lib", "test", "bin", "helpers"},
                 f"targets.{target_name}",
             )
             package = _require_string(
                 table.get("package"), f"targets.{target_name}.package"
             )
             has_lib = "lib" in table
-            has_test = "test" in table
-            if has_lib == has_test:
+            if sum(key in table for key in ("lib", "test", "bin")) != 1:
                 raise RunnerError(
-                    f"targets.{target_name} must declare exactly one of lib or test"
+                    f"targets.{target_name} must declare exactly one of lib, test or bin"
                 )
             if has_lib:
                 if table["lib"] is not True:
@@ -148,9 +154,9 @@ class Manifest:
                 selector_kind = "lib"
                 selector_value = None
             else:
-                selector_kind = "test"
+                selector_kind = "test" if "test" in table else "bin"
                 selector_value = _require_string(
-                    table["test"], f"targets.{target_name}.test"
+                    table[selector_kind], f"targets.{target_name}.{selector_kind}"
                 )
             helper_names = _require_string_list(
                 table.get("helpers"), f"targets.{target_name}.helpers"
@@ -184,7 +190,7 @@ class Manifest:
             for index, value in enumerate(steps_raw):
                 prefix = f"gates.{gate_name}.steps[{index}]"
                 step = _require_table(value, prefix)
-                _reject_unknown(step, {"target", "filter", "tests"}, prefix)
+                _reject_unknown(step, {"target", "filter", "tests", "helpers"}, prefix)
                 target_name = _require_string(step.get("target"), f"{prefix}.target")
                 if target_name not in targets:
                     raise RunnerError(
@@ -198,7 +204,18 @@ class Manifest:
                 if not tests:
                     raise RunnerError(f"{prefix}.tests must not be empty")
                 _reject_duplicates(tests, f"{prefix}.tests")
-                steps.append(GateStep(target_name, filterset, tuple(tests)))
+                step_helpers = None
+                if "helpers" in step:
+                    names = _require_string_list(step["helpers"], f"{prefix}.helpers")
+                    _reject_duplicates(names, f"{prefix}.helpers")
+                    if not set(names).issubset(targets[target_name].helpers):
+                        raise RunnerError(
+                            f"{prefix}.helpers must be a subset of target helpers"
+                        )
+                    step_helpers = tuple(names)
+                steps.append(
+                    GateStep(target_name, filterset, tuple(tests), step_helpers)
+                )
             gates[gate_name] = Gate(gate_name, description, tuple(steps))
 
         return cls(version, helpers, targets, gates)
@@ -258,7 +275,7 @@ class MetadataIndex:
     packages: Mapping[str, Mapping[str, Any]]
 
     @classmethod
-    def from_json(cls, raw: Any) -> "MetadataIndex":
+    def from_json(cls, raw: Any) -> MetadataIndex:
         root = _require_table(raw, "cargo metadata")
         target_directory = _require_string(
             root.get("target_directory"), "cargo metadata.target_directory"
@@ -295,7 +312,9 @@ class MetadataIndex:
                         f"target {target.name!r} declares --lib for package "
                         f"{target.package!r}, which has no library target"
                     )
-            elif not self._has_target(package, target.selector_value or "", "test"):
+            elif not self._has_target(
+                package, target.selector_value or "", target.selector_kind
+            ):
                 raise RunnerError(
                     f"target {target.name!r} declares missing test target "
                     f"{target.package}/{target.selector_value}"
@@ -377,6 +396,7 @@ class RustTestRunner:
         profile: str | None = None,
         no_fail_fast: bool = False,
         env: Mapping[str, str] | None = None,
+        cwd: Path = CODEX_RS_ROOT,
     ) -> None:
         metadata.validate_manifest(manifest)
         self.manifest = manifest
@@ -384,8 +404,11 @@ class RustTestRunner:
         self.target_dir = (target_dir or metadata.target_directory).resolve()
         self.platform = platform or current_platform()
         self.executor = executor
+        self.cwd = cwd
         self.no_fail_fast = no_fail_fast
         self.base_env = dict(os.environ if env is None else env)
+        # Ordinary acceptance must never update its expected outputs implicitly.
+        self.base_env["INSTA_UPDATE"] = "no"
         self.base_env.setdefault("RUST_MIN_STACK", RUST_MIN_STACK_BYTES)
         if profile is not None:
             self.base_env["NEXTEST_PROFILE"] = profile
@@ -403,18 +426,56 @@ class RustTestRunner:
             raise RunnerError(f"unknown named Rust test gate {name!r}") from exc
 
     def active_helpers(self, target_names: Iterable[str]) -> list[Helper]:
+        return self._active_helper_names(
+            name for target in target_names for name in self.target(target).helpers
+        )
+
+    def _active_helper_names(self, names: Iterable[str]) -> list[Helper]:
         selected: list[Helper] = []
         seen: set[str] = set()
-        for target_name in target_names:
-            for helper_name in self.target(target_name).helpers:
-                if helper_name in seen:
-                    continue
-                helper = self.manifest.helpers[helper_name]
-                if helper.platform is not None and helper.platform != self.platform:
-                    continue
-                selected.append(helper)
-                seen.add(helper_name)
+        for helper_name in names:
+            if helper_name in seen:
+                continue
+            helper = self.manifest.helpers[helper_name]
+            if helper.platform is not None and helper.platform != self.platform:
+                continue
+            selected.append(helper)
+            seen.add(helper_name)
         return selected
+
+    def _group_gate_steps(self, names: Sequence[str]) -> list[GateStep]:
+        groups: dict[tuple[str, str, str | None], list[GateStep]] = {}
+        for name in dict.fromkeys(names):
+            for step in self.gate(name).steps:
+                target = self.target(step.target)
+                key = (target.package, target.selector_kind, target.selector_value)
+                groups.setdefault(key, []).append(step)
+        grouped = []
+        for steps in groups.values():
+            filters = list(
+                dict.fromkeys(self._gate_filter_args(step)[1] for step in steps)
+            )
+            grouped.append(
+                GateStep(
+                    steps[0].target,
+                    filters[0]
+                    if len(filters) == 1
+                    else " | ".join(f"({value})" for value in filters),
+                    tuple(dict.fromkeys(test for step in steps for test in step.tests)),
+                    tuple(
+                        dict.fromkeys(
+                            helper
+                            for step in steps
+                            for helper in (
+                                self.target(step.target).helpers
+                                if step.helpers is None
+                                else step.helpers
+                            )
+                        )
+                    ),
+                )
+            )
+        return grouped
 
     def plan(self, name: str) -> dict[str, Any]:
         if name in self.manifest.targets:
@@ -431,11 +492,12 @@ class RustTestRunner:
                 "run": self._run_command(target, []),
             }
         if name in self.manifest.gates:
-            gate = self.gate(name)
-            targets = [step.target for step in gate.steps]
-            helpers = self.active_helpers(targets)
+            grouped = self._group_gate_steps([name])
+            helpers = self._active_helper_names(
+                helper for step in grouped for helper in step.helpers or ()
+            )
             steps = []
-            for step in gate.steps:
+            for step in grouped:
                 target = self.target(step.target)
                 filter_args = self._gate_filter_args(step)
                 steps.append(
@@ -443,7 +505,7 @@ class RustTestRunner:
                         "target": step.target,
                         "tests": list(step.tests),
                         "list": self._list_command(target, filter_args),
-                        "run": self._run_command(target, filter_args),
+                        "run": self._gate_run_command(target, filter_args),
                     }
                 )
             return {
@@ -474,10 +536,19 @@ class RustTestRunner:
         )
 
     def run_gate(self, name: str) -> None:
-        gate = self.gate(name)
-        for step in gate.steps:
+        self.run_gates([name])
+
+    def run_gates(
+        self, names: Sequence[str], *, quiet: bool = False, discover: bool = True
+    ) -> dict[str, list[str]]:
+        """Verify exact selections, prepare helpers once, and execute each test once."""
+        if not names:
+            raise RunnerError("at least one gate is required")
+        grouped = self._group_gate_steps(names)
+        for step in grouped if discover else ():
             target = self.target(step.target)
-            actual = set(self._list_tests(target, self._gate_filter_args(step)))
+            listed = self._list_tests(target, self._gate_filter_args(step))
+            actual = set(listed)
             expected = set(step.tests)
             if actual != expected:
                 missing = sorted(expected - actual)
@@ -488,20 +559,57 @@ class RustTestRunner:
                 if unexpected:
                     details.append(f"unexpected={unexpected}")
                 raise RunnerError(
-                    f"gate {name!r} step {step.target!r} selected the wrong test-ID set: "
+                    f"gates {list(names)!r} step {step.target!r} selected the wrong test-ID set: "
                     + ", ".join(details)
+                )
+            ignored = sorted(test for test, is_ignored in listed.items() if is_ignored)
+            if ignored:
+                raise RunnerError(
+                    f"gate requires ignored tests that would not execute: {ignored}",
+                    outcome="skipped",
                 )
 
         env = self._build_helper_environment(
-            self.active_helpers(step.target for step in gate.steps)
-        )
-        for step in gate.steps:
-            target = self.target(step.target)
-            self._checked(
-                self._run_command(target, self._gate_filter_args(step)),
-                env=env,
-                capture_output=False,
+            self._active_helper_names(
+                helper for step in grouped for helper in step.helpers or ()
             )
+        )
+        for step in grouped:
+            target = self.target(step.target)
+            filter_args = self._gate_filter_args(step) if discover else [
+                "-E", " | ".join(f"test(={test})" for test in step.tests)
+            ]
+            result = self._checked(
+                self._gate_run_command(target, filter_args),
+                env=env,
+                capture_output=True,
+            )
+            output = (result.stdout or "") + "\n" + (result.stderr or "")
+            if not quiet:
+                print(output, end="" if output.endswith("\n") else "\n")
+            # Require completed per-test results from this execution, not just
+            # a successful exit or discovery. Suppress summary repetitions and
+            # unrelated filtered-out skips, and disallow retries for this proof.
+            passed = re.findall(
+                r"(?m)^\s*PASS\s+\[[^]\r\n]+\]\s+\S+\s+(\S+)\s*$", output
+            )
+            if len(passed) != len(step.tests) or set(passed) != set(step.tests):
+                outcome = "not_executed"
+                if re.search(r"(?m)^\s*SKIP\s+\[", output):
+                    outcome = "skipped"
+                elif re.search(r"\b0 tests run\b", output):
+                    outcome = "zero_tests"
+                raise RunnerError(
+                    f"gate {step.target!r} did not report every required test passed exactly once: "
+                    f"expected={sorted(step.tests)}, passed={sorted(passed)}",
+                    outcome=outcome,
+                )
+        return {
+            name: sorted(
+                {test for step in self.gate(name).steps for test in step.tests}
+            )
+            for name in dict.fromkeys(names)
+        }
 
     def parity(self, legacy_name: str, replacement_names: Sequence[str]) -> None:
         if not replacement_names:
@@ -548,9 +656,9 @@ class RustTestRunner:
         all_names = [legacy_name, *replacement_names]
         env = self._build_helper_environment(self.active_helpers(all_names))
         legacy_env = dict(env)
-        legacy_env["INSTA_UPDATE"] = "always"
+        legacy_env["INSTA_UPDATE"] = "no"
         replacement_env = dict(env)
-        replacement_env["INSTA_UPDATE"] = "always"
+        replacement_env["INSTA_UPDATE"] = "no"
         behavior_args = [
             "--ignore-default-filter",
             "--no-fail-fast",
@@ -559,9 +667,10 @@ class RustTestRunner:
             "--run-ignored",
             "default",
         ]
-        behavior_runs = [(legacy, legacy_env), *(
-            (replacement, replacement_env) for replacement in replacements
-        )]
+        behavior_runs = [
+            (legacy, legacy_env),
+            *((replacement, replacement_env) for replacement in replacements),
+        ]
         failed_runs: list[str] = []
         for target, run_env in behavior_runs:
             command = self._run_command(target, behavior_args, internal_args=True)
@@ -600,7 +709,10 @@ class RustTestRunner:
 
         replacements_by_suffix: dict[str, list[Path]] = {}
         for replacement in replacements:
-            if replacement.package != legacy.package or replacement.selector_kind != "test":
+            if (
+                replacement.package != legacy.package
+                or replacement.selector_kind != "test"
+            ):
                 continue
             replacement_prefix = f"{replacement.selector_value}__"
             for path in snapshots_dir.glob(f"{replacement_prefix}*.snap"):
@@ -610,16 +722,14 @@ class RustTestRunner:
         missing = sorted(set(legacy_snapshots) - set(replacements_by_suffix))
         additions = sorted(set(replacements_by_suffix) - set(legacy_snapshots))
         duplicates = sorted(
-            suffix
-            for suffix, paths in replacements_by_suffix.items()
-            if len(paths) > 1
+            suffix for suffix, paths in replacements_by_suffix.items() if len(paths) > 1
         )
         mismatched = sorted(
             suffix
             for suffix, legacy_path in legacy_snapshots.items()
             if len(replacements_by_suffix.get(suffix, [])) == 1
-            and legacy_path.read_bytes()
-            != replacements_by_suffix[suffix][0].read_bytes()
+            and RustTestRunner._snapshot_semantics(legacy_path)
+            != RustTestRunner._snapshot_semantics(replacements_by_suffix[suffix][0])
         )
         if missing or additions or duplicates or mismatched:
             raise RunnerError(
@@ -628,8 +738,45 @@ class RustTestRunner:
                 f"duplicates={duplicates}, content_changes={mismatched}"
             )
 
+    @staticmethod
+    def _snapshot_semantics(path: Path) -> str:
+        text = path.read_text(encoding="utf-8")
+        if not text.startswith("---\n"):
+            return text
+        header, separator, body = text[4:].partition("\n---\n")
+        if not separator:
+            return text
+        # A shard can move its source file. Retain expression, info, and the
+        # complete approved payload; only source-location metadata is incidental.
+        header = "\n".join(
+            line for line in header.splitlines() if not line.startswith("source:")
+        )
+        return f"---\n{header}\n---\n{body}"
+
     def _gate_filter_args(self, step: GateStep) -> list[str]:
-        return ["-E", step.filterset] if step.filterset is not None else []
+        expression = step.filterset or " | ".join(
+            f"test(={test})" for test in step.tests
+        )
+        return ["-E", expression]
+
+    def _gate_run_command(
+        self, target: Target, filter_args: Sequence[str]
+    ) -> list[str]:
+        return [
+            *self._run_command(target, filter_args),
+            "--color",
+            "never",
+            "--status-level",
+            "pass",
+            "--final-status-level",
+            "none",
+            "--show-progress",
+            "none",
+            "--success-output",
+            "never",
+            "--retries",
+            "0",
+        ]
 
     def _selection_command(self, verb: str, target: Target) -> list[str]:
         return [
@@ -686,7 +833,8 @@ class RustTestRunner:
         tests = parse_nextest_list(result.stdout)
         if not tests:
             raise RunnerError(
-                f"named target {target.name!r} selected zero tests with args {args!r}"
+                f"named target {target.name!r} selected zero tests with args {args!r}",
+                outcome="zero_tests",
             )
         return tests
 
@@ -743,7 +891,7 @@ class RustTestRunner:
     ) -> subprocess.CompletedProcess[str]:
         result = self.executor(
             list(args),
-            cwd=CODEX_RS_ROOT,
+            cwd=self.cwd,
             env=env,
             capture_output=capture_output,
         )
@@ -861,15 +1009,19 @@ def validate_filtering_args(raw_args: Sequence[str]) -> list[str]:
             raise RunnerError("--no-tests is runner-owned and is forced to fail")
         if not after_separator and (
             token in _TARGET_OVERRIDE_OPTIONS
-            or token.startswith("--package=")
-            or token.startswith("--exclude=")
-            or token.startswith("--test=")
-            or token.startswith("--bin=")
-            or token.startswith("--bench=")
-            or token.startswith("--example=")
-            or token.startswith("--manifest-path=")
-            or token.startswith("--target=")
-            or token.startswith("--target-dir=")
+            or token.startswith(
+                (
+                    "--package=",
+                    "--exclude=",
+                    "--test=",
+                    "--bin=",
+                    "--bench=",
+                    "--example=",
+                    "--manifest-path=",
+                    "--target=",
+                    "--target-dir=",
+                )
+            )
             or (token.startswith("-p") and token != "-p")
         ):
             raise RunnerError(
@@ -950,10 +1102,12 @@ def guard_generic_recipe_args(
         index += 1
 
 
-def load_metadata(executor: Executor = _default_executor) -> MetadataIndex:
+def load_metadata(
+    executor: Executor = _default_executor, *, cwd: Path = CODEX_RS_ROOT
+) -> MetadataIndex:
     result = executor(
         ["cargo", "metadata", "--no-deps", "--format-version", "1"],
-        cwd=CODEX_RS_ROOT,
+        cwd=cwd,
         env=os.environ,
         capture_output=True,
     )
@@ -967,7 +1121,9 @@ def load_metadata(executor: Executor = _default_executor) -> MetadataIndex:
     return MetadataIndex.from_json(payload)
 
 
-def _resolve_target_dir(value: str | None, metadata: MetadataIndex) -> Path:
+def _resolve_target_dir(
+    value: str | None, metadata: MetadataIndex, *, cwd: Path = CODEX_RS_ROOT
+) -> Path:
     configured = (
         value
         or os.environ.get("CODEX_CARGO_LANE_TARGET_DIR")
@@ -976,7 +1132,7 @@ def _resolve_target_dir(value: str | None, metadata: MetadataIndex) -> Path:
     if configured is None:
         return metadata.target_directory
     path = Path(configured)
-    return path if path.is_absolute() else CODEX_RS_ROOT / path
+    return path if path.is_absolute() else cwd / path
 
 
 def build_parser() -> argparse.ArgumentParser:

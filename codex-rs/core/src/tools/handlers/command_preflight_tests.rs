@@ -7,6 +7,68 @@ fn strings(args: &[&str]) -> Vec<String> {
 }
 
 #[test]
+fn search_root_is_discovered_only_after_a_search_is_identified() {
+    use crate::tools::handlers::command_search::classify_rg_search_with_repository;
+    let root = Path::new("workspace");
+    for command in [strings(&["git", "status"]), strings(&["echo", "hello"])] {
+        assert!(
+            classify_rg_search_with_repository(&command, None, root, || {
+                panic!("ordinary commands must not discover a search root")
+            })
+            .unwrap()
+            .is_none()
+        );
+    }
+    let calls = std::cell::Cell::new(0);
+    let search =
+        classify_rg_search_with_repository(&strings(&["rg", "needle", "src"]), None, root, || {
+            calls.set(calls.get() + 1);
+            root.to_path_buf()
+        })
+        .unwrap()
+        .expect("search classified");
+    assert_eq!(calls.get(), 1);
+    assert!(search.1.search_identity.contains("needle"));
+}
+
+#[tokio::test]
+async fn expensive_search_scope_remains_searchable_without_reusable_miss_evidence() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    std::fs::create_dir(root.join(".git")).unwrap();
+    std::fs::create_dir(root.join("ignored")).unwrap();
+    std::fs::write(root.join("visible.txt"), "needle\n").unwrap();
+    std::fs::write(root.join(".gitignore"), "ignored/\n").unwrap();
+    for index in 0..600 {
+        std::fs::write(root.join("ignored").join(format!("{index}.txt")), "needle").unwrap();
+    }
+    let command = strings(&["rg", "needle", "."]);
+    let mut search = classify_rg_search_narrowing(&command, None, root, root)
+        .unwrap()
+        .unwrap();
+    let identity = search.search_identity.clone();
+    crate::tools::handlers::command_search::observe_rg_search_scope_state(&mut search).await;
+    assert_eq!(search.scope_state_identity, None);
+    assert_eq!(search.search_identity, identity);
+    let output = std::process::Command::new(&command[0])
+        .args(&command[1..])
+        .current_dir(root)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let output = String::from_utf8(output.stdout).unwrap();
+    assert!(output.contains("visible.txt"));
+    assert!(!output.contains("ignored"));
+    let miss = std::process::Command::new("rg")
+        .args(["missing-pattern", "."])
+        .current_dir(root)
+        .output()
+        .unwrap();
+    assert_eq!(miss.status.code(), Some(1));
+    assert!(miss.stdout.is_empty());
+}
+
+#[test]
 fn classifies_repository_wide_and_owner_scoped_rg() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -464,7 +526,7 @@ fn direct_argv_accepts_executable_with_powershell_cmdlet_shape() {
     )
     .expect("an unknown Verb-Noun executable is valid direct argv");
 
-    assert!(commands.is_empty());
+    assert_eq!(commands, vec![strings(&["Get-Widget", "--version"])]);
 }
 
 #[test]

@@ -355,7 +355,7 @@ fn send_message_tool_requires_message_and_has_no_output_schema() {
     );
     assert_eq!(
         parameters.required.as_ref(),
-        Some(&vec!["target".to_string(), "message".to_string()])
+        Some(&vec!["message".to_string()])
     );
     assert_eq!(output_schema, None);
 }
@@ -375,7 +375,7 @@ fn followup_task_tool_requires_message_and_has_no_output_schema() {
     assert_eq!(name, "followup_task");
     assert_eq!(
         description,
-        "Send a follow-up task to an existing non-root target agent and trigger a turn if it is idle. If the target is already running, deliver the task promptly at message boundaries while sampling, or after the pending tool call completes."
+        "Send a new assignment, correction requiring action, or urgent intervention to an existing non-root agent; trigger a turn if idle. If running, deliver promptly at message boundaries while sampling, or after the pending tool call completes. Use send_message for informational updates that need no new turn; ask for clarification when needed."
     );
     assert_eq!(
         parameters.schema_type,

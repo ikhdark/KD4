@@ -879,6 +879,7 @@ async fn audit_task_view_validation_history_and_receipt_references_are_complete(
         status: AgentStatusClaim::NeedsMain,
         summary: "receipt references the oldest retained call".to_string(),
         criterion_results: vec![CriterionResult {
+            evidence_ref: None,
             criterion_id: criterion().id,
             status: CriterionStatus::NotRun,
             evidence: None,
@@ -1467,6 +1468,7 @@ fn completed_receipt(validation_call_ids: Vec<String>) -> ReceiptDraft {
         status: AgentStatusClaim::Completed,
         summary: "completed and validated".to_string(),
         criterion_results: vec![CriterionResult {
+            evidence_ref: None,
             criterion_id: criterion().id,
             status: CriterionStatus::Passed,
             evidence: Some("focused validation passed".to_string()),
@@ -1539,6 +1541,7 @@ async fn architect_receipt_seals_canonical_contract_and_admits_exact_worker_proj
                 status: AgentStatusClaim::Completed,
                 summary: "architecture sealed".to_string(),
                 criterion_results: vec![CriterionResult {
+                    evidence_ref: None,
                     criterion_id: "architecture".to_string(),
                     status: CriterionStatus::Passed,
                     evidence: Some("canonical contract attached".to_string()),
@@ -1617,6 +1620,7 @@ async fn architect_dependent_workers_fail_closed_on_missing_or_wrong_contract_re
                 status: AgentStatusClaim::Completed,
                 summary: "architecture sealed".to_string(),
                 criterion_results: vec![CriterionResult {
+                    evidence_ref: None,
                     criterion_id: "architecture".to_string(),
                     status: CriterionStatus::Passed,
                     evidence: Some("canonical contract attached".to_string()),
@@ -2411,6 +2415,7 @@ async fn oversized_receipts_seal_and_remain_fully_retrievable() {
                 status: AgentStatusClaim::NeedsMain,
                 summary: summary.clone(),
                 criterion_results: vec![CriterionResult {
+                    evidence_ref: None,
                     criterion_id: criterion().id,
                     status: CriterionStatus::NotRun,
                     evidence: None,
@@ -2496,6 +2501,145 @@ async fn receipts_are_sealed_and_validation_calls_are_attempt_owned() {
     assert_eq!(
         task.receipt.expect("sealed receipt").status,
         AgentStatusClaim::Completed
+    );
+}
+
+#[tokio::test]
+async fn criterion_execution_reference_is_validated_persisted_and_projected() {
+    let fixture = Fixture::new().await;
+    initialize_validation_repository(fixture.repo.path());
+    let command = "cargo test -p evidence focused-proof";
+    let mut assignment_draft =
+        validation_worker_draft("criterion-evidence-root", "src/lib.rs", command);
+    assignment_draft
+        .acceptance_criteria
+        .push(AcceptanceCriterion {
+            id: "unverified-outcome".to_string(),
+            text: "a separately promised outcome".to_string(),
+        });
+    assignment_draft
+        .acceptance_criteria
+        .push(AcceptanceCriterion {
+            id: "shared-proof".to_string(),
+            text: "another criterion supported by the same execution".to_string(),
+        });
+    let (assignment, attempt) = fixture
+        .store
+        .create_assignment(fixture.repo.path(), assignment_draft)
+        .await
+        .expect("assignment");
+    let call = finish_focused_validation(
+        &fixture.store,
+        start_focused_validation(
+            &fixture.store,
+            attempt.attempt_id,
+            "criterion-proof",
+            command,
+        )
+        .await,
+    )
+    .await;
+    let reference = CriterionEvidenceRef {
+        call_id: call.call_id.clone(),
+        workspace_id: assignment.workspace_id.clone(),
+        evidence_epoch: call.evidence.end_epoch.expect("recorded epoch"),
+        kind: CriterionEvidenceKind::ValidationExecution,
+    };
+    let mut draft = completed_receipt(vec![call.call_id.clone()]);
+    draft.summary = "Every outcome tested; the new Desktop build is running".to_string();
+    draft.criterion_results[0].evidence_ref = Some(reference.clone());
+    draft.criterion_results.push(CriterionResult {
+        criterion_id: "unverified-outcome".to_string(),
+        status: CriterionStatus::Passed,
+        evidence: Some("trust the narrative".to_string()),
+        evidence_ref: None,
+    });
+    draft.criterion_results.push(CriterionResult {
+        criterion_id: "shared-proof".to_string(),
+        status: CriterionStatus::Passed,
+        evidence: None,
+        evidence_ref: Some(reference.clone()),
+    });
+    for invalid in [
+        CriterionEvidenceRef {
+            workspace_id: "another-workspace".to_string(),
+            ..reference.clone()
+        },
+        CriterionEvidenceRef {
+            evidence_epoch: reference.evidence_epoch + 1,
+            ..reference.clone()
+        },
+        CriterionEvidenceRef {
+            call_id: "unlisted-or-foreign-call".to_string(),
+            ..reference.clone()
+        },
+    ] {
+        let mut rejected = draft.clone();
+        rejected.criterion_results[0].evidence_ref = Some(invalid);
+        assert!(matches!(
+            fixture
+                .store
+                .submit_agent_receipt(attempt.attempt_id, rejected)
+                .await,
+            Err(StoreError::CriterionResultsInvalid(_))
+        ));
+        let task = fixture
+            .store
+            .get_agent_task(assignment.assignment_id, Some(0))
+            .await
+            .expect("unsealed task");
+        assert!(task.receipt.is_none());
+        assert_eq!(task.current_attempt.state, AttemptState::Active);
+    }
+    fixture
+        .store
+        .submit_agent_receipt(attempt.attempt_id, draft)
+        .await
+        .expect("valid reference seals");
+    let mut task = fixture
+        .store
+        .get_agent_task(assignment.assignment_id, Some(0))
+        .await
+        .expect("sealed task reloads");
+    assert_eq!(
+        task.receipt.as_ref().unwrap().criterion_results[0]
+            .evidence_ref
+            .as_ref(),
+        Some(&reference)
+    );
+    let summary = task.completion_evidence_summary();
+    assert!(summary.contains("criterion-1: supported by a successful validation execution"));
+    assert!(summary.contains("unverified-outcome: reported complete; behavior unverified"));
+    assert!(summary.contains("shared-proof: supported by a successful validation execution"));
+    assert_eq!(
+        task.receipt.as_ref().unwrap().validation_call_ids,
+        vec![call.call_id]
+    );
+    assert!(summary.contains("Running Desktop build: not established"));
+    assert!(!summary.contains("Every outcome tested"));
+    // The loaded workspace can advance without upgrading or rerunning old proof.
+    task.workspace_status.epoch += 1;
+    assert!(
+        task.completion_evidence_summary()
+            .contains("freshness unverified")
+    );
+    task.validation_calls[0].status = ValidationCallStatus::Cancelled;
+    assert!(
+        !task
+            .completion_evidence_summary()
+            .contains("supported by a successful")
+    );
+    // Old persisted JSON remains readable and acquires no proof from prose.
+    let mut legacy = serde_json::to_value(task.receipt.as_ref().unwrap()).unwrap();
+    legacy["criterion_results"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("evidence_ref");
+    task.receipt = Some(serde_json::from_value(legacy).unwrap());
+    assert!(
+        task.receipt.as_ref().unwrap().criterion_results[0]
+            .evidence_ref
+            .is_none()
     );
 }
 
@@ -2666,6 +2810,7 @@ async fn receipt_sealing_waits_for_all_attempt_owned_running_validations() {
         status: AgentStatusClaim::NeedsMain,
         summary: "main agent must reconcile the outcome".to_string(),
         criterion_results: vec![CriterionResult {
+            evidence_ref: None,
             criterion_id: criterion().id,
             status: CriterionStatus::NotRun,
             evidence: None,
@@ -6190,11 +6335,17 @@ async fn isolated_overlap_integrates_only_through_versioned_handoff() {
         )
         .await
         .expect("isolated receipt publishes handoff");
-    let ready = fixture
+    let ready_task = fixture
         .store
         .get_agent_task(isolated.assignment_id, Some(0))
         .await
-        .expect("isolated handoff reads")
+        .expect("isolated handoff reads");
+    assert!(
+        ready_task
+            .completion_evidence_summary()
+            .contains("patch ready, not integrated")
+    );
+    let ready = ready_task
         .isolation_handoff
         .expect("isolated handoff exists");
     assert_eq!(ready.state, IsolationHandoffState::Ready);
@@ -6249,11 +6400,17 @@ async fn isolated_overlap_integrates_only_through_versioned_handoff() {
         .create_assignment(fixture.repo.path(), integrator_draft.clone())
         .await
         .expect("integrator claims ready handoff");
-    let claimed = fixture
+    let claimed_task = fixture
         .store
         .get_agent_task(isolated.assignment_id, Some(0))
         .await
-        .expect("claimed handoff reads")
+        .expect("claimed handoff reads");
+    assert!(
+        claimed_task
+            .completion_evidence_summary()
+            .contains("claimed, not integrated")
+    );
+    let claimed = claimed_task
         .isolation_handoff
         .expect("claimed handoff exists");
     assert_eq!(claimed.state, IsolationHandoffState::Claimed);
@@ -6317,12 +6474,18 @@ async fn isolated_overlap_integrates_only_through_versioned_handoff() {
         )
         .await
         .expect("integrator seals versioned handoff");
+    let integrated_task = fixture
+        .store
+        .get_agent_task(isolated.assignment_id, Some(0))
+        .await
+        .expect("integrated handoff reads");
+    assert!(
+        integrated_task
+            .completion_evidence_summary()
+            .contains("recorded as integrated")
+    );
     assert_eq!(
-        fixture
-            .store
-            .get_agent_task(isolated.assignment_id, Some(0))
-            .await
-            .expect("integrated handoff reads")
+        integrated_task
             .isolation_handoff
             .expect("integrated handoff exists")
             .state,

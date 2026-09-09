@@ -12,6 +12,7 @@ use std::io;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use tokio::sync::Mutex;
@@ -415,6 +416,7 @@ struct CommandRetryState {
 
 #[derive(Default)]
 struct CommandSearchState {
+    revision: u64,
     allowed_expansions: HashSet<SearchNarrowingScope>,
     misses: HashSet<SearchMissCacheKey>,
     miss_order: VecDeque<SearchMissCacheKey>,
@@ -422,6 +424,7 @@ struct CommandSearchState {
 
 #[derive(Default)]
 struct CommandExecutionState {
+    persisted_revision: Option<(crate::git_workspace::WorkspaceEvidenceIdentity, u64)>,
     retry: CommandRetryState,
     process: CommandProcessState,
     repository: CommandRepositoryState,
@@ -432,6 +435,9 @@ pub(crate) struct CommandExecutionLedger {
     state: Mutex<CommandExecutionState>,
     workspace_identity_refresh: tokio::sync::Semaphore,
     persistence: Option<CommandExecutionPersistence>,
+    cache_persist: Arc<Mutex<()>>,
+    #[cfg(test)]
+    cache_commit_count: AtomicU64,
     #[cfg(test)]
     cache_persist_test_gate: std::sync::Mutex<Option<CachePersistTestGate>>,
 }
@@ -448,6 +454,9 @@ impl Default for CommandExecutionLedger {
             state: Mutex::new(CommandExecutionState::default()),
             workspace_identity_refresh: tokio::sync::Semaphore::new(/*permits*/ 1),
             persistence: None,
+            cache_persist: Arc::new(Mutex::new(())),
+            #[cfg(test)]
+            cache_commit_count: AtomicU64::new(0),
             #[cfg(test)]
             cache_persist_test_gate: std::sync::Mutex::new(None),
         }
@@ -470,6 +479,9 @@ impl CommandExecutionLedger {
             state: Mutex::new(CommandExecutionState::default()),
             workspace_identity_refresh: tokio::sync::Semaphore::new(/*permits*/ 1),
             persistence: Some(persistence),
+            cache_persist: Arc::new(Mutex::new(())),
+            #[cfg(test)]
+            cache_commit_count: AtomicU64::new(0),
             #[cfg(test)]
             cache_persist_test_gate: std::sync::Mutex::new(None),
         }
@@ -690,6 +702,8 @@ impl CommandExecutionLedger {
                     Some((repository_epoch, workspace_identity_hash));
             }
             if let Some(document) = cached_document {
+                let complete_document = state.search.miss_order.is_empty()
+                    && document.search_misses.len() <= MAX_TRACKED_COMMANDS;
                 for search_miss in document
                     .search_misses
                     .into_iter()
@@ -697,7 +711,12 @@ impl CommandExecutionLedger {
                 {
                     if state.search.misses.insert(search_miss.clone()) {
                         state.search.miss_order.push_back(search_miss);
+                        state.search.revision = state.search.revision.wrapping_add(1);
                     }
+                }
+                if complete_document {
+                    state.persisted_revision =
+                        Some((document.workspace_identity, state.search.revision));
                 }
             }
         }
@@ -937,16 +956,26 @@ impl CommandExecutionLedger {
         let Some(persistence) = self.persistence.clone() else {
             return;
         };
-        let Some((workspace_identity, search_misses)) = ({
+        let commit_guard = Arc::clone(&self.cache_persist).lock_owned().await;
+        let Some((workspace_identity, search_revision, search_misses)) = ({
             let state = self.state.lock().await;
             state
                 .repository
                 .observed_workspace_identity
                 .as_ref()
                 .filter(|(epoch, _)| *epoch == state.repository.epoch)
+                .filter(|(_, identity)| {
+                    state
+                        .persisted_revision
+                        .as_ref()
+                        .is_none_or(|(persisted, revision)| {
+                            persisted != identity || *revision != state.search.revision
+                        })
+                })
                 .map(|(_, workspace_identity)| {
                     (
                         workspace_identity.clone(),
+                        state.search.revision,
                         state.search.miss_order.iter().cloned().collect::<Vec<_>>(),
                     )
                 })
@@ -955,14 +984,20 @@ impl CommandExecutionLedger {
         };
         let document = CommandExecutionCacheDocument {
             schema_version: COMMAND_EXECUTION_CACHE_SCHEMA_VERSION,
-            workspace_identity,
+            workspace_identity: workspace_identity.clone(),
             search_misses,
         };
         let Ok(bytes) = serde_json::to_vec_pretty(&document) else {
             return;
         };
-        if let Err(error) = write_cache_document(persistence.cache_path, bytes).await {
-            tracing::warn!(%error, "failed to persist command execution cache");
+        match write_cache_document(persistence.cache_path, bytes, commit_guard).await {
+            Ok(_commit_guard) => {
+                #[cfg(test)]
+                self.cache_commit_count.fetch_add(1, Ordering::Relaxed);
+                self.state.lock().await.persisted_revision =
+                    Some((workspace_identity, search_revision));
+            }
+            Err(error) => tracing::warn!(%error, "failed to persist command execution cache"),
         }
     }
 
@@ -1373,6 +1408,7 @@ fn record_search_result_locked(
         return;
     };
     if exit_code == 1 && state.search.misses.insert(search_miss_key.clone()) {
+        state.search.revision = state.search.revision.wrapping_add(1);
         state.search.miss_order.push_back(search_miss_key);
         while state.search.misses.len() > MAX_TRACKED_COMMANDS {
             if let Some(oldest) = state.search.miss_order.pop_front() {
@@ -1380,6 +1416,7 @@ fn record_search_result_locked(
             }
         }
     } else if exit_code == 0 && state.search.misses.remove(&search_miss_key) {
+        state.search.revision = state.search.revision.wrapping_add(1);
         state
             .search
             .miss_order
@@ -1443,12 +1480,17 @@ fn command_attempt_is_active(state: &CommandExecutionState, key: &CommandAttempt
         .any(|running| running.key == *key)
 }
 
-async fn write_cache_document(cache_path: PathBuf, bytes: Vec<u8>) -> io::Result<()> {
-    let _commit =
-        tokio::task::spawn_blocking(move || write_cache_document_blocking(&cache_path, &bytes))
-            .await
-            .map_err(|error| io::Error::other(format!("command cache task failed: {error}")))??;
-    Ok(())
+async fn write_cache_document(
+    cache_path: PathBuf,
+    bytes: Vec<u8>,
+    commit_guard: tokio::sync::OwnedMutexGuard<()>,
+) -> io::Result<tokio::sync::OwnedMutexGuard<()>> {
+    tokio::task::spawn_blocking(move || {
+        // Cancellation must not let a later commit overtake a running disk write.
+        write_cache_document_blocking(&cache_path, &bytes).map(|_| commit_guard)
+    })
+    .await
+    .map_err(|error| io::Error::other(format!("command cache task failed: {error}")))?
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1465,25 +1507,50 @@ fn write_cache_document_blocking(
     let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
     temporary.write_all(bytes)?;
     temporary.as_file().sync_all()?;
-    temporary.persist(cache_path).map_err(|error| error.error)?;
-    sync_cache_parent(parent)?;
+    persist_cache_file(temporary, cache_path, parent)?;
     Ok(DurableCacheCommit)
 }
 
 #[cfg(windows)]
-fn sync_cache_parent(parent: &Path) -> io::Result<()> {
-    use std::os::windows::fs::OpenOptionsExt;
-
-    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-    std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-        .open(parent)?
-        .sync_all()
+fn persist_cache_file(
+    temporary: tempfile::NamedTempFile,
+    cache_path: &Path,
+    _parent: &Path,
+) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+    let temporary = temporary.into_temp_path();
+    let source: Vec<u16> = temporary.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination: Vec<u16> = cache_path
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    // The contents were flushed above. Commit the same-directory rename with
+    // write-through; flushing a read-only directory handle fails on Windows.
+    // SAFETY: both paths are live NUL-terminated strings for this call.
+    let moved = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if moved == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 #[cfg(not(windows))]
-fn sync_cache_parent(parent: &Path) -> io::Result<()> {
+fn persist_cache_file(
+    temporary: tempfile::NamedTempFile,
+    cache_path: &Path,
+    parent: &Path,
+) -> io::Result<()> {
+    temporary.persist(cache_path).map_err(|error| error.error)?;
     std::fs::File::open(parent)?.sync_all()
 }
 
@@ -2103,7 +2170,7 @@ mod tests {
     fn persisted_command_fingerprint_is_versioned_and_stable() {
         assert_eq!(
             fingerprint_value("fixed"),
-            "v2:5728fd88252f0fa0389c2564eb565e93671ef99ac9678ed4c24f0c8343786617"
+            "v2:69c37b82ff4edd189160d6845a76c70a130a0e25c7918f58bc4b9ed04ed1f9cb"
         );
     }
 
@@ -2255,10 +2322,9 @@ mod tests {
         use crate::shell::ShellType;
         use crate::tools::handlers::command_search::classify_rg_search_narrowing;
 
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(Path::parent)
-            .expect("codex-core is nested under the repository root");
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path();
+        std::fs::create_dir_all(root.join("codex-rs/core/src/tools")).unwrap();
         let argv = |args: &[&str]| args.iter().map(ToString::to_string).collect::<Vec<_>>();
         let narrow_command = argv(&["rg", "-n", "needle with space", "codex-rs/core/src/tools"]);
         let equivalent_command =
@@ -2269,8 +2335,15 @@ mod tests {
                 .expect("rg command classifies")
                 .expect("rg search is present")
         };
-        let narrow_search = classify(&narrow_command, None);
-        let equivalent_search = classify(&equivalent_command, None);
+        let mut narrow_search = classify(&narrow_command, None);
+        let mut equivalent_search = classify(&equivalent_command, None);
+        crate::tools::handlers::command_search::observe_rg_search_scope_state(&mut narrow_search)
+            .await;
+        crate::tools::handlers::command_search::observe_rg_search_scope_state(
+            &mut equivalent_search,
+        )
+        .await;
+        assert!(narrow_search.scope_state_identity.is_some());
         assert_eq!(
             narrow_search.search_identity,
             equivalent_search.search_identity
@@ -2311,7 +2384,24 @@ mod tests {
         ledger
             .begin_attempt(&changed_workspace, false)
             .await
-            .expect("workspace identity mutation invalidates the real rg miss");
+            .expect_err(
+                "an unchanged search scope remains reusable after unrelated workspace changes",
+            );
+        std::fs::write(
+            root.join("codex-rs/core/src/tools/new.txt"),
+            "needle with space",
+        )
+        .unwrap();
+        let mut changed_search = classify(&equivalent_command, None);
+        crate::tools::handlers::command_search::observe_rg_search_scope_state(&mut changed_search)
+            .await;
+        assert!(changed_search.scope_state_identity.is_some());
+        let changed_scope =
+            changed_workspace.with_search_narrowing("turn-b", "repo-a", Some(changed_search));
+        ledger
+            .begin_attempt(&changed_scope, false)
+            .await
+            .expect("a relevant source change invalidates the real rg miss");
 
         let compound_command = argv(&[
             "pwsh",
@@ -2385,7 +2475,7 @@ mod tests {
             )
         };
 
-        let producer = CommandExecutionLedger::load_or_new(
+        let mut producer = CommandExecutionLedger::load_or_new(
             codex_home.clone(),
             "thread".to_string(),
             &repository,
@@ -2403,6 +2493,13 @@ mod tests {
             .expect("first search runs");
         producer.record_exit(&first_search, 1).await;
         producer.finish_turn("turn-a").await;
+        assert_eq!(producer.cache_commit_count.load(Ordering::Relaxed), 1);
+        producer.persist_cache_after_terminal().await;
+        assert_eq!(
+            producer.cache_commit_count.load(Ordering::Relaxed),
+            1,
+            "unchanged state must not commit the cache again"
+        );
 
         let unused = CommandExecutionLedger::load_or_new(
             codex_home.clone(),
@@ -2484,6 +2581,41 @@ mod tests {
             .begin_attempt(&search("turn-b", consumer_epoch, &consumer_identity), false)
             .await
             .expect("a pre-command workspace edit invalidates the persisted search miss");
+
+        let cache_path = producer.persistence.as_ref().unwrap().cache_path.clone();
+        let prior_bytes = std::fs::read(&cache_path).unwrap();
+        producer.record_exit(&first_search, 0).await;
+        // Replacing a directory is a real commit failure on both supported platforms.
+        producer.persistence.as_mut().unwrap().cache_path = temp.path().to_path_buf();
+        producer.persist_cache_after_terminal().await;
+        assert_eq!(producer.cache_commit_count.load(Ordering::Relaxed), 1);
+        assert_eq!(std::fs::read(&cache_path).unwrap(), prior_bytes);
+        producer.persistence.as_mut().unwrap().cache_path = cache_path.clone();
+        tokio::join!(
+            producer.persist_cache_after_terminal(),
+            producer.persist_cache_after_terminal()
+        );
+        assert_eq!(
+            producer.cache_commit_count.load(Ordering::Relaxed),
+            2,
+            "a failed revision stays dirty; concurrent retries commit it once"
+        );
+        let document: CommandExecutionCacheDocument =
+            serde_json::from_slice(&std::fs::read(&cache_path).unwrap()).unwrap();
+        assert!(
+            document.search_misses.is_empty(),
+            "successful searches remove persisted misses"
+        );
+        producer.record_exit(&first_search, 1).await;
+        producer.persist_cache_after_terminal().await;
+        assert_eq!(producer.cache_commit_count.load(Ordering::Relaxed), 3);
+        let document: CommandExecutionCacheDocument =
+            serde_json::from_slice(&std::fs::read(&cache_path).unwrap()).unwrap();
+        assert_eq!(
+            document.search_misses.len(),
+            1,
+            "new misses must be persisted"
+        );
     }
 
     #[tokio::test]

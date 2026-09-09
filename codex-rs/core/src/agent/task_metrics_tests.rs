@@ -141,6 +141,7 @@ fn completed_task_with_validation(
             status: AgentStatusClaim::Completed,
             summary: "completed".to_string(),
             criterion_results: vec![CriterionResult {
+                evidence_ref: None,
                 criterion_id: "criterion".to_string(),
                 status: CriterionStatus::Passed,
                 evidence: None,

@@ -23,11 +23,11 @@ use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
 use crate::tools::handlers::command_preflight::preflight_invocation_with_equivalent_repair_async;
-use crate::tools::handlers::command_search::classify_rg_search_narrowing;
+use crate::tools::handlers::command_search::classify_rg_search_with_repository;
 use crate::tools::handlers::command_search::observe_rg_search_scope_state;
 use crate::tools::handlers::command_shape::CommandInvocation;
 use crate::tools::handlers::parse_arguments_with_base_path;
-use crate::tools::handlers::resolve_repository_root;
+use crate::tools::handlers::resolve_search_repository_root;
 use crate::tools::handlers::resolve_workdir_base_path;
 use crate::tools::handlers::rewrite_function_command_invocation;
 use crate::tools::hook_names::HookToolName;
@@ -445,7 +445,6 @@ impl ShellCommandHandler {
             .await;
         let validation_cwd = exec_params.cwd.to_string_lossy().into_owned();
         let attempt_key = if validation_launch.is_none() {
-            let repository = resolve_repository_root(exec_params.cwd.as_path());
             let attempt_key = CommandAttemptKey::new(
                 tool_name.name.as_str(),
                 &turn_environment.environment_id,
@@ -459,21 +458,24 @@ impl ShellCommandHandler {
             .with_runtime_context(&runtime_context)
             .with_repository_epoch(repository_epoch)
             .with_workspace_identity(workspace_identity.as_deref());
-            let mut search = classify_rg_search_narrowing(
+            let mut search = classify_rg_search_with_repository(
                 &safety_command,
                 shell_type,
                 exec_params.cwd.as_path(),
-                &repository,
+                || resolve_search_repository_root(exec_params.cwd.as_path()),
             )
             .map_err(FunctionCallError::RespondToModel)?;
-            if let Some(search) = search.as_mut() {
+            if let Some((_, search)) = search.as_mut() {
                 observe_rg_search_scope_state(search).await;
             }
-            let attempt_key = attempt_key.with_search_narrowing(
-                &turn.sub_id,
-                repository.to_string_lossy().as_ref(),
-                search,
-            );
+            let attempt_key = match search {
+                Some((repository, search)) => attempt_key.with_search_narrowing(
+                    &turn.sub_id,
+                    repository.to_string_lossy().as_ref(),
+                    Some(search),
+                ),
+                None => attempt_key,
+            };
             session
                 .services
                 .command_execution

@@ -25,6 +25,8 @@ const ALL_OPERATIONS: [ValidationOperation; 5] = [
 
 #[derive(Debug, Default)]
 pub(crate) struct ValidationAuthorization {
+    // Production turn construction intentionally leaves this inactive. Only tests
+    // opt into classification; its presence is not evidence of live enforcement.
     enabled: bool,
     pub(crate) revision: u64,
     denied: [bool; 5],
@@ -1443,26 +1445,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn positive_instruction_is_not_required_and_feature_boundary_is_preserved() {
-        let enabled = Arc::new(RwLock::new(ValidationAuthorization::enabled()));
+    async fn production_turn_keeps_validation_authorization_inactive() {
+        let (_session, turn) = crate::session::tests::make_session_and_context().await;
+        turn.update_validation_authorization(&[codex_protocol::user_input::UserInput::Text {
+            text: "do not run tests".to_string(),
+            text_elements: Vec::new(),
+        }])
+        .await;
         reset_validation_classification_count();
         assert!(matches!(
-            admit_validation(&enabled, &argv("cargo", &["test"]), false).await,
-            ValidationAdmission::Execute {
-                is_validation: true,
-                ..
-            }
-        ));
-        assert_eq!(validation_classification_count(), 1);
-
-        let disabled = Arc::new(RwLock::new(ValidationAuthorization::default()));
-        assert!(matches!(
-            admit_validation(&disabled, &argv("cargo", &["test"]), true).await,
+            admit_validation(
+                &turn.validation_authorization,
+                &argv("cargo", &["test"]),
+                true
+            )
+            .await,
             ValidationAdmission::Execute {
                 is_validation: false,
+                authorization_revision: 0,
                 ..
             }
         ));
+        assert_eq!(validation_classification_count(), 0);
     }
 
     #[test]

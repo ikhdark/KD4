@@ -1022,11 +1022,13 @@ struct ReceiptCriterionArgs {
     criterion_id: String,
     status: CriterionStatus,
     evidence: Option<String>,
+    evidence_ref: Option<codex_agent_task_store::CriterionEvidenceRef>,
 }
 
 impl ReceiptCriterionArgs {
     fn into_criterion_result(self) -> CriterionResult {
         CriterionResult {
+            evidence_ref: self.evidence_ref,
             criterion_id: self.criterion_id,
             status: self.status,
             evidence: self.evidence,
@@ -1132,16 +1134,47 @@ struct AbandonAgentTaskArgs {
     reason: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 struct GetAgentTaskResult {
     task: AgentTask,
-    #[serde(skip_serializing_if = "Option::is_none")]
     cold_review_context: Option<ColdReviewContext>,
 }
 
-#[derive(Debug, Serialize)]
+impl Serialize for GetAgentTaskResult {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut value = serializer.serialize_struct(
+            "GetAgentTaskResult",
+            2 + usize::from(self.cold_review_context.is_some()),
+        )?;
+        value.serialize_field("task", &self.task)?;
+        value.serialize_field(
+            "completion_evidence",
+            &self.task.completion_evidence_summary(),
+        )?;
+        if let Some(context) = &self.cold_review_context {
+            value.serialize_field("cold_review_context", context)?;
+        }
+        value.end()
+    }
+}
+
+#[derive(Debug)]
 struct SubmitAgentReceiptResult {
     receipt: AgentReceipt,
+}
+
+impl Serialize for SubmitAgentReceiptResult {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut value = serializer.serialize_struct("SubmitAgentReceiptResult", 2)?;
+        value.serialize_field("receipt", &self.receipt)?;
+        value.serialize_field(
+            "completion_evidence",
+            &bounded_receipt_projection(&self.receipt),
+        )?;
+        value.end()
+    }
 }
 
 const TASK_OUTPUT_INLINE_LIMIT_BYTES: usize = 8 * 1024;
@@ -1195,9 +1228,17 @@ fn bounded_receipt_projection_with_proof_limit(
         "criterion_counts": {
             "total": receipt.criterion_results.len(),
             "passed": passed,
+            "reported_passed": passed,
+            "with_execution_reference": receipt.criterion_results.iter().filter(|result| result.evidence_ref.is_some()).count(),
+            "reported_passed_without_execution_reference": receipt.criterion_results.iter().filter(|result| result.status == CriterionStatus::Passed && result.evidence_ref.is_none()).count(),
             "failed": failed,
             "not_run": receipt.criterion_results.len().saturating_sub(passed + failed),
         },
+        "criterion_execution_references": receipt.criterion_results.iter().filter_map(|result| {
+            result.evidence_ref.as_ref().filter(|reference| result.criterion_id.len() <= MAX_PROJECTED_EXACT_STRING_BYTES && reference.call_id.len() <= MAX_PROJECTED_EXACT_STRING_BYTES && reference.workspace_id.len() <= MAX_PROJECTED_EXACT_STRING_BYTES)
+                .map(|reference| json!({"criterion_id": result.criterion_id, "execution": reference}))
+        }).take(proof_limit).collect::<Vec<_>>(),
+        "evidence_scope": "Recorded validation executions; test coverage and current freshness are not established by this receipt alone.",
         "omitted_item_counts": {
             "changed_paths": omitted_changed_paths,
             "proof_references": omitted_proof_references,
@@ -1378,6 +1419,7 @@ fn task_projection(result: &GetAgentTaskResult) -> JsonValue {
         "attempt_id": task.current_attempt.attempt_id,
         "role": task.assignment.role,
         "attempt_state": task.current_attempt.state,
+        "completion_evidence": task.completion_evidence_summary(),
         "gates": task.gates.iter().map(|gate| json!({
             "kind": gate.kind,
             "status": gate.status,
@@ -2008,8 +2050,17 @@ fn submit_agent_receipt_spec() -> ToolSpec {
             (
                 "evidence",
                 JsonSchema::string(Some(
-                    "Concise evidence supporting the criterion result.".to_string(),
+                    "Optional short explanation when the evidence needs interpretation. Reuse evidence_ref across criteria instead of repeating command results; without a reference the reported outcome remains unverified.".to_string(),
                 )),
+            ),
+            (
+                "evidence_ref",
+                object_schema([
+                    ("call_id", JsonSchema::string(Some("Successful owned validation ID also listed in validation_call_ids.".to_string()))),
+                    ("workspace_id", JsonSchema::string(Some("Workspace identity from this task's assignment.".to_string()))),
+                    ("evidence_epoch", JsonSchema::integer(Some("The validation call's recorded end_epoch.".to_string()))),
+                    ("kind", enum_schema(["validation_execution"], "Execution evidence does not by itself establish test coverage or deployment.")),
+                ], &["call_id", "workspace_id", "evidence_epoch", "kind"]),
             ),
         ],
         &["criterion_id", "status"],
@@ -2304,6 +2355,7 @@ mod projection_tests {
             summary: "full durable receipt ".repeat(2_000),
             criterion_results: (0..100)
                 .map(|index| CriterionResult {
+                    evidence_ref: None,
                     criterion_id: format!("criterion-{index}"),
                     status: CriterionStatus::Passed,
                     evidence: Some("detailed durable criterion evidence ".repeat(20)),
@@ -2346,6 +2398,14 @@ mod projection_tests {
             serde_json::to_value(receipt.assignment_id).expect("assignment id serializes")
         );
         assert_eq!(metadata.essential_inline["criterion_counts"]["total"], 100);
+        assert_eq!(
+            metadata.essential_inline["criterion_counts"]["reported_passed_without_execution_reference"],
+            100
+        );
+        assert_eq!(
+            metadata.essential_inline["criterion_counts"]["with_execution_reference"],
+            0
+        );
         assert_eq!(metadata.essential_inline["evidence_epoch"], 7);
         assert_eq!(
             metadata.essential_inline["sealed_at"],
@@ -2458,11 +2518,13 @@ mod projection_tests {
             summary: "terminal receipt".to_string(),
             criterion_results: vec![
                 CriterionResult {
+                    evidence_ref: None,
                     criterion_id: "criterion-closed".to_string(),
                     status: CriterionStatus::Passed,
                     evidence: Some("proof".to_string()),
                 },
                 CriterionResult {
+                    evidence_ref: None,
                     criterion_id: "criterion-open".to_string(),
                     status: CriterionStatus::NotRun,
                     evidence: None,
@@ -2548,6 +2610,13 @@ mod projection_tests {
                     command_summary: "focused validation one".to_string(),
                     evidence: ValidationEvidence {
                         end_epoch: Some(13),
+                        validation_result: Some(json!({
+                            "argv": ["cargo", "test", "focused-proof"],
+                            "coveredPaths": ["src/lib.rs"],
+                            "callId": "validation-satisfied",
+                            "status": "succeeded",
+                            "durationMs": 1,
+                        })),
                         ..ValidationEvidence::default()
                     },
                     status: ValidationCallStatus::Succeeded,
@@ -2589,6 +2658,12 @@ mod projection_tests {
             "a".repeat(64)
         );
         assert_eq!(projection["receipt"]["evidence_epoch"], 13);
+        assert!(
+            projection["completion_evidence"]
+                .as_str()
+                .expect("completion evidence remains inline")
+                .contains("criterion-closed: reported complete; behavior unverified")
+        );
         assert_eq!(projection["unresolved_gates"].as_array().unwrap().len(), 1);
         assert_eq!(projection["unresolved_gates"][0]["kind"], "review");
         assert_eq!(

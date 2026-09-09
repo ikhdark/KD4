@@ -1,14 +1,16 @@
+use std::cell::OnceCell;
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::hash::Hash;
+use std::hash::Hasher;
 use std::path::Path;
 use std::path::PathBuf;
-use std::process::Command as ProcessCommand;
 use std::sync::Arc;
 use std::sync::Weak;
 use std::time::Duration;
 
-use codex_utils_absolute_path::normalize_for_path_comparison;
 use sha1::digest::Output;
 
 use codex_apply_patch::AppliedPatchChange;
@@ -24,30 +26,57 @@ const DIFF_TIMEOUT: Duration = Duration::from_millis(100);
 struct TrackedContent {
     content: String,
     mode: Option<String>,
-    revision: u64,
+    blob_oid: OnceCell<String>,
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug)]
 struct TrackedPath {
     environment_id: String,
     path: PathBuf,
+    comparison_key: PathBuf,
 }
 
 impl TrackedPath {
     fn new(environment_id: &str, path: &Path) -> Self {
+        let path = normalize_tracked_path(path);
+        #[cfg(windows)]
+        let comparison_key = PathBuf::from(windows_path_comparison_key(path.as_os_str()));
+        #[cfg(not(windows))]
+        let comparison_key = path.clone();
         Self {
             environment_id: environment_id.to_string(),
-            path: normalize_tracked_path(path),
+            path,
+            comparison_key,
         }
     }
 }
 
-#[derive(Eq, Hash, PartialEq)]
-struct DiffCacheKey {
-    left_path: TrackedPath,
-    left_revision: Option<u64>,
-    right_path: TrackedPath,
-    right_revision: Option<u64>,
+impl PartialEq for TrackedPath {
+    fn eq(&self, other: &Self) -> bool {
+        self.environment_id == other.environment_id && self.comparison_key == other.comparison_key
+    }
+}
+
+impl Eq for TrackedPath {}
+
+impl Hash for TrackedPath {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.environment_id.hash(state);
+        self.comparison_key.hash(state);
+    }
+}
+
+impl PartialOrd for TrackedPath {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for TrackedPath {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (&self.environment_id, &self.comparison_key)
+            .cmp(&(&other.environment_id, &other.comparison_key))
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -88,9 +117,12 @@ pub struct TurnDiffTracker {
     baseline_by_path: HashMap<TrackedPath, TrackedContent>,
     current_by_path: HashMap<TrackedPath, TrackedContent>,
     origin_by_current_path: HashMap<TrackedPath, TrackedPath>,
-    next_revision: u64,
     mutation_revision: u64,
-    rendered_diffs: HashMap<DiffCacheKey, Option<String>>,
+    rendered_diffs: BTreeMap<(String, TrackedPath), String>,
+    display_keys: HashMap<TrackedPath, String>,
+    destination_by_origin: HashMap<TrackedPath, TrackedPath>,
+    aggregate_dirty: bool,
+    patch_modes: HashMap<TrackedPath, String>,
     unified_diff: Option<String>,
     last_emitted_unified_diff: Option<String>,
     workspace_evidence_generation_batch:
@@ -107,9 +139,12 @@ impl Default for TurnDiffTracker {
             baseline_by_path: HashMap::new(),
             current_by_path: HashMap::new(),
             origin_by_current_path: HashMap::new(),
-            next_revision: 0,
             mutation_revision: 0,
-            rendered_diffs: HashMap::new(),
+            rendered_diffs: BTreeMap::new(),
+            display_keys: HashMap::new(),
+            destination_by_origin: HashMap::new(),
+            aggregate_dirty: false,
+            patch_modes: HashMap::new(),
             unified_diff: None,
             last_emitted_unified_diff: None,
             workspace_evidence_generation_batch: None,
@@ -180,15 +215,83 @@ impl TurnDiffTracker {
             return;
         }
 
+        let mut changed = HashSet::new();
         for change in delta.changes() {
+            let mut paths = vec![TrackedPath::new(environment_id, &change.path)];
+            if let AppliedPatchFileChange::Update {
+                move_path: Some(path),
+                ..
+            } = &change.change
+            {
+                paths.push(TrackedPath::new(environment_id, path));
+            }
+            for path in &paths {
+                self.collect_diff_partners(path, &mut changed);
+            }
             self.apply_change(environment_id, change);
+            for path in &paths {
+                self.collect_diff_partners(path, &mut changed);
+            }
         }
-        self.refresh_unified_diff();
+        self.refresh_unified_diff(changed);
+        self.patch_modes.clear();
+    }
+
+    pub(crate) fn missing_mode_paths(
+        &self,
+        environment_id: &str,
+        delta: &AppliedPatchDelta,
+    ) -> Vec<PathBuf> {
+        if !self.valid || !delta.is_exact() {
+            return Vec::new();
+        }
+        delta
+            .changes()
+            .iter()
+            .filter_map(|change| {
+                if !matches!(
+                    &change.change,
+                    AppliedPatchFileChange::Delete { .. }
+                        | AppliedPatchFileChange::Update {
+                            move_path: Some(_),
+                            ..
+                        }
+                ) {
+                    return None;
+                }
+                let path = TrackedPath::new(environment_id, &change.path);
+                if self.current_by_path.contains_key(&path)
+                    || self.baseline_by_path.contains_key(&path)
+                    || std::fs::symlink_metadata(&change.path).is_ok()
+                {
+                    return None;
+                }
+                Some(change.path.clone())
+            })
+            .collect()
+    }
+
+    pub(crate) fn set_patch_modes(
+        &mut self,
+        environment_id: &str,
+        modes: HashMap<PathBuf, String>,
+    ) {
+        self.patch_modes = modes
+            .into_iter()
+            .map(|(path, mode)| (TrackedPath::new(environment_id, &path), mode))
+            .collect();
+    }
+
+    pub(crate) fn patch_mode_root(&self, environment_id: &str) -> Option<&Path> {
+        self.display_roots_by_environment
+            .get(environment_id)
+            .map(PathBuf::as_path)
     }
 
     pub fn invalidate(&mut self) {
         self.valid = false;
         self.rendered_diffs.clear();
+        self.aggregate_dirty = false;
         self.unified_diff = None;
     }
 
@@ -247,13 +350,21 @@ impl TurnDiffTracker {
 
     #[cfg(test)]
     pub fn get_unified_diff(&self) -> Option<String> {
-        self.unified_diff.clone()
+        if self.aggregate_dirty {
+            self.flatten_diff()
+        } else {
+            self.unified_diff.clone()
+        }
     }
 
     /// Returns the latest aggregate only when it differs from the last value
     /// returned by this method. An empty string represents a previously
     /// published diff being cleared.
     pub fn take_unified_diff_if_changed(&mut self) -> Option<String> {
+        if self.aggregate_dirty {
+            self.unified_diff = self.flatten_diff();
+            self.aggregate_dirty = false;
+        }
         if self.unified_diff == self.last_emitted_unified_diff {
             return None;
         }
@@ -266,61 +377,77 @@ impl TurnDiffTracker {
         self.mutation_revision = self.mutation_revision.saturating_add(1);
     }
 
-    fn refresh_unified_diff(&mut self) {
-        let rename_pairs = self.rename_pairs();
-        let paired_destinations = rename_pairs.values().cloned().collect::<HashSet<_>>();
-        let mut handled = HashSet::new();
-        let mut paths = self
-            .baseline_by_path
-            .keys()
-            .chain(self.current_by_path.keys())
-            .cloned()
-            .collect::<Vec<_>>();
-        paths.sort_by_key(|path| self.display_path(path));
-        paths.dedup();
+    fn collect_diff_partners(&self, path: &TrackedPath, changed: &mut HashSet<TrackedPath>) {
+        changed.insert(path.clone());
+        if let Some(origin) = self.origin_by_current_path.get(path) {
+            changed.insert(origin.clone());
+        }
+        if let Some(destination) = self.destination_by_origin.get(path) {
+            changed.insert(destination.clone());
+        }
+    }
 
-        let mut previous_diffs = std::mem::take(&mut self.rendered_diffs);
-        let mut rendered_diffs = HashMap::new();
-        let mut aggregated = String::new();
-        for path in paths {
-            if !handled.insert(path.clone()) {
+    fn flatten_diff(&self) -> Option<String> {
+        if self.rendered_diffs.is_empty() {
+            return None;
+        }
+        let mut aggregate =
+            String::with_capacity(self.rendered_diffs.values().map(String::len).sum());
+        for fragment in self.rendered_diffs.values() {
+            aggregate.push_str(fragment);
+        }
+        Some(aggregate)
+    }
+
+    fn refresh_unified_diff(&mut self, changed: HashSet<TrackedPath>) {
+        if changed.is_empty() {
+            return;
+        }
+        for path in changed {
+            let display = match self.display_keys.get(&path) {
+                Some(display) => display.clone(),
+                None => {
+                    let display = self.display_path(&path);
+                    self.display_keys.insert(path.clone(), display.clone());
+                    display
+                }
+            };
+            let key = (display, path.clone());
+            let paired_destination = self
+                .origin_by_current_path
+                .get(&path)
+                .and_then(|origin| self.rename_destination(origin))
+                .is_some();
+            if paired_destination {
+                self.rendered_diffs.remove(&key);
                 continue;
             }
-
-            if paired_destinations.contains(&path) {
-                continue;
-            }
-
-            let (left_path, right_path) = if let Some(dest) = rename_pairs.get(&path) {
-                handled.insert(dest.clone());
-                (&path, dest)
-            } else {
-                (&path, &path)
-            };
-
-            let left_content = self.baseline_by_path.get(left_path);
-            let right_content = self.current_by_path.get(right_path);
-            let key = DiffCacheKey {
-                left_path: left_path.clone(),
-                left_revision: left_content.map(|content| content.revision),
-                right_path: right_path.clone(),
-                right_revision: right_content.map(|content| content.revision),
-            };
-            let rendered = previous_diffs.remove(&key).unwrap_or_else(|| {
-                self.render_diff(left_path, left_content, right_path, right_content)
-            });
-
-            if let Some(diff) = rendered.as_deref() {
-                aggregated.push_str(diff);
-                if !aggregated.ends_with('\n') {
-                    aggregated.push('\n');
+            let right_path = self.rename_destination(&path).unwrap_or(&path);
+            let rendered = self.render_diff(
+                &path,
+                self.baseline_by_path.get(&path),
+                right_path,
+                self.current_by_path.get(right_path),
+            );
+            match rendered {
+                Some(mut fragment) => {
+                    if !fragment.ends_with('\n') {
+                        fragment.push('\n');
+                    }
+                    self.rendered_diffs.insert(key, fragment);
+                }
+                None => {
+                    self.rendered_diffs.remove(&key);
                 }
             }
-            rendered_diffs.insert(key, rendered);
         }
+        self.aggregate_dirty = true;
+    }
 
-        self.rendered_diffs = rendered_diffs;
-        self.unified_diff = (!aggregated.is_empty()).then_some(aggregated);
+    fn remove_origin(&mut self, path: &TrackedPath) -> Option<TrackedPath> {
+        let origin = self.origin_by_current_path.remove(path)?;
+        self.destination_by_origin.remove(&origin);
+        Some(origin)
     }
 
     fn apply_change(&mut self, environment_id: &str, change: &AppliedPatchChange) {
@@ -352,7 +479,7 @@ impl TurnDiffTracker {
     }
 
     fn apply_add(&mut self, path: TrackedPath, content: &str, overwritten_content: Option<&str>) {
-        self.origin_by_current_path.remove(&path);
+        self.remove_origin(&path);
         if !self.current_by_path.contains_key(&path)
             && !self.baseline_by_path.contains_key(&path)
             && let Some(overwritten_content) = overwritten_content
@@ -372,7 +499,7 @@ impl TurnDiffTracker {
             let content = self.tracked_content(&path, content);
             self.baseline_by_path.insert(path.clone(), content);
         }
-        self.origin_by_current_path.remove(&path);
+        self.remove_origin(&path);
     }
 
     fn apply_update(
@@ -403,14 +530,15 @@ impl TurnDiffTracker {
                         .insert(dest_path.clone(), overwritten_move_content);
                 }
                 let origin = self
-                    .origin_by_current_path
-                    .remove(&source_path)
+                    .remove_origin(&source_path)
                     .unwrap_or_else(|| source_path.clone());
                 self.current_by_path.remove(&source_path);
                 let new_content = self.tracked_content(&dest_path, new_content);
                 self.current_by_path.insert(dest_path.clone(), new_content);
-                self.origin_by_current_path.remove(&dest_path);
+                self.remove_origin(&dest_path);
                 if dest_path != origin {
+                    self.destination_by_origin
+                        .insert(origin.clone(), dest_path.clone());
                     self.origin_by_current_path.insert(dest_path, origin);
                 }
             }
@@ -432,31 +560,20 @@ impl TurnDiffTracker {
                     .and_then(|tracked| tracked.mode.clone())
             })
             .or_else(|| self.file_mode(path).map(str::to_owned));
-        let revision = self.next_revision;
-        self.next_revision += 1;
         TrackedContent {
             content: content.to_string(),
             mode,
-            revision,
+            blob_oid: OnceCell::new(),
         }
     }
 
-    fn rename_pairs(&self) -> HashMap<TrackedPath, TrackedPath> {
-        self.origin_by_current_path
-            .iter()
-            .filter_map(|(dest_path, origin_path)| {
-                if dest_path == origin_path
-                    || self.current_by_path.contains_key(origin_path)
-                    || !self.current_by_path.contains_key(dest_path)
-                    || !self.baseline_by_path.contains_key(origin_path)
-                    || self.baseline_by_path.contains_key(dest_path)
-                {
-                    return None;
-                }
-
-                Some((origin_path.clone(), dest_path.clone()))
-            })
-            .collect()
+    fn rename_destination(&self, origin: &TrackedPath) -> Option<&TrackedPath> {
+        let destination = self.destination_by_origin.get(origin)?;
+        (!self.current_by_path.contains_key(origin)
+            && self.current_by_path.contains_key(destination)
+            && self.baseline_by_path.contains_key(origin)
+            && !self.baseline_by_path.contains_key(destination))
+        .then_some(destination)
     }
 
     fn render_diff(
@@ -478,14 +595,18 @@ impl TurnDiffTracker {
 
         let left_display = self.display_path(left_path);
         let right_display = self.display_path(right_path);
-        let left_oid = left_text.map_or_else(
-            || ZERO_OID.to_string(),
-            |content| git_blob_oid(content.as_bytes()),
-        );
-        let right_oid = right_text.map_or_else(
-            || ZERO_OID.to_string(),
-            |content| git_blob_oid(content.as_bytes()),
-        );
+        let left_oid = left_content.map_or(ZERO_OID, |content| {
+            content
+                .blob_oid
+                .get_or_init(|| git_blob_oid(content.content.as_bytes()))
+                .as_str()
+        });
+        let right_oid = right_content.map_or(ZERO_OID, |content| {
+            content
+                .blob_oid
+                .get_or_init(|| git_blob_oid(content.content.as_bytes()))
+                .as_str()
+        });
         let mut diff = format!("diff --git a/{left_display} b/{right_display}\n");
         match (left_content, right_content) {
             (None, Some(_)) => {
@@ -531,7 +652,10 @@ impl TurnDiffTracker {
         Some(diff)
     }
 
-    fn file_mode(&self, path: &TrackedPath) -> Option<&'static str> {
+    fn file_mode(&self, path: &TrackedPath) -> Option<&str> {
+        if let Some(mode) = self.patch_modes.get(path) {
+            return Some(mode.as_str());
+        }
         let filesystem_path = if path.path.is_absolute() {
             path.path.clone()
         } else {
@@ -544,33 +668,17 @@ impl TurnDiffTracker {
                 return Some("120000");
             }
 
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if metadata.is_file() && metadata.permissions().mode() & 0o111 != 0 {
+                    return Some("100755");
+                }
+            }
             return Some(REGULAR_FILE_MODE);
         }
 
-        let root = self
-            .display_roots_by_environment
-            .get(&path.environment_id)?;
-        let relative_path = filesystem_path.strip_prefix(root).ok()?;
-        let output = ProcessCommand::new("git")
-            .arg("-C")
-            .arg(root)
-            .args(["ls-files", "--stage", "--"])
-            .arg(relative_path)
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        match String::from_utf8_lossy(&output.stdout)
-            .split_whitespace()
-            .next()?
-        {
-            "100644" => Some(REGULAR_FILE_MODE),
-            "100755" => Some("100755"),
-            "120000" => Some("120000"),
-            "160000" => Some("160000"),
-            _ => None,
-        }
+        None
     }
 
     #[cfg(test)]
@@ -582,7 +690,7 @@ impl TurnDiffTracker {
         let display = self
             .display_roots_by_environment
             .get(&path.environment_id)
-            .and_then(|root| path.path.strip_prefix(root).ok())
+            .and_then(|root| strip_tracked_root(&path.path, root))
             .unwrap_or(path.path.as_path());
         let display = display.display().to_string().replace('\\', "/");
         if self.display_roots_by_environment.len() > 1 && !path.environment_id.is_empty() {
@@ -593,31 +701,129 @@ impl TurnDiffTracker {
     }
 }
 
-fn normalize_tracked_path(path: &Path) -> PathBuf {
-    let lexical = lexically_normalize_path(path);
-    let normalized = if lexical.is_relative() {
-        lexical
-    } else {
-        normalize_for_path_comparison(&lexical)
-            .unwrap_or_else(|_| normalize_from_existing_ancestor(&lexical).unwrap_or(lexical))
-    };
-
-    PathBuf::from(normalized.to_string_lossy().to_lowercase())
+#[cfg(test)]
+thread_local! {
+    static PATCH_MODE_QUERY_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static GIT_BLOB_HASH_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-fn normalize_from_existing_ancestor(path: &Path) -> Option<PathBuf> {
-    let mut cursor = path;
-    let mut missing = Vec::new();
-    loop {
-        if let Ok(mut normalized) = normalize_for_path_comparison(cursor) {
-            for component in missing.iter().rev() {
-                normalized.push(component);
+pub(crate) async fn resolve_patch_index_modes(
+    root: &Path,
+    paths: Vec<PathBuf>,
+) -> HashMap<PathBuf, String> {
+    let root = normalize_tracked_path(root);
+    let paths = paths
+        .into_iter()
+        .filter_map(|path| {
+            let path = normalize_tracked_path(&path);
+            strip_tracked_root(&path, &root).map(Path::to_path_buf)
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let mut modes = HashMap::new();
+    // Keep both the path count and command-line size bounded on Windows.
+    let mut start = 0;
+    while start < paths.len() {
+        let mut end = start;
+        let mut length = 0;
+        while end < paths.len() && end - start < 64 {
+            let next = paths[end].as_os_str().len() + 3;
+            if end > start && length + next > 16_000 {
+                break;
             }
-            return Some(normalized);
+            length += next;
+            end += 1;
         }
-        missing.push(cursor.file_name()?.to_os_string());
-        cursor = cursor.parent()?;
+        #[cfg(test)]
+        PATCH_MODE_QUERY_COUNT.with(|count| count.set(count.get() + 1));
+        let output = tokio::process::Command::new("git")
+            .arg("--literal-pathspecs")
+            .arg("-C")
+            .arg(&root)
+            .args(["ls-files", "--stage", "-z", "--"])
+            .args(&paths[start..end])
+            .kill_on_drop(true)
+            .output()
+            .await;
+        if let Ok(output) = output
+            && output.status.success()
+        {
+            for record in output.stdout.split(|byte| *byte == 0) {
+                let Some(tab) = record.iter().position(|byte| *byte == b'\t') else {
+                    continue;
+                };
+                let fields = record[..tab]
+                    .split(|byte| *byte == b' ')
+                    .collect::<Vec<_>>();
+                if fields.len() != 3 || fields[2] != b"0" {
+                    continue;
+                }
+                let mode = match fields[0] {
+                    b"100644" => "100644",
+                    b"100755" => "100755",
+                    b"120000" => "120000",
+                    b"160000" => "160000",
+                    _ => continue,
+                };
+                #[cfg(unix)]
+                let path = {
+                    use std::os::unix::ffi::OsStrExt;
+                    PathBuf::from(std::ffi::OsStr::from_bytes(&record[tab + 1..]))
+                };
+                #[cfg(not(unix))]
+                let path = match std::str::from_utf8(&record[tab + 1..]) {
+                    Ok(path) => PathBuf::from(path),
+                    Err(_) => continue,
+                };
+                modes.insert(root.join(path), mode.to_owned());
+            }
+        }
+        start = end;
     }
+    modes
+}
+
+fn normalize_tracked_path(path: &Path) -> PathBuf {
+    lexically_normalize_path(dunce::simplified(path))
+}
+
+#[cfg(windows)]
+fn windows_path_comparison_key(path: &std::ffi::OsStr) -> std::ffi::OsString {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    // Retain Windows case aliases without converting invalid native units to U+FFFD.
+    let mut folded = Vec::new();
+    for character in char::decode_utf16(path.encode_wide()) {
+        match character {
+            Ok(character) => {
+                for lower in character.to_lowercase() {
+                    folded.extend_from_slice(lower.encode_utf16(&mut [0; 2]));
+                }
+            }
+            Err(error) => folded.push(error.unpaired_surrogate()),
+        }
+    }
+    std::ffi::OsString::from_wide(&folded)
+}
+
+fn strip_tracked_root<'a>(path: &'a Path, root: &Path) -> Option<&'a Path> {
+    if let Ok(relative) = path.strip_prefix(root) {
+        return Some(relative);
+    }
+    #[cfg(windows)]
+    {
+        let mut components = path.components();
+        for root_component in root.components() {
+            if windows_path_comparison_key(components.next()?.as_os_str())
+                != windows_path_comparison_key(root_component.as_os_str())
+            {
+                return None;
+            }
+        }
+        return Some(components.as_path());
+    }
+    #[cfg(not(windows))]
+    None
 }
 
 fn lexically_normalize_path(path: &Path) -> PathBuf {
@@ -1357,6 +1563,8 @@ fn shell_filter_tokens(command: &str) -> Vec<String> {
 }
 
 fn git_blob_oid(data: &[u8]) -> String {
+    #[cfg(test)]
+    GIT_BLOB_HASH_COUNT.with(|count| count.set(count.get() + 1));
     format!("{:x}", git_blob_sha1_hex_bytes(data))
 }
 

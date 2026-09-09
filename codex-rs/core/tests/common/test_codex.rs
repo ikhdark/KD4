@@ -186,6 +186,9 @@ pub fn turn_permission_fields(
     (sandbox_policy, Some(permission_profile))
 }
 
+/// Builds a real session, router, and temporary workspace/home against a supplied
+/// mock model transport. Explicit hooks can replace auth, time, or environmental
+/// services; scenarios must describe those overrides and retain the behavior under test.
 pub struct TestCodexBuilder {
     config_mutators: Vec<Box<ConfigMutator>>,
     auth: CodexAuth,

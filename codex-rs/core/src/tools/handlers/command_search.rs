@@ -1,7 +1,11 @@
+#[cfg(windows)]
 use std::fs::File;
 use std::io;
 use std::path::Path;
 use std::path::PathBuf;
+use std::time::Duration;
+use std::time::Instant;
+use tokio_util::sync::CancellationToken;
 
 use sha2::Digest;
 use sha2::Sha256;
@@ -32,12 +36,23 @@ pub(crate) struct RgSearchNarrowing {
     pub(crate) can_record_miss: bool,
 }
 
+#[cfg(test)]
 pub(crate) fn classify_rg_search_narrowing(
     command: &[String],
     shell_type: Option<ShellType>,
     cwd: &Path,
     repository_root: &Path,
 ) -> Result<Option<RgSearchNarrowing>, String> {
+    classify_rg_search_with_repository(command, shell_type, cwd, || repository_root.to_path_buf())
+        .map(|search| search.map(|(_, search)| search))
+}
+
+pub(crate) fn classify_rg_search_with_repository(
+    command: &[String],
+    shell_type: Option<ShellType>,
+    cwd: &Path,
+    repository_root: impl FnOnce() -> PathBuf,
+) -> Result<Option<(PathBuf, RgSearchNarrowing)>, String> {
     let commands = match rg_argv_commands(command, shell_type) {
         Ok(commands) => commands,
         Err(_) => return Ok(None),
@@ -54,7 +69,7 @@ pub(crate) fn classify_rg_search_narrowing(
     if rg_commands.is_empty() {
         return Ok(None);
     }
-    let repository_root = normalized_search_path(repository_root);
+    let repository_root = normalized_search_path(&repository_root());
     let mut query_identities = Vec::new();
     let mut search_identities = Vec::new();
     let mut all_targets = Vec::new();
@@ -109,25 +124,54 @@ pub(crate) fn classify_rg_search_narrowing(
     let scope_identity = path_scope_identity(&all_targets);
     let parent_scope_identity = parent_scope_identity(&all_targets, &repository_root);
     let state_paths = search_state_paths(&all_targets, &explicit_ignore_files, &repository_root);
-    Ok(Some(RgSearchNarrowing {
-        breadth: if repository_wide {
-            RgSearchBreadth::Broad
-        } else {
-            RgSearchBreadth::Narrow
+    Ok(Some((
+        repository_root,
+        RgSearchNarrowing {
+            breadth: if repository_wide {
+                RgSearchBreadth::Broad
+            } else {
+                RgSearchBreadth::Narrow
+            },
+            query_identity: query_identities.join("\u{1f}"),
+            search_identity: search_identities.join("\u{1f}"),
+            scope_identity,
+            parent_scope_identity,
+            scope_state_identity: None,
+            state_paths,
+            // A compound process exit code cannot be attributed to its rg command.
+            // Following symlinks would require snapshotting content outside the
+            // classified target paths, so those searches remain retryable.
+            can_record_miss: commands.len() == 1
+                && rg_commands.len() == 1
+                && !rg_commands.iter().any(|argv| rg_follows_links(argv)),
         },
-        query_identity: query_identities.join("\u{1f}"),
-        search_identity: search_identities.join("\u{1f}"),
-        scope_identity,
-        parent_scope_identity,
-        scope_state_identity: None,
-        state_paths,
-        // A compound process exit code cannot be attributed to its rg command.
-        // Following symlinks would require snapshotting content outside the
-        // classified target paths, so those searches remain retryable.
-        can_record_miss: commands.len() == 1
-            && rg_commands.len() == 1
-            && !rg_commands.iter().any(|argv| rg_follows_links(argv)),
-    }))
+    )))
+}
+
+// This optional cache must not turn a cheap search into an unbounded filesystem scan.
+const SEARCH_SNAPSHOT_MAX_ENTRIES: usize = 512;
+const SEARCH_SNAPSHOT_TIMEOUT: Duration = Duration::from_millis(10);
+
+struct SearchSnapshotBudget {
+    remaining: usize,
+    deadline: Instant,
+    cancellation: CancellationToken,
+}
+
+impl SearchSnapshotBudget {
+    fn check(&mut self) -> io::Result<()> {
+        if self.remaining == 0
+            || Instant::now() >= self.deadline
+            || self.cancellation.is_cancelled()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "search snapshot budget exhausted",
+            ));
+        }
+        self.remaining -= 1;
+        Ok(())
+    }
 }
 
 pub(crate) async fn observe_rg_search_scope_state(search: &mut RgSearchNarrowing) {
@@ -135,9 +179,16 @@ pub(crate) async fn observe_rg_search_scope_state(search: &mut RgSearchNarrowing
         return;
     }
     let state_paths = search.state_paths.clone();
+    let cancellation = CancellationToken::new();
+    let _cancel_on_drop = cancellation.clone().drop_guard();
+    let mut budget = SearchSnapshotBudget {
+        remaining: SEARCH_SNAPSHOT_MAX_ENTRIES,
+        deadline: Instant::now() + SEARCH_SNAPSHOT_TIMEOUT,
+        cancellation,
+    };
     search.scope_state_identity = tokio::task::spawn_blocking(move || {
-        let first = capture_search_scope_state(&state_paths)?;
-        let second = capture_search_scope_state(&state_paths)?;
+        let first = capture_search_scope_state(&state_paths, &mut budget)?;
+        let second = capture_search_scope_state(&state_paths, &mut budget)?;
         (first == second).then_some(first)
     })
     .await
@@ -211,41 +262,68 @@ fn rg_follows_links(argv: &[String]) -> bool {
     })
 }
 
-fn capture_search_scope_state(paths: &[PathBuf]) -> Option<String> {
+fn capture_search_scope_state(
+    paths: &[PathBuf],
+    budget: &mut SearchSnapshotBudget,
+) -> Option<String> {
     let mut hasher = Sha256::new();
-    hasher.update(b"kd4-rg-scope-state-v1\0");
+    hasher.update(b"kd4-rg-scope-state-v2\0");
+    let mut covered_directories = Vec::new();
+    let mut symlinks = Vec::new();
     for path in paths {
-        hash_scope_path(&mut hasher, path).ok()?;
+        // Coverage is established only by a completed traversal of a real directory.
+        // Missing paths and symlinks must never cover their descendants.
+        if covered_directories
+            .iter()
+            .any(|root: &PathBuf| path.starts_with(root))
+            && !symlinks
+                .iter()
+                .any(|link: &PathBuf| path != link && path.starts_with(link))
+        {
+            continue;
+        }
+        if hash_scope_path(&mut hasher, path, budget, &mut symlinks).ok()? {
+            covered_directories.push(path.clone());
+        }
     }
     Some(format!("{:x}", hasher.finalize()))
 }
 
-fn hash_scope_path(hasher: &mut Sha256, path: &Path) -> io::Result<()> {
+fn hash_scope_path(
+    hasher: &mut Sha256,
+    path: &Path,
+    budget: &mut SearchSnapshotBudget,
+    symlinks: &mut Vec<PathBuf>,
+) -> io::Result<bool> {
+    budget.check()?;
     hash_path_field(hasher, path);
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             hasher.update(b"missing\0");
-            return Ok(());
+            return Ok(false);
         }
         Err(error) => return Err(error),
     };
     let file_type = metadata.file_type();
     if file_type.is_symlink() {
+        symlinks.push(path.to_path_buf());
         hasher.update(b"symlink\0");
         hash_path_field(hasher, &std::fs::read_link(path)?);
-        return Ok(());
+        return Ok(false);
     }
     if file_type.is_dir() {
         hasher.update(b"directory\0");
-        let mut entries = std::fs::read_dir(path)?
-            .map(|entry| entry.map(|entry| entry.path()))
-            .collect::<io::Result<Vec<_>>>()?;
+        let mut entries = Vec::new();
+        for entry in std::fs::read_dir(path)? {
+            budget.check()?;
+            entries.push(entry?.path());
+        }
         entries.sort_unstable();
         for entry in entries {
-            hash_scope_path(hasher, &entry)?;
+            hash_scope_path(hasher, &entry, budget, symlinks)?;
         }
-        return Ok(());
+        return Ok(true);
     }
     if !file_type.is_file() {
         return Err(io::Error::new(
@@ -254,7 +332,11 @@ fn hash_scope_path(hasher: &mut Sha256, path: &Path) -> io::Result<()> {
         ));
     }
     hasher.update(b"file\0");
-    hash_trusted_file_token(hasher, &File::open(path)?, &metadata)
+    #[cfg(windows)]
+    hash_trusted_file_token(hasher, &File::open(path)?, &metadata)?;
+    #[cfg(not(windows))]
+    hash_trusted_file_token(hasher, &metadata)?;
+    Ok(false)
 }
 
 #[cfg(windows)]
@@ -349,11 +431,7 @@ fn hash_trusted_file_token(
 }
 
 #[cfg(unix)]
-fn hash_trusted_file_token(
-    hasher: &mut Sha256,
-    _file: &File,
-    metadata: &std::fs::Metadata,
-) -> io::Result<()> {
+fn hash_trusted_file_token(hasher: &mut Sha256, metadata: &std::fs::Metadata) -> io::Result<()> {
     use std::os::unix::fs::MetadataExt;
 
     hasher.update(metadata.len().to_le_bytes());
@@ -368,11 +446,7 @@ fn hash_trusted_file_token(
 }
 
 #[cfg(not(any(unix, windows)))]
-fn hash_trusted_file_token(
-    hasher: &mut Sha256,
-    _file: &File,
-    metadata: &std::fs::Metadata,
-) -> io::Result<()> {
+fn hash_trusted_file_token(hasher: &mut Sha256, metadata: &std::fs::Metadata) -> io::Result<()> {
     let modified = metadata
         .modified()?
         .duration_since(std::time::UNIX_EPOCH)

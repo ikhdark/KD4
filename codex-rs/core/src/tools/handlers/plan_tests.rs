@@ -3,10 +3,9 @@ use crate::session::step_context::StepContext;
 use crate::session::tests::make_session_and_context_with_rx;
 use crate::tools::context::ToolCallSource;
 use crate::tools::parallel::ToolCallRuntime;
-use crate::tools::registry::CoreToolRuntime;
-use crate::tools::registry::ToolRegistry;
 use crate::tools::router::ToolCall;
 use crate::tools::router::ToolRouter;
+use crate::tools::router::ToolRouterParams;
 use crate::turn_diff_tracker::TurnDiffTracker;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::ResponseInputItem;
@@ -15,7 +14,6 @@ use codex_protocol::plan_tool::StepStatus;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::time::Duration;
-use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
 fn plan_update_args(step: &str, status: StepStatus) -> UpdatePlanArgs {
@@ -266,11 +264,6 @@ async fn update_plan_rejects_unknown_arguments_at_runtime() {
     );
 }
 
-#[test]
-fn update_plan_waits_for_runtime_cancellation_commit_cleanup() {
-    assert!(PlanHandler.waits_for_runtime_cancellation());
-}
-
 #[tokio::test]
 async fn cancellation_before_plan_commit_does_not_emit_plan_update() {
     let (session, turn, events) = make_session_and_context_with_rx().await;
@@ -317,12 +310,20 @@ async fn cancellation_after_plan_commit_boundary_waits_for_session_update() {
     let (session, turn, events) = make_session_and_context_with_rx().await;
     let call_id = "cancelled-after-plan-commit-boundary";
     let hook = PlanCommitBoundaryHook::install(call_id);
-    let handler = Arc::new(PlanHandler) as Arc<dyn CoreToolRuntime>;
-    let router = Arc::new(ToolRouter::from_parts(
-        ToolRegistry::from_tools([handler]),
-        Vec::new(),
+    let step_context = StepContext::for_test(Arc::clone(&turn));
+    let router = Arc::new(ToolRouter::from_context(
+        step_context.as_ref(),
+        ToolRouterParams {
+            tool_suggest_candidates: None,
+            deferred_mcp_tools: None,
+            mcp_tools: None,
+            extension_tool_executors: Vec::new(),
+            dynamic_tools: &[],
+            exposure_identity: Default::default(),
+        },
+        &Default::default(),
     ));
-    let step_context = StepContext::for_test(Arc::clone(&turn)).with_tool_router_for_test(router);
+    assert!(step_context.set_tool_router(router).is_ok());
     let runtime = ToolCallRuntime::new(
         Arc::clone(&session),
         step_context,
@@ -339,51 +340,71 @@ async fn cancellation_after_plan_commit_boundary_waits_for_session_update() {
             ),
         },
     };
-    let mut response_task =
-        tokio::spawn(runtime.handle_tool_call(call, cancellation_token.clone()));
-    timeout(Duration::from_secs(2), hook.wait_until_reached())
+    let response_task = runtime.handle_tool_call(call, cancellation_token.clone());
+    tokio::pin!(response_task);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    tokio::time::timeout_at(deadline, async {
+        tokio::select! {
+            _ = hook.wait_until_reached() => {},
+            result = &mut response_task => panic!("plan returned before commit boundary: {result:?}"),
+        }
+    })
         .await
         .expect("plan handler should reach its commit boundary");
 
     cancellation_token.cancel();
+    tokio::time::timeout_at(deadline, async {
+        tokio::select! {
+            _ = hook.cancellation_observed.notified() => {},
+            result = &mut response_task => panic!("plan returned before cancellation cleanup: {result:?}"),
+        }
+    })
+    .await
+    .expect("real runtime cancellation should reach the admitted handler");
     assert!(
-        timeout(Duration::from_millis(50), &mut response_task)
-            .await
-            .is_err(),
+        futures::poll!(&mut response_task).is_pending(),
         "runtime cancellation must wait for commit cleanup"
     );
     hook.release();
 
-    let response = timeout(Duration::from_secs(2), &mut response_task)
+    let response = tokio::time::timeout_at(deadline, &mut response_task)
         .await
         .expect("cancelled plan call should finish after commit")
-        .expect("plan response task should join")
         .expect("plan runtime should return a response");
-    let ResponseInputItem::FunctionCallOutput { output, .. } = response else {
+    let ResponseInputItem::FunctionCallOutput {
+        call_id: response_id,
+        output,
+    } = response
+    else {
         panic!("cancelled plan tool should return function output");
     };
+    assert_eq!(response_id, call_id);
     let FunctionCallOutputBody::Text(text) = output.body else {
         panic!("cancelled plan tool output should be text");
     };
     assert!(text.contains("aborted by user"));
 
-    let plan_update = timeout(Duration::from_secs(2), async {
-        loop {
-            let event = events
-                .recv()
-                .await
-                .expect("event channel should remain open");
-            if let EventMsg::PlanUpdate(update) = event.msg {
-                break update;
-            }
+    let mut updates = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if let EventMsg::PlanUpdate(update) = event.msg {
+            assert_eq!(event.id, turn.sub_id);
+            updates.push(update);
         }
-    })
-    .await
-    .expect("plan update event should be emitted before cancellation completes");
+    }
     assert_eq!(
-        plan_update.plan[0].step,
-        "Commit this plan before returning cancellation"
+        updates.len(),
+        1,
+        "exactly one update must already exist at response completion"
     );
+    let plan_update = &updates[0];
+    assert_eq!(
+        plan_update.plan,
+        vec![PlanItemArg {
+            step: "Commit this plan before returning cancellation".to_string(),
+            status: StepStatus::Pending,
+        }]
+    );
+    assert_eq!(plan_update.explanation, None);
     let stored = session
         .services
         .plan_store

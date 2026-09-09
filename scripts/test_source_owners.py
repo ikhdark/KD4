@@ -14,6 +14,61 @@ from scripts.generated_output_lock import source_map_lock  # noqa: E402
 
 
 class SourceOwnersTest(unittest.TestCase):
+    def test_slice_scopes_freshness_and_reports_warm_reads(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in ("selected.rs", "incoming.rs", "unrelated.rs"):
+                (root / name).write_bytes(name.encode())
+            manifest = {"owners": [
+                {"id": "selected", "primary_entries": [{"path": "selected.rs", "symbol": "selected"}]},
+                {"id": "incoming", "relationships": [{
+                    "category": "callers_consumers", "kind": "calls",
+                    "target": "owner:selected", "confidence": "declared",
+                    "evidence": [{"path": "incoming.rs"}],
+                }]},
+                {"id": "unrelated", "primary_entries": [{"path": "unrelated.rs", "symbol": "unrelated"}]},
+            ]}
+            source_owners._snapshot_cache.clear()
+            source_owners._snapshot_cache_bytes = 0
+            original_read = Path.read_bytes
+            reads = []
+
+            def read(path):
+                content = original_read(path)
+                reads.append((path.name, len(content)))
+                return content
+
+            def capture(digest="manifest"):
+                reads.clear()
+                with mock.patch.object(Path, "read_bytes", read), mock.patch.object(
+                    source_owners, "_supporting_source_digest",
+                    side_effect=AssertionError("slice hashed the whole graph"),
+                ):
+                    result = source_owners.architecture_slice(manifest, digest, root, ["selected"])
+                self.assertEqual({name for name, _ in reads}, {"selected.rs", "incoming.rs"})
+                self.assertEqual(result["metrics"]["files_read"] - 1, len(reads))
+                self.assertEqual(result["metrics"]["bytes_read"], sum(size for _, size in reads))
+                self.assertTrue(result["snapshot"].startswith("slice-v2:selected:"))
+                return result["snapshot"]
+
+            cold = capture()
+            self.assertEqual(cold, capture())
+            (root / "unrelated.rs").write_bytes(b"unrelated edit")
+            self.assertEqual(cold, capture())
+            (root / "incoming.rs").write_bytes(b"changed caller")
+            incoming = capture()
+            self.assertNotEqual(cold, incoming)
+            (root / "selected.rs").write_bytes(b"changed implementation")
+            selected = capture()
+            self.assertNotEqual(incoming, selected)
+            self.assertNotEqual(selected, capture("changed manifest"))
+            index = root / "architecture_index.json"
+            index.write_text(source_owners.expected_architecture_index(manifest, "manifest", root), encoding="utf-8")
+            with mock.patch.object(source_owners, "_supporting_source_digest", side_effect=AssertionError("index load hashed unrelated sources")):
+                loaded = source_owners.load_architecture_index(index, "manifest", root, refresh_sources=False)
+            self.assertIsNotNone(loaded)
+            self.assertIsNone(loaded["repository_revision"])
+
     def test_list_command_exposes_valid_owner_ids_before_slice(self) -> None:
         argv = [
             "source_owners.py",
@@ -417,7 +472,7 @@ primary_entries = [{ path = "source.rs", symbol = "locate" }]
             first = source_owners._slice_source_snapshot(root, graph, owners)
             warm = source_owners._slice_source_snapshot(root, graph, owners)
             self.assertEqual(first[0], warm[0])
-            self.assertEqual(warm[1:], (0, 0))
+            self.assertEqual(warm[1:], (1, len(b"first")))
 
             timestamps = source.stat()
             source.write_bytes(b"other")
@@ -608,6 +663,9 @@ evidence = [{ path = "src/lib.rs", symbol = "locate" }]
             root = Path(directory)
             (root / "src").mkdir()
             (root / "src" / "lib.rs").write_text("fn locate() {}\n", encoding="utf-8")
+            (root / "src" / "effect.rs").write_text(
+                "fn submitted_write_changes_file() {}\n", encoding="utf-8"
+            )
             manifest_path = root / "source_owners.toml"
             manifest_path.write_text(
                 """schema_version = 2
@@ -615,7 +673,7 @@ evidence = [{ path = "src/lib.rs", symbol = "locate" }]
 id = "alpha"
 roots = ["src"]
 primary_entries = [{ path = "src/lib.rs", symbol = "locate" }]
-tests = ["src/lib.rs"]
+tests = ["src/lib.rs", "src/effect.rs"]
 [owners.facet_exclusions]
 callers_and_consumers = "No external consumer in this fixture."
 configuration_and_gates = "No configuration in this fixture."
@@ -626,18 +684,53 @@ kind = "calls"
 target = "path:src/lib.rs"
 confidence = "compiler_resolved"
 evidence = [{ path = "src/lib.rs", symbol = "locate" }]
+[[owners.relationships]]
+category = "tests_contracts"
+kind = "validated_by"
+target = "path:src/effect.rs"
+confidence = "declared"
+evidence = [{ path = "src/effect.rs", symbol = "submitted_write_changes_file" }]
 [[owners.invariants]]
 id = "stable"
 kind = "semantic"
-statement = "Stable."
+statement = "A submitted write changes the consumer's file."
 evidence = [{ path = "src/lib.rs", symbol = "locate" }]
-tests = ["src/lib.rs"]
+tests = ["src/effect.rs"]
+[[owners.validation]]
+id = "effect-test"
+cwd = "."
+argv = ["cargo", "test", "submitted_write_changes_file"]
+role = "focused_tests"
 """,
                 encoding="utf-8",
             )
             manifest, digest = source_owners.load_and_validate(manifest_path, root)
 
-            slice_ = source_owners.architecture_slice(manifest, digest, root, ["alpha"])
+            with (
+                mock.patch.object(
+                    sys, "argv", [
+                        "source_owners.py", "slice", "--owner", "alpha",
+                        "--focus", "lib", "--manifest", str(manifest_path),
+                        "--repo-root", str(root),
+                    ]
+                ),
+                mock.patch("builtins.print") as emit,
+            ):
+                self.assertEqual(source_owners.main(), 0)
+            slice_ = json.loads(emit.call_args.args[0])
+            scenario = slice_["tests_and_contracts"]["representative_scenario"]
+            self.assertEqual(scenario["target"], "path:src/effect.rs")
+            self.assertEqual(
+                scenario["evidence"], "src/effect.rs::submitted_write_changes_file"
+            )
+            self.assertEqual(
+                scenario["behavioral_contracts"],
+                ["A submitted write changes the consumer's file."],
+            )
+            self.assertEqual(
+                slice_["tests_and_contracts"]["focused_validation"][0]["argv"],
+                ["cargo", "test", "submitted_write_changes_file"],
+            )
 
             self.assertEqual(slice_["material_unknowns"], [])
             self.assertFalse(slice_["truncated"])

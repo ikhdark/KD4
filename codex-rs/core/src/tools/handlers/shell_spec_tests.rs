@@ -113,7 +113,7 @@ fn exec_command_tool_matches_expected_spec() {
     });
 
     let description = format!(
-        "Runs a command in a PTY, returning output or a session ID for ongoing interaction.{}",
+        "Runs a command, returning output or a session ID for ongoing interaction. Omit redundant defaults such as tty: false, force_fresh: false, yield_time_ms: 2000, and absent optional metadata. Keep explicit workdir, environment, validation, permissions, and login: false when they affect the invocation; omitted login follows configuration. For commands needing no shell interpretation, use program and args (kind: argv) instead of subprocess launchers or quoting wrappers. Use kind: powershell_script with script_body for PowerShell semantics. Keep pipelines, redirections, and shell expansion in script form.{}",
         exec_command_guidance_description()
     );
 

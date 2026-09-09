@@ -137,7 +137,7 @@ flowchart LR
     PROTOCOL --> SDK["TypeScript and Python SDKs"]
     PROTOCOL --> DESKTOP["Codex Desktop client"]
     CLI --> PUBLISH["Local build and publish"]
-    PUBLISH --> LOCAL["LOCAL-KD/codex.exe"]
+    PUBLISH --> LOCAL["LOCAL-KD/bin/codex.exe"]
     LOCAL --> DESKTOP
 ```
 
@@ -390,8 +390,18 @@ owner must trace every reader and writer before completion.
 | KD4 audits, evaluation, and measurement     | `scripts/kd4_sync_audit.py`, `scripts/kd4_model_attempt_analysis.py`, `scripts/kd4_perf_snapshot.py`, `scripts/investigation_evidence_smoke.py`, `scripts/investigation_eval` | matching fixture/unit test; keep audits non-mutating and distinguish measured subprocess wall time from startup-only timing, test duration, estimates, and stale binaries     |
 | Runtime binary selection proof              | `scripts/vscode_runtime_proof.py`                                                                                                                                             | read-only path, version, and environment evidence; binary replacement remains owned by the explicit publish/update flow                                                       |
 
-The expected installed target is
-`C:\Users\kuh\Desktop\LOCAL-KD\codex.exe`. Source edits do not hot-apply to the
+Capability verifications in `kd4_features.toml` select exact named Rust gates.
+The existing runner groups compatible gates, verifies their required test IDs,
+prepares the union of declared helpers once, and checks completed test results.
+A gate step may declare a smaller `helpers` list for its fixed scenario; an
+empty list requires no runtime helpers. Missing required artifacts fail the
+run. Python capability selectors share one unittest process per interpreter.
+`--static-only` checks references without claiming that runtime tests passed.
+Directive-based validation authorization is inactive in production; test-only
+activation does not establish enforcement in ordinary sessions.
+
+The default installed target, unless explicitly overridden, is
+`C:\Users\kuh\Desktop\LOCAL-KD\bin\codex.exe`. Source edits do not hot-apply to the
 installed Desktop app. Unless the task explicitly includes local publish and
 restart, report that `just publish-local-codex-final` and a Desktop restart
 remain required.

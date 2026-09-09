@@ -30,6 +30,12 @@ struct PromptContract {
 
 const PROMPT_CONTRACTS: &[PromptContract] = &[
     PromptContract {
+        id: "avoid-overengineering",
+        scope: PromptScope::LocalPolicyAndFallback,
+        expectation: AnchorExpectation::All,
+        anchors: &["Do not over-engineer implementations."],
+    },
+    PromptContract {
         id: "nearest-sufficient-completion",
         scope: PromptScope::FallbackAndBundled,
         expectation: AnchorExpectation::Any,
@@ -114,9 +120,8 @@ const PROMPT_CONTRACTS: &[PromptContract] = &[
         anchors: &[
             "Read every applicable AGENTS.md",
             "Resolve conflicts by authority and scope",
-            "Ask only when evidence leaves choices",
-            "choose a safe, reversible option",
-            "finish or persist does not expand authorization",
+            "autonomous within the requested scope",
+            "Ask questions when clarity is needed.",
         ],
     },
     PromptContract {
@@ -128,8 +133,12 @@ const PROMPT_CONTRACTS: &[PromptContract] = &[
             "direct callers and consumers",
             "duplicate or generated representations",
             "Resolve each category with a source location or scoped search showing no match",
-            "Test at the narrowest stable boundary",
-            "actually executes at least one relevant test through the changed path",
+            "normal entry point, input, expected observable result",
+            "one plausible incorrect implementation the test would reject",
+            "never copy the production algorithm",
+            "never manually connect the wiring being proved",
+            "Missing prerequisites mean unverified",
+            "Prompt-content checks prove wording or delivery, not model obedience.",
             "Do not claim completion",
         ],
     },
@@ -228,6 +237,7 @@ fn prompts_for_scope(scope: PromptScope, response: &ModelsResponse) -> Vec<(Stri
 
 #[test]
 fn resolved_prompts_satisfy_named_contract_registry() {
+    // This checks authored wording after resolution, not whether an agent obeys it.
     let response = crate::bundled_models_response().expect("bundled models.json should parse");
     assert!(!response.models.is_empty());
 

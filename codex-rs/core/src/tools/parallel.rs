@@ -1868,6 +1868,7 @@ impl ToolCallRuntime {
         let supports_parallel = router.tool_supports_parallel(&call);
         let wait_for_runtime_cancellation = router.tool_waits_for_runtime_cancellation(&call);
         let owns_unified_exec_processes = router.tool_owns_unified_exec_processes(&call);
+        let requires_commit_barrier = router.tool_cancellation_requires_commit_barrier(&call);
         let router = Arc::clone(router);
         let session = Arc::clone(&self.session);
         let step_context = Arc::clone(&self.step_context);
@@ -2174,10 +2175,11 @@ impl ToolCallRuntime {
                                 call.tool_name.clone(),
                                 Arc::clone(&cancellation_timing),
                             );
-                            if owns_unified_exec_processes {
+                            if owns_unified_exec_processes || requires_commit_barrier {
                                 // A retained exec process is part of the turn's terminal
                                 // ownership barrier. Do not publish TurnAborted until the
                                 // originating handler and its process registry entry close.
+                                // State commits likewise publish their update before the response.
                                 cleanup.await;
                             } else {
                                 // Other runtimes retain their owned dispatch future in a

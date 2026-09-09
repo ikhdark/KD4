@@ -223,3 +223,113 @@ tests = [
   "suite::rmcp_client::streamable_http_tool_call_round_trip",
   "suite::rmcp_client::streamable_http_with_oauth_round_trip",
 ]
+
+
+# Capability checks reuse exact gates. Helpers on a step override the target's
+# conservative defaults only for that fixed proof. An omitted list inherits
+# the defaults; an explicit empty list is a library-only proof.
+[helpers.codex-app-server]
+package = "codex-app-server"
+bin = "codex-app-server"
+
+[targets.extension_registry]
+package = "codex-extension-api"
+test = "registry"
+helpers = []
+
+[targets.shell_command_lib]
+package = "codex-shell-command"
+lib = true
+helpers = []
+
+[targets.app_server_initialize]
+package = "codex-app-server"
+test = "all"
+helpers = ["codex-app-server", "codex-code-mode-host"]
+
+[targets.cli_bin]
+package = "codex-cli"
+bin = "codex"
+helpers = []
+
+[targets.agent_task_store_lib]
+package = "codex-agent-task-store"
+lib = true
+helpers = []
+
+[gates.capability-extension-boundary-core]
+description = "Reuse ToolContributor, ToolLifecycleContributor, and ContextContributor before adding KD4-only hooks."
+[[gates.capability-extension-boundary-core.steps]]
+target = "extension_registry"
+tests = ["build_round_trips_every_contributor_category"]
+helpers = []
+
+[gates.capability-structured-command-execution]
+description = "Script and argv command shapes with untagged legacy compatibility; explicitly tagged legacy input is rejected."
+[[gates.capability-structured-command-execution.steps]]
+target = "core_lib"
+tests = ["tools::handlers::command_shape::command_shape_tests::tagged_script_is_canonical_and_tagged_legacy_is_rejected"]
+helpers = []
+
+[gates.capability-command-preflight]
+description = "Active preflight with one bounded read-only equivalent repair and rejection-only mutating commands."
+[[gates.capability-command-preflight.steps]]
+target = "core_lib"
+tests = ["tools::handlers::command_preflight::command_preflight_tests::never_repairs_mutating_command_flag_typos"]
+helpers = []
+
+[gates.capability-shell-output-summary]
+description = "Bounded failure-focused output on classic and unified execution paths."
+[[gates.capability-shell-output-summary.steps]]
+target = "core_lib"
+tests = ["tools::shell_output_summary::tests::failed_output_keeps_exact_error_lines"]
+helpers = []
+
+[gates.capability-command-attempt-ledger]
+description = "Session-bounded command fingerprints with repair accounting and third-identical-failure prevention."
+[[gates.capability-command-attempt-ledger.steps]]
+target = "core_lib"
+tests = ["tools::command_execution::tests::input_state_determined_failure_blocks_exact_retry_but_freshness_bypasses"]
+helpers = []
+
+[gates.capability-command-output-artifacts]
+description = "Addressable full raw command output streamed before bounded transcript retention or model summarization, including background completion."
+[[gates.capability-command-output-artifacts.steps]]
+target = "core_lib"
+tests = ["tools::handlers::unified_exec::tests::foreground_output_artifact_retains_bytes_beyond_transcript_cap"]
+helpers = ["codex", "codex-code-mode-host", "codex-windows-sandbox-setup", "codex-command-runner"]
+
+[gates.capability-preferred-powershell-host]
+description = "Explicit PowerShell paths win, otherwise pwsh is preferred with Windows PowerShell compatibility fallback."
+[[gates.capability-preferred-powershell-host.steps]]
+target = "shell_command_lib"
+tests = ["shell_detect::tests::powershell_resolver_prefers_pwsh_then_compatibility_host"]
+helpers = []
+
+[gates.capability-app-server-runtime-provenance]
+description = "Build, install, runtime, and KD4 watermark metadata at initialization."
+[[gates.capability-app-server-runtime-provenance.steps]]
+target = "app_server_initialize"
+tests = ["suite::v2::initialize::initialize_response_includes_local_runtime_metadata"]
+helpers = ["codex-app-server", "codex-code-mode-host"]
+
+[gates.capability-tool-search-routing]
+description = "Cached and diversified discovery of deferred core and extension tools."
+[[gates.capability-tool-search-routing.steps]]
+target = "core_lib"
+tests = ["tools::spec_plan::tests::tool_search_cache_rebuilds_when_deferred_sources_change"]
+helpers = []
+
+[gates.capability-config-explain]
+description = "Human-readable configuration reference exposed through codex config explain."
+[[gates.capability-config-explain.steps]]
+target = "cli_bin"
+tests = ["tests::config_explain_parses_optional_filter"]
+helpers = []
+
+[gates.capability-shared-worktree-reliability]
+description = "Nonblocking workspace revision and path-event tracking, advisory claims, best-effort mutation evidence, validation singleflight, lifecycle quiescence, and versioned isolated-worktree handoffs."
+[[gates.capability-shared-worktree-reliability.steps]]
+target = "agent_task_store_lib"
+tests = ["tests::completed_receipt_rejects_workspace_change_after_validation"]
+helpers = []

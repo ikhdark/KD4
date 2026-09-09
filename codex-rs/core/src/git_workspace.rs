@@ -12,9 +12,13 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
+use std::time::Instant;
 use std::time::SystemTime;
+use tokio::io::AsyncReadExt;
+use tokio_util::sync::CancellationToken;
 
 use codex_config::ProjectDiscoveryContext;
 use codex_file_system::ExecutorFileSystem;
@@ -222,9 +226,16 @@ async fn capture_workspace_evidence_identity_with_attribution(
 async fn capture_workspace_evidence_identity_for_repo_root_with_attribution(
     repo_root: PathBuf,
 ) -> WorkspaceEvidenceCapture {
+    capture_workspace_evidence_with_cancellation(repo_root, CancellationToken::new()).await
+}
+
+async fn capture_workspace_evidence_with_cancellation(
+    repo_root: PathBuf,
+    cancellation: CancellationToken,
+) -> WorkspaceEvidenceCapture {
     match within_workspace_generation_deadline(
         WORKSPACE_GENERATION_DEADLINE,
-        capture_workspace_generation_marker(repo_root),
+        capture_workspace_generation_marker(repo_root, cancellation),
     )
     .await
     {
@@ -280,14 +291,19 @@ fn workspace_generation_status_args() -> &'static [&'static str] {
 
 async fn capture_workspace_generation_marker(
     repo_root: PathBuf,
+    cancellation: CancellationToken,
 ) -> Option<WorkspaceEvidenceIdentity> {
+    let _cancel_on_drop = cancellation.clone().drop_guard();
+    let control = WorkspaceCaptureControl {
+        deadline: Instant::now() + WORKSPACE_GENERATION_DEADLINE,
+        cancellation,
+    };
     let (head, status) = tokio::join!(
         workspace_generation_git_output(&repo_root, &["rev-parse", "--verify", "HEAD"]),
-        workspace_generation_git_output(&repo_root, workspace_generation_status_args()),
+        workspace_generation_status(&repo_root),
     );
-    let status = status?;
-    let paths = workspace_generation_paths(&status);
-    let metadata = workspace_generation_metadata(repo_root.clone(), paths).await?;
+    let (status, paths) = status?;
+    let metadata = capture_workspace_metadata(repo_root.clone(), paths, control).await?;
 
     let mut index_hasher = Sha256::new();
     index_hasher.update(b"KD4_WORKSPACE_INDEX_GENERATION_V1\n");
@@ -310,31 +326,131 @@ async fn capture_workspace_generation_marker(
     })
 }
 
-fn workspace_generation_paths(status: &[u8]) -> Vec<String> {
-    let mut paths = status
-        .split(|byte| *byte == 0)
-        .filter_map(|record| {
-            let field_index: usize = match record.first().copied() {
-                Some(b'1') => 8,
-                Some(b'2') => 9,
-                Some(b'u') => 10,
-                Some(b'?') => {
-                    return std::str::from_utf8(record.get(2..)?)
-                        .ok()
-                        .map(str::to_string);
+#[derive(Debug)]
+struct WorkspaceGenerationPath {
+    path: String,
+    deleted: bool,
+}
+
+// Porcelain v2 rename records have a second NUL-delimited pathname, which is
+// not another status record (even when that pathname starts with "? " or "1 ").
+struct WorkspaceStatusReader {
+    bytes: Vec<u8>,
+    record_start: usize,
+    rename_source: bool,
+    paths: BTreeMap<String, bool>,
+}
+
+impl WorkspaceStatusReader {
+    fn new() -> Self {
+        Self {
+            bytes: Vec::new(),
+            record_start: 0,
+            rename_source: false,
+            paths: BTreeMap::new(),
+        }
+    }
+
+    fn push(&mut self, chunk: &[u8]) -> Option<()> {
+        const MAX_STATUS_BYTES: usize = 2 * 1024 * 1024;
+        if self.bytes.len().checked_add(chunk.len())? > MAX_STATUS_BYTES {
+            return None;
+        }
+        let start = self.bytes.len();
+        self.bytes.extend_from_slice(chunk);
+        for end in start..self.bytes.len() {
+            if self.bytes[end] != 0 {
+                continue;
+            }
+            let record = &self.bytes[self.record_start..end];
+            self.record_start = end + 1;
+            if self.rename_source {
+                self.rename_source = false;
+                continue;
+            }
+            let (path, deleted) = match record.first().copied()? {
+                b'?' if record.get(1) == Some(&b' ') => (record.get(2..)?, false),
+                kind @ (b'1' | b'2' | b'u') => {
+                    let count = match kind {
+                        b'1' => 9,
+                        b'2' => 10,
+                        _ => 11,
+                    };
+                    let fields = record
+                        .splitn(count, |byte| *byte == b' ')
+                        .collect::<Vec<_>>();
+                    if fields.len() != count {
+                        return None;
+                    }
+                    self.rename_source = kind == b'2';
+                    let deleted =
+                        kind == b'1' && fields[1].contains(&b'D') && fields[5] == b"000000";
+                    (fields[count - 1], deleted)
                 }
                 _ => return None,
             };
-            record
-                .splitn(field_index.saturating_add(1), |byte| *byte == b' ')
-                .nth(field_index)
-                .and_then(|path| std::str::from_utf8(path).ok())
-                .map(str::to_string)
-        })
-        .collect::<Vec<_>>();
-    paths.sort();
-    paths.dedup();
-    paths
+            let path = std::str::from_utf8(path).ok()?;
+            if path.is_empty() {
+                return None;
+            }
+            if let Some(previous) = self.paths.insert(path.to_owned(), deleted)
+                && previous != deleted
+            {
+                return None;
+            }
+            if self.paths.len() > WORKSPACE_GENERATION_MAX_PATHS {
+                return None;
+            }
+        }
+        Some(())
+    }
+
+    fn finish(self) -> Option<(Vec<u8>, Vec<WorkspaceGenerationPath>)> {
+        if self.record_start != self.bytes.len() || self.rename_source {
+            return None;
+        }
+        Some((
+            self.bytes,
+            self.paths
+                .into_iter()
+                .map(|(path, deleted)| WorkspaceGenerationPath { path, deleted })
+                .collect(),
+        ))
+    }
+}
+
+async fn workspace_generation_status(
+    repo_root: &Path,
+) -> Option<(Vec<u8>, Vec<WorkspaceGenerationPath>)> {
+    let mut child = Command::new("git")
+        .arg("-c")
+        .arg(format!("core.hooksPath={DISABLED_HOOKS_PATH}"))
+        .args(["-c", "core.fsmonitor=false"])
+        .args(workspace_generation_status_args())
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .current_dir(repo_root)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .ok()?;
+    let mut stdout = child.stdout.take()?;
+    let mut reader = WorkspaceStatusReader::new();
+    let mut buffer = [0; 8192];
+    loop {
+        match stdout.read(&mut buffer).await {
+            Ok(0) => break,
+            Ok(count) if reader.push(&buffer[..count]).is_some() => {}
+            _ => {
+                // Explicitly reap rejected captures; never publish a partial identity.
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                return None;
+            }
+        }
+    }
+    child.wait().await.ok()?.success().then_some(())?;
+    reader.finish()
 }
 
 fn workspace_head_identity(head: Option<Vec<u8>>) -> Option<String> {
@@ -350,40 +466,99 @@ struct WorkspaceGenerationMetadata {
     manifest: Vec<u8>,
 }
 
+#[derive(Clone)]
+struct WorkspaceCaptureControl {
+    deadline: Instant,
+    cancellation: CancellationToken,
+}
+
+impl WorkspaceCaptureControl {
+    fn active(&self) -> bool {
+        Instant::now() < self.deadline && !self.cancellation.is_cancelled()
+    }
+}
+
+#[cfg(test)]
 async fn workspace_generation_metadata(
     repo_root: PathBuf,
     paths: Vec<String>,
 ) -> Option<WorkspaceGenerationMetadata> {
-    tokio::task::spawn_blocking(move || {
-        if paths.len() > WORKSPACE_GENERATION_MAX_PATHS {
+    capture_workspace_metadata(
+        repo_root,
+        paths
+            .into_iter()
+            .map(|path| WorkspaceGenerationPath {
+                path,
+                deleted: false,
+            })
+            .collect(),
+        WorkspaceCaptureControl {
+            deadline: Instant::now() + WORKSPACE_GENERATION_DEADLINE,
+            cancellation: CancellationToken::new(),
+        },
+    )
+    .await
+}
+
+fn hash_workspace_content(
+    reader: &mut impl Read,
+    remaining: u64,
+    buffer: &mut [u8],
+    control: &WorkspaceCaptureControl,
+) -> Option<(String, u64)> {
+    let mut hasher = Sha256::new();
+    let mut bytes_read = 0_u64;
+    loop {
+        if !control.active() {
             return None;
         }
+        let limit = usize::try_from((remaining + 1 - bytes_read).min(buffer.len() as u64)).ok()?;
+        let count = reader.read(&mut buffer[..limit]).ok()?;
+        if count == 0 {
+            break;
+        }
+        bytes_read += count as u64;
+        if bytes_read > remaining {
+            return None;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Some((format!("{:x}", hasher.finalize()), bytes_read))
+}
+
+async fn capture_workspace_metadata(
+    repo_root: PathBuf,
+    paths: Vec<WorkspaceGenerationPath>,
+    control: WorkspaceCaptureControl,
+) -> Option<WorkspaceGenerationMetadata> {
+    tokio::task::spawn_blocking(move || {
+        if paths.len() > WORKSPACE_GENERATION_MAX_PATHS { return None; }
         let total_paths = paths.len();
         let mut manifest = format!("total_paths={total_paths}\n").into_bytes();
-        let mut observed_declared_bytes = 0_u64;
-
-        for path in paths {
+        let mut observed_bytes = 0_u64;
+        let mut buffer = [0_u8; 64 * 1024];
+        let mut deletions = Vec::new();
+        for observation in paths {
+            if !control.active() { return None; }
+            let path = observation.path;
             let absolute = repo_root.join(&path);
-            let metadata = std::fs::symlink_metadata(&absolute).ok()?;
-            let declared_bytes = if metadata.is_file() {
-                metadata.len()
-            } else {
-                0
+            let metadata = match std::fs::symlink_metadata(&absolute) {
+                Ok(metadata) if !observation.deleted => metadata,
+                Err(error) if error.kind() == ErrorKind::NotFound && observation.deleted => {
+                    manifest.extend_from_slice(path.as_bytes());
+                    manifest.extend_from_slice(b"\0deleted\0\n");
+                    deletions.push(absolute);
+                    continue;
+                }
+                _ => return None,
             };
-            if observed_declared_bytes.saturating_add(declared_bytes)
-                > WORKSPACE_GENERATION_MAX_DECLARED_BYTES
-            {
-                return None;
-            }
-            let kind = if metadata.file_type().is_symlink() {
-                "symlink"
-            } else if metadata.is_file() {
-                "file"
-            } else if metadata.is_dir() {
-                "directory"
-            } else {
-                "other"
-            };
+            let declared_bytes = if metadata.is_file() { metadata.len() } else { 0 };
+            let remaining = WORKSPACE_GENERATION_MAX_DECLARED_BYTES.checked_sub(observed_bytes)?;
+            if declared_bytes > remaining { return None; }
+            let kind = if metadata.file_type().is_symlink() { "symlink" }
+                else if metadata.is_file() { "file" }
+                else if metadata.is_dir() { "directory" }
+                else { "other" };
             manifest.extend_from_slice(path.as_bytes());
             manifest.push(0);
             manifest.extend_from_slice(kind.as_bytes());
@@ -392,30 +567,26 @@ async fn workspace_generation_metadata(
             manifest.push(0);
             if metadata.file_type().is_symlink() {
                 let target = std::fs::read_link(&absolute).ok()?;
-                manifest.extend_from_slice(
-                    format!("{:x}", Sha256::digest(target.to_string_lossy().as_bytes())).as_bytes(),
-                );
+                manifest.extend_from_slice(format!("{:x}", Sha256::digest(target.to_string_lossy().as_bytes())).as_bytes());
             } else if metadata.is_file() {
-                let remaining =
-                    WORKSPACE_GENERATION_MAX_DECLARED_BYTES.saturating_sub(observed_declared_bytes);
-                let mut content = Vec::new();
-                File::open(&absolute)
-                    .ok()?
-                    .take(remaining.saturating_add(1))
-                    .read_to_end(&mut content)
-                    .ok()?;
-                if u64::try_from(content.len()).ok()? > remaining {
+                let mut file = File::open(&absolute).ok()?;
+                let (hash, actual_bytes) = hash_workspace_content(&mut file, remaining, &mut buffer, &control)?;
+                let after = file.metadata().ok()?;
+                if actual_bytes != declared_bytes || after.len() != declared_bytes || after.modified().ok()? != metadata.modified().ok()? {
                     return None;
                 }
-                manifest.extend_from_slice(format!("{:x}", Sha256::digest(&content)).as_bytes());
+                observed_bytes = observed_bytes.checked_add(actual_bytes)?;
+                manifest.extend_from_slice(hash.as_bytes());
             }
             manifest.push(b'\n');
-            observed_declared_bytes = observed_declared_bytes.saturating_add(declared_bytes);
         }
-        Some(WorkspaceGenerationMetadata { manifest })
-    })
-    .await
-    .ok()?
+        for path in deletions {
+            if !control.active() || !matches!(std::fs::symlink_metadata(path), Err(error) if error.kind() == ErrorKind::NotFound) {
+                return None;
+            }
+        }
+        control.active().then_some(WorkspaceGenerationMetadata { manifest })
+    }).await.ok()?
 }
 
 async fn workspace_generation_git_output(repo_root: &Path, args: &[&str]) -> Option<Vec<u8>> {
@@ -560,6 +731,38 @@ struct WorkspaceEvidenceCaptureKey {
 struct InFlightWorkspaceEvidenceCapture {
     capture_sequence: u64,
     future: Shared<BoxFuture<'static, WorkspaceEvidenceCapture>>,
+    interest: Arc<WorkspaceCaptureInterest>,
+}
+
+struct WorkspaceCaptureInterest {
+    waiters: AtomicUsize,
+    cancellation: CancellationToken,
+}
+
+struct WorkspaceCaptureWaiter<'a> {
+    interest: Arc<WorkspaceCaptureInterest>,
+    cache: &'a GitWorkspaceCache,
+    key: WorkspaceEvidenceCaptureKey,
+    sequence: u64,
+}
+
+impl Drop for WorkspaceCaptureWaiter<'_> {
+    fn drop(&mut self) {
+        let mut captures = self
+            .cache
+            .in_flight_workspace_evidence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.interest.waiters.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.interest.cancellation.cancel();
+            if captures
+                .get(&self.key)
+                .is_some_and(|capture| capture.capture_sequence == self.sequence)
+            {
+                captures.remove(&self.key);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -904,6 +1107,23 @@ impl GitWorkspaceCache {
         cwd: &Path,
     ) -> WorkspaceEvidenceCapture {
         let Some(repo_root) = resolve_workspace_evidence_root(cwd).await else {
+            let cwd = canonical_workspace_evidence_root(cwd);
+            let mut retention = self
+                .repository_retention
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let sequence = self
+                .workspace_evidence_capture_sequence
+                .fetch_add(1, Ordering::AcqRel)
+                .saturating_add(1);
+            for (root, cached) in &mut retention.latest_workspace_evidence {
+                if cwd.starts_with(root) {
+                    cached.identity = None;
+                    cached.capture_sequence = sequence;
+                }
+            }
+            // A later successful discovery must not rejoin a capture from before this failure.
+            self.host_mutation_generation.fetch_add(1, Ordering::AcqRel);
             return WorkspaceEvidenceCapture::default();
         };
         let key = WorkspaceEvidenceCaptureKey {
@@ -921,11 +1141,15 @@ impl GitWorkspaceCache {
             // capture. Dropping the map's old shared future is cancellation
             // safe because every active caller owns its own clone, and keeps
             // abandoned epochs bounded to one entry per repository.
-            in_flight.retain(|existing_key, _| {
-                existing_key.repo_root != repo_root || existing_key == &key
+            in_flight.retain(|existing_key, capture| {
+                !capture.interest.cancellation.is_cancelled()
+                    && (existing_key.repo_root != repo_root || existing_key == &key)
             });
             match in_flight.entry(key.clone()) {
-                std::collections::hash_map::Entry::Occupied(entry) => (entry.get().clone(), true),
+                std::collections::hash_map::Entry::Occupied(entry) => {
+                    entry.get().interest.waiters.fetch_add(1, Ordering::AcqRel);
+                    (entry.get().clone(), true)
+                }
                 std::collections::hash_map::Entry::Vacant(entry) => {
                     let capture_sequence = self
                         .workspace_evidence_capture_sequence
@@ -941,14 +1165,20 @@ impl GitWorkspaceCache {
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .take();
                     let capture_repo_root = repo_root.clone();
+                    let cancellation = CancellationToken::new();
+                    let interest = Arc::new(WorkspaceCaptureInterest {
+                        waiters: AtomicUsize::new(1),
+                        cancellation: cancellation.clone(),
+                    });
                     let future = async move {
                         #[cfg(test)]
                         if let Some(pause) = pause {
                             pause.started.notify_one();
                             pause.release.notified().await;
                         }
-                        capture_workspace_evidence_identity_for_repo_root_with_attribution(
+                        capture_workspace_evidence_with_cancellation(
                             capture_repo_root,
+                            cancellation,
                         )
                         .await
                     }
@@ -957,11 +1187,18 @@ impl GitWorkspaceCache {
                     let capture = InFlightWorkspaceEvidenceCapture {
                         capture_sequence,
                         future,
+                        interest,
                     };
                     entry.insert(capture.clone());
                     (capture, false)
                 }
             }
+        };
+        let _waiter = WorkspaceCaptureWaiter {
+            interest: Arc::clone(&in_flight_capture.interest),
+            cache: self,
+            key: key.clone(),
+            sequence: in_flight_capture.capture_sequence,
         };
         #[cfg(test)]
         if coalesced {

@@ -18,7 +18,6 @@ use crate::tools::handlers::multi_agents_v2::InterruptAgentHandler;
 use crate::tools::handlers::multi_agents_v2::ListAgentsHandler as ListAgentsHandlerV2;
 use crate::tools::handlers::multi_agents_v2::SendMessageHandler as SendMessageHandlerV2;
 use crate::tools::handlers::multi_agents_v2::SpawnAgentHandler as SpawnAgentHandlerV2;
-use crate::tools::handlers::multi_agents_v2::SubmitAgentReceiptHandler as SubmitAgentReceiptHandlerV2;
 use crate::tools::handlers::multi_agents_v2::WaitAgentHandler as WaitAgentHandlerV2;
 use crate::turn_diff_tracker::TurnDiffTracker;
 use crate::windows_sandbox::WindowsSandboxLevelExt;
@@ -1005,6 +1004,17 @@ async fn multi_agent_v2_typed_spawn_persists_and_binds_assignment_before_start()
         .record_validation_call(validation_call)
         .await
         .expect("validation call should finish for the same bound attempt");
+    let proof = task_store
+        .get_validation_call(validation_call_id.clone())
+        .await
+        .expect("stored validation reads")
+        .expect("stored validation exists");
+    let evidence_ref = json!({
+        "call_id": validation_call_id,
+        "workspace_id": task.assignment.workspace_id,
+        "evidence_epoch": proof.evidence.end_epoch.unwrap(),
+        "kind": "validation_execution",
+    });
     let (mut child_session, mut child_turn) = make_session_and_context().await;
     child_session.services.agent_control = agent_control.clone();
     child_session.thread_id = child_thread_id;
@@ -1022,6 +1032,7 @@ async fn multi_agent_v2_typed_spawn_persists_and_binds_assignment_before_start()
             "criterion_results": [{
                 "criterion_id": "criterion-1",
                 "status": "passed",
+                "evidence_ref": evidence_ref.clone(),
                 "evidence": validation_call_id.clone()
             }],
             "declared_changes": [{
@@ -1034,8 +1045,49 @@ async fn multi_agent_v2_typed_spawn_persists_and_binds_assignment_before_start()
             "next_action": null
         })),
     );
-    let mut receipt_task =
-        tokio::spawn(async move { SubmitAgentReceiptHandlerV2.handle(receipt_invocation).await });
+    let receipt_router = Arc::new(crate::tools::router::ToolRouter::from_context(
+        receipt_invocation.step_context.as_ref(),
+        crate::tools::router::ToolRouterParams {
+            tool_suggest_candidates: None,
+            deferred_mcp_tools: None,
+            mcp_tools: None,
+            extension_tool_executors: Vec::new(),
+            dynamic_tools: &[],
+            exposure_identity: Default::default(),
+        },
+        &Default::default(),
+    ));
+    let receipt_names = receipt_router
+        .registered_tool_names_for_test()
+        .into_iter()
+        .filter(|name| name.name == "submit_agent_receipt")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        receipt_names.len(),
+        1,
+        "typed child must expose the receipt tool exactly once"
+    );
+    assert!(
+        receipt_invocation
+            .step_context
+            .set_tool_router(receipt_router)
+            .is_ok()
+    );
+    let receipt_runtime = crate::tools::parallel::ToolCallRuntime::new(
+        receipt_invocation.session,
+        receipt_invocation.step_context,
+        receipt_invocation.tracker,
+    );
+    let receipt_call = crate::tools::router::ToolCall {
+        tool_name: receipt_names[0].clone(),
+        call_id: receipt_invocation.call_id,
+        payload: receipt_invocation.payload,
+    };
+    let mut receipt_task = tokio::spawn(async move {
+        receipt_runtime
+            .handle_tool_call(receipt_call, receipt_invocation.cancellation_token)
+            .await
+    });
     assert!(
         tokio::time::timeout(std::time::Duration::from_millis(20), &mut receipt_task)
             .await
@@ -1043,10 +1095,33 @@ async fn multi_agent_v2_typed_spawn_persists_and_binds_assignment_before_start()
         "receipt submission must wait for the workspace operation gate"
     );
     drop(receipt_gate);
-    receipt_task
+    let receipt_response = receipt_task
         .await
         .expect("receipt submission task should join")
         .expect("bound attempt should seal a validation-backed risk-gated receipt");
+    let ResponseInputItem::FunctionCallOutput { output, .. } = receipt_response else {
+        panic!("registered receipt tool must return its result");
+    };
+    assert_eq!(output.success, Some(true));
+    let FunctionCallOutputBody::Text(receipt_text) = &output.body else {
+        panic!("receipt response must include the evidence projection");
+    };
+    // The normal runtime returns a JSON projection header followed by selected text.
+    let receipt_header: serde_json::Value = serde_json::from_str(
+        receipt_text
+            .lines()
+            .next()
+            .expect("receipt projection header"),
+    )
+    .expect("receipt projection JSON");
+    assert_eq!(
+        receipt_header["essential"]["criterion_counts"]["with_execution_reference"],
+        1
+    );
+    assert_eq!(
+        receipt_header["essential"]["criterion_counts"]["reported_passed_without_execution_reference"],
+        0
+    );
     before_initial_submission.release_one();
     let output = spawn_task
         .await
@@ -1114,6 +1189,15 @@ async fn multi_agent_v2_typed_spawn_persists_and_binds_assignment_before_start()
     assert_eq!(
         reloaded_task.current_attempt.state,
         codex_agent_task_store::AttemptState::Completed
+    );
+    assert_eq!(
+        serde_json::to_value(
+            reloaded_task.receipt.as_ref().unwrap().criterion_results[0]
+                .evidence_ref
+                .as_ref()
+        )
+        .unwrap(),
+        evidence_ref
     );
     assert_eq!(
         reloaded_task
@@ -1226,6 +1310,7 @@ async fn multi_agent_v2_spawn_reuses_completed_explorer_result() {
                 status: codex_agent_task_store::AgentStatusClaim::Completed,
                 summary: "ownership trace completed".to_string(),
                 criterion_results: vec![codex_agent_task_store::CriterionResult {
+                    evidence_ref: None,
                     criterion_id: "criterion-1".to_string(),
                     status: codex_agent_task_store::CriterionStatus::Passed,
                     evidence: Some("bounded trace".to_string()),
@@ -2218,6 +2303,187 @@ async fn spawn_agent_errors_when_manager_dropped() {
         err,
         FunctionCallError::RespondToModel("collab manager unavailable".to_string())
     );
+}
+
+#[tokio::test]
+async fn multi_agent_v2_registered_message_batch_preserves_delivery_and_partial_failure() {
+    async fn dispatch(
+        mut invocation: ToolInvocation,
+    ) -> codex_protocol::models::FunctionCallOutputPayload {
+        invocation.call_id = format!("message-{}", ThreadId::new());
+        let router = Arc::new(crate::tools::router::ToolRouter::from_context(
+            invocation.step_context.as_ref(),
+            crate::tools::router::ToolRouterParams {
+                tool_suggest_candidates: None,
+                deferred_mcp_tools: None,
+                mcp_tools: None,
+                extension_tool_executors: Vec::new(),
+                dynamic_tools: &[],
+                exposure_identity: Default::default(),
+            },
+            &Default::default(),
+        ));
+        assert!(invocation.step_context.set_tool_router(router).is_ok());
+        let runtime = crate::tools::parallel::ToolCallRuntime::new(
+            invocation.session,
+            invocation.step_context,
+            invocation.tracker,
+        );
+        let response = runtime
+            .handle_tool_call(
+                crate::tools::router::ToolCall {
+                    tool_name: invocation.tool_name,
+                    call_id: invocation.call_id,
+                    payload: invocation.payload,
+                },
+                invocation.cancellation_token,
+            )
+            .await
+            .expect("registered message returns");
+        let ResponseInputItem::FunctionCallOutput { output, .. } = response else {
+            panic!("message must return a function result");
+        };
+        output
+    }
+
+    let (mut session, mut turn) = make_session_and_context().await;
+    let manager = thread_manager();
+    let root = manager
+        .start_thread((*turn.config).clone())
+        .await
+        .expect("root");
+    let foreign = manager
+        .start_thread((*turn.config).clone())
+        .await
+        .expect("other session");
+    session.services.agent_control = manager.agent_control();
+    session.thread_id = root.thread_id;
+    let mut config = (*turn.config).clone();
+    config
+        .features
+        .enable(Feature::MultiAgentV2)
+        .expect("enable v2");
+    set_turn_config(&mut turn, config);
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    for name in ["batch_one", "batch_two", "unselected"] {
+        SpawnAgentHandlerV2::default()
+            .handle(invocation(
+                session.clone(),
+                turn.clone(),
+                "spawn_agent",
+                function_payload(json!({"task_name": name, "message": "initial task"})),
+            ))
+            .await
+            .expect("child starts");
+    }
+    let before = manager.captured_ops().len();
+    let output = dispatch(invocation(
+        session.clone(),
+        turn.clone(),
+        "send_message",
+        function_payload(json!({
+            "targets": ["batch_one", foreign.thread_id.to_string(), "missing", "/root/batch_two"],
+            "message": "shared information"
+        })),
+    ))
+    .await;
+    assert_eq!(
+        output.success,
+        Some(false),
+        "partial failure is not success"
+    );
+    let body: serde_json::Value = serde_json::from_str(&output.body.to_text().unwrap()).unwrap();
+    let recipients = body["recipients"]
+        .as_array()
+        .expect("per-recipient outcomes");
+    assert_eq!(recipients.len(), 4);
+    assert_eq!(
+        recipients[0],
+        json!({"target": "batch_one", "status": "queued"})
+    );
+    assert_eq!(recipients[1]["status"], "failed");
+    assert!(recipients[1]["error"].is_string());
+    assert_eq!(recipients[2]["status"], "failed");
+    assert_eq!(
+        recipients[3],
+        json!({"target": "/root/batch_two", "status": "queued"})
+    );
+    let mut deliveries: Vec<_> = manager.captured_ops()[before..]
+        .iter()
+        .filter_map(|(_, op)| {
+            if let Op::InterAgentCommunication { communication } = op {
+                assert!(!communication.trigger_turn);
+                assert_eq!(
+                    communication.encrypted_content.as_deref(),
+                    Some("shared information")
+                );
+                assert!(communication.other_recipients.is_empty());
+                Some(communication.recipient.to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
+    deliveries.sort();
+    assert_eq!(deliveries, vec!["/root/batch_one", "/root/batch_two"]);
+
+    let before = manager.captured_ops().len();
+    let cancelled = invocation(
+        session.clone(),
+        turn.clone(),
+        "send_message",
+        function_payload(json!({"targets": ["batch_one", "batch_two"], "message": "cancelled"})),
+    );
+    cancelled.cancellation_token.cancel();
+    let output = dispatch(cancelled).await;
+    assert_eq!(output.success, Some(false));
+    assert_eq!(
+        manager.captured_ops().len(),
+        before,
+        "cancelled batch must not enqueue updates"
+    );
+
+    for args in [
+        json!({"target": "batch_one", "targets": ["batch_two"], "message": "invalid"}),
+        json!({"targets": [], "message": "invalid"}),
+        json!({"targets": ["batch_one"], "message": " "}),
+    ] {
+        let before = manager.captured_ops().len();
+        let output = dispatch(invocation(
+            session.clone(),
+            turn.clone(),
+            "send_message",
+            function_payload(args),
+        ))
+        .await;
+        assert_eq!(output.success, Some(false));
+        assert_eq!(
+            manager.captured_ops().len(),
+            before,
+            "invalid input must not deliver anything"
+        );
+    }
+    for (tool, trigger_turn) in [("send_message", false), ("followup_task", true)] {
+        let before = manager.captured_ops().len();
+        let output = dispatch(invocation(
+            session.clone(),
+            turn.clone(),
+            tool,
+            function_payload(json!({"target": "batch_one", "message": "single update"})),
+        ))
+        .await;
+        assert_eq!(output.success, Some(true));
+        assert!(
+            manager.captured_ops()[before..]
+                .iter()
+                .any(|(_, op)| matches!(op,
+                    Op::InterAgentCommunication { communication }
+                        if communication.trigger_turn == trigger_turn
+                            && communication.recipient.as_str() == "/root/batch_one"
+                ))
+        );
+    }
 }
 
 #[tokio::test]

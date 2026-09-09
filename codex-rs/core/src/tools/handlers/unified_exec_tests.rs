@@ -1064,6 +1064,142 @@ async fn shellless_remote_handler_rejects_shell_commands_but_allows_argv() {
 }
 
 #[tokio::test]
+async fn registered_exec_minimal_and_explicit_defaults_preserve_process_and_permissions() {
+    async fn dispatch(
+        invocation: ToolInvocation,
+    ) -> codex_protocol::models::FunctionCallOutputPayload {
+        let router = Arc::new(crate::tools::router::ToolRouter::from_context(
+            invocation.step_context.as_ref(),
+            crate::tools::router::ToolRouterParams {
+                tool_suggest_candidates: None,
+                deferred_mcp_tools: None,
+                mcp_tools: None,
+                extension_tool_executors: Vec::new(),
+                dynamic_tools: &[],
+                exposure_identity: Default::default(),
+            },
+            &Default::default(),
+        ));
+        assert!(invocation.step_context.set_tool_router(router).is_ok());
+        let runtime = crate::tools::parallel::ToolCallRuntime::new(
+            invocation.session,
+            invocation.step_context,
+            invocation.tracker,
+        );
+        let response = runtime
+            .handle_tool_call(
+                crate::tools::router::ToolCall {
+                    tool_name: invocation.tool_name,
+                    call_id: invocation.call_id,
+                    payload: invocation.payload,
+                },
+                invocation.cancellation_token,
+            )
+            .await
+            .expect("registered exec returns");
+        let codex_protocol::models::ResponseInputItem::FunctionCallOutput { output, .. } = response
+        else {
+            panic!("exec must return a function result");
+        };
+        output
+    }
+
+    let workspace = tempfile::tempdir().expect("command workspace");
+    let cwd = workspace.path().join("exact cwd");
+    std::fs::create_dir(&cwd).expect("explicit working directory");
+    for allow_login in [false, true] {
+        let (session, mut turn) = make_session_and_context().await;
+        turn.permission_profile = PermissionProfile::Disabled;
+        let mut config = (*turn.config).clone();
+        config
+            .features
+            .enable(codex_features::Feature::UnifiedExec)
+            .expect("enable exec");
+        config.permissions.allow_login_shell = allow_login;
+        config.permissions.approval_policy =
+            crate::config::Constrained::allow_any(codex_protocol::protocol::AskForApproval::Never);
+        config
+            .permissions
+            .shell_environment_policy
+            .set
+            .insert("KD4_ARGUMENT_PROOF".into(), "configured value".into());
+        turn.config = Arc::new(config);
+        let session = Arc::new(session);
+        let turn = Arc::new(turn);
+        let exit_code = if allow_login { 7 } else { 0 };
+        let script = format!(
+            "import os,sys,json; print('PROOF='+json.dumps(dict(args=sys.argv[1:],cwd=os.path.basename(os.getcwd()),env=os.environ.get('KD4_ARGUMENT_PROOF')))); sys.exit({exit_code})"
+        );
+        for explicit in [false, true] {
+            let mut args = serde_json::json!({
+                "program": "python", "args": ["-c", script, "two words", "$literal", "a\"b", ""],
+                "workdir": cwd,
+            });
+            if explicit {
+                args.as_object_mut().unwrap().extend(
+                    serde_json::json!({
+                        "kind": "argv", "tty": false, "force_fresh": false,
+                        "yield_time_ms": 2000, "login": allow_login,
+                        "sandbox_permissions": "use_default", "additional_permissions": null,
+                        "justification": null, "prefix_rule": null, "validation": null,
+                        "max_output_tokens": null, "environment_id": null,
+                    })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                );
+            }
+            let output = dispatch(ToolInvocation {
+                session: session.clone(),
+                step_context: StepContext::for_test(turn.clone()),
+                cancellation_token: tokio_util::sync::CancellationToken::new(),
+                tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+                call_id: format!("defaults-{allow_login}-{explicit}"),
+                tool_name: codex_tools::ToolName::plain("exec_command"),
+                source: ToolCallSource::Direct,
+                payload: ToolPayload::Function {
+                    arguments: args.to_string(),
+                },
+            })
+            .await;
+            let text = output.body.to_text().expect("process output");
+            assert!(
+                text.contains(&format!("Process exited with code {exit_code}")),
+                "{text}"
+            );
+            let proof = text
+                .lines()
+                .find_map(|line| line.strip_prefix("PROOF="))
+                .expect("child process proof");
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(proof).unwrap(),
+                serde_json::json!({
+                    "args": ["two words", "$literal", "a\"b", ""], "cwd": "exact cwd", "env": "configured value"
+                })
+            );
+        }
+        // An explicit permission override remains meaningful: it cannot execute under Never.
+        let output = dispatch(ToolInvocation {
+            session, step_context: StepContext::for_test(turn),
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
+            tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+            call_id: format!("denied-{allow_login}"),
+            tool_name: codex_tools::ToolName::plain("exec_command"), source: ToolCallSource::Direct,
+            payload: ToolPayload::Function { arguments: serde_json::json!({
+                "program": "python", "args": ["-c", "open('forbidden', 'w').write('launched')"],
+                "workdir": cwd, "sandbox_permissions": "require_escalated", "justification": "test rejection"
+            }).to_string() },
+        }).await;
+        assert_eq!(output.success, Some(false));
+        assert!(output.body.to_text().unwrap().contains("approval policy"));
+        assert!(
+            !cwd.join("forbidden").exists(),
+            "denied command must not launch"
+        );
+    }
+}
+
+#[tokio::test]
 async fn read_only_preflight_repair_executes_and_releases_process_id() {
     let invocation = invocation_for_payload(
         "exec_command",
