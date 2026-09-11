@@ -1096,8 +1096,14 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mu
     let turn_context = context.step_context.turn.as_ref();
     let can_spawn = !primary_environment_uses_foreign_cwd(context.step_context);
     if agent_jobs_tools_enabled(context) {
-        planned_tools
-            .add_with_authorization_class(SpawnAgentsOnCsvHandler, TypedToolClass::RootTaskControl);
+        if turn_context.multi_agent_version != MultiAgentVersion::V2
+            || crate::session::multi_agents::spawn_is_authorized(turn_context)
+        {
+            planned_tools.add_with_authorization_class(
+                SpawnAgentsOnCsvHandler,
+                TypedToolClass::RootTaskControl,
+            );
+        }
         if agent_jobs_worker_tools_enabled(context) {
             planned_tools
                 .add_with_authorization_class(ReportAgentJobResultHandler, TypedToolClass::OwnTask);

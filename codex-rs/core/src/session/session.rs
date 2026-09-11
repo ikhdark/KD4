@@ -68,7 +68,7 @@ struct ToolHistoryPersistenceState {
 
 #[derive(Clone)]
 pub(super) struct ToolHistoryPersistenceQueue {
-    state: Arc<std::sync::Mutex<ToolHistoryPersistenceState>>,
+    state: Arc<tokio::sync::Mutex<ToolHistoryPersistenceState>>,
     wake_tx: mpsc::Sender<()>,
     completed_sequence: watch::Receiver<u64>,
     mirror: Arc<tokio::sync::Mutex<crate::tool_history::ToolHistoryState>>,
@@ -83,7 +83,9 @@ impl ToolHistoryPersistenceQueue {
         thread_id: ThreadId,
         initial_state: crate::tool_history::ToolHistoryState,
     ) -> Self {
-        let state = Arc::new(std::sync::Mutex::new(ToolHistoryPersistenceState::default()));
+        let state = Arc::new(tokio::sync::Mutex::new(
+            ToolHistoryPersistenceState::default(),
+        ));
         let worker_state = Arc::clone(&state);
         let mirror = Arc::new(tokio::sync::Mutex::new(initial_state));
         let worker_mirror = Arc::clone(&mirror);
@@ -111,9 +113,7 @@ impl ToolHistoryPersistenceQueue {
             while wake_rx.recv().await.is_some() {
                 loop {
                     let requests = {
-                        let mut state = worker_state
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let mut state = worker_state.lock().await;
                         std::mem::take(&mut state.pending)
                     };
                     if requests.is_empty() {
@@ -252,62 +252,33 @@ impl ToolHistoryPersistenceQueue {
         }
     }
 
-    pub(super) fn enqueue_mutation(
+    pub(super) async fn writer(&self) -> ToolHistoryPersistenceWriter<'_> {
+        ToolHistoryPersistenceWriter {
+            state: self.state.lock().await,
+            wake_tx: &self.wake_tx,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) async fn enqueue_mutation(
         &self,
         mutation: crate::tool_history::ToolHistoryMutation,
         description: &'static str,
     ) -> Result<(), ToolHistoryPersistenceEnqueueError> {
-        self.enqueue_command(
-            ToolHistoryPersistenceCommand::Mutation(Box::new(mutation)),
-            description,
-        )
-        .map(|_| ())
-    }
-
-    fn enqueue_command(
-        &self,
-        command: ToolHistoryPersistenceCommand,
-        description: &'static str,
-    ) -> Result<u64, ToolHistoryPersistenceEnqueueError> {
-        if self.wake_tx.is_closed() {
-            return Err(ToolHistoryPersistenceEnqueueError::WorkerClosed);
-        }
-        let enqueued_sequence;
-        {
-            let mut state = self
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let Some(sequence) = next_tool_history_persistence_sequence(state.next_sequence) else {
-                return Err(ToolHistoryPersistenceEnqueueError::SequenceOverflow);
-            };
-            state.next_sequence = sequence;
-            enqueued_sequence = sequence;
-            state.pending.push(PendingToolHistoryPersistence {
-                sequence,
-                command,
-                description,
-            });
-        }
-        match self.wake_tx.try_send(()) {
-            Ok(()) | Err(mpsc::error::TrySendError::Full(())) => {}
-            Err(mpsc::error::TrySendError::Closed(())) => {
-                return Err(ToolHistoryPersistenceEnqueueError::WorkerClosed);
-            }
-        }
-        Ok(enqueued_sequence)
+        self.writer().await.enqueue_mutation(mutation, description)
     }
 
     pub(super) async fn drain(&self) {
-        let target_sequence = self.current_sequence();
+        let target_sequence = self.state.lock().await.next_sequence;
         self.wait_for_sequence(target_sequence).await;
     }
 
     pub(super) async fn checkpoint(&self) {
-        let target_sequence = match self.enqueue_command(
+        let result = self.writer().await.enqueue_command(
             ToolHistoryPersistenceCommand::Checkpoint,
             "completed-tool history checkpoint",
-        ) {
+        );
+        let target_sequence = match result {
             Ok(target_sequence) => target_sequence,
             Err(err) => {
                 tracing::warn!(
@@ -317,13 +288,6 @@ impl ToolHistoryPersistenceQueue {
             }
         };
         self.wait_for_sequence(target_sequence).await;
-    }
-
-    fn current_sequence(&self) -> u64 {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .next_sequence
     }
 
     async fn wait_for_sequence(&self, target_sequence: u64) {
@@ -354,6 +318,52 @@ impl ToolHistoryPersistenceQueue {
     #[cfg(test)]
     pub(super) async fn wait_until_worker_closed_for_test(&self) {
         self.wake_tx.closed().await;
+    }
+}
+
+/// Acquired before changing session history so publishing its matching queue
+/// entry needs no await and cannot be separated from that change by cancellation.
+pub(super) struct ToolHistoryPersistenceWriter<'a> {
+    state: tokio::sync::MutexGuard<'a, ToolHistoryPersistenceState>,
+    wake_tx: &'a mpsc::Sender<()>,
+}
+
+impl ToolHistoryPersistenceWriter<'_> {
+    pub(super) fn enqueue_mutation(
+        &mut self,
+        mutation: crate::tool_history::ToolHistoryMutation,
+        description: &'static str,
+    ) -> Result<(), ToolHistoryPersistenceEnqueueError> {
+        self.enqueue_command(
+            ToolHistoryPersistenceCommand::Mutation(Box::new(mutation)),
+            description,
+        )
+        .map(|_| ())
+    }
+
+    fn enqueue_command(
+        &mut self,
+        command: ToolHistoryPersistenceCommand,
+        description: &'static str,
+    ) -> Result<u64, ToolHistoryPersistenceEnqueueError> {
+        if self.wake_tx.is_closed() {
+            return Err(ToolHistoryPersistenceEnqueueError::WorkerClosed);
+        }
+        let sequence = next_tool_history_persistence_sequence(self.state.next_sequence)
+            .ok_or(ToolHistoryPersistenceEnqueueError::SequenceOverflow)?;
+        self.state.next_sequence = sequence;
+        self.state.pending.push(PendingToolHistoryPersistence {
+            sequence,
+            command,
+            description,
+        });
+        match self.wake_tx.try_send(()) {
+            Ok(()) | Err(mpsc::error::TrySendError::Full(())) => {}
+            Err(mpsc::error::TrySendError::Closed(())) => {
+                return Err(ToolHistoryPersistenceEnqueueError::WorkerClosed);
+            }
+        }
+        Ok(sequence)
     }
 }
 

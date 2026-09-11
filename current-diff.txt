@@ -1,0 +1,2068 @@
+diff --git a/.gitignore b/.gitignore
+index 2ec2b93ae6..5d46a674dd 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -37,6 +37,7 @@ CLAUDE.md
+ AGENTS.override.md
+ 
+ # caches
++.kda/
+ .cache/
+ .turbo/
+ .parcel-cache/
+diff --git a/AGENTS.md b/AGENTS.md
+index 0c66d65689..06767d8899 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -1,8 +1,7 @@
+ ## Repository identity and runtime boundary
+ 
+ - This is the user's local fork of [`openai/codex`](https://github.com/openai/codex).
+-  Operate only on fork-local source and artifacts. Upstream synchronization or
+-  distribution requires a request that explicitly names it.
++  Upstream synchronization or distribution requires a request that explicitly names it.
+ - This is a local project for the user's own use and is not intended for public
+   release or distribution. It's main goal is to improve and optimize codex.
+ - Treat the active repository root as the checkout location; do not hard-code a
+diff --git a/codex-rs/agent-task-store/src/local.rs b/codex-rs/agent-task-store/src/local.rs
+index 3680af8d8d..1c2c4b9407 100644
+--- a/codex-rs/agent-task-store/src/local.rs
++++ b/codex-rs/agent-task-store/src/local.rs
+@@ -680,39 +680,43 @@ impl LocalAgentTaskStore {
+             return Err(StoreError::AttemptNotActive(attempt_id));
+         }
+         let capsule_path = task_capsule_path(&self.coordination_root, assignment_id);
+-        if assignment.task_capsule.is_some() || capsule_path.try_exists()? {
++        if assignment.task_capsule.is_some() || tokio::fs::try_exists(&capsule_path).await? {
+             return Err(StoreError::TaskCapsuleAlreadyAttached(assignment_id));
+         }
+-        if let Some(parent) = capsule_path.parent() {
+-            std::fs::create_dir_all(parent)?;
+-        }
+         let temporary_path = task_capsule_staging_path(&self.coordination_root, assignment_id);
+-        if temporary_path.try_exists()? {
+-            std::fs::remove_file(&temporary_path)?;
+-        }
+-        let mut file = match std::fs::OpenOptions::new()
+-            .write(true)
+-            .create_new(true)
+-            .open(&temporary_path)
+-        {
+-            Ok(file) => file,
+-            Err(error) => return Err(error.into()),
+-        };
+-        if let Err(error) = file
+-            .write_all(canonical_payload.as_bytes())
+-            .and_then(|()| file.sync_all())
+-        {
+-            drop(file);
+-            let _ = std::fs::remove_file(&temporary_path);
+-            return Err(error.into());
+-        }
+-        drop(file);
++        let staging_path = temporary_path.clone();
++        let staging_payload = canonical_payload.clone();
++        // Finish the staging write, including failure cleanup, in one worker.
++        // Cancellation must not interrupt it with a partial JSON recovery file.
++        tokio::task::spawn_blocking(move || -> std::io::Result<()> {
++            if let Some(parent) = staging_path.parent() {
++                std::fs::create_dir_all(parent)?;
++            }
++            if staging_path.try_exists()? {
++                std::fs::remove_file(&staging_path)?;
++            }
++            let mut file = std::fs::OpenOptions::new()
++                .write(true)
++                .create_new(true)
++                .open(&staging_path)?;
++            if let Err(error) = file
++                .write_all(staging_payload.as_bytes())
++                .and_then(|()| file.sync_all())
++            {
++                drop(file);
++                let _ = std::fs::remove_file(&staging_path);
++                return Err(error);
++            }
++            Ok(())
++        })
++        .await
++        .map_err(std::io::Error::other)??;
+         assignment.task_capsule = Some(canonical_payload.clone());
+         if let Err(error) = transaction.commit().await {
+-            let _ = std::fs::remove_file(&temporary_path);
++            let _ = tokio::fs::remove_file(&temporary_path).await;
+             return Err(error.into());
+         }
+-        std::fs::rename(&temporary_path, &capsule_path)?;
++        tokio::fs::rename(&temporary_path, &capsule_path).await?;
+         Ok(assignment)
+     }
+ 
+@@ -3275,15 +3279,16 @@ ORDER BY
+ 
+     async fn reconcile_task_capsules(&self) -> StoreResult<()> {
+         let capsule_dir = self.coordination_root.join("task_capsules");
+-        std::fs::create_dir_all(&capsule_dir)?;
+-        for entry in std::fs::read_dir(&capsule_dir)? {
+-            let path = entry?.path();
++        tokio::fs::create_dir_all(&capsule_dir).await?;
++        let mut entries = tokio::fs::read_dir(&capsule_dir).await?;
++        while let Some(entry) = entries.next_entry().await? {
++            let path = entry.path();
+             let is_stage = path
+                 .file_name()
+                 .and_then(|name| name.to_str())
+                 .is_some_and(|name| name.starts_with('.') && name.ends_with(".staged.json"));
+             if is_stage {
+-                let payload = std::fs::read_to_string(&path)?;
++                let payload = tokio::fs::read_to_string(&path).await?;
+                 let capsule: TaskCapsuleV1 = serde_json::from_str(&payload)
+                     .map_err(|error| StoreError::InvalidTaskCapsule(error.to_string()))?;
+                 let exists = sqlx::query_scalar::<_, i64>(
+@@ -3296,14 +3301,14 @@ ORDER BY
+                 let expected_stage =
+                     task_capsule_staging_path(&self.coordination_root, capsule.assignment_id);
+                 if !exists || path != expected_stage {
+-                    std::fs::remove_file(path)?;
++                    tokio::fs::remove_file(path).await?;
+                     continue;
+                 }
+                 let final_path = task_capsule_path(&self.coordination_root, capsule.assignment_id);
+-                if final_path.try_exists()? {
+-                    std::fs::remove_file(path)?;
++                if tokio::fs::try_exists(&final_path).await? {
++                    tokio::fs::remove_file(path).await?;
+                 } else {
+-                    std::fs::rename(path, final_path)?;
++                    tokio::fs::rename(path, final_path).await?;
+                 }
+             }
+         }
+diff --git a/codex-rs/analytics/src/analytics_client_tests.rs b/codex-rs/analytics/src/analytics_client_tests.rs
+index 5c1010a068..fdd17a1039 100644
+--- a/codex-rs/analytics/src/analytics_client_tests.rs
++++ b/codex-rs/analytics/src/analytics_client_tests.rs
+@@ -865,6 +865,10 @@ fn sample_command_execution_item_with_id(
+         command: "echo hi".to_string(),
+         cwd: test_path_buf("/tmp").abs().into(),
+         process_id: Some("pid-1".to_string()),
++        parent_call_id: None,
++        parent_cell_id: None,
++        runtime_tool_call_id: None,
++        execution_id: None,
+         source: CommandExecutionSource::Agent,
+         status,
+         command_actions: Vec::new(),
+diff --git a/codex-rs/app-server/src/external_agent_config.rs b/codex-rs/app-server/src/external_agent_config.rs
+index ab2d77c376..2b7486871a 100644
+--- a/codex-rs/app-server/src/external_agent_config.rs
++++ b/codex-rs/app-server/src/external_agent_config.rs
+@@ -510,7 +510,7 @@ impl ExternalAgentConfigService {
+         let mut mcp_server_names = migrated_mcp_server_names(&migrated_mcp);
+         if !is_empty_toml_table(&migrated_mcp) {
+             if target_config.exists() {
+-                let existing_raw = fs::read_to_string(&target_config)?;
++                let existing_raw = tokio::fs::read_to_string(&target_config).await?;
+                 let mut existing = if existing_raw.trim().is_empty() {
+                     TomlValue::Table(Default::default())
+                 } else {
+@@ -1171,7 +1171,7 @@ impl ExternalAgentConfigService {
+             )));
+         }
+ 
+-        let existing_raw = fs::read_to_string(&target_config)?;
++        let existing_raw = tokio::fs::read_to_string(&target_config).await?;
+         let mut existing = if existing_raw.trim().is_empty() {
+             TomlValue::Table(Default::default())
+         } else {
+diff --git a/codex-rs/app-server/src/thread_status.rs b/codex-rs/app-server/src/thread_status.rs
+index e86cd37733..80d213366d 100644
+--- a/codex-rs/app-server/src/thread_status.rs
++++ b/codex-rs/app-server/src/thread_status.rs
+@@ -277,7 +277,7 @@ impl ThreadWatchManager {
+     where
+         F: FnOnce(&mut ThreadWatchState) -> Option<ThreadStatusChangedNotification>,
+     {
+-        let (notification, running_turn_count) = {
++        let notification = {
+             let mut state = self.state.lock().await;
+             let notification = mutate(&mut state);
+             let running_turn_count = state
+@@ -285,9 +285,11 @@ impl ThreadWatchManager {
+                 .values()
+                 .filter(|runtime| runtime.running)
+                 .count();
+-            (notification, running_turn_count)
++            // Retain the count for late subscribers and publish under the state
++            // lock so an older mutation cannot overwrite a newer count.
++            self.running_turn_count_tx.send_replace(running_turn_count);
++            notification
+         };
+-        let _ = self.running_turn_count_tx.send(running_turn_count);
+ 
+         if let Some(notification) = notification
+             && let Some(outgoing) = &self.outgoing
+@@ -817,11 +819,16 @@ mod tests {
+ 
+         manager.note_turn_started(INTERACTIVE_THREAD_ID).await;
+         assert_eq!(manager.running_turn_count().await, 1);
++        let running = manager.subscribe_running_turn_count();
++        assert_eq!(*running.borrow(), 1);
++        drop(running);
+ 
+         manager
+             .note_turn_completed(INTERACTIVE_THREAD_ID, false)
+             .await;
+         assert_eq!(manager.running_turn_count().await, 0);
++        let completed = manager.subscribe_running_turn_count();
++        assert_eq!(*completed.borrow(), 0);
+     }
+ 
+     #[tokio::test]
+diff --git a/codex-rs/cli/src/doctor/thread_inventory.rs b/codex-rs/cli/src/doctor/thread_inventory.rs
+index fb254270d1..b1a45b8beb 100644
+--- a/codex-rs/cli/src/doctor/thread_inventory.rs
++++ b/codex-rs/cli/src/doctor/thread_inventory.rs
+@@ -443,7 +443,7 @@ async fn scan_rollout_root(root: &Path, archived: bool, scan: &mut RolloutScan)
+         if scan.reached_scan_cap {
+             return;
+         }
+-        let entries = match std::fs::read_dir(&dir) {
++        let mut entries = match tokio::fs::read_dir(&dir).await {
+             Ok(entries) => entries,
+             Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+             Err(err) => {
+@@ -451,19 +451,20 @@ async fn scan_rollout_root(root: &Path, archived: bool, scan: &mut RolloutScan)
+                 continue;
+             }
+         };
+-        for entry in entries {
++        loop {
+             if scan.reached_scan_cap {
+                 return;
+             }
+-            let entry = match entry {
+-                Ok(entry) => entry,
++            let entry = match entries.next_entry().await {
++                Ok(Some(entry)) => entry,
++                Ok(None) => break,
+                 Err(err) => {
+                     scan.record_scan_error(format!("{} ({err})", dir.display()));
+                     continue;
+                 }
+             };
+             let path = entry.path();
+-            let file_type = match entry.file_type() {
++            let file_type = match entry.file_type().await {
+                 Ok(file_type) => file_type,
+                 Err(err) => {
+                     scan.record_scan_error(format!("{} ({err})", path.display()));
+diff --git a/codex-rs/core/src/session/mod.rs b/codex-rs/core/src/session/mod.rs
+index 4856dcd614..05d4853a5a 100644
+--- a/codex-rs/core/src/session/mod.rs
++++ b/codex-rs/core/src/session/mod.rs
+@@ -2175,7 +2175,7 @@ impl Session {
+ 
+         let mut reloaded_user_configs = Vec::with_capacity(config_toml_paths.len());
+         for config_toml_path in config_toml_paths {
+-            let user_config = match std::fs::read_to_string(&config_toml_path) {
++            let user_config = match tokio::fs::read_to_string(&config_toml_path).await {
+                 Ok(contents) => match toml::from_str::<toml::Value>(&contents) {
+                     Ok(config) => config,
+                     Err(err) => {
+@@ -4767,11 +4767,11 @@ impl Session {
+             unreachable!("session-owned tool-history reconciliation semaphore is never closed");
+         };
+         let mutation = crate::tool_history::ToolHistoryMutation::RegisterCandidate { candidate };
++        let mut persistence_writer = self.tool_history_persistence.writer().await;
+         let mut state = self.state.lock().await;
+         state.apply_tool_history_mutation(&mutation);
+-        if let Err(err) = self
+-            .tool_history_persistence
+-            .enqueue_mutation(mutation, "completed-tool history metadata")
++        if let Err(err) =
++            persistence_writer.enqueue_mutation(mutation, "completed-tool history metadata")
+         {
+             tracing::warn!(
+                 "failed to enqueue completed-tool history metadata; in-memory state is not durable: {err}"
+@@ -4796,11 +4796,11 @@ impl Session {
+         };
+         let mutation =
+             crate::tool_history::ToolHistoryMutation::RegisterWorkspaceEvidence { observation };
++        let mut persistence_writer = self.tool_history_persistence.writer().await;
+         let mut state = self.state.lock().await;
+         state.apply_tool_history_mutation(&mutation);
+-        if let Err(err) = self
+-            .tool_history_persistence
+-            .enqueue_mutation(mutation, "workspace evidence metadata")
++        if let Err(err) =
++            persistence_writer.enqueue_mutation(mutation, "workspace evidence metadata")
+         {
+             tracing::warn!(
+                 "failed to enqueue workspace evidence metadata; in-memory state is not durable: {err}"
+@@ -4819,10 +4819,10 @@ impl Session {
+         };
+         let mutation =
+             crate::tool_history::ToolHistoryMutation::RegisterNonWorkspaceCodeModeCall { call_id };
++        let mut persistence_writer = self.tool_history_persistence.writer().await;
+         let mut state = self.state.lock().await;
+         state.apply_tool_history_mutation(&mutation);
+-        if let Err(err) = self
+-            .tool_history_persistence
++        if let Err(err) = persistence_writer
+             .enqueue_mutation(mutation, "code-mode workspace classification metadata")
+         {
+             tracing::warn!(
+@@ -4867,12 +4867,12 @@ impl Session {
+             excluded_call_ids: excluded_call_ids.clone(),
+         };
+         {
++            let mut persistence_writer = self.tool_history_persistence.writer().await;
+             let mut state = self.state.lock().await;
+             if !state.apply_tool_history_mutation(&mutation) {
+                 return;
+             }
+-            if let Err(err) = self
+-                .tool_history_persistence
++            if let Err(err) = persistence_writer
+                 .enqueue_mutation(mutation, "source-dependency invalidation state")
+             {
+                 tracing::warn!(
+@@ -4898,12 +4898,13 @@ impl Session {
+             unreachable!("session-owned tool-history reconciliation semaphore is never closed");
+         };
+         {
++            let mut persistence_writer = self.tool_history_persistence.writer().await;
+             let mut state = self.state.lock().await;
+             let call_ids = state.mark_tool_history_consumed_with_delta(input, generation.clone());
+             if call_ids.is_empty() {
+                 return;
+             }
+-            if let Err(err) = self.tool_history_persistence.enqueue_mutation(
++            if let Err(err) = persistence_writer.enqueue_mutation(
+                 crate::tool_history::ToolHistoryMutation::MarkConsumed {
+                     call_ids,
+                     generation,
+diff --git a/codex-rs/core/src/session/reasoning_governor.rs b/codex-rs/core/src/session/reasoning_governor.rs
+index 9340f7623b..823092a462 100644
+--- a/codex-rs/core/src/session/reasoning_governor.rs
++++ b/codex-rs/core/src/session/reasoning_governor.rs
+@@ -2072,8 +2072,8 @@ fn final_diff_status_script_is_read_only(script: &str) -> bool {
+             .rsplit(['/', '\\'])
+             .next()
+             .unwrap_or(words[0])
+-            .trim_end_matches(".exe")
+             .to_ascii_lowercase();
++        let program = program.strip_suffix(".exe").unwrap_or(&program);
+         if program != "git" {
+             return false;
+         }
+@@ -2151,14 +2151,14 @@ fn source_invocation_class_from_canonical(
+             .rsplit(['/', '\\'])
+             .next()
+             .unwrap_or(program)
+-            .trim_end_matches(".exe")
+             .to_ascii_lowercase();
++        let program = program.strip_suffix(".exe").unwrap_or(&program);
+         let args = args
+             .into_iter()
+             .flatten()
+             .filter_map(Value::as_str)
+             .collect::<Vec<_>>();
+-        return classify_read_only_evidence_program(&program, &args);
++        return classify_read_only_evidence_program(program, &args);
+     }
+     let script = ["cmd", "command", "script_body"]
+         .iter()
+@@ -2180,9 +2180,9 @@ fn source_invocation_class_from_canonical(
+         .rsplit(['/', '\\'])
+         .next()
+         .unwrap_or(program)
+-        .trim_end_matches(".exe")
+         .to_ascii_lowercase();
+-    classify_read_only_evidence_program(&program, args)
++    let program = program.strip_suffix(".exe").unwrap_or(&program);
++    classify_read_only_evidence_program(program, args)
+ }
+ 
+ fn classify_read_only_evidence_program(program: &str, args: &[&str]) -> StructuredActionClass {
+@@ -5006,27 +5006,84 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn one_combined_diff_status_observation_may_follow_fresh_validation() {
+-        let mut governor = SamplingReasoningGovernor::new(None);
+-        let baselines = governor.baselines(0);
+-        let collector =
+-            recorded_validation_collector(&governor, &baselines, ToolOutputOutcome::Success);
+-        record_invocation_result(
+-            &collector,
+-            ToolName::plain("exec_command"),
+-            final_diff_status_payload(),
+-            "final-diff-status",
+-            ToolOutputOutcome::Success,
+-        );
+-        let settled_state = settled(0);
+-        governor.settle(&baselines, &collector, &settled_state);
++    fn final_diff_status_observation_requires_exact_git_executable() {
++        for (program, terminalizes) in [
++            ("git", true),
++            ("git.exe", true),
++            ("GIT.EXE", true),
++            ("git.exe.exe", false),
++            ("git.EXE.EXE", false),
++        ] {
++            let mut governor = SamplingReasoningGovernor::new(None);
++            let baselines = governor.baselines(0);
++            let collector =
++                recorded_validation_collector(&governor, &baselines, ToolOutputOutcome::Success);
++            record_invocation_result(
++                &collector,
++                ToolName::plain("exec_command"),
++                ToolPayload::Function {
++                    arguments: json!({
++                        "cmd": format!("{program} diff --check && {program} status --short")
++                    })
++                    .to_string(),
++                },
++                "final-diff-status",
++                ToolOutputOutcome::Success,
++            );
++            let settled_state = settled(0);
++            governor.settle(&baselines, &collector, &settled_state);
++            assert_eq!(
++                governor
++                    .evaluate_convergence(&baselines, &collector, &settled_state)
++                    .continuation
++                    == ContinuationDisposition::TerminalCompletionRequired,
++                terminalizes,
++                "executable: {program}"
++            );
++        }
++    }
+ 
+-        assert_eq!(
+-            governor
+-                .evaluate_convergence(&baselines, &collector, &settled_state)
+-                .continuation,
+-            ContinuationDisposition::TerminalCompletionRequired
+-        );
++    #[test]
++    fn source_convergence_requires_exact_executable_identity() {
++        for program in ["rg.exe", "RG.EXE", "rg.exe.exe", "rg.EXE.EXE"] {
++            for direct_argv in [true, false] {
++                let mut governor = SamplingReasoningGovernor::new(None);
++                let (baselines, settled) = unchanged_state(&governor);
++                let arguments = if direct_argv {
++                    json!({"kind": "argv", "program": program, "args": ["--files"]})
++                } else {
++                    json!({"command": format!("{program} --files")})
++                };
++                for generation in 0..2 {
++                    let collector = governor.collector(&baselines);
++                    let registration = collector.register_deterministic_tool_call(
++                        &ToolName::plain("exec_command"),
++                        &ToolPayload::Function {
++                            arguments: arguments.to_string(),
++                        },
++                        "source-call",
++                    );
++                    collector.record_response_result(
++                        registration.ordinal,
++                        ToolOutputOutcomeContext::new(ToolOutputOutcome::Success),
++                        None,
++                        &successful_tool_response("source-call", "src/lib.rs"),
++                        false,
++                    );
++                    let decision = governor.evaluate_convergence(&baselines, &collector, &settled);
++                    assert_eq!(
++                        decision
++                            .directive
++                            .as_deref()
++                            .is_some_and(|directive| directive.starts_with(
++                                "Convergence required: the broad source pass repeated"
++                            )),
++                        generation == 1 && matches!(program, "rg.exe" | "RG.EXE"),
++                        "program={program}, direct_argv={direct_argv}, generation={generation}"
++                    );
++                }
++            }
++        }
+     }
+ 
+     #[test]
+diff --git a/codex-rs/core/src/session/session.rs b/codex-rs/core/src/session/session.rs
+index a08923e820..620443b02b 100644
+--- a/codex-rs/core/src/session/session.rs
++++ b/codex-rs/core/src/session/session.rs
+@@ -68,7 +68,7 @@ struct ToolHistoryPersistenceState {
+ 
+ #[derive(Clone)]
+ pub(super) struct ToolHistoryPersistenceQueue {
+-    state: Arc<std::sync::Mutex<ToolHistoryPersistenceState>>,
++    state: Arc<tokio::sync::Mutex<ToolHistoryPersistenceState>>,
+     wake_tx: mpsc::Sender<()>,
+     completed_sequence: watch::Receiver<u64>,
+     mirror: Arc<tokio::sync::Mutex<crate::tool_history::ToolHistoryState>>,
+@@ -83,7 +83,9 @@ impl ToolHistoryPersistenceQueue {
+         thread_id: ThreadId,
+         initial_state: crate::tool_history::ToolHistoryState,
+     ) -> Self {
+-        let state = Arc::new(std::sync::Mutex::new(ToolHistoryPersistenceState::default()));
++        let state = Arc::new(tokio::sync::Mutex::new(
++            ToolHistoryPersistenceState::default(),
++        ));
+         let worker_state = Arc::clone(&state);
+         let mirror = Arc::new(tokio::sync::Mutex::new(initial_state));
+         let worker_mirror = Arc::clone(&mirror);
+@@ -111,9 +113,7 @@ impl ToolHistoryPersistenceQueue {
+             while wake_rx.recv().await.is_some() {
+                 loop {
+                     let requests = {
+-                        let mut state = worker_state
+-                            .lock()
+-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
++                        let mut state = worker_state.lock().await;
+                         std::mem::take(&mut state.pending)
+                     };
+                     if requests.is_empty() {
+@@ -252,62 +252,33 @@ impl ToolHistoryPersistenceQueue {
+         }
+     }
+ 
+-    pub(super) fn enqueue_mutation(
+-        &self,
+-        mutation: crate::tool_history::ToolHistoryMutation,
+-        description: &'static str,
+-    ) -> Result<(), ToolHistoryPersistenceEnqueueError> {
+-        self.enqueue_command(
+-            ToolHistoryPersistenceCommand::Mutation(Box::new(mutation)),
+-            description,
+-        )
+-        .map(|_| ())
++    pub(super) async fn writer(&self) -> ToolHistoryPersistenceWriter<'_> {
++        ToolHistoryPersistenceWriter {
++            state: self.state.lock().await,
++            wake_tx: &self.wake_tx,
++        }
+     }
+ 
+-    fn enqueue_command(
++    #[cfg(test)]
++    pub(super) async fn enqueue_mutation(
+         &self,
+-        command: ToolHistoryPersistenceCommand,
++        mutation: crate::tool_history::ToolHistoryMutation,
+         description: &'static str,
+-    ) -> Result<u64, ToolHistoryPersistenceEnqueueError> {
+-        if self.wake_tx.is_closed() {
+-            return Err(ToolHistoryPersistenceEnqueueError::WorkerClosed);
+-        }
+-        let enqueued_sequence;
+-        {
+-            let mut state = self
+-                .state
+-                .lock()
+-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+-            let Some(sequence) = next_tool_history_persistence_sequence(state.next_sequence) else {
+-                return Err(ToolHistoryPersistenceEnqueueError::SequenceOverflow);
+-            };
+-            state.next_sequence = sequence;
+-            enqueued_sequence = sequence;
+-            state.pending.push(PendingToolHistoryPersistence {
+-                sequence,
+-                command,
+-                description,
+-            });
+-        }
+-        match self.wake_tx.try_send(()) {
+-            Ok(()) | Err(mpsc::error::TrySendError::Full(())) => {}
+-            Err(mpsc::error::TrySendError::Closed(())) => {
+-                return Err(ToolHistoryPersistenceEnqueueError::WorkerClosed);
+-            }
+-        }
+-        Ok(enqueued_sequence)
++    ) -> Result<(), ToolHistoryPersistenceEnqueueError> {
++        self.writer().await.enqueue_mutation(mutation, description)
+     }
+ 
+     pub(super) async fn drain(&self) {
+-        let target_sequence = self.current_sequence();
++        let target_sequence = self.state.lock().await.next_sequence;
+         self.wait_for_sequence(target_sequence).await;
+     }
+ 
+     pub(super) async fn checkpoint(&self) {
+-        let target_sequence = match self.enqueue_command(
++        let result = self.writer().await.enqueue_command(
+             ToolHistoryPersistenceCommand::Checkpoint,
+             "completed-tool history checkpoint",
+-        ) {
++        );
++        let target_sequence = match result {
+             Ok(target_sequence) => target_sequence,
+             Err(err) => {
+                 tracing::warn!(
+@@ -319,13 +290,6 @@ impl ToolHistoryPersistenceQueue {
+         self.wait_for_sequence(target_sequence).await;
+     }
+ 
+-    fn current_sequence(&self) -> u64 {
+-        self.state
+-            .lock()
+-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+-            .next_sequence
+-    }
+-
+     async fn wait_for_sequence(&self, target_sequence: u64) {
+         let mut completed_sequence = self.completed_sequence.clone();
+         loop {
+@@ -357,6 +321,52 @@ impl ToolHistoryPersistenceQueue {
+     }
+ }
+ 
++/// Acquired before changing session history so publishing its matching queue
++/// entry needs no await and cannot be separated from that change by cancellation.
++pub(super) struct ToolHistoryPersistenceWriter<'a> {
++    state: tokio::sync::MutexGuard<'a, ToolHistoryPersistenceState>,
++    wake_tx: &'a mpsc::Sender<()>,
++}
++
++impl ToolHistoryPersistenceWriter<'_> {
++    pub(super) fn enqueue_mutation(
++        &mut self,
++        mutation: crate::tool_history::ToolHistoryMutation,
++        description: &'static str,
++    ) -> Result<(), ToolHistoryPersistenceEnqueueError> {
++        self.enqueue_command(
++            ToolHistoryPersistenceCommand::Mutation(Box::new(mutation)),
++            description,
++        )
++        .map(|_| ())
++    }
++
++    fn enqueue_command(
++        &mut self,
++        command: ToolHistoryPersistenceCommand,
++        description: &'static str,
++    ) -> Result<u64, ToolHistoryPersistenceEnqueueError> {
++        if self.wake_tx.is_closed() {
++            return Err(ToolHistoryPersistenceEnqueueError::WorkerClosed);
++        }
++        let sequence = next_tool_history_persistence_sequence(self.state.next_sequence)
++            .ok_or(ToolHistoryPersistenceEnqueueError::SequenceOverflow)?;
++        self.state.next_sequence = sequence;
++        self.state.pending.push(PendingToolHistoryPersistence {
++            sequence,
++            command,
++            description,
++        });
++        match self.wake_tx.try_send(()) {
++            Ok(()) | Err(mpsc::error::TrySendError::Full(())) => {}
++            Err(mpsc::error::TrySendError::Closed(())) => {
++                return Err(ToolHistoryPersistenceEnqueueError::WorkerClosed);
++            }
++        }
++        Ok(sequence)
++    }
++}
++
+ pub(super) fn next_tool_history_persistence_sequence(current: u64) -> Option<u64> {
+     current.checked_add(1)
+ }
+diff --git a/codex-rs/core/src/session/tests.rs b/codex-rs/core/src/session/tests.rs
+index 6670a748ba..82fada7707 100644
+--- a/codex-rs/core/src/session/tests.rs
++++ b/codex-rs/core/src/session/tests.rs
+@@ -278,6 +278,7 @@ async fn tool_history_persistence_queue_batches_mutations_without_dropping_them(
+                 },
+                 "test completed-tool history metadata",
+             )
++            .await
+             .expect("persistence worker remains available");
+     }
+ 
+@@ -299,6 +300,46 @@ async fn tool_history_persistence_queue_batches_mutations_without_dropping_them(
+     );
+ }
+ 
++#[tokio::test]
++async fn tool_history_registration_waits_without_blocking_or_partially_mutating() {
++    let (session, _turn_context) = make_session_and_context().await;
++    let codex_home = session.get_config().await.codex_home.clone();
++    let writer = session.tool_history_persistence.writer().await;
++    let before = serde_json::to_value(session.state.lock().await.tool_history_state())
++        .expect("serialize initial history");
++
++    assert!(
++        tokio::time::timeout(
++            Duration::from_millis(25),
++            session
++                .register_non_workspace_code_mode_call(&codex_home, "cancelled-call".to_string()),
++        )
++        .await
++        .is_err(),
++        "queue contention must yield to the runtime"
++    );
++    let after = serde_json::to_value(session.state.lock().await.tool_history_state())
++        .expect("serialize history after cancellation");
++    assert_eq!(
++        after, before,
++        "cancelled registration must not alter history"
++    );
++
++    drop(writer);
++    session
++        .register_non_workspace_code_mode_call(&codex_home, "persisted-call".to_string())
++        .await;
++    session.flush_tool_history_persistence().await;
++    let (persisted, warning) =
++        crate::tool_history::load_tool_history_state(&codex_home, &session.thread_id.to_string())
++            .await
++            .into_state_and_warning();
++    assert_eq!(warning, None);
++    let persisted = serde_json::to_string(&persisted).expect("serialize persisted history");
++    assert!(persisted.contains("persisted-call"));
++    assert!(!persisted.contains("cancelled-call"));
++}
++
+ #[tokio::test]
+ async fn tool_history_persistence_queue_does_not_acknowledge_a_failed_write() {
+     let codex_home = tempfile::tempdir().expect("create codex home");
+@@ -318,6 +359,7 @@ async fn tool_history_persistence_queue_does_not_acknowledge_a_failed_write() {
+             },
+             "test completed-tool history metadata",
+         )
++        .await
+         .expect("persistence worker remains available");
+ 
+     failure.wait_until_reached().await;
+@@ -361,6 +403,7 @@ async fn tool_history_persistence_queue_rejects_mutations_after_worker_closes()
+             },
+             "test completed-tool history metadata",
+         )
++        .await
+         .expect("the first mutation wakes the worker");
+     queue.wait_until_worker_closed_for_test().await;
+ 
+@@ -371,6 +414,7 @@ async fn tool_history_persistence_queue_rejects_mutations_after_worker_closes()
+             },
+             "test completed-tool history metadata",
+         )
++        .await
+         .expect_err("a closed worker must reject later mutations");
+     assert_eq!(
+         error,
+@@ -396,6 +440,7 @@ async fn tool_history_persistence_checkpoint_does_not_acknowledge_after_worker_c
+             },
+             "test completed-tool history metadata",
+         )
++        .await
+         .expect("the first mutation wakes the worker");
+     queue.wait_until_worker_closed_for_test().await;
+ 
+diff --git a/codex-rs/core/src/tools/command_output_artifact.rs b/codex-rs/core/src/tools/command_output_artifact.rs
+index 8c8ba12dfb..f36b10dfd1 100644
+--- a/codex-rs/core/src/tools/command_output_artifact.rs
++++ b/codex-rs/core/src/tools/command_output_artifact.rs
+@@ -2681,7 +2681,7 @@ pub(crate) async fn remint_tool_history_artifact_for_thread(
+     )
+     .await
+     {
+-        let _ = std::fs::remove_file(active_tool_history_protection_path(&target_path));
++        let _ = tokio::fs::remove_file(active_tool_history_protection_path(&target_path)).await;
+         rollback_logical_artifact_creation(&target_retention_token, &target_path);
+         return Err(format!("failed to protect reminted artifact: {err}"));
+     }
+diff --git a/codex-rs/core/src/tools/handlers/command_preflight.rs b/codex-rs/core/src/tools/handlers/command_preflight.rs
+index 57e73bc3ac..1080748d95 100644
+--- a/codex-rs/core/src/tools/handlers/command_preflight.rs
++++ b/codex-rs/core/src/tools/handlers/command_preflight.rs
+@@ -300,6 +300,11 @@ fn preflight_invocation_with_equivalent_repair_detailed(
+     let Some(repaired_command) = repaired.to_direct_argv() else {
+         return Err(issue);
+     };
++    // Search executables can also launch helpers (for example rg --pre).
++    // Verify the complete repaired argv before automatically executing it.
++    if !codex_shell_command::is_safe_command::is_known_safe_direct_argv(&repaired_command) {
++        return Err(issue);
++    }
+     // One repair is the hard limit. If the repaired command has another issue,
+     // reject it rather than chaining mechanical transformations.
+     let repaired_argv_commands =
+diff --git a/codex-rs/core/src/tools/handlers/command_preflight_tests.rs b/codex-rs/core/src/tools/handlers/command_preflight_tests.rs
+index 3519bd1012..22fe7d0964 100644
+--- a/codex-rs/core/src/tools/handlers/command_preflight_tests.rs
++++ b/codex-rs/core/src/tools/handlers/command_preflight_tests.rs
+@@ -612,6 +612,29 @@ fn never_repairs_mutating_command_flag_typos() {
+     );
+ }
+ 
++#[tokio::test]
++async fn runtime_preflight_rejects_repairs_that_can_launch_search_helpers() {
++    for args in [
++        strings(&["--ignorecase", "--pre", "helper.exe", "TODO", "src"]),
++        strings(&["--ignorecase", "--pre=helper.exe", "TODO", "src"]),
++        strings(&["--ignorecase", "--hostname-bin=helper.exe", "TODO", "src"]),
++    ] {
++        let invocation = CommandInvocation::Argv {
++            program: "rg".to_string(),
++            args,
++        };
++        let error = preflight_invocation_for_runtime(
++            false,
++            &invocation,
++            &invocation.to_direct_argv().expect("argv"),
++            None,
++        )
++        .await
++        .expect_err("helper execution must not be introduced by automatic repair");
++        assert!(error.contains("--ignorecase"));
++    }
++}
++
+ #[test]
+ fn never_repairs_script_even_when_first_command_is_read_only() {
+     let invocation =
+diff --git a/codex-rs/core/src/tools/handlers/multi_agents_v2/spawn.rs b/codex-rs/core/src/tools/handlers/multi_agents_v2/spawn.rs
+index 4ad811421f..46f7ee89b4 100644
+--- a/codex-rs/core/src/tools/handlers/multi_agents_v2/spawn.rs
++++ b/codex-rs/core/src/tools/handlers/multi_agents_v2/spawn.rs
+@@ -1308,7 +1308,7 @@ async fn construct_and_attach_task_capsule(
+                 "relevant handle {path:?} is outside the assignment read/write scope"
+             )));
+         }
+-        match std::fs::metadata(repo_root.join(&path)) {
++        match tokio::fs::metadata(repo_root.join(&path)).await {
+             Ok(metadata) if metadata.is_dir() => {
+                 return Err(StoreError::InvalidTaskCapsule(format!(
+                     "relevant handle {path:?} resolves to a directory"
+diff --git a/codex-rs/core/src/tools/parallel.rs b/codex-rs/core/src/tools/parallel.rs
+index d741b36db6..a30a10707d 100644
+--- a/codex-rs/core/src/tools/parallel.rs
++++ b/codex-rs/core/src/tools/parallel.rs
+@@ -1918,6 +1918,15 @@ impl ToolCallRuntime {
+                 turn.config.cwd.as_path(),
+                 workspace_admission_hint,
+             );
++        // Nested reads must carry their dependencies even when their output is
++        // small enough to skip projection. Keep non-workspace calls as None;
++        // Some(empty) means an unscoped workspace observation to the exec owner.
++        let projection_source_dependencies = projection_source_dependencies.or_else(|| {
++            workspace_call_classification
++                .as_ref()
++                .filter(|classification| classification.observes_workspace)
++                .map(|classification| classification.source_dependencies.clone())
++        });
+         let model_issued = matches!(&source, ToolCallSource::Direct);
+         let abort_turn = Arc::clone(&turn);
+         let dispatch_state = Arc::new(ToolDispatchState::new());
+@@ -3702,6 +3711,112 @@ mod tests {
+         );
+     }
+ 
++    #[test_case::test_case("Get-Content contract.txt", true; "scoped read")]
++    #[test_case::test_case("git status --short", false; "unscoped read")]
++    #[tokio::test]
++    async fn nested_workspace_result_carries_dependencies_without_output_projection(
++        command: &str,
++        scoped: bool,
++    ) {
++        let (session, turn_context) = crate::session::tests::make_session_and_context().await;
++        let session = Arc::new(session);
++        let turn_context = Arc::new(turn_context);
++        let tool_name = codex_tools::ToolName::plain("exec_command");
++        let handler = Arc::new(ImmediateHandler {
++            tool_name: tool_name.clone(),
++        }) as Arc<dyn CoreToolRuntime>;
++        let router = Arc::new(ToolRouter::from_parts(
++            ToolRegistry::from_tools([handler]),
++            Vec::new(),
++        ));
++        let step_context =
++            StepContext::for_test(Arc::clone(&turn_context)).with_tool_router_for_test(router);
++        let governor = crate::session::reasoning_governor::SamplingReasoningGovernor::new(None);
++        let baselines = governor.baselines(0);
++        let collector = governor.collector(&baselines);
++        let runtime = ToolCallRuntime::new(
++            Arc::clone(&session),
++            step_context,
++            Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
++        )
++        .with_sampling_request_signals(collector.clone());
++        let payload = ToolPayload::Function {
++            arguments: serde_json::json!({ "cmd": command }).to_string(),
++        };
++        let expected = if scoped {
++            std::collections::BTreeSet::from([crate::tool_history::SourceDependencyV1::new(
++                &turn_context.config.cwd.join("contract.txt"),
++                false,
++            )])
++        } else {
++            std::collections::BTreeSet::new()
++        };
++        let result = runtime
++            .clone()
++            .handle_tool_call_with_source(
++                ToolCall {
++                    tool_name: tool_name.clone(),
++                    call_id: "nested-read".to_string(),
++                    payload: payload.clone(),
++                },
++                ToolCallSource::CodeMode {
++                    cell_id: "read-cell".to_string(),
++                    parent_call_id: Some("outer-exec".to_string()),
++                    runtime_tool_call_id: "runtime-read".to_string(),
++                },
++                CancellationToken::new(),
++            )
++            .await
++            .expect("nested workspace read succeeds");
++
++        assert!(result.model_projection.is_none());
++        assert_eq!(result.projected_source_dependencies(), Some(&expected));
++        let canonical: Arc<[ResponseItem]> = Arc::from([
++            ResponseItem::FunctionCall {
++                id: None,
++                name: "exec_command".to_string(),
++                namespace: None,
++                arguments: serde_json::json!({ "cmd": command }).to_string(),
++                call_id: "nested-read".to_string(),
++                internal_chat_message_metadata_passthrough: None,
++            },
++            ResponseItem::from(result.response()),
++        ]);
++        let history = session.clone_history().await;
++        let history = history.tool_history_state();
++        let revision = history
++            .workspace_evidence_revision_for_test("nested-read")
++            .expect("nested read registers workspace evidence");
++        assert_eq!(
++            history
++                .project_with_workspace_identity(Arc::clone(&canonical), revision.as_ref())
++                .items,
++            canonical,
++            "a successful nested read must remain visible at its captured revision"
++        );
++        let dependencies = result.projected_source_dependencies().cloned();
++        let outcome_context = result.outcome_context();
++        let value = result.code_mode_result();
++        assert_eq!(value, serde_json::json!("ok"));
++        runtime.record_code_mode_result(
++            CodeModeToolResult {
++                cell_id: "read-cell",
++                tool_name: &tool_name,
++                payload: &payload,
++                source_dependencies: dependencies,
++                outcome_context,
++                signal: None,
++                result: &value,
++                canonical_artifact_required: false,
++            },
++            &[],
++        );
++        assert_eq!(
++            collector.code_mode_source_dependencies("read-cell"),
++            Some(expected)
++        );
++    }
++
+     #[tokio::test]
+     async fn non_workspace_evidence_skips_workspace_gate() {
+         let (session, turn_context) = crate::session::tests::make_session_and_context().await;
+@@ -4938,8 +5053,6 @@ mod tests {
+         cleanup_started_rx
+             .await
+             .expect("handler should start cleanup");
+-        tokio::time::sleep(Duration::from_millis(10)).await;
+-        allow_cleanup.notify_one();
+ 
+         let response = tokio::time::timeout(Duration::from_secs(1), response_task)
+             .await
+@@ -4969,7 +5082,12 @@ mod tests {
+             .find(|timing| timing.call_id == "call-1")
+             .expect("cancelled call timing");
+         assert!(call_timing.handler_entry_at_ms.is_some());
+-        assert!(call_timing.handler_exit_at_ms.is_some());
++        assert!(
++            call_timing.handler_exit_at_ms.is_none(),
++            "the abort response is delivered while runtime cleanup is still held"
++        );
++
++        allow_cleanup.notify_one();
+ 
+         Ok(())
+     }
+@@ -5047,7 +5165,6 @@ mod tests {
+             .await
+             .expect("owned abort should start cooperative runtime cleanup");
+         assert!(handler_token.is_cancelled());
+-        allow_cleanup.notify_one();
+ 
+         let response = tokio::time::timeout(Duration::from_secs(1), response_task)
+             .await
+@@ -5084,7 +5201,10 @@ mod tests {
+         );
+         assert_eq!(call_timing.parent_call_id.as_deref(), Some("outer-call"));
+         assert!(call_timing.handler_entry_at_ms.is_some());
+-        assert!(call_timing.handler_exit_at_ms.is_some());
++        assert!(
++            call_timing.handler_exit_at_ms.is_none(),
++            "the abort response is delivered while runtime cleanup is still held"
++        );
+         assert!(call_timing.output_projection_ms.is_some());
+         let closure = turn_context.turn_timing_state.tool_closure_snapshot();
+         assert_eq!(closure.accepted_count, 1);
+@@ -5096,6 +5216,8 @@ mod tests {
+         );
+         assert!(closure.orphan_calls.is_empty());
+ 
++        allow_cleanup.notify_one();
++
+         Ok(())
+     }
+ 
+diff --git a/codex-rs/core/src/tools/registry.rs b/codex-rs/core/src/tools/registry.rs
+index 0719d3b07c..3117d7016c 100644
+--- a/codex-rs/core/src/tools/registry.rs
++++ b/codex-rs/core/src/tools/registry.rs
+@@ -535,7 +535,7 @@ pub(crate) async fn install_synthetic_terminal_projection(
+             .step_context
+             .turn
+             .turn_timing_state
+-            .record_tool_output_projection_facts(
++            .record_tool_output_projection_facts_async(
+                 projection.canonical_bytes,
+                 projection.canonical_tokens,
+                 projection.model_bytes,
+@@ -545,7 +545,8 @@ pub(crate) async fn install_synthetic_terminal_projection(
+                 projection.projection_truncated,
+                 projection.omitted_sections,
+                 provider_visible,
+-            );
++            )
++            .await;
+     }
+     result.install_model_projection(model_projection, /*source_dependencies_override*/ None);
+ }
+@@ -766,11 +767,11 @@ impl ToolOutput for UnavailableModelProjectionOutput {
+     }
+ 
+     fn success_for_logging(&self) -> bool {
+-        false
++        self.original.success_for_logging()
+     }
+ 
+     fn outcome_for_logging(&self) -> ToolOutputOutcome {
+-        ToolOutputOutcome::Failure
++        self.original.outcome_for_logging()
+     }
+ 
+     fn outcome_context(&self) -> codex_tools::ToolOutputOutcomeContext {
+@@ -1534,7 +1535,7 @@ impl ToolRegistry {
+                     let model_visible = FunctionToolOutput::from_text(
+                         "Tool execution completed, but its full result could not be preserved for model delivery."
+                             .to_string(),
+-                        Some(false),
++                        Some(result.success_for_logging()),
+                     );
+                     result.result = Box::new(UnavailableModelProjectionOutput {
+                         original: result.result,
+@@ -1546,7 +1547,7 @@ impl ToolRegistry {
+                         .step_context
+                         .turn
+                         .turn_timing_state
+-                        .record_tool_output_projection_facts(
++                        .record_tool_output_projection_facts_async(
+                             projection.canonical_bytes,
+                             projection.canonical_tokens,
+                             projection.model_bytes,
+@@ -1556,7 +1557,8 @@ impl ToolRegistry {
+                             projection.projection_truncated,
+                             projection.omitted_sections,
+                             provider_visible,
+-                        );
++                        )
++                        .await;
+                     if admission_tracking_enabled && let Some(candidate) = &projection.candidate {
+                         let phase_started = Instant::now();
+                         invocation
+@@ -1570,6 +1572,15 @@ impl ToolRegistry {
+                     }
+                 }
+                 result.install_model_projection(model_projection, rewritten_source_dependencies);
++                // Cancellation may win while projection or its bookkeeping is
++                // pending. Its owner publishes the aborted terminal outcome.
++                if dispatch_state.is_aborted() {
++                    let err = FunctionCallError::RespondToModel(
++                        "tool cancelled after runtime cleanup".to_string(),
++                    );
++                    dispatch_trace.record_failed(&err).await;
++                    return Err(err);
++                }
+                 let phase_started = Instant::now();
+                 notify_tool_finish(&invocation, lifecycle_outcome).await;
+                 record_lifecycle_phase(&invocation, "notify_finish", phase_started);
+diff --git a/codex-rs/core/src/tools/registry_tests.rs b/codex-rs/core/src/tools/registry_tests.rs
+index 672aa17f89..47d7f5d168 100644
+--- a/codex-rs/core/src/tools/registry_tests.rs
++++ b/codex-rs/core/src/tools/registry_tests.rs
+@@ -3222,7 +3222,8 @@ async fn dispatch_notifies_tool_lifecycle_contributors() -> anyhow::Result<()> {
+ }
+ 
+ #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+-async fn handler_completion_reserves_projection_before_abort_can_claim() -> anyhow::Result<()> {
++async fn cancellation_during_projection_does_not_publish_completed_lifecycle() -> anyhow::Result<()>
++{
+     let (mut session, turn) = crate::session::tests::make_session_and_context().await;
+     let records = Arc::new(std::sync::Mutex::new(Vec::new()));
+     let mut builder = codex_extension_api::ExtensionRegistryBuilder::<crate::config::Config>::new();
+@@ -3269,33 +3270,29 @@ async fn handler_completion_reserves_projection_before_abort_can_claim() -> anyh
+         .send(())
+         .expect("projection materialization should remain in flight");
+ 
+-    let result = dispatch.await.expect("dispatch task should join")?;
++    let err = match dispatch.await.expect("dispatch task should join") {
++        Ok(_) => anyhow::bail!("cancelled projection must not return an ordinary result"),
++        Err(err) => err,
++    };
+     assert!(
+-        !simulated_abort_claimed,
+-        "handler completion must reserve the ordinary projection before an abort can claim it"
++        simulated_abort_claimed,
++        "unfinished projection remains cancellable"
+     );
+-    assert!(result.model_projection.is_some());
++    assert_eq!(err.to_string(), "tool cancelled after runtime cleanup");
+     assert_eq!(
+         projection_calls.load(std::sync::atomic::Ordering::Acquire),
+         1,
+-        "the ordinary terminal transaction materializes exactly one projection"
++        "cancellation must not repeat projection materialization"
+     );
+     assert_eq!(
+         records
+             .lock()
+             .unwrap_or_else(std::sync::PoisonError::into_inner)
+             .as_slice(),
+-        &[
+-            RecordedToolLifecycle::Start {
+-                call_id: "projection-call".to_string(),
+-                tool_name: codex_tools::ToolName::plain("blocking_projection_tool"),
+-            },
+-            RecordedToolLifecycle::Finish {
+-                call_id: "projection-call".to_string(),
+-                tool_name: codex_tools::ToolName::plain("blocking_projection_tool"),
+-                outcome: codex_extension_api::ToolCallOutcome::Completed { success: true },
+-            },
+-        ]
++        &[RecordedToolLifecycle::Start {
++            call_id: "projection-call".to_string(),
++            tool_name: codex_tools::ToolName::plain("blocking_projection_tool"),
++        },]
+     );
+ 
+     Ok(())
+diff --git a/codex-rs/core/src/turn_timing.rs b/codex-rs/core/src/turn_timing.rs
+index 073274134c..813ceeb856 100644
+--- a/codex-rs/core/src/turn_timing.rs
++++ b/codex-rs/core/src/turn_timing.rs
+@@ -2583,6 +2583,42 @@ impl TurnTimingState {
+         }
+     }
+ 
++    /// Keep contended timing bookkeeping off the async tool-dispatch worker.
++    #[allow(clippy::too_many_arguments)]
++    pub(crate) async fn record_tool_output_projection_facts_async(
++        self: &Arc<Self>,
++        canonical_bytes: u64,
++        canonical_tokens: u64,
++        model_bytes: u64,
++        model_tokens: u64,
++        artifact_created: bool,
++        artifact_reused: bool,
++        projection_truncated: bool,
++        omitted_sections: u64,
++        provider_visible: bool,
++    ) {
++        let timing = Arc::clone(self);
++        if let Err(error) = tokio::task::spawn_blocking(move || {
++            timing.record_tool_output_projection_facts(
++                canonical_bytes,
++                canonical_tokens,
++                model_bytes,
++                model_tokens,
++                artifact_created,
++                artifact_reused,
++                projection_truncated,
++                omitted_sections,
++                provider_visible,
++            );
++        })
++        .await
++        {
++            // A bookkeeping failure must not skip the accepted tool's terminal
++            // projection and lifecycle publication.
++            tracing::error!(%error, "failed to record tool output projection timing");
++        }
++    }
++
+     pub(crate) fn record_tool_output_recovery(&self, retruncation_count: u32) {
+         let mut state = self.state();
+         state.counters.tool_output_recovery_call_count = state
+diff --git a/codex-rs/core/src/turn_timing_tests.rs b/codex-rs/core/src/turn_timing_tests.rs
+index 5ee6952a15..f6e49122aa 100644
+--- a/codex-rs/core/src/turn_timing_tests.rs
++++ b/codex-rs/core/src/turn_timing_tests.rs
+@@ -2209,6 +2209,50 @@ fn start_after_completion_is_rejected_without_changing_frozen_snapshot() {
+     assert_eq!(state.state().counters.invalid_transition_count, 1);
+ }
+ 
++#[tokio::test]
++async fn projection_recording_keeps_executor_available_under_contention() {
++    let (_clock, state) = timing();
++    let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
++    let (release_tx, release_rx) = std::sync::mpsc::channel();
++    let held_state = Arc::clone(&state);
++    let holder = std::thread::spawn(move || {
++        let guard = held_state.state();
++        locked_tx.send(()).expect("announce held timing lock");
++        let released = release_rx.recv_timeout(Duration::from_secs(5)).is_ok();
++        drop(guard);
++        released
++    });
++    locked_rx.await.expect("timing lock held");
++    let recording_state = Arc::clone(&state);
++    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
++    let recording = tokio::spawn(async move {
++        started_tx.send(()).expect("announce recording attempt");
++        recording_state
++            .record_tool_output_projection_facts_async(
++                1_000, 250, 400, 100, true, false, true, 3, true,
++            )
++            .await
++    });
++    started_rx.await.expect("recording attempt started");
++    assert!(
++        !recording.is_finished(),
++        "recording waits without blocking the executor"
++    );
++    release_tx
++        .send(())
++        .expect("release timing lock before timeout");
++    recording.await.expect("recording task");
++    assert!(
++        holder.join().expect("lock holder"),
++        "executor remained responsive"
++    );
++    let counters = state.complete_snapshot().protocol_timing().counters;
++    assert_eq!(counters.tool_output_canonical_byte_count, 1_000);
++    assert_eq!(counters.tool_output_model_token_count, 100);
++    assert_eq!(counters.tool_output_artifact_creation_count, 1);
++    assert_eq!(counters.tool_output_omitted_section_count, 3);
++}
++
+ #[test]
+ fn wait_and_tool_output_counters_are_additive() {
+     let (_clock, state) = timing();
+diff --git a/codex-rs/kda.toml b/codex-rs/kda.toml
+index 42c8e83875..31da2ef691 100644
+--- a/codex-rs/kda.toml
++++ b/codex-rs/kda.toml
+@@ -1,6 +1,5 @@
+ version = 1
+ policy-pack = ["kd4@1"]
+-all-profiles = true
+ 
+ # KD4's local Windows quality gate. Paths are relative to this Cargo workspace.
+ # Preserve the registry's warn/deny defaults; overriding the global default
+@@ -14,7 +13,7 @@ generic-instantiation-uncertain = "warn"
+ 
+ # Normal runtime and the only optional workspace feature (code-mode/Cargo.toml).
+ # Trusted loading provides build-script outputs and procedural macro expansion.
+-# Both profiles run by default; --profile windows selects normal features.
++# Use --all-profiles for both; --profile windows selects normal features.
+ [[analysis-profile]]
+ name = "windows"
+ target = "x86_64-pc-windows-msvc"
+diff --git a/codex-rs/lmstudio/Cargo.toml b/codex-rs/lmstudio/Cargo.toml
+index aa57b10ebe..80c29a833b 100644
+--- a/codex-rs/lmstudio/Cargo.toml
++++ b/codex-rs/lmstudio/Cargo.toml
+@@ -15,11 +15,12 @@ codex-core = { workspace = true }
+ codex-http-client = { workspace = true }
+ codex-model-provider-info = { workspace = true }
+ serde_json = { workspace = true }
+-tokio = { workspace = true, features = ["rt"] }
++tokio = { workspace = true, features = ["rt", "process"] }
+ tracing = { workspace = true, features = ["log"] }
+ which = { workspace = true }
+ 
+ [dev-dependencies]
++tempfile = { workspace = true }
+ wiremock = { workspace = true }
+ tokio = { workspace = true, features = ["full"] }
+ 
+diff --git a/codex-rs/lmstudio/src/client.rs b/codex-rs/lmstudio/src/client.rs
+index 013c80fc0f..720500574f 100644
+--- a/codex-rs/lmstudio/src/client.rs
++++ b/codex-rs/lmstudio/src/client.rs
+@@ -158,11 +158,12 @@ impl LMStudioClient {
+         let lms = Self::find_lms()?;
+         eprintln!("Downloading model: {model}");
+ 
+-        let status = std::process::Command::new(&lms)
++        let status = tokio::process::Command::new(&lms)
+             .args(["get", "--yes", model])
+             .stdout(std::process::Stdio::inherit())
+             .stderr(std::process::Stdio::null())
+             .status()
++            .await
+             .map_err(|e| {
+                 std::io::Error::other(format!("Failed to execute '{lms} get --yes {model}': {e}"))
+             })?;
+@@ -369,31 +370,63 @@ mod tests {
+             .expect("load request should succeed");
+     }
+ 
+-    #[test]
+-    fn test_find_lms() {
+-        let result = LMStudioClient::find_lms();
+-
+-        match result {
+-            Ok(_) => {
+-                // lms was found in PATH - that's fine
+-            }
+-            Err(e) => {
+-                // Expected error when LM Studio not installed
+-                assert!(e.to_string().contains("LM Studio not found"));
+-            }
++    #[tokio::test]
++    async fn test_find_lms() {
++        if std::env::var_os("CODEX_LMS_DISCOVERY_CHILD").is_some() {
++            let client = LMStudioClient::from_host_root("http://localhost:1234").unwrap();
++            let error = client.download_model("test-model").await.unwrap_err();
++            assert_eq!(error.kind(), io::ErrorKind::NotFound);
++            assert!(error.to_string().contains("LM Studio not found"));
++        } else {
++            run_discovery_child("client::tests::test_find_lms", false).await;
+         }
+     }
+ 
+-    #[test]
+-    fn test_find_lms_with_mock_home() {
+-        // Test fallback path construction without touching env vars
++    #[tokio::test]
++    async fn test_find_lms_with_mock_home() {
++        if std::env::var_os("CODEX_LMS_DISCOVERY_CHILD").is_some() {
++            let client = LMStudioClient::from_host_root("http://localhost:1234").unwrap();
++            let error = client.download_model("test-model").await.unwrap_err();
++            assert!(
++                error
++                    .to_string()
++                    .starts_with("Model download failed with exit code:"),
++                "the discovered executable must run and its failure must propagate: {error}"
++            );
++        } else {
++            run_discovery_child("client::tests::test_find_lms_with_mock_home", true).await;
++        }
++    }
+ 
+-        {
+-            let result = LMStudioClient::find_lms_with_home_dir(Some("C:\\test\\home"));
+-            if let Err(e) = result {
+-                assert!(e.to_string().contains("LM Studio not found"));
+-            }
++    async fn run_discovery_child(test: &str, install_failing_executable: bool) {
++        let home = tempfile::tempdir().unwrap();
++        if install_failing_executable {
++            let bin = home.path().join(".lmstudio/bin");
++            std::fs::create_dir_all(&bin).unwrap();
++            // WHERE is a real Windows executable. The unsupported --yes option
++            // makes it fail without downloading a model or contacting a service.
++            let windows = std::env::var_os("SystemRoot").expect("Windows system directory");
++            std::fs::copy(
++                Path::new(&windows).join("System32/where.exe"),
++                bin.join("lms.exe"),
++            )
++            .unwrap();
+         }
++        let output = tokio::process::Command::new(std::env::current_exe().unwrap())
++            .args(["--exact", test, "--nocapture"])
++            .env("CODEX_LMS_DISCOVERY_CHILD", "1")
++            .env("USERPROFILE", home.path())
++            .env("PATH", "")
++            .output()
++            .await
++            .unwrap();
++        assert!(
++            output.status.success(),
++            "discovery subprocess failed: {}\n{}",
++            String::from_utf8_lossy(&output.stdout),
++            String::from_utf8_lossy(&output.stderr)
++        );
++        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+     }
+ 
+     #[test]
+diff --git a/codex-rs/rollout/src/recorder.rs b/codex-rs/rollout/src/recorder.rs
+index 96312dce69..237fbd4605 100644
+--- a/codex-rs/rollout/src/recorder.rs
++++ b/codex-rs/rollout/src/recorder.rs
+@@ -1774,16 +1774,26 @@ impl RolloutWriterState {
+         if self.is_deferred() {
+             return;
+         }
+-        if let Err(err) = self.flush().await {
++        // Automatic writes retain coalesced token counts until a turn boundary
++        // or an explicit durability barrier.
++        if let Err(err) = self.write_pending_with_recovery("record").await {
+             self.enter_recovery_mode(&err);
+         }
+     }
+ 
++    fn drain_pending_token_count(&mut self) {
++        if let Some(token_count) = self.pending_token_count.take() {
++            self.pending_items.push(token_count);
++        }
++    }
++
+     async fn persist(&mut self) -> std::io::Result<()> {
++        self.drain_pending_token_count();
+         self.write_pending_with_recovery("persist").await
+     }
+ 
+     async fn flush(&mut self) -> std::io::Result<()> {
++        self.drain_pending_token_count();
+         if self.is_deferred() && self.pending_items.is_empty() {
+             return Ok(());
+         }
+@@ -1791,9 +1801,7 @@ impl RolloutWriterState {
+     }
+ 
+     async fn shutdown(&mut self) -> std::io::Result<()> {
+-        if let Some(token_count) = self.pending_token_count.take() {
+-            self.pending_items.push(token_count);
+-        }
++        self.drain_pending_token_count();
+         if self.is_deferred() && self.pending_items.is_empty() {
+             return Ok(());
+         }
+@@ -1884,13 +1892,18 @@ impl RolloutWriterState {
+             .map(|info| info.path.as_path())
+             .unwrap_or(self.rollout_path.as_path());
+         let path = path.to_path_buf();
+-        let file = tokio::task::spawn_blocking(move || open_log_file(path.as_path()))
+-            .await
+-            .map_err(IoError::other)??;
++        let inspect_existing = self.meta.is_some();
++        let (file, has_existing_content) = tokio::task::spawn_blocking(move || {
++            let file = open_log_file(path.as_path())?;
++            let has_existing_content = inspect_existing && file.file.metadata()?.len() > 0;
++            Ok::<_, IoError>((file, has_existing_content))
++        })
++        .await
++        .map_err(IoError::other)??;
+         // Multiple recorders for the same newly-created thread can be initialized before any of
+         // them materializes the rollout. Re-check under the append lock so a later writer does not
+         // append another canonical session_meta or an already-persisted manifest.
+-        let existing_rollout_state = if self.meta.is_some() && file.file.metadata()?.len() > 0 {
++        let existing_rollout_state = if has_existing_content {
+             Some(RolloutRecorder::existing_rollout_state(&file.path).await?)
+         } else {
+             None
+@@ -2002,7 +2015,7 @@ async fn rollout_writer(
+                 Ok(()) => {
+                     writer_task.finish_shutdown(true);
+                     let _ = ack.send(Ok(()));
+-                    break;
++                    return Ok(());
+                 }
+                 Err(err) => {
+                     writer_task.finish_shutdown(false);
+@@ -2017,6 +2030,9 @@ async fn rollout_writer(
+         }
+     }
+ 
++    // Closing the last sender still owes durability for accepted records.
++    state.shutdown().await?;
++    writer_task.finish_shutdown(true);
+     Ok(())
+ }
+ 
+diff --git a/codex-rs/rollout/src/recorder_tests.rs b/codex-rs/rollout/src/recorder_tests.rs
+index e529d17cfb..4f8c5f047c 100644
+--- a/codex-rs/rollout/src/recorder_tests.rs
++++ b/codex-rs/rollout/src/recorder_tests.rs
+@@ -549,6 +549,162 @@ async fn load_rollout_items_filters_legacy_ghost_snapshots_from_compaction_histo
+     Ok(())
+ }
+ 
++#[tokio::test]
++async fn recorder_barriers_persist_latest_coalesced_token_count() -> std::io::Result<()> {
++    for barrier in ["flush", "persist", "shutdown"] {
++        let home = TempDir::new()?;
++        let recorder = RolloutRecorder::new(
++            &test_config(home.path()),
++            RolloutRecorderParams::new(
++                ThreadId::new(),
++                None,
++                None,
++                SessionSource::Exec,
++                None,
++                "barrier-test".to_string(),
++                BaseInstructions::default(),
++                Vec::new(),
++            )
++            .with_history_mode(ThreadHistoryMode::Paginated),
++        )
++        .await?;
++        recorder.persist().await?;
++        let rollout_path = recorder.rollout_path().to_path_buf();
++        let token_count = |count| {
++            RolloutItem::EventMsg(EventMsg::TokenCount(TokenCountEvent {
++                info: Some(codex_protocol::protocol::TokenUsageInfo {
++                    total_token_usage: codex_protocol::protocol::TokenUsage {
++                        total_tokens: count,
++                        ..Default::default()
++                    },
++                    last_token_usage: Default::default(),
++                    model_context_window: None,
++                }),
++                rate_limits: None,
++            }))
++        };
++        recorder
++            .record_canonical_items(&[token_count(10), token_count(20)])
++            .await?;
++        // Acceptance of the next item fences both prior automatic writes.
++        recorder
++            .record_canonical_items_ordered(&[RolloutItem::EventMsg(EventMsg::AgentMessage(
++                AgentMessageEvent {
++                    message: "accepted-marker".into(),
++                    phase: None,
++                    memory_citation: None,
++                },
++            ))])
++            .await?;
++        assert!(
++            !fs::read_to_string(&rollout_path)?.contains("token_count"),
++            "automatic writes still coalesce counts"
++        );
++        match barrier {
++            "flush" => recorder.flush().await?,
++            "persist" => recorder.persist().await?,
++            "shutdown" => recorder.shutdown().await?,
++            _ => unreachable!(),
++        }
++        let contents = fs::read_to_string(&rollout_path)?;
++        let records = contents
++            .lines()
++            .map(serde_json::from_str::<RolloutLine>)
++            .collect::<Result<Vec<_>, _>>()?;
++        let counts = records
++            .iter()
++            .filter_map(|line| match &line.item {
++                RolloutItem::EventMsg(EventMsg::TokenCount(event)) => event
++                    .info
++                    .as_ref()
++                    .map(|info| info.total_token_usage.total_tokens),
++                _ => None,
++            })
++            .collect::<Vec<_>>();
++        assert_eq!(counts, vec![20], "barrier: {barrier}");
++        assert!(
++            contents.contains("accepted-marker"),
++            "barrier persists all queued records"
++        );
++        if barrier != "shutdown" {
++            recorder.flush().await?;
++            assert_eq!(
++                fs::read_to_string(&rollout_path)?,
++                contents,
++                "repeated barrier must not duplicate records"
++            );
++            recorder.shutdown().await?;
++        }
++    }
++    Ok(())
++}
++
++#[tokio::test]
++async fn recorder_last_handle_drop_drains_accepted_deferred_records() -> std::io::Result<()> {
++    let home = TempDir::new()?;
++    let recorder = RolloutRecorder::new(
++        &test_config(home.path()),
++        RolloutRecorderParams::new(
++            ThreadId::new(),
++            None,
++            None,
++            SessionSource::Exec,
++            None,
++            "drop-test".to_string(),
++            BaseInstructions::default(),
++            Vec::new(),
++        )
++        .with_history_mode(ThreadHistoryMode::Paginated),
++    )
++    .await?;
++    let rollout_path = recorder.rollout_path().to_path_buf();
++    recorder
++        .record_canonical_items_ordered(&[
++            RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent {
++                message: "accepted-before-last-drop".into(),
++                phase: None,
++                memory_citation: None,
++            })),
++            RolloutItem::EventMsg(EventMsg::TokenCount(TokenCountEvent {
++                info: None,
++                rate_limits: None,
++            })),
++        ])
++        .await?;
++    assert!(
++        !rollout_path.exists(),
++        "records remain deferred before the last handle drops"
++    );
++    let writer = recorder
++        .writer_task
++        .handle
++        .lock()
++        .expect("writer handle")
++        .take()
++        .expect("running writer");
++    drop(recorder);
++    tokio::time::timeout(Duration::from_secs(5), writer)
++        .await
++        .expect("writer drains after channel closure")
++        .expect("writer task");
++    let contents = fs::read_to_string(&rollout_path)?;
++    let records = contents
++        .lines()
++        .map(serde_json::from_str::<RolloutLine>)
++        .collect::<Result<Vec<_>, _>>()?;
++    assert_eq!(records.iter().filter(|line| matches!(&line.item,
++        RolloutItem::EventMsg(EventMsg::AgentMessage(event)) if event.message == "accepted-before-last-drop"
++    )).count(), 1);
++    assert_eq!(
++        records
++            .iter()
++            .filter(|line| matches!(&line.item, RolloutItem::EventMsg(EventMsg::TokenCount(_))))
++            .count(),
++        1
++    );
++    Ok(())
++}
++
+ #[tokio::test]
+ async fn recorder_materializes_on_flush_with_pending_items() -> std::io::Result<()> {
+     let home = TempDir::new().expect("temp dir");
+diff --git a/codex-rs/thread-store/src/local/archive_thread.rs b/codex-rs/thread-store/src/local/archive_thread.rs
+index 7d230cd12c..bc06840adb 100644
+--- a/codex-rs/thread-store/src/local/archive_thread.rs
++++ b/codex-rs/thread-store/src/local/archive_thread.rs
+@@ -39,15 +39,17 @@ pub(super) async fn archive_thread(
+         .config
+         .codex_home
+         .join(codex_rollout::ARCHIVED_SESSIONS_SUBDIR);
+-    std::fs::create_dir_all(&archive_folder).map_err(|err| ThreadStoreError::Internal {
+-        message: format!("failed to archive thread: {err}"),
+-    })?;
++    tokio::fs::create_dir_all(&archive_folder)
++        .await
++        .map_err(|err| ThreadStoreError::Internal {
++            message: format!("failed to archive thread: {err}"),
++        })?;
+     let archived_path = archive_folder.join(&file_name);
+-    std::fs::rename(&canonical_rollout_path, &archived_path).map_err(|err| {
+-        ThreadStoreError::Internal {
++    tokio::fs::rename(&canonical_rollout_path, &archived_path)
++        .await
++        .map_err(|err| ThreadStoreError::Internal {
+             message: format!("failed to archive thread: {err}"),
+-        }
+-    })?;
++        })?;
+ 
+     if let Some(ctx) = state_db_ctx
+         && let Err(err) = ctx
+diff --git a/codex-rs/thread-store/src/local/delete_thread.rs b/codex-rs/thread-store/src/local/delete_thread.rs
+index f4ef572941..e0bf6dc1cc 100644
+--- a/codex-rs/thread-store/src/local/delete_thread.rs
++++ b/codex-rs/thread-store/src/local/delete_thread.rs
+@@ -124,15 +124,14 @@ pub(super) async fn stage_thread_deletes<'a>(
+         for rollout_path in paths {
+             let plain_path = codex_rollout::plain_rollout_path(&rollout_path);
+             for path in [plain_path.clone(), plain_path.with_extension("jsonl.zst")] {
+-                if !path
+-                    .try_exists()
+-                    .map_err(|err| ThreadStoreError::Internal {
++                if !tokio::fs::try_exists(&path).await.map_err(|err| {
++                    ThreadStoreError::Internal {
+                         message: format!(
+                             "failed to inspect rollout file `{}` before staging deletion: {err}",
+                             path.display()
+                         ),
+-                    })?
+-                {
++                    }
++                })? {
+                     continue;
+                 }
+                 let checked_path = checked_rollout_path(store, path.as_path(), *thread_id)?;
+diff --git a/codex-rs/thread-store/src/local/unarchive_thread.rs b/codex-rs/thread-store/src/local/unarchive_thread.rs
+index 1298235c30..c7cdd12d8a 100644
+--- a/codex-rs/thread-store/src/local/unarchive_thread.rs
++++ b/codex-rs/thread-store/src/local/unarchive_thread.rs
+@@ -91,14 +91,16 @@ where
+     })?;
+     thread.rollout_path = Some(codex_rollout::plain_rollout_path(restored_path.as_path()));
+ 
+-    std::fs::create_dir_all(&dest_dir).map_err(|err| ThreadStoreError::Internal {
+-        message: format!("failed to unarchive thread: {err}"),
+-    })?;
+-    std::fs::rename(&canonical_archived_path, &restored_path).map_err(|err| {
+-        ThreadStoreError::Internal {
++    tokio::fs::create_dir_all(&dest_dir)
++        .await
++        .map_err(|err| ThreadStoreError::Internal {
+             message: format!("failed to unarchive thread: {err}"),
+-        }
+-    })?;
++        })?;
++    tokio::fs::rename(&canonical_archived_path, &restored_path)
++        .await
++        .map_err(|err| ThreadStoreError::Internal {
++            message: format!("failed to unarchive thread: {err}"),
++        })?;
+ 
+     if let Some(ctx) = state_db_ctx
+         && let Err(err) = ctx
+diff --git a/codex-rs/tui/src/external_editor.rs b/codex-rs/tui/src/external_editor.rs
+index e86e67f28a..d46988ce10 100644
+--- a/codex-rs/tui/src/external_editor.rs
++++ b/codex-rs/tui/src/external_editor.rs
+@@ -1,5 +1,4 @@
+ use std::env;
+-use std::fs;
+ use std::path::Path;
+ use std::process::Stdio;
+ 
+@@ -66,7 +65,7 @@ pub(crate) async fn run_editor(seed: &str, editor_cmd: &[String]) -> Result<Stri
+ 
+     // Convert to TempPath immediately so no file handle stays open on Windows.
+     let temp_path = Builder::new().suffix(".md").tempfile()?.into_temp_path();
+-    fs::write(&temp_path, seed)?;
++    tokio::fs::write(&temp_path, seed).await?;
+ 
+     let program = resolve_windows_program(&editor_cmd[0]);
+     let mut cmd = if is_batch_program(&program) {
+@@ -87,7 +86,7 @@ pub(crate) async fn run_editor(seed: &str, editor_cmd: &[String]) -> Result<Stri
+         return Err(Report::msg(format!("editor exited with status {status}")));
+     }
+ 
+-    let contents = fs::read_to_string(&temp_path)?;
++    let contents = tokio::fs::read_to_string(&temp_path).await?;
+     Ok(contents)
+ }
+ 
+@@ -96,6 +95,7 @@ mod tests {
+     use super::*;
+     use pretty_assertions::assert_eq;
+     use serial_test::serial;
++    use std::fs;
+ 
+     struct EnvGuard {
+         visual: Option<String>,
+diff --git a/codex-rs/tui/src/goal_files.rs b/codex-rs/tui/src/goal_files.rs
+index b07b648e9a..6abf44adf5 100644
+--- a/codex-rs/tui/src/goal_files.rs
++++ b/codex-rs/tui/src/goal_files.rs
+@@ -1,6 +1,5 @@
+ //! Materializes oversized TUI goal objectives, pastes, and images as app-server-host files.
+ 
+-use std::fs;
+ use std::path::Path;
+ 
+ use crate::app_server_session::AppServerSession;
+@@ -92,7 +91,8 @@ pub(crate) async fn materialize_goal_draft(
+         let path = ensure_goal_output_dir(app_server, codex_home, &mut output_dir)
+             .await?
+             .join(format!("image-{}.{}", idx + 1, extension));
+-        let bytes = fs::read(&image.path)
++        let bytes = tokio::fs::read(&image.path)
++            .await
+             .with_context(|| format!("Could not read goal image {}", image.path.display()))?;
+         write_goal_file(app_server, path.clone(), bytes).await?;
+         if image.placeholder.is_empty() {
+diff --git a/codex-rs/tui/src/lib.rs b/codex-rs/tui/src/lib.rs
+index 8e78c69407..9267d9ec05 100644
+--- a/codex-rs/tui/src/lib.rs
++++ b/codex-rs/tui/src/lib.rs
+@@ -1113,7 +1113,7 @@ pub async fn run_main(
+ 
+     let (tui_file_layer, _tui_file_log_guard) = if config_toml_log_dir_configured {
+         let log_dir = config.log_dir.clone();
+-        std::fs::create_dir_all(&log_dir)?;
++        tokio::fs::create_dir_all(&log_dir).await?;
+         let mut log_file_opts = OpenOptions::new();
+         log_file_opts.create(true).append(true);
+ 
+diff --git a/codex-rs/utils/pty/src/pipe_tests.rs b/codex-rs/utils/pty/src/pipe_tests.rs
+index 28f2317ecd..53a7d9acb7 100644
+--- a/codex-rs/utils/pty/src/pipe_tests.rs
++++ b/codex-rs/utils/pty/src/pipe_tests.rs
+@@ -43,7 +43,7 @@ async fn managed_job_terminates_child_and_grandchild() -> anyhow::Result<()> {
+         "-NoProfile".to_string(),
+         "-NonInteractive".to_string(),
+         "-Command".to_string(),
+-        "$child = Start-Process ping.exe -ArgumentList '-n','60','127.0.0.1' -PassThru; \
++        "$child = Start-Process ping.exe -WindowStyle Hidden -ArgumentList '-n','60','127.0.0.1' -PassThru; \
+          [Console]::Out.WriteLine($child.Id); [Console]::Out.Flush(); Start-Sleep -Seconds 60"
+             .to_string(),
+     ];
+@@ -63,7 +63,9 @@ async fn managed_job_terminates_child_and_grandchild() -> anyhow::Result<()> {
+     let grandchild_pid = std::str::from_utf8(&output)?.trim().parse::<u32>()?;
+ 
+     session.terminate().expect("terminate pipe process");
+-    let _ = tokio::time::timeout(Duration::from_secs(5), exit_rx).await?;
++    let exit_code = tokio::time::timeout(Duration::from_secs(5), exit_rx).await??;
++    assert_ne!(exit_code, 0, "terminated root must report failure");
++    assert!(session.has_exited());
+ 
+     let raw = unsafe {
+         OpenProcess(
+diff --git a/codex-rs/utils/pty/src/process.rs b/codex-rs/utils/pty/src/process.rs
+index ca209dec4e..1c2d6609dc 100644
+--- a/codex-rs/utils/pty/src/process.rs
++++ b/codex-rs/utils/pty/src/process.rs
+@@ -282,10 +282,10 @@ impl ProcessHandle {
+         {
+             handle.abort();
+         }
+-        if let Ok(mut h) = self.wait_handle.lock()
+-            && let Some(handle) = h.take()
+-        {
+-            handle.abort();
++        if let Ok(mut h) = self.wait_handle.lock() {
++            // The waiter must still observe termination and publish the exit
++            // status. Dropping its handle detaches it instead of cancelling it.
++            h.take();
+         }
+         if let Ok(mut handles) = self._pty_handles.lock() {
+             handles.take();
+diff --git a/codex-rs/windows-sandbox-rs/src/deny_read_resolver.rs b/codex-rs/windows-sandbox-rs/src/deny_read_resolver.rs
+index c10942d378..07bfe697cd 100644
+--- a/codex-rs/windows-sandbox-rs/src/deny_read_resolver.rs
++++ b/codex-rs/windows-sandbox-rs/src/deny_read_resolver.rs
+@@ -77,17 +77,21 @@ fn collect_existing_glob_matches(
+     max_depth: Option<usize>,
+     depth: usize,
+ ) -> Result<(), String> {
+-    if !path.exists() {
+-        return Ok(());
+-    }
++    let metadata = match path.metadata() {
++        Ok(metadata) => metadata,
++        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
++        Err(err) => {
++            return Err(format!(
++                "failed to inspect deny-read scan path {}: {err}",
++                path.display()
++            ));
++        }
++    };
+ 
+     if matcher.is_read_denied(path) {
+         push_absolute_path(paths, seen_paths, path.to_path_buf())?;
+     }
+ 
+-    let Ok(metadata) = path.metadata() else {
+-        return Ok(());
+-    };
+     if !metadata.is_dir() {
+         return Ok(());
+     }
+@@ -104,10 +108,19 @@ fn collect_existing_glob_matches(
+         return Ok(());
+     }
+ 
+-    let Ok(entries) = std::fs::read_dir(path) else {
+-        return Ok(());
+-    };
+-    for entry in entries.flatten() {
++    let entries = std::fs::read_dir(path).map_err(|err| {
++        format!(
++            "failed to enumerate deny-read scan path {}: {err}",
++            path.display()
++        )
++    })?;
++    for entry in entries {
++        let entry = entry.map_err(|err| {
++            format!(
++                "failed to read deny-read entry in {}: {err}",
++                path.display()
++            )
++        })?;
+         collect_existing_glob_matches(
+             &entry.path(),
+             matcher,
+@@ -326,6 +339,67 @@ mod tests {
+         assert!(err.contains("invalid range"), "unexpected error: {err}");
+     }
+ 
++    #[test]
++    fn glob_scan_inspection_errors_are_not_reported_as_no_matches() {
++        let tmp = TempDir::new().expect("tempdir");
++        let cwd = AbsolutePathBuf::from_absolute_path(tmp.path()).expect("absolute cwd");
++        let policy = FileSystemSandboxPolicy::restricted(vec![unreadable_glob_entry(format!(
++            "{}/invalid\0path/*.env",
++            tmp.path().display()
++        ))]);
++
++        let err = resolve_windows_deny_read_paths(&policy, &cwd)
++            .expect_err("an uninspectable scan root must fail closed");
++        assert!(
++            err.contains("failed to inspect deny-read scan path"),
++            "unexpected error: {err}"
++        );
++    }
++
++    #[test]
++    fn missing_glob_scan_roots_have_no_existing_matches() {
++        let tmp = TempDir::new().expect("tempdir");
++        let cwd = AbsolutePathBuf::from_absolute_path(tmp.path()).expect("absolute cwd");
++        let policy = FileSystemSandboxPolicy::restricted(vec![unreadable_glob_entry(format!(
++            "{}/missing/*.env",
++            tmp.path().display()
++        ))]);
++
++        assert!(
++            resolve_windows_deny_read_paths(&policy, &cwd)
++                .expect("missing scan root")
++                .is_empty()
++        );
++    }
++
++    #[cfg(windows)]
++    #[test]
++    fn glob_scan_enumeration_failure_does_not_return_partial_success() {
++        use std::os::windows::fs::OpenOptionsExt;
++
++        let tmp = TempDir::new().expect("tempdir");
++        std::fs::write(tmp.path().join("secret.env"), "secret").expect("write secret");
++        let cwd = AbsolutePathBuf::from_absolute_path(tmp.path()).expect("absolute cwd");
++        let policy = FileSystemSandboxPolicy::restricted(vec![unreadable_glob_entry(format!(
++            "{}/*.env",
++            tmp.path().display()
++        ))]);
++        let exclusive_directory = std::fs::OpenOptions::new()
++            .read(true)
++            .share_mode(0)
++            .custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS)
++            .open(tmp.path())
++            .expect("open directory exclusively");
++
++        let result = resolve_windows_deny_read_paths(&policy, &cwd);
++        drop(exclusive_directory);
++        let err = result.expect_err("unreadable directory must fail closed");
++        assert!(
++            err.contains("failed to enumerate deny-read scan path"),
++            "unexpected error: {err}"
++        );
++    }
++
+     #[test]
+     fn non_recursive_globs_do_not_expand_nested_matches() {
+         let tmp = TempDir::new().expect("tempdir");
+diff --git a/scripts/kd4_live_agent_benchmark.py b/scripts/kd4_live_agent_benchmark.py
+index 33e4e84f77..970fdca460 100644
+--- a/scripts/kd4_live_agent_benchmark.py
++++ b/scripts/kd4_live_agent_benchmark.py
+@@ -664,6 +664,7 @@ _DIAGNOSTIC_PATTERNS: dict[str, tuple[tuple[str, str], ...]] = {
+     "freshness_invalidation": (
+         ("stale_workspace_evidence", "workspace evidence was marked stale"),
+         ("stale workspace evidence", "workspace evidence was marked stale"),
++        ("unverified workspace evidence", "workspace evidence was unverified"),
+         ('"force_fresh":true', "the call requested a fresh rerun"),
+         ('"force_fresh": true', "the call requested a fresh rerun"),
+     ),
+@@ -3096,7 +3097,10 @@ def classify_diagnostics(
+     lowered = observed_text.lower()
+     diagnostics: list[dict[str, Any]] = []
+     for category, patterns in _DIAGNOSTIC_PATTERNS.items():
+-        signals = [signal for needle, signal in patterns if needle in lowered]
++        category_text = lowered
++        if category == "freshness_invalidation" and final_message:
++            category_text += "\n" + final_message.lower()
++        signals = [signal for needle, signal in patterns if needle in category_text]
+         if signals:
+             diagnostics.append({"category": category, "signals": sorted(set(signals))})
+ 
+diff --git a/scripts/test_kd4_live_agent_benchmark.py b/scripts/test_kd4_live_agent_benchmark.py
+index 63652cb54c..574ef0e66e 100644
+--- a/scripts/test_kd4_live_agent_benchmark.py
++++ b/scripts/test_kd4_live_agent_benchmark.py
+@@ -544,7 +544,6 @@ def render_report(text: str) -> str:
+ 
+     def test_final_verification_complaints_are_separate_from_runtime_markers(self) -> None:
+         for final_message, expected in (
+-            ("Tool results were rejected as stale workspace evidence.", True),
+             ("Tests passed, but the results are unverified.", True),
+             ("Verification is unverifiable in this session.", True),
+             ("I could not independently verify the changes.", True),
+@@ -569,6 +568,35 @@ def render_report(text: str) -> str:
+                     ["final_verification_complaint"] if expected else [],
+                 )
+ 
++    def test_freshness_diagnostic_reads_final_workspace_evidence(self) -> None:
++        for final_message, signal in (
++            (
++                "Tool results were rejected as stale workspace evidence.",
++                "workspace evidence was marked stale",
++            ),
++            (
++                "I cannot confirm the fix with UNVERIFIED WORKSPACE EVIDENCE.",
++                "workspace evidence was unverified",
++            ),
++        ):
++            with self.subTest(final_message=final_message):
++                diagnostics = benchmark.classify_diagnostics(
++                    observed_text="turn.started\nturn.completed",
++                    final_message=final_message,
++                    timed_out=False,
++                    exit_code=0,
++                    terminal_event="turn.completed",
++                    invalid_json_lines=0,
++                    verifier_passed=True,
++                    required_test_passed=True,
++                    command_execution_failures=0,
++                )
++                self.assertEqual(
++                    [diagnostic["category"] for diagnostic in diagnostics],
++                    ["freshness_invalidation", "final_verification_complaint"],
++                )
++                self.assertEqual(diagnostics[0]["signals"], [signal])
++
+     def test_exact_source_state_rejects_dirty_contents(self) -> None:
+         with tempfile.TemporaryDirectory(prefix="kd4-live-source-test-") as temp:
+             root = Path(temp)
+@@ -1742,7 +1770,7 @@ def render_report(text: str) -> str:
+         }
+         final_message = (
+             "Implemented the fix. " * 40
+-            + "Tool results were rejected as stale workspace evidence; verification is unverified."
++            + "Tool results contain unverified workspace evidence."
+         )
+         events = [
+             {"type": "thread.started", "thread_id": "thread_0"},
+@@ -1818,6 +1846,9 @@ def render_report(text: str) -> str:
+         self.assertEqual(
+             summary["diagnosticCategoryCounts"]["final_verification_complaint"], 1
+         )
++        self.assertEqual(
++            summary["diagnosticCategoryCounts"]["freshness_invalidation"], 1
++        )
+         self.assertEqual(run["actualCommandCount"], 2)
+         self.assertEqual(run["continuationCount"], 1)
+         trace = run["turnTrace"]

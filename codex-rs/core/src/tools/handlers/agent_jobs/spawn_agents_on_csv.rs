@@ -78,6 +78,13 @@ pub async fn handle(
     arguments: String,
     cancellation_token: CancellationToken,
 ) -> Result<FunctionToolOutput, FunctionCallError> {
+    if turn.multi_agent_version == MultiAgentVersion::V2
+        && !crate::session::multi_agents::spawn_is_authorized(turn.as_ref())
+    {
+        return Err(FunctionCallError::RespondToModel(
+            "spawn_agents_on_csv: this turn does not authorize spawning agents".to_string(),
+        ));
+    }
     let args: SpawnAgentsOnCsvArgs = parse_arguments(arguments.as_str())?;
     if args.instruction.trim().is_empty() {
         return Err(FunctionCallError::RespondToModel(

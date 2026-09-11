@@ -1,6 +1,5 @@
 //! Materializes oversized TUI goal objectives, pastes, and images as app-server-host files.
 
-use std::fs;
 use std::path::Path;
 
 use crate::app_server_session::AppServerSession;
@@ -92,7 +91,8 @@ pub(crate) async fn materialize_goal_draft(
         let path = ensure_goal_output_dir(app_server, codex_home, &mut output_dir)
             .await?
             .join(format!("image-{}.{}", idx + 1, extension));
-        let bytes = fs::read(&image.path)
+        let bytes = tokio::fs::read(&image.path)
+            .await
             .with_context(|| format!("Could not read goal image {}", image.path.display()))?;
         write_goal_file(app_server, path.clone(), bytes).await?;
         if image.placeholder.is_empty() {

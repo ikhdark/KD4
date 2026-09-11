@@ -1774,16 +1774,26 @@ impl RolloutWriterState {
         if self.is_deferred() {
             return;
         }
-        if let Err(err) = self.flush().await {
+        // Automatic writes retain coalesced token counts until a turn boundary
+        // or an explicit durability barrier.
+        if let Err(err) = self.write_pending_with_recovery("record").await {
             self.enter_recovery_mode(&err);
         }
     }
 
+    fn drain_pending_token_count(&mut self) {
+        if let Some(token_count) = self.pending_token_count.take() {
+            self.pending_items.push(token_count);
+        }
+    }
+
     async fn persist(&mut self) -> std::io::Result<()> {
+        self.drain_pending_token_count();
         self.write_pending_with_recovery("persist").await
     }
 
     async fn flush(&mut self) -> std::io::Result<()> {
+        self.drain_pending_token_count();
         if self.is_deferred() && self.pending_items.is_empty() {
             return Ok(());
         }
@@ -1791,9 +1801,7 @@ impl RolloutWriterState {
     }
 
     async fn shutdown(&mut self) -> std::io::Result<()> {
-        if let Some(token_count) = self.pending_token_count.take() {
-            self.pending_items.push(token_count);
-        }
+        self.drain_pending_token_count();
         if self.is_deferred() && self.pending_items.is_empty() {
             return Ok(());
         }
@@ -1884,13 +1892,18 @@ impl RolloutWriterState {
             .map(|info| info.path.as_path())
             .unwrap_or(self.rollout_path.as_path());
         let path = path.to_path_buf();
-        let file = tokio::task::spawn_blocking(move || open_log_file(path.as_path()))
-            .await
-            .map_err(IoError::other)??;
+        let inspect_existing = self.meta.is_some();
+        let (file, has_existing_content) = tokio::task::spawn_blocking(move || {
+            let file = open_log_file(path.as_path())?;
+            let has_existing_content = inspect_existing && file.file.metadata()?.len() > 0;
+            Ok::<_, IoError>((file, has_existing_content))
+        })
+        .await
+        .map_err(IoError::other)??;
         // Multiple recorders for the same newly-created thread can be initialized before any of
         // them materializes the rollout. Re-check under the append lock so a later writer does not
         // append another canonical session_meta or an already-persisted manifest.
-        let existing_rollout_state = if self.meta.is_some() && file.file.metadata()?.len() > 0 {
+        let existing_rollout_state = if has_existing_content {
             Some(RolloutRecorder::existing_rollout_state(&file.path).await?)
         } else {
             None
@@ -2002,7 +2015,7 @@ async fn rollout_writer(
                 Ok(()) => {
                     writer_task.finish_shutdown(true);
                     let _ = ack.send(Ok(()));
-                    break;
+                    return Ok(());
                 }
                 Err(err) => {
                     writer_task.finish_shutdown(false);
@@ -2017,6 +2030,9 @@ async fn rollout_writer(
         }
     }
 
+    // Closing the last sender still owes durability for accepted records.
+    state.shutdown().await?;
+    writer_task.finish_shutdown(true);
     Ok(())
 }
 

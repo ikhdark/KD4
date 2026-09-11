@@ -497,7 +497,7 @@ async fn run_git_command_with_timeout_os_from(
     fsmonitor: crate::FsmonitorOverride,
 ) -> Option<std::process::Output> {
     let command_args = git_inspection_args_os(args, fsmonitor, None);
-    let output = run_git_command_attempt(git, &command_args, cwd).await?;
+    let output = run_git_command_attempt(git, &command_args, cwd, fsmonitor).await?;
     let Some(retry_args) = safe_directory_retry_args_os(
         args,
         cwd,
@@ -508,7 +508,7 @@ async fn run_git_command_with_timeout_os_from(
         return Some(output);
     };
 
-    run_git_command_attempt(git, &retry_args, cwd).await
+    run_git_command_attempt(git, &retry_args, cwd, fsmonitor).await
 }
 
 fn safe_directory_retry_args_os(
@@ -588,6 +588,7 @@ async fn run_git_command_attempt(
     git: &Path,
     args: &[OsString],
     cwd: &Path,
+    fsmonitor: crate::FsmonitorOverride,
 ) -> Option<std::process::Output> {
     let mut command = Command::new(git);
     command
@@ -595,7 +596,43 @@ async fn run_git_command_attempt(
         .args(args)
         .current_dir(cwd)
         .kill_on_drop(true);
-    let result = timeout(GIT_COMMAND_TIMEOUT, command.output()).await;
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .creation_flags(codex_utils_pty::WINDOWS_CREATE_SUSPENDED);
+    let result = timeout(GIT_COMMAND_TIMEOUT, async move {
+        let managed = codex_utils_pty::ManagedRootProcess::reserve_with_reclaim().await?;
+        managed.require_descendant_containment()?;
+        // Git can launch clean/process filters even when hooks, external diffs,
+        // and text conversion are disabled. Attach the root before it can run,
+        // and retain ownership across both output collection and cancellation.
+        let mut child = tokio::task::spawn_blocking(move || command.spawn())
+            .await
+            .map_err(std::io::Error::other)??;
+        let pid = child
+            .id()
+            .ok_or_else(|| std::io::Error::other("missing Git process id"))?;
+        if let Err(error) = managed.attach_and_resume(pid) {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            return Err(error);
+        }
+        let output = child.wait_with_output().await?;
+        if fsmonitor == crate::FsmonitorOverride::BuiltIn
+            && output
+                .status
+                .code()
+                .is_some_and(|code| code == 0 || code == 1)
+        {
+            // A completed inspection may intentionally have started Git's
+            // built-in fsmonitor daemon. Timeout and cancellation never reach
+            // this transfer of ownership.
+            managed.preserve_descendants()?;
+        }
+        Ok(output)
+    })
+    .await;
 
     match result {
         Ok(Ok(output)) => Some(output),
@@ -1169,6 +1206,133 @@ mod tests {
                 OsString::from("tab\tname.txt"),
                 OsString::from("line\nname.txt")
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn diff_to_remote_timeout_terminates_clean_filter_and_descendant() {
+        assert_diff_to_remote_cleans_filter_tree(false).await;
+    }
+
+    #[tokio::test]
+    async fn diff_to_remote_cancellation_terminates_clean_filter_and_descendant() {
+        assert_diff_to_remote_cleans_filter_tree(true).await;
+    }
+
+    async fn assert_diff_to_remote_cleans_filter_tree(cancel_after_spawn: bool) {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (repo, _remote, _branch, _base_sha) = init_repo_with_remote(&temp);
+        let filter = temp.path().join("clean-filter.ps1");
+        let pids = temp.path().join("filter-pids.txt");
+        let pids_literal = pids.display().to_string().replace('\'', "''");
+        std::fs::write(
+            &filter,
+            format!(
+                "$child = Start-Process powershell.exe -ArgumentList '-NoProfile', '-Command', 'Start-Sleep -Seconds 60' -WindowStyle Hidden -PassThru\n[System.IO.File]::WriteAllText('{pids_literal}', \"$PID $($child.Id)\")\nStart-Sleep -Seconds 60\n"
+            ),
+        )
+        .expect("write clean filter");
+        std::fs::write(
+            repo.join(".gitattributes"),
+            "tracked.txt filter=timeout-test\n",
+        )
+        .expect("write filter attributes");
+        run_git(
+            &repo,
+            &[
+                "config",
+                "filter.timeout-test.clean",
+                &format!(
+                    "powershell.exe -NoProfile -ExecutionPolicy Bypass -File '{}'",
+                    filter.display().to_string().replace('\\', "/")
+                ),
+            ],
+        );
+        run_git(&repo, &["config", "filter.timeout-test.required", "true"]);
+        std::fs::write(repo.join("tracked.txt"), "changed content\n").expect("change tracked file");
+
+        // Enter the public operation used by the app-server's Git diff request.
+        // The real Git child invokes the repository's configured clean filter.
+        let result = if cancel_after_spawn {
+            let operation = git_diff_to_remote(&repo);
+            tokio::pin!(operation);
+            tokio::select! {
+                result = &mut operation => panic!("Git diff completed before cancellation: {result:?}"),
+                _ = async {
+                    while !std::fs::read_to_string(&pids).is_ok_and(|contents| {
+                        let ids = contents
+                            .split_whitespace()
+                            .map(str::parse::<u32>)
+                            .collect::<Result<Vec<_>, _>>();
+                        ids.is_ok_and(|ids| ids.len() == 2)
+                    }) {
+                        tokio::time::sleep(TokioDuration::from_millis(10)).await;
+                    }
+                } => {}
+            }
+            // Dropping the public operation must also release its process tree.
+            None
+        } else {
+            git_diff_to_remote(&repo).await
+        };
+        let process_ids = std::fs::read_to_string(&pids)
+            .expect("Git must have launched the configured filter")
+            .split_whitespace()
+            .map(|pid| pid.parse::<u32>().expect("recorded process id"))
+            .collect::<Vec<_>>();
+        assert_eq!(process_ids.len(), 2);
+        let ids = process_ids
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        // Record the failure before cleanup so a failing regression never leaks
+        // its fixture processes into subsequent scenarios.
+        let observed = StdCommand::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-Command",
+                &format!(
+                    "$live = @(Get-Process -Id {ids} -ErrorAction SilentlyContinue); $live | ForEach-Object {{ $_.Id }}; $live | Stop-Process -Force -ErrorAction SilentlyContinue"
+                ),
+            ])
+            .output()
+            .expect("observe and clean up filter processes");
+        assert!(
+            result.is_none(),
+            "timed out Git diff must not return partial data"
+        );
+        assert!(observed.status.success());
+        assert!(
+            observed.stdout.is_empty(),
+            "timed out Git diff left filter processes alive: {}",
+            String::from_utf8_lossy(&observed.stdout)
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_status_preserves_builtin_fsmonitor_daemon() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (repo, _remote, _branch, _base_sha) = init_repo_with_remote(&temp);
+        run_git(&repo, &["config", "core.fsmonitor", "true"]);
+
+        let changes = get_has_changes(&repo).await;
+        let daemon = StdCommand::new("git")
+            .args(["fsmonitor--daemon", "status"])
+            .current_dir(&repo)
+            .output()
+            .expect("observe builtin fsmonitor daemon");
+        // Stop the real daemon even if the behavior assertions fail.
+        let _ = StdCommand::new("git")
+            .args(["fsmonitor--daemon", "stop"])
+            .current_dir(&repo)
+            .output();
+
+        assert_eq!(changes, Some(false));
+        assert!(
+            daemon.status.success(),
+            "successful status must preserve Git's builtin fsmonitor daemon: {}",
+            String::from_utf8_lossy(&daemon.stderr)
         );
     }
 

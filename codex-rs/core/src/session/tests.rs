@@ -278,6 +278,7 @@ async fn tool_history_persistence_queue_batches_mutations_without_dropping_them(
                 },
                 "test completed-tool history metadata",
             )
+            .await
             .expect("persistence worker remains available");
     }
 
@@ -300,6 +301,46 @@ async fn tool_history_persistence_queue_batches_mutations_without_dropping_them(
 }
 
 #[tokio::test]
+async fn tool_history_registration_waits_without_blocking_or_partially_mutating() {
+    let (session, _turn_context) = make_session_and_context().await;
+    let codex_home = session.get_config().await.codex_home.clone();
+    let writer = session.tool_history_persistence.writer().await;
+    let before = serde_json::to_value(session.state.lock().await.tool_history_state())
+        .expect("serialize initial history");
+
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(25),
+            session
+                .register_non_workspace_code_mode_call(&codex_home, "cancelled-call".to_string()),
+        )
+        .await
+        .is_err(),
+        "queue contention must yield to the runtime"
+    );
+    let after = serde_json::to_value(session.state.lock().await.tool_history_state())
+        .expect("serialize history after cancellation");
+    assert_eq!(
+        after, before,
+        "cancelled registration must not alter history"
+    );
+
+    drop(writer);
+    session
+        .register_non_workspace_code_mode_call(&codex_home, "persisted-call".to_string())
+        .await;
+    session.flush_tool_history_persistence().await;
+    let (persisted, warning) =
+        crate::tool_history::load_tool_history_state(&codex_home, &session.thread_id.to_string())
+            .await
+            .into_state_and_warning();
+    assert_eq!(warning, None);
+    let persisted = serde_json::to_string(&persisted).expect("serialize persisted history");
+    assert!(persisted.contains("persisted-call"));
+    assert!(!persisted.contains("cancelled-call"));
+}
+
+#[tokio::test]
 async fn tool_history_persistence_queue_does_not_acknowledge_a_failed_write() {
     let codex_home = tempfile::tempdir().expect("create codex home");
     let thread_id = ThreadId::new();
@@ -318,6 +359,7 @@ async fn tool_history_persistence_queue_does_not_acknowledge_a_failed_write() {
             },
             "test completed-tool history metadata",
         )
+        .await
         .expect("persistence worker remains available");
 
     failure.wait_until_reached().await;
@@ -361,6 +403,7 @@ async fn tool_history_persistence_queue_rejects_mutations_after_worker_closes() 
             },
             "test completed-tool history metadata",
         )
+        .await
         .expect("the first mutation wakes the worker");
     queue.wait_until_worker_closed_for_test().await;
 
@@ -371,6 +414,7 @@ async fn tool_history_persistence_queue_rejects_mutations_after_worker_closes() 
             },
             "test completed-tool history metadata",
         )
+        .await
         .expect_err("a closed worker must reject later mutations");
     assert_eq!(
         error,
@@ -396,6 +440,7 @@ async fn tool_history_persistence_checkpoint_does_not_acknowledge_after_worker_c
             },
             "test completed-tool history metadata",
         )
+        .await
         .expect("the first mutation wakes the worker");
     queue.wait_until_worker_closed_for_test().await;
 
@@ -5724,7 +5769,6 @@ async fn active_profile_update_rebuilds_network_proxy_config() -> std::io::Resul
     Ok(())
 }
 
-#[ignore]
 #[tokio::test]
 async fn new_default_turn_uses_config_aware_skills_for_role_overrides() {
     let (session, _turn_context) = make_session_and_context().await;
@@ -5770,10 +5814,10 @@ async fn new_default_turn_uses_config_aware_skills_for_role_overrides() {
             r#"developer_instructions = "Stay focused"
 
 [[skills.config]]
-path = "{}"
+path = {}
 enabled = false
 "#,
-            skill_path.display()
+            toml::Value::String(skill_path.to_string_lossy().into_owned())
         ),
     )
     .expect("write role config");

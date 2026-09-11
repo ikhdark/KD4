@@ -1719,6 +1719,13 @@ async fn thread_goal_set_preserves_budget_limited_same_objective() -> Result<()>
     )
     .await??;
 
+    let state_db =
+        StateRuntime::init(codex_home.path().to_path_buf(), "mock_provider".into()).await?;
+    let persisted_id = ThreadId::from_string(&thread.id)?;
+    state_db
+        .set_thread_memory_mode(persisted_id, "disabled")
+        .await?;
+
     let goal_id = mcp
         .send_raw_request(
             "thread/goal/set",
@@ -1737,6 +1744,14 @@ async fn thread_goal_set_preserves_budget_limited_same_objective() -> Result<()>
     .await??;
     let goal: ThreadGoalSetResponse = to_response(goal_resp)?;
     assert_eq!(goal.goal.status, ThreadGoalStatus::BudgetLimited);
+    assert_eq!(
+        state_db
+            .get_thread_memory_mode(persisted_id)
+            .await?
+            .as_deref(),
+        Some("disabled"),
+        "setting a goal must preserve independently stored memory policy"
+    );
 
     timeout(
         DEFAULT_READ_TIMEOUT,
@@ -1765,6 +1780,24 @@ async fn thread_goal_set_preserves_budget_limited_same_objective() -> Result<()>
     assert_eq!(replacement.goal.tokens_used, 0);
     assert_eq!(replacement.goal.time_used_seconds, 0);
 
+    let clear_id = mcp
+        .send_raw_request("thread/goal/clear", Some(json!({"threadId": thread.id})))
+        .await?;
+    let clear_resp = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(clear_id)),
+    )
+    .await??;
+    let clear: ThreadGoalClearResponse = to_response(clear_resp)?;
+    assert!(clear.cleared);
+    assert_eq!(
+        state_db
+            .get_thread_memory_mode(persisted_id)
+            .await?
+            .as_deref(),
+        Some("disabled"),
+        "clearing a goal must preserve independently stored memory policy"
+    );
     Ok(())
 }
 

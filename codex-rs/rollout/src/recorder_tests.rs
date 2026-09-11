@@ -550,6 +550,162 @@ async fn load_rollout_items_filters_legacy_ghost_snapshots_from_compaction_histo
 }
 
 #[tokio::test]
+async fn recorder_barriers_persist_latest_coalesced_token_count() -> std::io::Result<()> {
+    for barrier in ["flush", "persist", "shutdown"] {
+        let home = TempDir::new()?;
+        let recorder = RolloutRecorder::new(
+            &test_config(home.path()),
+            RolloutRecorderParams::new(
+                ThreadId::new(),
+                None,
+                None,
+                SessionSource::Exec,
+                None,
+                "barrier-test".to_string(),
+                BaseInstructions::default(),
+                Vec::new(),
+            )
+            .with_history_mode(ThreadHistoryMode::Paginated),
+        )
+        .await?;
+        recorder.persist().await?;
+        let rollout_path = recorder.rollout_path().to_path_buf();
+        let token_count = |count| {
+            RolloutItem::EventMsg(EventMsg::TokenCount(TokenCountEvent {
+                info: Some(codex_protocol::protocol::TokenUsageInfo {
+                    total_token_usage: codex_protocol::protocol::TokenUsage {
+                        total_tokens: count,
+                        ..Default::default()
+                    },
+                    last_token_usage: Default::default(),
+                    model_context_window: None,
+                }),
+                rate_limits: None,
+            }))
+        };
+        recorder
+            .record_canonical_items(&[token_count(10), token_count(20)])
+            .await?;
+        // Acceptance of the next item fences both prior automatic writes.
+        recorder
+            .record_canonical_items_ordered(&[RolloutItem::EventMsg(EventMsg::AgentMessage(
+                AgentMessageEvent {
+                    message: "accepted-marker".into(),
+                    phase: None,
+                    memory_citation: None,
+                },
+            ))])
+            .await?;
+        assert!(
+            !fs::read_to_string(&rollout_path)?.contains("token_count"),
+            "automatic writes still coalesce counts"
+        );
+        match barrier {
+            "flush" => recorder.flush().await?,
+            "persist" => recorder.persist().await?,
+            "shutdown" => recorder.shutdown().await?,
+            _ => unreachable!(),
+        }
+        let contents = fs::read_to_string(&rollout_path)?;
+        let records = contents
+            .lines()
+            .map(serde_json::from_str::<RolloutLine>)
+            .collect::<Result<Vec<_>, _>>()?;
+        let counts = records
+            .iter()
+            .filter_map(|line| match &line.item {
+                RolloutItem::EventMsg(EventMsg::TokenCount(event)) => event
+                    .info
+                    .as_ref()
+                    .map(|info| info.total_token_usage.total_tokens),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(counts, vec![20], "barrier: {barrier}");
+        assert!(
+            contents.contains("accepted-marker"),
+            "barrier persists all queued records"
+        );
+        if barrier != "shutdown" {
+            recorder.flush().await?;
+            assert_eq!(
+                fs::read_to_string(&rollout_path)?,
+                contents,
+                "repeated barrier must not duplicate records"
+            );
+            recorder.shutdown().await?;
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn recorder_last_handle_drop_drains_accepted_deferred_records() -> std::io::Result<()> {
+    let home = TempDir::new()?;
+    let recorder = RolloutRecorder::new(
+        &test_config(home.path()),
+        RolloutRecorderParams::new(
+            ThreadId::new(),
+            None,
+            None,
+            SessionSource::Exec,
+            None,
+            "drop-test".to_string(),
+            BaseInstructions::default(),
+            Vec::new(),
+        )
+        .with_history_mode(ThreadHistoryMode::Paginated),
+    )
+    .await?;
+    let rollout_path = recorder.rollout_path().to_path_buf();
+    recorder
+        .record_canonical_items_ordered(&[
+            RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent {
+                message: "accepted-before-last-drop".into(),
+                phase: None,
+                memory_citation: None,
+            })),
+            RolloutItem::EventMsg(EventMsg::TokenCount(TokenCountEvent {
+                info: None,
+                rate_limits: None,
+            })),
+        ])
+        .await?;
+    assert!(
+        !rollout_path.exists(),
+        "records remain deferred before the last handle drops"
+    );
+    let writer = recorder
+        .writer_task
+        .handle
+        .lock()
+        .expect("writer handle")
+        .take()
+        .expect("running writer");
+    drop(recorder);
+    tokio::time::timeout(Duration::from_secs(5), writer)
+        .await
+        .expect("writer drains after channel closure")
+        .expect("writer task");
+    let contents = fs::read_to_string(&rollout_path)?;
+    let records = contents
+        .lines()
+        .map(serde_json::from_str::<RolloutLine>)
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(records.iter().filter(|line| matches!(&line.item,
+        RolloutItem::EventMsg(EventMsg::AgentMessage(event)) if event.message == "accepted-before-last-drop"
+    )).count(), 1);
+    assert_eq!(
+        records
+            .iter()
+            .filter(|line| matches!(&line.item, RolloutItem::EventMsg(EventMsg::TokenCount(_))))
+            .count(),
+        1
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn recorder_materializes_on_flush_with_pending_items() -> std::io::Result<()> {
     let home = TempDir::new().expect("temp dir");
     let config = test_config(home.path());

@@ -535,7 +535,7 @@ pub(crate) async fn install_synthetic_terminal_projection(
             .step_context
             .turn
             .turn_timing_state
-            .record_tool_output_projection_facts(
+            .record_tool_output_projection_facts_async(
                 projection.canonical_bytes,
                 projection.canonical_tokens,
                 projection.model_bytes,
@@ -545,7 +545,8 @@ pub(crate) async fn install_synthetic_terminal_projection(
                 projection.projection_truncated,
                 projection.omitted_sections,
                 provider_visible,
-            );
+            )
+            .await;
     }
     result.install_model_projection(model_projection, /*source_dependencies_override*/ None);
 }
@@ -766,11 +767,11 @@ impl ToolOutput for UnavailableModelProjectionOutput {
     }
 
     fn success_for_logging(&self) -> bool {
-        false
+        self.original.success_for_logging()
     }
 
     fn outcome_for_logging(&self) -> ToolOutputOutcome {
-        ToolOutputOutcome::Failure
+        self.original.outcome_for_logging()
     }
 
     fn outcome_context(&self) -> codex_tools::ToolOutputOutcomeContext {
@@ -1534,7 +1535,7 @@ impl ToolRegistry {
                     let model_visible = FunctionToolOutput::from_text(
                         "Tool execution completed, but its full result could not be preserved for model delivery."
                             .to_string(),
-                        Some(false),
+                        Some(result.success_for_logging()),
                     );
                     result.result = Box::new(UnavailableModelProjectionOutput {
                         original: result.result,
@@ -1546,7 +1547,7 @@ impl ToolRegistry {
                         .step_context
                         .turn
                         .turn_timing_state
-                        .record_tool_output_projection_facts(
+                        .record_tool_output_projection_facts_async(
                             projection.canonical_bytes,
                             projection.canonical_tokens,
                             projection.model_bytes,
@@ -1556,7 +1557,8 @@ impl ToolRegistry {
                             projection.projection_truncated,
                             projection.omitted_sections,
                             provider_visible,
-                        );
+                        )
+                        .await;
                     if admission_tracking_enabled && let Some(candidate) = &projection.candidate {
                         let phase_started = Instant::now();
                         invocation
@@ -1570,6 +1572,15 @@ impl ToolRegistry {
                     }
                 }
                 result.install_model_projection(model_projection, rewritten_source_dependencies);
+                // Cancellation may win while projection or its bookkeeping is
+                // pending. Its owner publishes the aborted terminal outcome.
+                if dispatch_state.is_aborted() {
+                    let err = FunctionCallError::RespondToModel(
+                        "tool cancelled after runtime cleanup".to_string(),
+                    );
+                    dispatch_trace.record_failed(&err).await;
+                    return Err(err);
+                }
                 let phase_started = Instant::now();
                 notify_tool_finish(&invocation, lifecycle_outcome).await;
                 record_lifecycle_phase(&invocation, "notify_finish", phase_started);

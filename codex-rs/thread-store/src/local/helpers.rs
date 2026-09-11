@@ -44,6 +44,18 @@ pub(super) fn rollout_lookup_error(
     }
 }
 
+pub(super) async fn scoped_rollout_path_async(
+    root: PathBuf,
+    rollout_path: PathBuf,
+    root_name: &'static str,
+) -> ThreadStoreResult<PathBuf> {
+    tokio::task::spawn_blocking(move || scoped_rollout_path(root, &rollout_path, root_name))
+        .await
+        .map_err(|err| ThreadStoreError::Internal {
+            message: format!("rollout path validation worker failed: {err}"),
+        })?
+}
+
 pub(super) fn scoped_rollout_path(
     root: PathBuf,
     rollout_path: &Path,

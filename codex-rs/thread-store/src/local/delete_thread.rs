@@ -28,6 +28,17 @@ struct StagedRolloutFile {
     staged_path: PathBuf,
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    static TEST_STAGE_PAUSE: std::sync::Arc<TestStagePause>;
+}
+
+#[cfg(test)]
+struct TestStagePause {
+    reached: tokio::sync::Notify,
+    release: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+}
+
 /// A rollback guard for one or more local thread rollout deletions.
 ///
 /// Dropping an uncommitted guard restores every staged rollout. Committing keeps the rollout paths
@@ -37,6 +48,13 @@ pub struct StagedThreadDelete<'a> {
     store: &'a LocalThreadStore,
     thread_ids: Vec<codex_protocol::ThreadId>,
     found_thread_ids: Vec<codex_protocol::ThreadId>,
+    files: StagedRolloutFiles,
+}
+
+// This guard owns every filesystem mutation, including while a blocking worker
+// runs after its async caller is cancelled.
+#[derive(Debug)]
+struct StagedRolloutFiles {
     staged_files: Vec<StagedRolloutFile>,
     staging_dir: Option<tempfile::TempDir>,
     committed: bool,
@@ -48,7 +66,7 @@ impl StagedThreadDelete<'_> {
     }
 
     pub async fn commit(mut self) {
-        self.committed = true;
+        self.files.committed = true;
         for thread_id in &self.thread_ids {
             if let Err(err) =
                 remove_thread_name_entries(self.store.config.codex_home.as_path(), *thread_id).await
@@ -71,7 +89,9 @@ impl StagedThreadDelete<'_> {
             projections.remove(thread_id);
         }
     }
+}
 
+impl StagedRolloutFiles {
     fn restore(&mut self) {
         for staged in self.staged_files.iter().rev() {
             if !staged.staged_path.exists() {
@@ -88,7 +108,7 @@ impl StagedThreadDelete<'_> {
     }
 }
 
-impl Drop for StagedThreadDelete<'_> {
+impl Drop for StagedRolloutFiles {
     fn drop(&mut self) {
         if !self.committed {
             self.restore();
@@ -114,82 +134,97 @@ pub(super) async fn stage_thread_deletes<'a>(
     thread_ids: &[codex_protocol::ThreadId],
 ) -> ThreadStoreResult<StagedThreadDelete<'a>> {
     let mut found_thread_ids = Vec::new();
-    let mut original_paths = Vec::new();
-
+    let mut candidates = Vec::new();
     for thread_id in thread_ids {
         let paths = rollout_paths(store, *thread_id).await?;
         if !paths.is_empty() {
             found_thread_ids.push(*thread_id);
         }
-        for rollout_path in paths {
-            let plain_path = codex_rollout::plain_rollout_path(&rollout_path);
-            for path in [plain_path.clone(), plain_path.with_extension("jsonl.zst")] {
-                if !path
-                    .try_exists()
-                    .map_err(|err| ThreadStoreError::Internal {
-                        message: format!(
-                            "failed to inspect rollout file `{}` before staging deletion: {err}",
-                            path.display()
-                        ),
-                    })?
-                {
+        candidates.extend(paths.into_iter().map(|path| (*thread_id, path)));
+    }
+    let codex_home = store.config.codex_home.clone();
+    #[cfg(test)]
+    let pause = TEST_STAGE_PAUSE.try_with(std::sync::Arc::clone).ok();
+    let files =
+        tokio::task::spawn_blocking(move || {
+            let mut original_paths = Vec::new();
+            for (thread_id, rollout_path) in candidates {
+                let plain_path = codex_rollout::plain_rollout_path(&rollout_path);
+                for path in [plain_path.clone(), plain_path.with_extension("jsonl.zst")] {
+                    if !path.try_exists().map_err(|err| ThreadStoreError::Internal {
+                    message: format!(
+                        "failed to inspect rollout file `{}` before staging deletion: {err}",
+                        path.display()
+                    ),
+                })? {
                     continue;
                 }
-                let checked_path = checked_rollout_path(store, path.as_path(), *thread_id)?;
-                if !original_paths.contains(&checked_path) {
-                    original_paths.push(checked_path);
+                    let checked_path = checked_rollout_path(&codex_home, &path, thread_id)?;
+                    if !original_paths.contains(&checked_path) {
+                        original_paths.push(checked_path);
+                    }
                 }
             }
-        }
-    }
-
-    let staging_dir = if original_paths.is_empty() {
-        None
-    } else {
-        Some(
-            tempfile::Builder::new()
-                .prefix("thread-delete-")
-                .tempdir_in(store.config.codex_home.as_path())
-                .map_err(|err| ThreadStoreError::Internal {
-                    message: format!("failed to create thread deletion staging directory: {err}"),
-                })?,
-        )
-    };
-    let mut staged = StagedThreadDelete {
+            let staging_dir = if original_paths.is_empty() {
+                None
+            } else {
+                Some(
+                    tempfile::Builder::new()
+                        .prefix("thread-delete-")
+                        .tempdir_in(&codex_home)
+                        .map_err(|err| ThreadStoreError::Internal {
+                            message: format!(
+                                "failed to create thread deletion staging directory: {err}"
+                            ),
+                        })?,
+                )
+            };
+            let mut files = StagedRolloutFiles {
+                staged_files: Vec::new(),
+                staging_dir,
+                committed: false,
+            };
+            for (index, original_path) in original_paths.into_iter().enumerate() {
+                let staged_path = files
+                    .staging_dir
+                    .as_ref()
+                    .ok_or_else(|| ThreadStoreError::Internal {
+                        message: "thread deletion staging directory is missing".to_string(),
+                    })?
+                    .path()
+                    .join(format!("rollout-{index}"));
+                std::fs::rename(&original_path, &staged_path).map_err(|err| {
+                    ThreadStoreError::Internal {
+                        message: format!(
+                            "failed to stage rollout file `{}` for deletion: {err}",
+                            original_path.display()
+                        ),
+                    }
+                })?;
+                files.staged_files.push(StagedRolloutFile {
+                    original_path,
+                    staged_path,
+                });
+                #[cfg(test)]
+                if let Some(pause) = &pause
+                    && let Some(release) = pause.release.lock().expect("pause lock").take()
+                {
+                    pause.reached.notify_one();
+                    let _ = release.recv();
+                }
+            }
+            Ok::<_, ThreadStoreError>(files)
+        })
+        .await
+        .map_err(|err| ThreadStoreError::Internal {
+            message: format!("thread deletion staging worker failed: {err}"),
+        })??;
+    Ok(StagedThreadDelete {
         store,
         thread_ids: thread_ids.to_vec(),
         found_thread_ids,
-        staged_files: Vec::new(),
-        staging_dir,
-        committed: false,
-    };
-    let staging_path = staged
-        .staging_dir
-        .as_ref()
-        .map(|staging_dir| staging_dir.path().to_path_buf());
-
-    for (index, original_path) in original_paths.into_iter().enumerate() {
-        let staged_path = staging_path
-            .as_ref()
-            .ok_or_else(|| ThreadStoreError::Internal {
-                message: "thread deletion staging directory is missing".to_string(),
-            })?
-            .join(format!("rollout-{index}"));
-        std::fs::rename(&original_path, &staged_path).map_err(|err| {
-            ThreadStoreError::Internal {
-                message: format!(
-                    "failed to stage rollout file `{}` for deletion: {err}",
-                    original_path.display()
-                ),
-            }
-        })?;
-        staged.staged_files.push(StagedRolloutFile {
-            original_path,
-            staged_path,
-        });
-    }
-
-    Ok(staged)
+        files,
+    })
 }
 
 pub(super) async fn preflight_delete_thread(
@@ -201,10 +236,17 @@ pub(super) async fn preflight_delete_thread(
     if rollout_paths.is_empty() {
         return Err(ThreadStoreError::ThreadNotFound { thread_id });
     }
-    for rollout_path in rollout_paths {
-        preflight_rollout_file(store, rollout_path.as_path(), thread_id)?;
-    }
-    Ok(())
+    let codex_home = store.config.codex_home.clone();
+    tokio::task::spawn_blocking(move || {
+        for rollout_path in rollout_paths {
+            preflight_rollout_file(&codex_home, rollout_path.as_path(), thread_id)?;
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|err| ThreadStoreError::Internal {
+        message: format!("thread deletion preflight worker failed: {err}"),
+    })?
 }
 
 async fn rollout_paths(
@@ -249,7 +291,7 @@ async fn rollout_paths(
 }
 
 fn preflight_rollout_file(
-    store: &LocalThreadStore,
+    codex_home: &Path,
     rollout_path: &Path,
     thread_id: codex_protocol::ThreadId,
 ) -> ThreadStoreResult<()> {
@@ -266,7 +308,7 @@ fn preflight_rollout_file(
         {
             continue;
         }
-        let checked_path = checked_rollout_path(store, path.as_path(), thread_id)?;
+        let checked_path = checked_rollout_path(codex_home, path.as_path(), thread_id)?;
         if checked_path
             .try_exists()
             .map_err(|err| ThreadStoreError::Internal {
@@ -319,7 +361,8 @@ fn delete_rollout_path(
     rollout_path: &Path,
     thread_id: codex_protocol::ThreadId,
 ) -> ThreadStoreResult<bool> {
-    let canonical_rollout_path = checked_rollout_path(store, rollout_path, thread_id)?;
+    let canonical_rollout_path =
+        checked_rollout_path(&store.config.codex_home, rollout_path, thread_id)?;
     match std::fs::remove_file(&canonical_rollout_path) {
         Ok(()) => Ok(true),
         Err(err) if err.kind() == ErrorKind::NotFound => Ok(false),
@@ -333,26 +376,23 @@ fn delete_rollout_path(
 }
 
 fn checked_rollout_path(
-    store: &LocalThreadStore,
+    codex_home: &Path,
     rollout_path: &Path,
     thread_id: codex_protocol::ThreadId,
 ) -> ThreadStoreResult<PathBuf> {
-    let canonical_rollout_path = scoped_rollout_path(
-        store.config.codex_home.join(SESSIONS_SUBDIR),
-        rollout_path,
-        "sessions",
-    )
-    .or_else(|_| {
-        scoped_rollout_path(
-            store.config.codex_home.join(ARCHIVED_SESSIONS_SUBDIR),
-            rollout_path,
-            "archived sessions",
-        )
-    })
-    .or_else(|err| match rollout_path.try_exists() {
-        Ok(false) => Ok(rollout_path.to_path_buf()),
-        Ok(true) | Err(_) => Err(err),
-    })?;
+    let canonical_rollout_path =
+        scoped_rollout_path(codex_home.join(SESSIONS_SUBDIR), rollout_path, "sessions")
+            .or_else(|_| {
+                scoped_rollout_path(
+                    codex_home.join(ARCHIVED_SESSIONS_SUBDIR),
+                    rollout_path,
+                    "archived sessions",
+                )
+            })
+            .or_else(|err| match rollout_path.try_exists() {
+                Ok(false) => Ok(rollout_path.to_path_buf()),
+                Ok(true) | Err(_) => Err(err),
+            })?;
     matching_rollout_file_name(&canonical_rollout_path, thread_id, rollout_path)?;
     Ok(canonical_rollout_path)
 }
@@ -475,5 +515,98 @@ mod tests {
             .await
             .expect_err("locked rollout must fail before deletion begins");
         assert!(path.exists());
+    }
+
+    #[tokio::test]
+    async fn delete_thread_restores_all_files_when_a_sibling_cannot_be_staged() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let home = TempDir::new().expect("temp dir");
+        let store = LocalThreadStore::new(test_config(home.path()), None);
+        let uuid = Uuid::from_u128(308);
+        let thread_id = ThreadId::from_string(&uuid.to_string()).expect("thread id");
+        let path =
+            write_session_file(home.path(), "2025-01-03T12-00-00", uuid).expect("session file");
+        let original = std::fs::read(&path).expect("original rollout");
+        let compressed = path.with_extension("jsonl.zst");
+        std::fs::write(&compressed, b"locked sibling").expect("compressed sibling");
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0x0000_0001 | 0x0000_0002)
+            .open(&compressed)
+            .expect("deny deletion of sibling");
+
+        store
+            .delete_thread(DeleteThreadParams { thread_id })
+            .await
+            .expect_err("locked sibling must reject the entire deletion");
+
+        assert_eq!(std::fs::read(&path).expect("restored rollout"), original);
+        assert_eq!(
+            std::fs::read(&compressed).expect("retained sibling"),
+            b"locked sibling"
+        );
+        drop(lock);
+        store
+            .preflight_delete_thread(DeleteThreadParams { thread_id })
+            .await
+            .expect("restored thread remains discoverable and deletable");
+        store
+            .delete_thread(DeleteThreadParams { thread_id })
+            .await
+            .expect("retry deletion");
+        assert!(!path.exists());
+        assert!(!compressed.exists());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn delete_thread_cancellation_restores_files_owned_by_the_running_worker() {
+        let home = TempDir::new().expect("temp dir");
+        let store = std::sync::Arc::new(LocalThreadStore::new(test_config(home.path()), None));
+        let uuid = Uuid::from_u128(309);
+        let thread_id = ThreadId::from_string(&uuid.to_string()).expect("thread id");
+        let path =
+            write_session_file(home.path(), "2025-01-03T12-00-00", uuid).expect("session file");
+        let original = std::fs::read(&path).expect("original rollout");
+        let (release, released) = std::sync::mpsc::channel();
+        let pause = std::sync::Arc::new(TestStagePause {
+            reached: tokio::sync::Notify::new(),
+            release: std::sync::Mutex::new(Some(released)),
+        });
+        let deleting = std::sync::Arc::clone(&store);
+        let operation = tokio::spawn(TEST_STAGE_PAUSE.scope(
+            std::sync::Arc::clone(&pause),
+            async move {
+                deleting
+                    .delete_thread(DeleteThreadParams { thread_id })
+                    .await
+            },
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(10), pause.reached.notified())
+            .await
+            .expect("worker staged the real rollout without blocking the runtime");
+        assert!(!path.exists());
+        operation.abort();
+        assert!(
+            operation
+                .await
+                .expect_err("delete task cancelled")
+                .is_cancelled()
+        );
+        drop(release);
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if tokio::fs::read(&path).await.ok().as_deref() == Some(original.as_slice()) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("detached worker restored the cancelled deletion");
+        store
+            .preflight_delete_thread(DeleteThreadParams { thread_id })
+            .await
+            .expect("cancelled deletion leaves the thread discoverable");
     }
 }

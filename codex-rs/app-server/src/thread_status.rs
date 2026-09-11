@@ -277,7 +277,7 @@ impl ThreadWatchManager {
     where
         F: FnOnce(&mut ThreadWatchState) -> Option<ThreadStatusChangedNotification>,
     {
-        let (notification, running_turn_count) = {
+        let notification = {
             let mut state = self.state.lock().await;
             let notification = mutate(&mut state);
             let running_turn_count = state
@@ -285,9 +285,11 @@ impl ThreadWatchManager {
                 .values()
                 .filter(|runtime| runtime.running)
                 .count();
-            (notification, running_turn_count)
+            // Retain the count for late subscribers and publish under the state
+            // lock so an older mutation cannot overwrite a newer count.
+            self.running_turn_count_tx.send_replace(running_turn_count);
+            notification
         };
-        let _ = self.running_turn_count_tx.send(running_turn_count);
 
         if let Some(notification) = notification
             && let Some(outgoing) = &self.outgoing
@@ -817,11 +819,16 @@ mod tests {
 
         manager.note_turn_started(INTERACTIVE_THREAD_ID).await;
         assert_eq!(manager.running_turn_count().await, 1);
+        let running = manager.subscribe_running_turn_count();
+        assert_eq!(*running.borrow(), 1);
+        drop(running);
 
         manager
             .note_turn_completed(INTERACTIVE_THREAD_ID, false)
             .await;
         assert_eq!(manager.running_turn_count().await, 0);
+        let completed = manager.subscribe_running_turn_count();
+        assert_eq!(*completed.borrow(), 0);
     }
 
     #[tokio::test]

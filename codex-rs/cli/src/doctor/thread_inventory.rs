@@ -443,7 +443,7 @@ async fn scan_rollout_root(root: &Path, archived: bool, scan: &mut RolloutScan) 
         if scan.reached_scan_cap {
             return;
         }
-        let entries = match std::fs::read_dir(&dir) {
+        let mut entries = match tokio::fs::read_dir(&dir).await {
             Ok(entries) => entries,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
             Err(err) => {
@@ -451,19 +451,20 @@ async fn scan_rollout_root(root: &Path, archived: bool, scan: &mut RolloutScan) 
                 continue;
             }
         };
-        for entry in entries {
+        loop {
             if scan.reached_scan_cap {
                 return;
             }
-            let entry = match entry {
-                Ok(entry) => entry,
+            let entry = match entries.next_entry().await {
+                Ok(Some(entry)) => entry,
+                Ok(None) => break,
                 Err(err) => {
                     scan.record_scan_error(format!("{} ({err})", dir.display()));
                     continue;
                 }
             };
             let path = entry.path();
-            let file_type = match entry.file_type() {
+            let file_type = match entry.file_type().await {
                 Ok(file_type) => file_type,
                 Err(err) => {
                     scan.record_scan_error(format!("{} ({err})", path.display()));

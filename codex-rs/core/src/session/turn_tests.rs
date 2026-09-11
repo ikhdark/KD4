@@ -4227,6 +4227,267 @@ fn stop_hook_continuation_reaches_the_final_response() -> Result<()> {
     )
 }
 
+#[cfg(windows)]
+#[test]
+fn registered_exec_rejects_invalid_yield_without_starting_the_command() -> Result<()> {
+    run_turn_multi_thread_test_with_stack(
+        "registered_exec_rejects_invalid_yield_without_starting_the_command",
+        registered_exec_rejects_invalid_yield_without_starting_the_command_impl,
+    )
+}
+
+#[cfg(windows)]
+async fn registered_exec_rejects_invalid_yield_without_starting_the_command_impl() -> Result<()> {
+    let fixtures = tempfile::tempdir()?;
+    let marker = fixtures.path().join("command-ran.txt");
+    let script = format!(
+        "Set-Content -LiteralPath '{}' -Value ran",
+        marker.to_string_lossy().replace('\'', "''")
+    );
+    let server = responses::start_mock_server().await;
+    let response_log = responses::mount_sse_sequence(
+        &server,
+        vec![
+            responses::sse(vec![
+                responses::ev_response_created("invalid-yield-response"),
+                responses::ev_function_call(
+                    "invalid-yield",
+                    "exec_command",
+                    &serde_json::json!({
+                        "kind": "argv",
+                        "program": "powershell.exe",
+                        "args": ["-NoProfile", "-NonInteractive", "-Command", script],
+                        "yield_time_ms": 120_000,
+                    })
+                    .to_string(),
+                ),
+                responses::ev_completed("invalid-yield-response"),
+            ]),
+            responses::sse(vec![
+                responses::ev_response_created("invalid-yield-final-response"),
+                responses::ev_assistant_message(
+                    "invalid-yield-final-message",
+                    "invalid wait rejected",
+                ),
+                responses::ev_completed("invalid-yield-final-response"),
+            ]),
+        ],
+    )
+    .await;
+    let mut builder = test_codex().with_config(|config| {
+        config
+            .features
+            .enable(Feature::UnifiedExec)
+            .expect("register exec_command");
+    });
+    let test = builder.build(&server).await?;
+    let completion = test
+        .submit_turn_and_capture_completion("run the supplied command")
+        .await?;
+    assert!(completion.error.is_none(), "{completion:?}");
+    let requests = response_log.requests();
+    assert_eq!(requests.len(), 2);
+    let rejected = requests[1]
+        .function_call_output_text("invalid-yield")
+        .expect("model receives argument rejection");
+    assert!(rejected.contains("$.yield_time_ms"), "{rejected}");
+    assert!(rejected.contains("30000"), "{rejected}");
+    assert!(
+        !marker.exists(),
+        "invalid arguments must not start the command"
+    );
+    Ok(())
+}
+
+#[cfg(windows)]
+#[test]
+fn registered_command_repair_preserves_safety_history_and_post_hook_context() -> Result<()> {
+    run_turn_multi_thread_test_with_stack(
+        "registered_command_repair_preserves_safety_history_and_post_hook_context",
+        registered_command_repair_preserves_safety_history_and_post_hook_context_impl,
+    )
+}
+
+#[cfg(windows)]
+async fn registered_command_repair_preserves_safety_history_and_post_hook_context_impl()
+-> Result<()> {
+    let fixtures = tempfile::tempdir()?;
+    let input_path = fixtures.path().join("input.txt");
+    let helper_path = fixtures.path().join("search-helper.cmd");
+    let helper_marker = fixtures.path().join("helper-ran.txt");
+    // Produce enough real output to exercise durable completed-tool history.
+    let input_contents = "todo: registered search result\n".repeat(256);
+    fs::write(&input_path, &input_contents)?;
+    fs::write(
+        &helper_path,
+        "@echo off\r\n> \"%~dp0helper-ran.txt\" echo ran\r\ntype \"%~1\"\r\n",
+    )?;
+    let server = responses::start_mock_server().await;
+    let response_log = responses::mount_sse_sequence(
+        &server,
+        vec![
+            responses::sse(vec![
+                responses::ev_response_created("unsafe-search-response"),
+                responses::ev_function_call(
+                    "unsafe-search",
+                    "exec_command",
+                    &serde_json::json!({
+                        "kind": "argv", "program": "rg",
+                        "args": ["--ignorecase", "--pre", helper_path, "TODO", input_path],
+                        "yield_time_ms": 1000,
+                    })
+                    .to_string(),
+                ),
+                responses::ev_completed("unsafe-search-response"),
+            ]),
+            responses::sse(vec![
+                responses::ev_response_created("safe-search-response"),
+                responses::ev_function_call(
+                    "safe-search",
+                    "exec_command",
+                    &serde_json::json!({
+                        "kind": "argv", "program": "rg",
+                        "args": ["--ignorecase", "TODO", input_path],
+                        "yield_time_ms": 1000,
+                    })
+                    .to_string(),
+                ),
+                responses::ev_completed("safe-search-response"),
+            ]),
+            responses::sse(vec![
+                responses::ev_response_created("search-final-response"),
+                responses::ev_assistant_message("search-final-message", "search complete"),
+                responses::ev_completed("search-final-response"),
+            ]),
+        ],
+    )
+    .await;
+    let mut builder = test_codex()
+        .with_pre_build_hook(|home| {
+            let script_path = home.join("post_search_hook.py");
+            fs::write(
+                &script_path,
+                concat!(
+                    "import json, sys\n",
+                    "json.load(sys.stdin)\n",
+                    "print(json.dumps({'hookSpecificOutput': {'hookEventName': 'PostToolUse', ",
+                    "'additionalContext': 'registered search post-hook context'}}))\n",
+                ),
+            )
+            .expect("write post-tool hook");
+            fs::write(
+                home.join("hooks.json"),
+                serde_json::json!({
+                    "hooks": {"PostToolUse": [{"matcher": "Bash", "hooks": [{
+                        "type": "command",
+                        "command": format!("python \"{}\"", script_path.display()),
+                    }]}]},
+                })
+                .to_string(),
+            )
+            .expect("write hook registration");
+        })
+        .with_config(|config| {
+            config
+                .features
+                .disable(Feature::DirectRuntime)
+                .expect("configure legacy repair");
+            config
+                .features
+                .enable(Feature::UnifiedExec)
+                .expect("register exec_command");
+            config
+                .features
+                .enable(Feature::CodexHooks)
+                .expect("enable registered hooks");
+            config.completed_tool_history_projection = true;
+            trust_discovered_hooks(config);
+        });
+    let test = builder.build(&server).await?;
+    let completion = test
+        .submit_turn_and_capture_completion("search for TODO in the supplied file")
+        .await?;
+    assert!(completion.error.is_none(), "{completion:?}");
+    let requests = response_log.requests();
+    assert_eq!(requests.len(), 3);
+    let rejected = requests[1]
+        .function_call_output_text("unsafe-search")
+        .expect("model receives rejected command result");
+    assert!(rejected.contains("--ignorecase"), "{rejected}");
+    assert!(
+        !rejected.contains("read-only equivalent repair"),
+        "{rejected}"
+    );
+    assert!(
+        !helper_marker.exists(),
+        "rejected repair must not launch its search helper"
+    );
+    let output = requests[2]
+        .function_call_output_text("safe-search")
+        .expect("model receives real command output");
+    assert!(
+        output.contains("todo: registered search result"),
+        "{output}"
+    );
+    assert!(output.contains("read-only equivalent repair"), "{output}");
+    let inputs = requests[2].input();
+    let output_index = inputs
+        .iter()
+        .position(|item| item["call_id"] == "safe-search" && item["type"] == "function_call_output")
+        .expect("completed tool output");
+    let context_indices = inputs
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| {
+            (item["type"] == "message"
+                && item
+                    .to_string()
+                    .contains("registered search post-hook context"))
+            .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        context_indices.len(),
+        1,
+        "the registered hook context must be delivered once"
+    );
+    assert!(
+        context_indices[0] > output_index,
+        "post-tool context must follow its tool output"
+    );
+
+    test.codex.submit(Op::Shutdown).await?;
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if matches!(
+                test.codex.next_event().await.expect("shutdown event").msg,
+                EventMsg::ShutdownComplete
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("shutdown flushes completed-tool history");
+    let (persisted, warning) = crate::tool_history::load_tool_history_state(
+        test.codex_home_path(),
+        &test.session_configured.thread_id.to_string(),
+    )
+    .await
+    .into_state_and_warning();
+    assert_eq!(warning, None);
+    let persisted = serde_json::to_value(persisted)?;
+    assert_eq!(persisted["candidates"]["safe-search"]["successful"], true);
+    assert!(
+        persisted["candidates"]["safe-search"]["bounded_digest"]
+            .as_str()
+            .expect("persisted result")
+            .contains("todo: registered search result")
+    );
+    assert_eq!(fs::read_to_string(input_path)?, input_contents);
+    Ok(())
+}
+
 #[test]
 fn direct_runtime_stop_hook_continuation_reaches_the_final_response() -> Result<()> {
     run_turn_multi_thread_test_with_stack(

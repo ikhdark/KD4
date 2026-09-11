@@ -233,9 +233,12 @@ impl ChatWidget {
 
         for name in server_names {
             match current.get(&name) {
-                Some(McpStartupStatus::Ready) => {}
+                // Lag only settles the local display. A missing terminal update
+                // does not mean the producer cancelled startup; the lossless
+                // startup-completed notification can still supply that outcome.
+                Some(McpStartupStatus::Ready | McpStartupStatus::Starting) | None => {}
                 Some(McpStartupStatus::Failed { .. }) => failed.push(name),
-                Some(McpStartupStatus::Cancelled | McpStartupStatus::Starting) | None => {
+                Some(McpStartupStatus::Cancelled) => {
                     cancelled.push(name);
                 }
             }

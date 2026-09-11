@@ -2209,6 +2209,50 @@ fn start_after_completion_is_rejected_without_changing_frozen_snapshot() {
     assert_eq!(state.state().counters.invalid_transition_count, 1);
 }
 
+#[tokio::test]
+async fn projection_recording_keeps_executor_available_under_contention() {
+    let (_clock, state) = timing();
+    let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let held_state = Arc::clone(&state);
+    let holder = std::thread::spawn(move || {
+        let guard = held_state.state();
+        locked_tx.send(()).expect("announce held timing lock");
+        let released = release_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+        drop(guard);
+        released
+    });
+    locked_rx.await.expect("timing lock held");
+    let recording_state = Arc::clone(&state);
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let recording = tokio::spawn(async move {
+        started_tx.send(()).expect("announce recording attempt");
+        recording_state
+            .record_tool_output_projection_facts_async(
+                1_000, 250, 400, 100, true, false, true, 3, true,
+            )
+            .await
+    });
+    started_rx.await.expect("recording attempt started");
+    assert!(
+        !recording.is_finished(),
+        "recording waits without blocking the executor"
+    );
+    release_tx
+        .send(())
+        .expect("release timing lock before timeout");
+    recording.await.expect("recording task");
+    assert!(
+        holder.join().expect("lock holder"),
+        "executor remained responsive"
+    );
+    let counters = state.complete_snapshot().protocol_timing().counters;
+    assert_eq!(counters.tool_output_canonical_byte_count, 1_000);
+    assert_eq!(counters.tool_output_model_token_count, 100);
+    assert_eq!(counters.tool_output_artifact_creation_count, 1);
+    assert_eq!(counters.tool_output_omitted_section_count, 3);
+}
+
 #[test]
 fn wait_and_tool_output_counters_are_additive() {
     let (_clock, state) = timing();

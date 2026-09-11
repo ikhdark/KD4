@@ -2175,7 +2175,7 @@ impl Session {
 
         let mut reloaded_user_configs = Vec::with_capacity(config_toml_paths.len());
         for config_toml_path in config_toml_paths {
-            let user_config = match std::fs::read_to_string(&config_toml_path) {
+            let user_config = match tokio::fs::read_to_string(&config_toml_path).await {
                 Ok(contents) => match toml::from_str::<toml::Value>(&contents) {
                     Ok(config) => config,
                     Err(err) => {
@@ -4767,11 +4767,11 @@ impl Session {
             unreachable!("session-owned tool-history reconciliation semaphore is never closed");
         };
         let mutation = crate::tool_history::ToolHistoryMutation::RegisterCandidate { candidate };
+        let mut persistence_writer = self.tool_history_persistence.writer().await;
         let mut state = self.state.lock().await;
         state.apply_tool_history_mutation(&mutation);
-        if let Err(err) = self
-            .tool_history_persistence
-            .enqueue_mutation(mutation, "completed-tool history metadata")
+        if let Err(err) =
+            persistence_writer.enqueue_mutation(mutation, "completed-tool history metadata")
         {
             tracing::warn!(
                 "failed to enqueue completed-tool history metadata; in-memory state is not durable: {err}"
@@ -4796,11 +4796,11 @@ impl Session {
         };
         let mutation =
             crate::tool_history::ToolHistoryMutation::RegisterWorkspaceEvidence { observation };
+        let mut persistence_writer = self.tool_history_persistence.writer().await;
         let mut state = self.state.lock().await;
         state.apply_tool_history_mutation(&mutation);
-        if let Err(err) = self
-            .tool_history_persistence
-            .enqueue_mutation(mutation, "workspace evidence metadata")
+        if let Err(err) =
+            persistence_writer.enqueue_mutation(mutation, "workspace evidence metadata")
         {
             tracing::warn!(
                 "failed to enqueue workspace evidence metadata; in-memory state is not durable: {err}"
@@ -4819,10 +4819,10 @@ impl Session {
         };
         let mutation =
             crate::tool_history::ToolHistoryMutation::RegisterNonWorkspaceCodeModeCall { call_id };
+        let mut persistence_writer = self.tool_history_persistence.writer().await;
         let mut state = self.state.lock().await;
         state.apply_tool_history_mutation(&mutation);
-        if let Err(err) = self
-            .tool_history_persistence
+        if let Err(err) = persistence_writer
             .enqueue_mutation(mutation, "code-mode workspace classification metadata")
         {
             tracing::warn!(
@@ -4867,12 +4867,12 @@ impl Session {
             excluded_call_ids: excluded_call_ids.clone(),
         };
         {
+            let mut persistence_writer = self.tool_history_persistence.writer().await;
             let mut state = self.state.lock().await;
             if !state.apply_tool_history_mutation(&mutation) {
                 return;
             }
-            if let Err(err) = self
-                .tool_history_persistence
+            if let Err(err) = persistence_writer
                 .enqueue_mutation(mutation, "source-dependency invalidation state")
             {
                 tracing::warn!(
@@ -4898,12 +4898,13 @@ impl Session {
             unreachable!("session-owned tool-history reconciliation semaphore is never closed");
         };
         {
+            let mut persistence_writer = self.tool_history_persistence.writer().await;
             let mut state = self.state.lock().await;
             let call_ids = state.mark_tool_history_consumed_with_delta(input, generation.clone());
             if call_ids.is_empty() {
                 return;
             }
-            if let Err(err) = self.tool_history_persistence.enqueue_mutation(
+            if let Err(err) = persistence_writer.enqueue_mutation(
                 crate::tool_history::ToolHistoryMutation::MarkConsumed {
                     call_ids,
                     generation,

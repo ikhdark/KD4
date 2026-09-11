@@ -407,8 +407,8 @@ async fn app_server_mcp_startup_lag_settles_startup_and_ignores_late_updates() {
         .iter()
         .map(|lines| lines_to_single_string(lines))
         .collect::<String>();
-    assert!(summary_text.contains("MCP startup interrupted"));
-    assert!(summary_text.contains("beta"));
+    assert!(!summary_text.contains("MCP startup interrupted"));
+    assert!(!summary_text.contains("beta"));
     assert!(summary_text.contains("MCP startup incomplete (failed: alpha)"));
     assert!(!chat.bottom_pane.is_task_running());
 

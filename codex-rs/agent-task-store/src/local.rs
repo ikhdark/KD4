@@ -680,39 +680,44 @@ impl LocalAgentTaskStore {
             return Err(StoreError::AttemptNotActive(attempt_id));
         }
         let capsule_path = task_capsule_path(&self.coordination_root, assignment_id);
-        if assignment.task_capsule.is_some() || capsule_path.try_exists()? {
+        if assignment.task_capsule.is_some() || tokio::fs::try_exists(&capsule_path).await? {
             return Err(StoreError::TaskCapsuleAlreadyAttached(assignment_id));
         }
-        if let Some(parent) = capsule_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
         let temporary_path = task_capsule_staging_path(&self.coordination_root, assignment_id);
-        if temporary_path.try_exists()? {
-            std::fs::remove_file(&temporary_path)?;
-        }
-        let mut file = match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary_path)
-        {
-            Ok(file) => file,
-            Err(error) => return Err(error.into()),
-        };
-        if let Err(error) = file
-            .write_all(canonical_payload.as_bytes())
-            .and_then(|()| file.sync_all())
-        {
-            drop(file);
-            let _ = std::fs::remove_file(&temporary_path);
-            return Err(error.into());
-        }
-        drop(file);
+        let staging_path = temporary_path.clone();
+        let staging_payload = canonical_payload.clone();
+        // Finish the staging write, including failure cleanup, in one worker.
+        // Retain the transaction's assignment lock through the write even if
+        // the caller is cancelled, and never leave partial JSON for recovery.
+        let transaction = tokio::task::spawn_blocking(move || -> std::io::Result<_> {
+            if let Some(parent) = staging_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            if staging_path.try_exists()? {
+                std::fs::remove_file(&staging_path)?;
+            }
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&staging_path)?;
+            if let Err(error) = file
+                .write_all(staging_payload.as_bytes())
+                .and_then(|()| file.sync_all())
+            {
+                drop(file);
+                let _ = std::fs::remove_file(&staging_path);
+                return Err(error);
+            }
+            Ok(transaction)
+        })
+        .await
+        .map_err(std::io::Error::other)??;
         assignment.task_capsule = Some(canonical_payload.clone());
         if let Err(error) = transaction.commit().await {
-            let _ = std::fs::remove_file(&temporary_path);
+            let _ = tokio::fs::remove_file(&temporary_path).await;
             return Err(error.into());
         }
-        std::fs::rename(&temporary_path, &capsule_path)?;
+        tokio::fs::rename(&temporary_path, &capsule_path).await?;
         Ok(assignment)
     }
 
@@ -840,7 +845,7 @@ impl LocalAgentTaskStore {
         let next_required_action = (!pending_gates.is_empty())
             .then(|| "resolve pending gates before completion".to_string());
         transaction.commit().await?;
-        hydrate_task_capsule(&self.coordination_root, &mut assignment)?;
+        hydrate_task_capsule(&self.coordination_root, &mut assignment).await?;
         Ok(AgentTask {
             assignment,
             current_attempt,
@@ -3275,15 +3280,16 @@ ORDER BY
 
     async fn reconcile_task_capsules(&self) -> StoreResult<()> {
         let capsule_dir = self.coordination_root.join("task_capsules");
-        std::fs::create_dir_all(&capsule_dir)?;
-        for entry in std::fs::read_dir(&capsule_dir)? {
-            let path = entry?.path();
+        tokio::fs::create_dir_all(&capsule_dir).await?;
+        let mut entries = tokio::fs::read_dir(&capsule_dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
             let is_stage = path
                 .file_name()
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| name.starts_with('.') && name.ends_with(".staged.json"));
             if is_stage {
-                let payload = std::fs::read_to_string(&path)?;
+                let payload = tokio::fs::read_to_string(&path).await?;
                 let capsule: TaskCapsuleV1 = serde_json::from_str(&payload)
                     .map_err(|error| StoreError::InvalidTaskCapsule(error.to_string()))?;
                 let exists = sqlx::query_scalar::<_, i64>(
@@ -3296,14 +3302,14 @@ ORDER BY
                 let expected_stage =
                     task_capsule_staging_path(&self.coordination_root, capsule.assignment_id);
                 if !exists || path != expected_stage {
-                    std::fs::remove_file(path)?;
+                    tokio::fs::remove_file(path).await?;
                     continue;
                 }
                 let final_path = task_capsule_path(&self.coordination_root, capsule.assignment_id);
-                if final_path.try_exists()? {
-                    std::fs::remove_file(path)?;
+                if tokio::fs::try_exists(&final_path).await? {
+                    tokio::fs::remove_file(path).await?;
                 } else {
-                    std::fs::rename(path, final_path)?;
+                    tokio::fs::rename(path, final_path).await?;
                 }
             }
         }
@@ -5904,9 +5910,12 @@ fn task_capsule_staging_path(coordination_root: &Path, assignment_id: Assignment
         .join(format!(".{assignment_id}.staged.json"))
 }
 
-fn hydrate_task_capsule(coordination_root: &Path, assignment: &mut Assignment) -> StoreResult<()> {
+async fn hydrate_task_capsule(
+    coordination_root: &Path,
+    assignment: &mut Assignment,
+) -> StoreResult<()> {
     let capsule_path = task_capsule_path(coordination_root, assignment.assignment_id);
-    let canonical_payload = match std::fs::read_to_string(capsule_path) {
+    let canonical_payload = match tokio::fs::read_to_string(capsule_path).await {
         Ok(payload) => payload,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error.into()),

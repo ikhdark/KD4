@@ -313,7 +313,8 @@ async fn report_agent_job_result_rejects_wrong_thread() -> Result<()> {
         .mount(&server)
         .await;
 
-    test.submit_turn("run job").await?;
+    test.submit_turn("Use subagents to run the CSV job.")
+        .await?;
 
     let db = test.codex.state_db().expect("state db");
     let output = fs::read_to_string(&output_path)?;
@@ -347,6 +348,97 @@ async fn report_agent_job_result_rejects_wrong_thread() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn csv_spawning_requires_explicit_authorization_in_v2_turns() -> Result<()> {
+    use sqlx::Connection;
+
+    for authorized in [false, true] {
+        let server = start_mock_server().await;
+        let test = test_codex()
+            .with_model("gpt-5.6-sol")
+            .with_config(|config| {
+                config.features.enable(Feature::SpawnCsv).unwrap();
+                config.features.enable(Feature::MultiAgentV2).unwrap();
+                config.multi_agent_v2.multi_agent_mode_hint_text = None;
+            })
+            .build(&server)
+            .await?;
+        let input_path = test.cwd_path().join("authorization.csv");
+        let output_path = test.cwd_path().join("authorization-output.csv");
+        fs::write(&input_path, "path\nfile-1\n")?;
+        let args = json!({
+            "csv_path": input_path,
+            "instruction": "Return {path}",
+            "output_csv_path": output_path,
+        });
+        Mock::given(method("POST"))
+            .and(path_regex(".*/responses$"))
+            .respond_with(AgentJobsResponder::new(serde_json::to_string(&args)?))
+            .mount(&server)
+            .await;
+
+        let created_before = test.thread_manager.list_thread_created_ids().await;
+        test.submit_turn(if authorized {
+            "Use subagents to process the CSV."
+        } else {
+            "Read the CSV. Do not spawn agents."
+        })
+        .await?;
+
+        let request_bodies = server
+            .received_requests()
+            .await
+            .expect("capture actual model requests")
+            .iter()
+            .map(|request| serde_json::from_slice::<Value>(&decode_body_bytes(request)))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let worker_requests = request_bodies
+            .iter()
+            .filter(|body| !has_function_call_output(body) && extract_job_and_item(body).is_some())
+            .count();
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(codex_state::state_db_path(&test.config.sqlite_home))
+            .read_only(true);
+        let mut connection = sqlx::SqliteConnection::connect_with(&options).await?;
+        let jobs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_jobs")
+            .fetch_one(&mut connection)
+            .await?;
+        let items: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_job_items")
+            .fetch_one(&mut connection)
+            .await?;
+        connection.close().await?;
+
+        if authorized {
+            assert_eq!((jobs, items, worker_requests), (1, 1, 1));
+            let output = fs::read_to_string(&output_path)?;
+            let records = parse_csv_records(&output).map_err(anyhow::Error::msg)?;
+            assert_eq!(records.len(), 2, "header plus completed input row");
+            assert_eq!(records[1][0], "file-1");
+            assert!(records[1].iter().any(|value| value == "completed"));
+        } else {
+            assert_eq!((jobs, items, worker_requests), (0, 0, 0));
+            assert_eq!(
+                test.thread_manager.list_thread_created_ids().await,
+                created_before
+            );
+            assert!(
+                !output_path.exists(),
+                "denied spawning must not create an export"
+            );
+            assert!(
+                request_bodies.iter().any(|body| {
+                    has_function_call_output(body)
+                        && body
+                            .to_string()
+                            .contains("unsupported call: spawn_agents_on_csv")
+                }),
+                "normal dispatch must return the rejected tool call to the model"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn spawn_agents_on_csv_runs_and_exports() -> Result<()> {
     let server = start_mock_server().await;
     let mut builder = test_codex().with_config(|config| {
@@ -375,7 +467,8 @@ async fn spawn_agents_on_csv_runs_and_exports() -> Result<()> {
         .mount(&server)
         .await;
 
-    test.submit_turn("run batch job").await?;
+    test.submit_turn("Use subagents to run the CSV batch job.")
+        .await?;
 
     let worker_request_bodies = server
         .received_requests()
@@ -483,7 +576,8 @@ async fn spawn_agents_on_csv_dedupes_item_ids() -> Result<()> {
         .mount(&server)
         .await;
 
-    test.submit_turn("run batch job with duplicate ids").await?;
+    test.submit_turn("Use subagents to run the CSV batch job with duplicate ids.")
+        .await?;
 
     let output = fs::read_to_string(&output_path)?;
     let mut lines = output.lines();
@@ -538,7 +632,8 @@ async fn spawn_agents_on_csv_stop_halts_future_items() -> Result<()> {
         .mount(&server)
         .await;
 
-    test.submit_turn("run job").await?;
+    test.submit_turn("Use subagents to run the CSV job.")
+        .await?;
 
     let output = fs::read_to_string(&output_path)?;
     let rows: Vec<&str> = output.lines().skip(1).collect();

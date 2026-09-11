@@ -412,7 +412,11 @@ async fn audit_mutation_recovery_f070_capsule_publication_reconciles_committed_s
         serde_json::to_string(&audit_capsule(&assignment, &attempt)).expect("capsule serializes");
     fixture
         .store
-        .attach_task_capsule(assignment.assignment_id, attempt.attempt_id, canonical)
+        .attach_task_capsule(
+            assignment.assignment_id,
+            attempt.attempt_id,
+            canonical.clone(),
+        )
         .await
         .expect("capsule attaches");
     let dir = fixture
@@ -429,14 +433,15 @@ async fn audit_mutation_recovery_f070_capsule_publication_reconciles_committed_s
         .expect("store restarts");
     assert!(final_path.exists());
     assert!(!stage_path.exists());
-    assert!(
+    assert_eq!(
         restarted
             .get_agent_task(assignment.assignment_id, None)
             .await
             .expect("task reads")
             .assignment
             .task_capsule
-            .is_some()
+            .as_deref(),
+        Some(canonical.as_str())
     );
     restarted.close().await;
 }
@@ -5347,6 +5352,48 @@ async fn task_capsule_attachment_rejects_noncanonical_or_mismatched_payloads() {
             .await,
         Err(StoreError::InvalidTaskCapsule(_))
     ));
+    let capsule_dir = fixture
+        .state
+        .codex_home()
+        .join("agent-task-coordination")
+        .join("task_capsules");
+    assert!(
+        std::fs::read_dir(&capsule_dir)
+            .expect("capsule directory reads")
+            .next()
+            .is_none(),
+        "rejected attachments must not leave published or staged capsules"
+    );
+    assert_eq!(
+        fixture
+            .store
+            .get_agent_task(assignment.assignment_id, None)
+            .await
+            .expect("task remains readable after rejected attachments")
+            .assignment
+            .task_capsule,
+        None
+    );
+    fixture
+        .store
+        .attach_task_capsule(
+            assignment.assignment_id,
+            attempt.attempt_id,
+            legacy_canonical.clone(),
+        )
+        .await
+        .expect("valid attachment succeeds after rejected inputs");
+    assert_eq!(
+        fixture
+            .store
+            .get_agent_task(assignment.assignment_id, None)
+            .await
+            .expect("consumer reads the valid attachment")
+            .assignment
+            .task_capsule
+            .as_deref(),
+        Some(legacy_canonical.as_str())
+    );
 }
 
 #[tokio::test]

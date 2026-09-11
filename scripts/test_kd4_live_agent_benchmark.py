@@ -544,7 +544,6 @@ def render_report(text: str) -> str:
 
     def test_final_verification_complaints_are_separate_from_runtime_markers(self) -> None:
         for final_message, expected in (
-            ("Tool results were rejected as stale workspace evidence.", True),
             ("Tests passed, but the results are unverified.", True),
             ("Verification is unverifiable in this session.", True),
             ("I could not independently verify the changes.", True),
@@ -568,6 +567,35 @@ def render_report(text: str) -> str:
                     [diagnostic["category"] for diagnostic in diagnostics],
                     ["final_verification_complaint"] if expected else [],
                 )
+
+    def test_freshness_diagnostic_reads_final_workspace_evidence(self) -> None:
+        for final_message, signal in (
+            (
+                "Tool results were rejected as stale workspace evidence.",
+                "workspace evidence was marked stale",
+            ),
+            (
+                "I cannot confirm the fix with UNVERIFIED WORKSPACE EVIDENCE.",
+                "workspace evidence was unverified",
+            ),
+        ):
+            with self.subTest(final_message=final_message):
+                diagnostics = benchmark.classify_diagnostics(
+                    observed_text="turn.started\nturn.completed",
+                    final_message=final_message,
+                    timed_out=False,
+                    exit_code=0,
+                    terminal_event="turn.completed",
+                    invalid_json_lines=0,
+                    verifier_passed=True,
+                    required_test_passed=True,
+                    command_execution_failures=0,
+                )
+                self.assertEqual(
+                    [diagnostic["category"] for diagnostic in diagnostics],
+                    ["freshness_invalidation", "final_verification_complaint"],
+                )
+                self.assertEqual(diagnostics[0]["signals"], [signal])
 
     def test_exact_source_state_rejects_dirty_contents(self) -> None:
         with tempfile.TemporaryDirectory(prefix="kd4-live-source-test-") as temp:
@@ -1742,7 +1770,7 @@ def render_report(text: str) -> str:
         }
         final_message = (
             "Implemented the fix. " * 40
-            + "Tool results were rejected as stale workspace evidence; verification is unverified."
+            + "Tool results contain unverified workspace evidence."
         )
         events = [
             {"type": "thread.started", "thread_id": "thread_0"},
@@ -1817,6 +1845,9 @@ def render_report(text: str) -> str:
         self.assertEqual(summary["outcomeCorrectness"]["ratePercent"], 100.0)
         self.assertEqual(
             summary["diagnosticCategoryCounts"]["final_verification_complaint"], 1
+        )
+        self.assertEqual(
+            summary["diagnosticCategoryCounts"]["freshness_invalidation"], 1
         )
         self.assertEqual(run["actualCommandCount"], 2)
         self.assertEqual(run["continuationCount"], 1)

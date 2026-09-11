@@ -664,6 +664,7 @@ _DIAGNOSTIC_PATTERNS: dict[str, tuple[tuple[str, str], ...]] = {
     "freshness_invalidation": (
         ("stale_workspace_evidence", "workspace evidence was marked stale"),
         ("stale workspace evidence", "workspace evidence was marked stale"),
+        ("unverified workspace evidence", "workspace evidence was unverified"),
         ('"force_fresh":true', "the call requested a fresh rerun"),
         ('"force_fresh": true', "the call requested a fresh rerun"),
     ),
@@ -3096,7 +3097,10 @@ def classify_diagnostics(
     lowered = observed_text.lower()
     diagnostics: list[dict[str, Any]] = []
     for category, patterns in _DIAGNOSTIC_PATTERNS.items():
-        signals = [signal for needle, signal in patterns if needle in lowered]
+        category_text = lowered
+        if category == "freshness_invalidation" and final_message:
+            category_text += "\n" + final_message.lower()
+        signals = [signal for needle, signal in patterns if needle in category_text]
         if signals:
             diagnostics.append({"category": category, "signals": sorted(set(signals))})
 

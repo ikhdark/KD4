@@ -300,6 +300,11 @@ fn preflight_invocation_with_equivalent_repair_detailed(
     let Some(repaired_command) = repaired.to_direct_argv() else {
         return Err(issue);
     };
+    // Search executables can also launch helpers (for example rg --pre).
+    // Verify the complete repaired argv before automatically executing it.
+    if !codex_shell_command::is_safe_command::is_known_safe_direct_argv(&repaired_command) {
+        return Err(issue);
+    }
     // One repair is the hard limit. If the repaired command has another issue,
     // reject it rather than chaining mechanical transformations.
     let repaired_argv_commands =

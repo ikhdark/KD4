@@ -22,6 +22,7 @@ use crate::app_event_sender::AppEventSender;
 use crate::key_hint;
 use crate::key_hint::KeyBinding;
 use crate::line_truncation::truncate_line_with_ellipsis_if_overflow;
+use crate::line_truncation::truncate_line_to_width;
 use crate::motion::MotionMode;
 use crate::motion::ReducedMotionIndicator;
 use crate::motion::activity_indicator;
@@ -218,13 +219,12 @@ impl StatusIndicatorWidget {
 
         if out.len() > self.details_max_lines {
             out.truncate(self.details_max_lines);
-            let content_width = usize::from(width).saturating_sub(prefix_width).max(1);
-            let max_base_len = content_width.saturating_sub(1);
-            if let Some(last) = out.last_mut()
-                && let Some(span) = last.spans.last_mut()
-            {
-                let trimmed: String = span.content.as_ref().chars().take(max_base_len).collect();
-                *span = format!("{trimmed}…").dim();
+            if let Some(last) = out.last_mut() {
+                *last = truncate_line_to_width(
+                    std::mem::take(last),
+                    usize::from(width).saturating_sub(1),
+                );
+                last.spans.push("…".dim());
             }
         }
 
@@ -479,9 +479,40 @@ mod tests {
         assert_eq!(lines.len(), STATUS_DETAILS_DEFAULT_MAX_LINES);
         let last = lines.last().expect("expected last details line");
         assert!(
-            last.spans[1].content.as_ref().ends_with("…"),
+            last.spans.last().unwrap().content.as_ref().ends_with("…"),
             "expected ellipsis in last line: {last:?}"
         );
+    }
+
+    #[test]
+    fn renders_unicode_details_with_visible_overflow_marker() {
+        for (details, expected_cells) in [
+            ("界界界界界", ["界", " ", "…", " "]),
+            ("e\u{301}e\u{301}e\u{301}e\u{301}e\u{301}", ["e\u{301}", "e\u{301}", "e\u{301}", "…"]),
+        ] {
+            let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
+            let mut widget = StatusIndicatorWidget::new(
+                AppEventSender::new(tx_raw),
+                crate::tui::FrameRequester::test_dummy(),
+                /*animations_enabled*/ false,
+            );
+            widget.update_details(
+                Some(details.to_string()),
+                StatusDetailsCapitalization::Preserve,
+                /*max_lines*/ 1,
+            );
+            let mut terminal = Terminal::new(TestBackend::new(8, 2)).expect("terminal");
+            terminal
+                .draw(|frame| widget.render(frame.area(), frame.buffer_mut()))
+                .expect("draw");
+            for (offset, expected) in expected_cells.into_iter().enumerate() {
+                assert_eq!(
+                    terminal.backend().buffer()[(4 + offset as u16, 1)].symbol(),
+                    expected,
+                    "details: {details}"
+                );
+            }
+        }
     }
 
     #[test]

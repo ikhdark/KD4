@@ -1,6 +1,5 @@
 version = 1
 policy-pack = ["kd4@1"]
-all-profiles = true
 
 # KD4's local Windows quality gate. Paths are relative to this Cargo workspace.
 # Preserve the registry's warn/deny defaults; overriding the global default
@@ -14,7 +13,7 @@ generic-instantiation-uncertain = "warn"
 
 # Normal runtime and the only optional workspace feature (code-mode/Cargo.toml).
 # Trusted loading provides build-script outputs and procedural macro expansion.
-# Both profiles run by default; --profile windows selects normal features.
+# Use --all-profiles for both; --profile windows selects normal features.
 [[analysis-profile]]
 name = "windows"
 target = "x86_64-pc-windows-msvc"

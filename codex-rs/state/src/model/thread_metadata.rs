@@ -283,8 +283,17 @@ impl ThreadMetadata {
         if self.updated_at != other.updated_at {
             diffs.push("updated_at");
         }
+        if self.recency_at != other.recency_at {
+            diffs.push("recency_at");
+        }
         if self.source != other.source {
             diffs.push("source");
+        }
+        if self.history_mode != other.history_mode {
+            diffs.push("history_mode");
+        }
+        if self.thread_source != other.thread_source {
+            diffs.push("thread_source");
         }
         if self.agent_nickname != other.agent_nickname {
             diffs.push("agent_nickname");

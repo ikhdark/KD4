@@ -144,6 +144,7 @@ pub(super) async fn spawn_review_thread(
         validation_authorization: Arc::clone(&parent_turn_context.validation_authorization),
         turn_metadata_state,
         extension_data,
+        pending_post_tool_contexts: Default::default(),
         turn_skills: TurnSkillsContext::new(parent_turn_context.turn_skills.snapshot.clone()),
         turn_timing_state: Arc::new(TurnTimingState::default()),
         tool_call_acceptance: Arc::new(crate::state::ToolCallAcceptanceGate::default()),

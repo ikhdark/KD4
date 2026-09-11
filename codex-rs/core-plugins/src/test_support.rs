@@ -14,6 +14,70 @@ use toml::Value;
 pub(crate) const TEST_CURATED_PLUGIN_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
 pub(crate) const TEST_CURATED_PLUGIN_CACHE_VERSION: &str = "01234567";
 
+/// Denies metadata access within one test-owned directory, restoring its ACL even
+/// when a behavior assertion unwinds. Never apply this guard outside a fixture.
+pub(crate) struct DeniedMetadata {
+    path: std::path::PathBuf,
+    active: bool,
+}
+
+impl DeniedMetadata {
+    pub(crate) fn new(fixture: &tempfile::TempDir, path: &Path) -> Self {
+        let target = path.canonicalize().expect("canonical fixture directory");
+        let fixture_root = fixture.path().canonicalize().unwrap();
+        let path = target
+            .parent()
+            .expect("fixture target parent")
+            .to_path_buf();
+        assert!(path.starts_with(&fixture_root) && path != fixture_root);
+        let mut guard = Self {
+            path,
+            active: false,
+        };
+        let output = std::process::Command::new("icacls.exe")
+            .arg(&guard.path)
+            // Deny both child attributes and parent enumeration. Windows can
+            // otherwise obtain metadata through its directory-query fallback.
+            .args(["/deny", "*S-1-1-0:(OI)(CI)(R)", "/Q"])
+            .output()
+            .expect("deny fixture metadata access");
+        // Attempt cleanup even if icacls reports a partially applied operation.
+        guard.active = true;
+        assert!(output.status.success(), "{output:?}");
+        guard
+    }
+
+    pub(crate) fn restore(mut self) {
+        self.remove_deny().expect("restore fixture metadata access");
+        self.active = false;
+    }
+
+    fn remove_deny(&self) -> std::io::Result<()> {
+        let output = std::process::Command::new("icacls.exe")
+            .arg(&self.path)
+            .args(["/remove:d", "*S-1-1-0", "/Q"])
+            .output()?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(format!("{output:?}")))
+        }
+    }
+}
+
+impl Drop for DeniedMetadata {
+    fn drop(&mut self) {
+        if self.active
+            && let Err(err) = self.remove_deny()
+        {
+            eprintln!(
+                "failed to restore fixture ACL at {}: {err}",
+                self.path.display()
+            );
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum CuratedPluginFixture {
     Complete,

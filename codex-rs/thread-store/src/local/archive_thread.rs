@@ -4,7 +4,7 @@ use codex_rollout::find_thread_path_by_id_str;
 use super::LocalThreadStore;
 use super::helpers::matching_rollout_file_name;
 use super::helpers::rollout_lookup_error;
-use super::helpers::scoped_rollout_path;
+use super::helpers::scoped_rollout_path_async;
 use crate::ArchiveThreadParams;
 use crate::ThreadStoreError;
 use crate::ThreadStoreResult;
@@ -24,11 +24,12 @@ pub(super) async fn archive_thread(
     .map_err(|err| rollout_lookup_error(thread_id, /*archived*/ false, err))?
     .ok_or(ThreadStoreError::ThreadNotFound { thread_id })?;
 
-    let canonical_rollout_path = scoped_rollout_path(
+    let canonical_rollout_path = scoped_rollout_path_async(
         store.config.codex_home.join(codex_rollout::SESSIONS_SUBDIR),
-        rollout_path.as_path(),
+        rollout_path.clone(),
         "sessions",
-    )?;
+    )
+    .await?;
     let file_name = matching_rollout_file_name(
         canonical_rollout_path.as_path(),
         thread_id,
@@ -39,15 +40,17 @@ pub(super) async fn archive_thread(
         .config
         .codex_home
         .join(codex_rollout::ARCHIVED_SESSIONS_SUBDIR);
-    std::fs::create_dir_all(&archive_folder).map_err(|err| ThreadStoreError::Internal {
-        message: format!("failed to archive thread: {err}"),
-    })?;
-    let archived_path = archive_folder.join(&file_name);
-    std::fs::rename(&canonical_rollout_path, &archived_path).map_err(|err| {
-        ThreadStoreError::Internal {
+    tokio::fs::create_dir_all(&archive_folder)
+        .await
+        .map_err(|err| ThreadStoreError::Internal {
             message: format!("failed to archive thread: {err}"),
-        }
-    })?;
+        })?;
+    let archived_path = archive_folder.join(&file_name);
+    tokio::fs::rename(&canonical_rollout_path, &archived_path)
+        .await
+        .map_err(|err| ThreadStoreError::Internal {
+            message: format!("failed to archive thread: {err}"),
+        })?;
 
     if let Some(ctx) = state_db_ctx
         && let Err(err) = ctx

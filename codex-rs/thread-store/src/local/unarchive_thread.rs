@@ -5,7 +5,7 @@ use codex_rollout::rollout_date_parts;
 use super::LocalThreadStore;
 use super::helpers::matching_rollout_file_name;
 use super::helpers::rollout_lookup_error;
-use super::helpers::scoped_rollout_path;
+use super::helpers::scoped_rollout_path_async;
 use super::helpers::stored_thread_from_rollout_item;
 use super::helpers::touch_modified_time;
 use crate::ArchiveThreadParams;
@@ -26,7 +26,7 @@ async fn unarchive_thread_with_touch<F>(
     touch: F,
 ) -> ThreadStoreResult<StoredThread>
 where
-    F: FnOnce(&std::path::Path) -> std::io::Result<()>,
+    F: FnOnce(&std::path::Path) -> std::io::Result<()> + Send + 'static,
 {
     let thread_id = params.thread_id;
     let state_db_ctx = store.state_db().await;
@@ -39,14 +39,15 @@ where
     .map_err(|err| rollout_lookup_error(thread_id, /*archived*/ true, err))?
     .ok_or(ThreadStoreError::ThreadNotFound { thread_id })?;
 
-    let canonical_archived_path = scoped_rollout_path(
+    let canonical_archived_path = scoped_rollout_path_async(
         store
             .config
             .codex_home
             .join(codex_rollout::ARCHIVED_SESSIONS_SUBDIR),
-        archived_path.as_path(),
+        archived_path.clone(),
         "archived",
-    )?;
+    )
+    .await?;
     let file_name = matching_rollout_file_name(
         canonical_archived_path.as_path(),
         thread_id,
@@ -91,14 +92,16 @@ where
     })?;
     thread.rollout_path = Some(codex_rollout::plain_rollout_path(restored_path.as_path()));
 
-    std::fs::create_dir_all(&dest_dir).map_err(|err| ThreadStoreError::Internal {
-        message: format!("failed to unarchive thread: {err}"),
-    })?;
-    std::fs::rename(&canonical_archived_path, &restored_path).map_err(|err| {
-        ThreadStoreError::Internal {
+    tokio::fs::create_dir_all(&dest_dir)
+        .await
+        .map_err(|err| ThreadStoreError::Internal {
             message: format!("failed to unarchive thread: {err}"),
-        }
-    })?;
+        })?;
+    tokio::fs::rename(&canonical_archived_path, &restored_path)
+        .await
+        .map_err(|err| ThreadStoreError::Internal {
+            message: format!("failed to unarchive thread: {err}"),
+        })?;
 
     if let Some(ctx) = state_db_ctx
         && let Err(err) = ctx
@@ -111,7 +114,11 @@ where
         );
     }
 
-    if let Err(err) = touch(restored_path.as_path()) {
+    let touch_result = tokio::task::spawn_blocking(move || touch(restored_path.as_path()))
+        .await
+        .map_err(std::io::Error::other)
+        .and_then(std::convert::identity);
+    if let Err(err) = touch_result {
         tracing::warn!(
             "failed to update unarchived thread timestamp after moving the rollout; \
              the unarchive remains committed: {err}"

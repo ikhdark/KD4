@@ -224,6 +224,13 @@ impl ManagedRootProcess {
         resume_process_threads(pid)
     }
 
+    /// Prevent descendant launchers from escaping this root's Windows job.
+    /// Configure this before attaching and resuming the root.
+    #[cfg(windows)]
+    pub fn require_descendant_containment(&self) -> io::Result<()> {
+        self.job.require_descendant_containment()
+    }
+
     #[cfg(windows)]
     pub fn terminate(&self) -> io::Result<()> {
         self.job.terminate()

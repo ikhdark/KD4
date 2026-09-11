@@ -270,6 +270,16 @@ impl ThreadGoalRequestProcessor {
             })?
             .ok_or_else(|| invalid_request(format!("thread not found: {thread_id}")))?,
         };
+        // Goal mutations do not own thread metadata. A valid row for this
+        // rollout already provides the identity needed by the goal store.
+        if state_db
+            .get_thread(thread_id)
+            .await
+            .map_err(|err| internal_error(format!("failed to read thread metadata: {err}")))?
+            .is_some_and(|metadata| metadata.rollout_path == rollout_path)
+        {
+            return Ok(());
+        }
         reconcile_rollout(
             Some(state_db),
             rollout_path.as_path(),

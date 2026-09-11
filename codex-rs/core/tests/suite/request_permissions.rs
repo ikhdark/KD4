@@ -1329,6 +1329,12 @@ async fn partial_request_permissions_grants_do_not_preapprove_new_permissions() 
 
     let first_dir = tempfile::tempdir()?;
     let second_dir = tempfile::tempdir()?;
+    let unrequested_dir = tempfile::tempdir()?;
+    let forbidden_write = unrequested_dir.path().join("unrequested-write.txt");
+    let forbidden_command = write_and_read_command(&forbidden_write, "must-not-run");
+    let unrequested_permissions =
+        requested_directory_write_permissions(unrequested_dir.path());
+    let native_unrequested_permissions = native_permissions(unrequested_permissions.clone())?;
     let second_write = second_dir.path().join("partial-grant-write.txt");
     let command = write_and_read_command(&second_write, "partial-grant-ok");
 
@@ -1357,6 +1363,16 @@ async fn partial_request_permissions_grants_do_not_preapprove_new_permissions() 
         ..RequestPermissionProfile::default()
     };
     let granted_permissions = normalized_directory_write_permissions(first_dir.path())?;
+    let mut overbroad_response_permissions = granted_permissions.clone();
+    overbroad_response_permissions
+        .file_system
+        .as_mut()
+        .expect("filesystem grant")
+        .entries
+        .extend(unrequested_permissions.file_system.expect("unrequested grant").entries);
+    overbroad_response_permissions.network = Some(codex_protocol::models::NetworkPermissions {
+        enabled: Some(true),
+    });
     let second_dir_permissions = requested_directory_write_permissions(second_dir.path());
     let native_second_dir_permissions = native_permissions(second_dir_permissions.clone())?;
     let merged_permissions = PermissionProfile {
@@ -1393,8 +1409,17 @@ async fn partial_request_permissions_grants_do_not_preapprove_new_permissions() 
             ]),
             sse(vec![
                 ev_response_created("resp-partial-3"),
-                ev_assistant_message("msg-partial-1", "done"),
+                exec_command_event_with_request_permissions(
+                    "forbidden-exec-call",
+                    &forbidden_command,
+                    &native_unrequested_permissions,
+                )?,
                 ev_completed("resp-partial-3"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-partial-4"),
+                ev_assistant_message("msg-partial-1", "done"),
+                ev_completed("resp-partial-4"),
             ]),
         ],
     )
@@ -1414,7 +1439,7 @@ async fn partial_request_permissions_grants_do_not_preapprove_new_permissions() 
         .submit(Op::RequestPermissionsResponse {
             id: "permissions-call".to_string(),
             response: RequestPermissionsResponse {
-                permissions: granted_permissions.clone(),
+                permissions: overbroad_response_permissions,
                 scope: PermissionGrantScope::Turn,
                 strict_auto_review: false,
             },
@@ -1455,7 +1480,29 @@ async fn partial_request_permissions_grants_do_not_preapprove_new_permissions() 
             decision: ReviewDecision::Approved,
         })
         .await?;
+    let forbidden_approval = expect_exec_approval(&test, &forbidden_command).await;
+    assert!(
+        !forbidden_write.exists(),
+        "unrequested authority must not bypass approval"
+    );
+    test.codex
+        .submit(Op::ExecApproval {
+            id: forbidden_approval.effective_approval_id(),
+            turn_id: None,
+            decision: ReviewDecision::Denied,
+        })
+        .await?;
     wait_for_completion(&test).await;
+
+    let permission_output = responses
+        .function_call_output_text("permissions-call")
+        .expect("model receives bounded permission grant");
+    let permission_response: RequestPermissionsResponse = serde_json::from_str(&permission_output)?;
+    assert_eq!(permission_response.permissions, granted_permissions);
+    assert!(
+        !forbidden_write.exists(),
+        "an overbroad response must not authorize the unrequested write"
+    );
 
     let exec_output = responses
         .function_call_output_text("exec-call")

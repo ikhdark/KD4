@@ -1918,6 +1918,15 @@ impl ToolCallRuntime {
                 turn.config.cwd.as_path(),
                 workspace_admission_hint,
             );
+        // Nested reads must carry their dependencies even when their output is
+        // small enough to skip projection. Keep non-workspace calls as None;
+        // Some(empty) means an unscoped workspace observation to the exec owner.
+        let projection_source_dependencies = projection_source_dependencies.or_else(|| {
+            workspace_call_classification
+                .as_ref()
+                .filter(|classification| classification.observes_workspace)
+                .map(|classification| classification.source_dependencies.clone())
+        });
         let model_issued = matches!(&source, ToolCallSource::Direct);
         let abort_turn = Arc::clone(&turn);
         let dispatch_state = Arc::new(ToolDispatchState::new());
@@ -3702,6 +3711,112 @@ mod tests {
         );
     }
 
+    #[test_case::test_case("Get-Content contract.txt", true; "scoped read")]
+    #[test_case::test_case("git status --short", false; "unscoped read")]
+    #[tokio::test]
+    async fn nested_workspace_result_carries_dependencies_without_output_projection(
+        command: &str,
+        scoped: bool,
+    ) {
+        let (session, turn_context) = crate::session::tests::make_session_and_context().await;
+        let session = Arc::new(session);
+        let turn_context = Arc::new(turn_context);
+        let tool_name = codex_tools::ToolName::plain("exec_command");
+        let handler = Arc::new(ImmediateHandler {
+            tool_name: tool_name.clone(),
+        }) as Arc<dyn CoreToolRuntime>;
+        let router = Arc::new(ToolRouter::from_parts(
+            ToolRegistry::from_tools([handler]),
+            Vec::new(),
+        ));
+        let step_context =
+            StepContext::for_test(Arc::clone(&turn_context)).with_tool_router_for_test(router);
+        let governor = crate::session::reasoning_governor::SamplingReasoningGovernor::new(None);
+        let baselines = governor.baselines(0);
+        let collector = governor.collector(&baselines);
+        let runtime = ToolCallRuntime::new(
+            Arc::clone(&session),
+            step_context,
+            Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+        )
+        .with_sampling_request_signals(collector.clone());
+        let payload = ToolPayload::Function {
+            arguments: serde_json::json!({ "cmd": command }).to_string(),
+        };
+        let expected = if scoped {
+            std::collections::BTreeSet::from([crate::tool_history::SourceDependencyV1::new(
+                &turn_context.config.cwd.join("contract.txt"),
+                false,
+            )])
+        } else {
+            std::collections::BTreeSet::new()
+        };
+        let result = runtime
+            .clone()
+            .handle_tool_call_with_source(
+                ToolCall {
+                    tool_name: tool_name.clone(),
+                    call_id: "nested-read".to_string(),
+                    payload: payload.clone(),
+                },
+                ToolCallSource::CodeMode {
+                    cell_id: "read-cell".to_string(),
+                    parent_call_id: Some("outer-exec".to_string()),
+                    runtime_tool_call_id: "runtime-read".to_string(),
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .expect("nested workspace read succeeds");
+
+        assert!(result.model_projection.is_none());
+        assert_eq!(result.projected_source_dependencies(), Some(&expected));
+        let canonical: Arc<[ResponseItem]> = Arc::from([
+            ResponseItem::FunctionCall {
+                id: None,
+                name: "exec_command".to_string(),
+                namespace: None,
+                arguments: serde_json::json!({ "cmd": command }).to_string(),
+                call_id: "nested-read".to_string(),
+                internal_chat_message_metadata_passthrough: None,
+            },
+            ResponseItem::from(result.response()),
+        ]);
+        let history = session.clone_history().await;
+        let history = history.tool_history_state();
+        let revision = history
+            .workspace_evidence_revision_for_test("nested-read")
+            .expect("nested read registers workspace evidence");
+        assert_eq!(
+            history
+                .project_with_workspace_identity(Arc::clone(&canonical), revision.as_ref())
+                .items,
+            canonical,
+            "a successful nested read must remain visible at its captured revision"
+        );
+        let dependencies = result.projected_source_dependencies().cloned();
+        let outcome_context = result.outcome_context();
+        let value = result.code_mode_result();
+        assert_eq!(value, serde_json::json!("ok"));
+        runtime.record_code_mode_result(
+            CodeModeToolResult {
+                cell_id: "read-cell",
+                tool_name: &tool_name,
+                payload: &payload,
+                source_dependencies: dependencies,
+                outcome_context,
+                signal: None,
+                result: &value,
+                canonical_artifact_required: false,
+            },
+            &[],
+        );
+        assert_eq!(
+            collector.code_mode_source_dependencies("read-cell"),
+            Some(expected)
+        );
+    }
+
     #[tokio::test]
     async fn non_workspace_evidence_skips_workspace_gate() {
         let (session, turn_context) = crate::session::tests::make_session_and_context().await;
@@ -4938,8 +5053,6 @@ mod tests {
         cleanup_started_rx
             .await
             .expect("handler should start cleanup");
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        allow_cleanup.notify_one();
 
         let response = tokio::time::timeout(Duration::from_secs(1), response_task)
             .await
@@ -4969,7 +5082,12 @@ mod tests {
             .find(|timing| timing.call_id == "call-1")
             .expect("cancelled call timing");
         assert!(call_timing.handler_entry_at_ms.is_some());
-        assert!(call_timing.handler_exit_at_ms.is_some());
+        assert!(
+            call_timing.handler_exit_at_ms.is_none(),
+            "the abort response is delivered while runtime cleanup is still held"
+        );
+
+        allow_cleanup.notify_one();
 
         Ok(())
     }
@@ -5047,7 +5165,6 @@ mod tests {
             .await
             .expect("owned abort should start cooperative runtime cleanup");
         assert!(handler_token.is_cancelled());
-        allow_cleanup.notify_one();
 
         let response = tokio::time::timeout(Duration::from_secs(1), response_task)
             .await
@@ -5084,7 +5201,10 @@ mod tests {
         );
         assert_eq!(call_timing.parent_call_id.as_deref(), Some("outer-call"));
         assert!(call_timing.handler_entry_at_ms.is_some());
-        assert!(call_timing.handler_exit_at_ms.is_some());
+        assert!(
+            call_timing.handler_exit_at_ms.is_none(),
+            "the abort response is delivered while runtime cleanup is still held"
+        );
         assert!(call_timing.output_projection_ms.is_some());
         let closure = turn_context.turn_timing_state.tool_closure_snapshot();
         assert_eq!(closure.accepted_count, 1);
@@ -5095,6 +5215,8 @@ mod tests {
             "this runtime unit stops below the owning direct-call persistence boundary"
         );
         assert!(closure.orphan_calls.is_empty());
+
+        allow_cleanup.notify_one();
 
         Ok(())
     }

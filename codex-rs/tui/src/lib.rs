@@ -1113,7 +1113,7 @@ pub async fn run_main(
 
     let (tui_file_layer, _tui_file_log_guard) = if config_toml_log_dir_configured {
         let log_dir = config.log_dir.clone();
-        std::fs::create_dir_all(&log_dir)?;
+        tokio::fs::create_dir_all(&log_dir).await?;
         let mut log_file_opts = OpenOptions::new();
         log_file_opts.create(true).append(true);
 

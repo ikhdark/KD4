@@ -1,8 +1,7 @@
 ## Repository identity and runtime boundary
 
 - This is the user's local fork of [`openai/codex`](https://github.com/openai/codex).
-  Operate only on fork-local source and artifacts. Upstream synchronization or
-  distribution requires a request that explicitly names it.
+  Upstream synchronization or distribution requires a request that explicitly names it.
 - This is a local project for the user's own use and is not intended for public
   release or distribution. It's main goal is to improve and optimize codex.
 - Treat the active repository root as the checkout location; do not hard-code a

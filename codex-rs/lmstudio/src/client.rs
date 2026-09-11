@@ -155,14 +155,17 @@ impl LMStudioClient {
     }
 
     pub async fn download_model(&self, model: &str) -> std::io::Result<()> {
-        let lms = Self::find_lms()?;
+        let lms = tokio::task::spawn_blocking(Self::find_lms)
+            .await
+            .map_err(io::Error::other)??;
         eprintln!("Downloading model: {model}");
 
-        let status = std::process::Command::new(&lms)
+        let status = tokio::process::Command::new(&lms)
             .args(["get", "--yes", model])
             .stdout(std::process::Stdio::inherit())
             .stderr(std::process::Stdio::null())
             .status()
+            .await
             .map_err(|e| {
                 std::io::Error::other(format!("Failed to execute '{lms} get --yes {model}': {e}"))
             })?;
@@ -369,31 +372,95 @@ mod tests {
             .expect("load request should succeed");
     }
 
-    #[test]
-    fn test_find_lms() {
-        let result = LMStudioClient::find_lms();
-
-        match result {
-            Ok(_) => {
-                // lms was found in PATH - that's fine
-            }
-            Err(e) => {
-                // Expected error when LM Studio not installed
-                assert!(e.to_string().contains("LM Studio not found"));
-            }
+    #[tokio::test]
+    async fn test_find_lms() {
+        if std::env::var_os("CODEX_LMS_DISCOVERY_CHILD").is_some() {
+            let error = missing_model_readiness_error().await;
+            assert_eq!(error.kind(), io::ErrorKind::NotFound);
+            assert!(error.to_string().contains("LM Studio not found"));
+        } else {
+            run_discovery_child("client::tests::test_find_lms", false).await;
         }
     }
 
-    #[test]
-    fn test_find_lms_with_mock_home() {
-        // Test fallback path construction without touching env vars
-
-        {
-            let result = LMStudioClient::find_lms_with_home_dir(Some("C:\\test\\home"));
-            if let Err(e) = result {
-                assert!(e.to_string().contains("LM Studio not found"));
-            }
+    #[tokio::test]
+    async fn test_find_lms_with_mock_home() {
+        if std::env::var_os("CODEX_LMS_DISCOVERY_CHILD").is_some() {
+            let error = missing_model_readiness_error().await;
+            assert!(
+                error
+                    .to_string()
+                    .starts_with("Model download failed with exit code:"),
+                "the discovered executable must run and its failure must propagate: {error}"
+            );
+        } else {
+            run_discovery_child("client::tests::test_find_lms_with_mock_home", true).await;
         }
+    }
+
+    async fn missing_model_readiness_error() -> io::Error {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/models"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "data": [] })),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/responses"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let config_home = tempfile::tempdir().unwrap();
+        let mut config = codex_core::config::ConfigBuilder::default()
+            .codex_home(config_home.path().to_path_buf())
+            .build()
+            .await
+            .unwrap();
+        config.model = Some("test-model".to_string());
+        config
+            .model_providers
+            .get_mut(LMSTUDIO_OSS_PROVIDER_ID)
+            .unwrap()
+            .base_url = Some(server.uri());
+        let error = crate::ensure_oss_ready(&config).await.unwrap_err();
+        server.verify().await;
+        error
+    }
+
+    async fn run_discovery_child(test: &str, install_failing_executable: bool) {
+        let home = tempfile::tempdir().unwrap();
+        if install_failing_executable {
+            let bin = home.path().join(".lmstudio/bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            // WHERE is a real Windows executable. The unsupported --yes option
+            // makes it fail without downloading a model or contacting a service.
+            let windows = std::env::var_os("SystemRoot").expect("Windows system directory");
+            std::fs::copy(
+                Path::new(&windows).join("System32/where.exe"),
+                bin.join("lms.exe"),
+            )
+            .unwrap();
+        }
+        let output = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture"])
+            .env("CODEX_LMS_DISCOVERY_CHILD", "1")
+            .env("USERPROFILE", home.path())
+            .env("PATH", "")
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "discovery subprocess failed: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
     }
 
     #[test]

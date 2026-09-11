@@ -121,14 +121,23 @@ impl Drop for StagedMarketplaceRoot {
 }
 
 fn stage_marketplace_root(root: &Path) -> Result<StagedMarketplaceRoot, MarketplaceRemoveError> {
-    if !root.exists() {
-        return Ok(StagedMarketplaceRoot {
-            original_root: root.to_path_buf(),
-            staged_root: None,
-            removed_root: None,
-            staging_dir: None,
-            committed: false,
-        });
+    match fs::symlink_metadata(root) {
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(StagedMarketplaceRoot {
+                original_root: root.to_path_buf(),
+                staged_root: None,
+                removed_root: None,
+                staging_dir: None,
+                committed: false,
+            });
+        }
+        Err(err) => {
+            return Err(MarketplaceRemoveError::Internal(format!(
+                "failed to inspect installed marketplace root {}: {err}",
+                root.display()
+            )));
+        }
     }
 
     let removed_root = AbsolutePathBuf::try_from(root.to_path_buf()).map_err(|err| {
@@ -298,6 +307,53 @@ mod tests {
                 .contains("failed to remove marketplace 'debug' from user config.toml")
         );
         assert!(installed_root.exists());
+    }
+
+    #[tokio::test]
+    async fn remove_marketplace_preserves_config_and_files_when_metadata_is_denied() {
+        let codex_home = TempDir::new().unwrap();
+        record_user_marketplace(
+            codex_home.path(),
+            "debug",
+            &MarketplaceConfigUpdate {
+                last_updated: "2026-04-13T00:00:00Z",
+                last_revision: None,
+                source_type: "git",
+                source: "https://github.com/owner/repo.git",
+                ref_name: Some("main"),
+                sparse_paths: &[],
+            },
+        )
+        .unwrap();
+        let config_path = codex_home.path().join(codex_config::CONFIG_TOML_FILE);
+        let original_config = fs::read(&config_path).unwrap();
+        let installed_root = marketplace_install_root(codex_home.path()).join("debug");
+        fs::create_dir_all(&installed_root).unwrap();
+        fs::write(installed_root.join("installed-marker"), "installed").unwrap();
+        let denied = crate::test_support::DeniedMetadata::new(&codex_home, &installed_root);
+        assert_eq!(
+            fs::symlink_metadata(&installed_root).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+
+        let result = remove_marketplace(
+            codex_home.path().to_path_buf(),
+            MarketplaceRemoveRequest {
+                marketplace_name: "debug".to_string(),
+            },
+        )
+        .await;
+        denied.restore();
+
+        assert!(
+            result.is_err(),
+            "metadata failure must not report successful removal"
+        );
+        assert_eq!(fs::read(&config_path).unwrap(), original_config);
+        assert_eq!(
+            fs::read_to_string(installed_root.join("installed-marker")).unwrap(),
+            "installed"
+        );
     }
 
     #[test]

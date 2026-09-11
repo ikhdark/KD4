@@ -36,6 +36,14 @@ impl std::error::Error for ThreadSpawnEdgeWriteError {
 
 impl StateRuntime {
     pub async fn get_thread(&self, id: ThreadId) -> anyhow::Result<Option<crate::ThreadMetadata>> {
+        let mut connection = self.pool.acquire().await?;
+        Self::get_thread_on_connection(&mut connection, id).await
+    }
+
+    async fn get_thread_on_connection(
+        connection: &mut sqlx::SqliteConnection,
+        id: ThreadId,
+    ) -> anyhow::Result<Option<crate::ThreadMetadata>> {
         let row = sqlx::query(
             r#"
 SELECT
@@ -70,7 +78,7 @@ WHERE threads.id = ?
             "#,
         )
         .bind(id.to_string())
-        .fetch_optional(self.pool.as_ref())
+        .fetch_optional(connection)
         .await?;
         row.map(|row| ThreadRow::try_from_row(&row).and_then(ThreadMetadata::try_from))
             .transpose()
@@ -839,6 +847,27 @@ WHERE id = ?
         creation_memory_mode: Option<&str>,
         allocate_timestamps: bool,
     ) -> anyhow::Result<()> {
+        let mut connection = self.pool.acquire().await?;
+        self.upsert_thread_on_connection(
+            &mut connection,
+            metadata,
+            creation_memory_mode,
+            allocate_timestamps,
+        )
+        .await?;
+        drop(connection);
+        self.insert_thread_spawn_edge_from_source_if_absent(metadata.id, metadata.source.as_str())
+            .await?;
+        Ok(())
+    }
+
+    async fn upsert_thread_on_connection(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        metadata: &crate::ThreadMetadata,
+        creation_memory_mode: Option<&str>,
+        allocate_timestamps: bool,
+    ) -> anyhow::Result<()> {
         let updated_at = if allocate_timestamps {
             self.allocate_thread_updated_at(metadata.updated_at)?
         } else {
@@ -961,10 +990,8 @@ ON CONFLICT(id) DO UPDATE SET
         .bind(metadata.git_branch.as_deref())
         .bind(metadata.git_origin_url.as_deref())
         .bind(creation_memory_mode.unwrap_or("enabled"))
-        .execute(self.pool.as_ref())
+        .execute(connection)
         .await?;
-        self.insert_thread_spawn_edge_from_source_if_absent(metadata.id, metadata.source.as_str())
-            .await?;
         Ok(())
     }
 
@@ -979,7 +1006,16 @@ ON CONFLICT(id) DO UPDATE SET
         if items.is_empty() {
             return Ok(());
         }
-        let existing_metadata = self.get_thread(builder.id).await?;
+        // Resolve filesystem data before taking the SQLite write reservation.
+        let updated_at = match updated_at_override {
+            Some(updated_at) => Some(updated_at),
+            None => file_modified_time_utc(builder.rollout_path.as_path()).await,
+        };
+        // Reserve the writer before reading: a deferred transaction could read a
+        // stale snapshot and then fail to upgrade after another writer commits.
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let existing_metadata =
+            Self::get_thread_on_connection(&mut transaction, builder.id).await?;
         let mut metadata = existing_metadata
             .clone()
             .unwrap_or_else(|| builder.build(&self.default_provider));
@@ -988,24 +1024,23 @@ ON CONFLICT(id) DO UPDATE SET
         if let Some(existing_metadata) = existing_metadata.as_ref() {
             metadata.prefer_existing_git_info(existing_metadata);
         }
-        let updated_at = match updated_at_override {
-            Some(updated_at) => Some(updated_at),
-            None => file_modified_time_utc(builder.rollout_path.as_path()).await,
-        };
         if let Some(updated_at) = updated_at {
             metadata.updated_at = updated_at;
         }
-        let upsert_result = if existing_metadata.is_none() {
-            self.upsert_thread_with_creation_memory_mode(
-                &metadata,
-                new_thread_memory_mode,
-                /*allocate_timestamps*/ true,
-            )
-            .await
-        } else {
-            self.upsert_thread(&metadata).await
-        };
-        upsert_result?;
+        self.upsert_thread_on_connection(
+            &mut transaction,
+            &metadata,
+            if existing_metadata.is_none() {
+                new_thread_memory_mode
+            } else {
+                None
+            },
+            true,
+        )
+        .await?;
+        transaction.commit().await?;
+        self.insert_thread_spawn_edge_from_source_if_absent(metadata.id, metadata.source.as_str())
+            .await?;
         if let Some(parent_thread_id) = builder.parent_thread_id {
             self.insert_thread_spawn_edge_if_absent(parent_thread_id, builder.id)
                 .await?;
@@ -1027,21 +1062,8 @@ ON CONFLICT(id) DO UPDATE SET
         rollout_path: &Path,
         archived_at: DateTime<Utc>,
     ) -> anyhow::Result<()> {
-        let Some(mut metadata) = self.get_thread(thread_id).await? else {
-            return Ok(());
-        };
-        metadata.archived_at = Some(archived_at);
-        metadata.rollout_path = rollout_path.to_path_buf();
-        if let Some(updated_at) = file_modified_time_utc(rollout_path).await {
-            metadata.updated_at = updated_at;
-        }
-        if metadata.id != thread_id {
-            warn!(
-                "thread id mismatch during archive: expected {thread_id}, got {}",
-                metadata.id
-            );
-        }
-        self.upsert_thread(&metadata).await
+        self.update_thread_archive_state(thread_id, rollout_path, Some(archived_at))
+            .await
     }
 
     /// Mark a thread as unarchived using the underlying database.
@@ -1050,21 +1072,30 @@ ON CONFLICT(id) DO UPDATE SET
         thread_id: ThreadId,
         rollout_path: &Path,
     ) -> anyhow::Result<()> {
-        let Some(mut metadata) = self.get_thread(thread_id).await? else {
-            return Ok(());
-        };
-        metadata.archived_at = None;
-        metadata.rollout_path = rollout_path.to_path_buf();
-        if let Some(updated_at) = file_modified_time_utc(rollout_path).await {
-            metadata.updated_at = updated_at;
-        }
-        if metadata.id != thread_id {
-            warn!(
-                "thread id mismatch during unarchive: expected {thread_id}, got {}",
-                metadata.id
-            );
-        }
-        self.upsert_thread(&metadata).await
+        self.update_thread_archive_state(thread_id, rollout_path, None)
+            .await
+    }
+
+    async fn update_thread_archive_state(
+        &self,
+        thread_id: ThreadId,
+        rollout_path: &Path,
+        archived_at: Option<DateTime<Utc>>,
+    ) -> anyhow::Result<()> {
+        let updated_at = file_modified_time_utc(rollout_path)
+            .await
+            .map(|time| self.allocate_thread_updated_at(time))
+            .transpose()?;
+        // Archive state does not own titles, usage, models, or other metadata.
+        sqlx::query("UPDATE threads SET rollout_path = ?, archived = ?, archived_at = ?, updated_at = COALESCE(?, updated_at), updated_at_ms = COALESCE(?, updated_at_ms) WHERE id = ?")
+            .bind(rollout_path.display().to_string())
+            .bind(archived_at.is_some())
+            .bind(archived_at.map(datetime_to_epoch_seconds))
+            .bind(updated_at.map(datetime_to_epoch_seconds))
+            .bind(updated_at.map(datetime_to_epoch_millis))
+            .bind(thread_id.to_string())
+            .execute(self.pool.as_ref()).await?;
+        Ok(())
     }
 
     /// Delete a thread and all associated state by id.
@@ -1573,6 +1604,104 @@ mod tests {
     use pretty_assertions::assert_eq;
     use serde_json::json;
     use std::path::PathBuf;
+
+    #[tokio::test]
+    async fn rollout_and_archive_updates_preserve_concurrent_metadata_writes() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let runtime = StateRuntime::init(home.path().to_path_buf(), "test-provider".into()).await?;
+        let thread_id = ThreadId::new();
+        let metadata = test_thread_metadata(home.path(), thread_id, home.path().to_path_buf());
+        let builder = ThreadMetadataBuilder::new(
+            thread_id,
+            metadata.rollout_path.clone(),
+            metadata.created_at,
+            SessionSource::Cli,
+        );
+        let items = [RolloutItem::EventMsg(EventMsg::AgentMessage(
+            codex_protocol::protocol::AgentMessageEvent {
+                message: "completed response".into(),
+                phase: None,
+                memory_citation: None,
+            },
+        ))];
+        for operation in 0..3 {
+            runtime.upsert_thread(&metadata).await?;
+            // Simulate an independent writer that has changed metadata but has
+            // not committed yet. WAL readers can still see the previous row.
+            let mut writer = runtime.pool.begin_with("BEGIN IMMEDIATE").await?;
+            sqlx::query("UPDATE threads SET title = 'concurrent title', model = 'concurrent model' WHERE id = ?")
+                .bind(thread_id.to_string()).execute(&mut *writer).await?;
+            let mut update = Box::pin(async {
+                match operation {
+                    0 => {
+                        runtime
+                            .apply_rollout_items(&builder, &items, None, Some(metadata.updated_at))
+                            .await
+                    }
+                    1 => {
+                        runtime
+                            .mark_archived(thread_id, &metadata.rollout_path, metadata.updated_at)
+                            .await
+                    }
+                    _ => {
+                        runtime
+                            .mark_unarchived(thread_id, &metadata.rollout_path)
+                            .await
+                    }
+                }
+            });
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(100), &mut update)
+                    .await
+                    .is_err(),
+                "metadata operation must wait for the existing writer"
+            );
+            writer.commit().await?;
+            update.await?;
+            let actual = runtime
+                .get_thread(thread_id)
+                .await?
+                .expect("thread remains stored");
+            assert_eq!(actual.title, "concurrent title");
+            assert_eq!(actual.model.as_deref(), Some("concurrent model"));
+            assert_eq!(actual.archived_at.is_some(), operation == 1);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn persisted_metadata_diff_reports_history_source_and_recency_changes() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let runtime = StateRuntime::init(home.path().to_path_buf(), "test-provider".into()).await?;
+        let thread_id = ThreadId::new();
+        let metadata = test_thread_metadata(home.path(), thread_id, home.path().to_path_buf());
+        runtime
+            .upsert_thread_preserving_timestamps(&metadata)
+            .await?;
+        let before = runtime
+            .get_thread(thread_id)
+            .await?
+            .expect("stored metadata");
+        let mut changed = before.clone();
+        changed.history_mode = ThreadHistoryMode::Paginated;
+        changed.thread_source = Some(codex_protocol::protocol::ThreadSource::User);
+        runtime
+            .upsert_thread_preserving_timestamps(&changed)
+            .await?;
+        runtime
+            .touch_thread_recency_at(thread_id, before.recency_at + chrono::Duration::seconds(5))
+            .await?;
+        let after = runtime
+            .get_thread(thread_id)
+            .await?
+            .expect("updated metadata");
+        assert_eq!(
+            before.diff_fields(&after),
+            vec!["recency_at", "history_mode", "thread_source"]
+        );
+        assert!(after.diff_fields(&after).is_empty());
+        Ok(())
+    }
 
     #[tokio::test]
     async fn upsert_thread_keeps_creation_memory_mode_for_existing_rows() {

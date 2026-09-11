@@ -82,6 +82,19 @@ impl JobObject {
         }
     }
 
+    /// Keep descendants in this job even when a launcher requests breakaway.
+    /// Call before assigning the root process.
+    pub fn require_descendant_containment(&self) -> io::Result<()> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("job state lock poisoned"))?;
+        if *state != JobState::Active {
+            return Err(io::Error::other("job containment is no longer active"));
+        }
+        Self::set_limit_flags(&self.handle, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE)
+    }
+
     /// Allows contained descendants to keep running after the root exits normally.
     ///
     /// This disables both explicit job termination and kill-on-close for this

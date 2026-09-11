@@ -1,5 +1,4 @@
 use std::env;
-use std::fs;
 use std::path::Path;
 use std::process::Stdio;
 
@@ -65,10 +64,14 @@ pub(crate) async fn run_editor(seed: &str, editor_cmd: &[String]) -> Result<Stri
     }
 
     // Convert to TempPath immediately so no file handle stays open on Windows.
-    let temp_path = Builder::new().suffix(".md").tempfile()?.into_temp_path();
-    fs::write(&temp_path, seed)?;
+    let editor_program = editor_cmd[0].clone();
+    let (temp_path, program) = tokio::task::spawn_blocking(move || {
+        let temp_path = Builder::new().suffix(".md").tempfile()?.into_temp_path();
+        Ok::<_, std::io::Error>((temp_path, resolve_windows_program(&editor_program)))
+    })
+    .await??;
+    tokio::fs::write(&temp_path, seed).await?;
 
-    let program = resolve_windows_program(&editor_cmd[0]);
     let mut cmd = if is_batch_program(&program) {
         windows_batch_command(&program, &editor_cmd[1..], &temp_path)
     } else {
@@ -87,7 +90,7 @@ pub(crate) async fn run_editor(seed: &str, editor_cmd: &[String]) -> Result<Stri
         return Err(Report::msg(format!("editor exited with status {status}")));
     }
 
-    let contents = fs::read_to_string(&temp_path)?;
+    let contents = tokio::fs::read_to_string(&temp_path).await?;
     Ok(contents)
 }
 
@@ -96,6 +99,7 @@ mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
     use serial_test::serial;
+    use std::fs;
 
     struct EnvGuard {
         visual: Option<String>,
@@ -157,11 +161,30 @@ mod tests {
         let editor_dir = temp_dir.path().join("editor with spaces");
         fs::create_dir(&editor_dir).expect("create editor directory");
         let editor = editor_dir.join("replace.CMD");
-        fs::write(&editor, "@echo off\r\n>\"%~1\" echo edited\r\n").expect("write editor shim");
+        let observed_seed = temp_dir.path().join("observed-seed.md");
+        let observed_path = temp_dir.path().join("observed-path.txt");
+        fs::write(
+            &editor,
+            "@echo off\r\ncopy /y \"%~3\" \"%~1\" >nul\r\n>\"%~2\" echo %~3\r\n>\"%~3\" echo edited\r\n",
+        )
+        .expect("write editor shim");
 
-        let contents = run_editor("seed", &[editor.to_string_lossy().into_owned()])
-            .await
-            .expect("batch editor should run through cmd.exe");
+        let contents = run_editor(
+            "seed",
+            &[
+                editor.to_string_lossy().into_owned(),
+                observed_seed.to_string_lossy().into_owned(),
+                observed_path.to_string_lossy().into_owned(),
+            ],
+        )
+        .await
+        .expect("batch editor should run through cmd.exe");
+        assert_eq!(fs::read_to_string(observed_seed).unwrap(), "seed");
         assert_eq!(contents.trim(), "edited");
+        let path = fs::read_to_string(observed_path).unwrap();
+        assert!(
+            !Path::new(path.trim()).exists(),
+            "editor temp file must be removed"
+        );
     }
 }

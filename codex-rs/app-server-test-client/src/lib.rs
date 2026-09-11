@@ -17,7 +17,6 @@ use std::process::Stdio;
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
-use std::time::SystemTime;
 
 use anyhow::Context;
 use anyhow::Result;
@@ -2180,14 +2179,14 @@ impl Drop for CodexClient {
             return;
         }
 
-        let deadline = SystemTime::now() + APP_SERVER_GRACEFUL_SHUTDOWN_TIMEOUT;
+        let deadline = Instant::now() + APP_SERVER_GRACEFUL_SHUTDOWN_TIMEOUT;
         loop {
             if let Ok(Some(status)) = child.try_wait() {
                 println!("[codex app-server exited: {status}]");
                 return;
             }
 
-            if SystemTime::now() >= deadline {
+            if Instant::now() >= deadline {
                 break;
             }
 
@@ -2202,6 +2201,82 @@ impl Drop for CodexClient {
 #[cfg(test)]
 mod tests {
     use super::NOTIFICATIONS_TO_OPT_OUT;
+
+    #[test]
+    fn client_shutdown_reaps_cooperative_and_unresponsive_processes() {
+        use super::*;
+        use std::os::windows::process::CommandExt;
+
+        for (script, must_wait_for_grace) in [
+            (
+                "[Console]::WriteLine('ready'); $null = [Console]::In.ReadToEnd()",
+                false,
+            ),
+            (
+                "[Console]::WriteLine('ready'); Start-Sleep -Seconds 60",
+                true,
+            ),
+        ] {
+            let mut child = Command::new("powershell.exe")
+                .args(["-NoProfile", "-NonInteractive", "-Command", script])
+                .creation_flags(0x08000000)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .expect("start real stdio server substitute");
+            let pid = child.id();
+            let stdin = child.stdin.take();
+            let mut stdout = BufReader::new(child.stdout.take().expect("stdout"));
+            let mut ready = String::new();
+            stdout.read_line(&mut ready).expect("server startup");
+            assert_eq!(ready.trim(), "ready");
+            let client = CodexClient {
+                transport: ClientTransport::Stdio {
+                    child,
+                    stdin,
+                    stdout,
+                },
+                pending_notifications: VecDeque::new(),
+                command_approval_behavior: CommandApprovalBehavior::AlwaysAccept,
+                command_approval_count: 0,
+                command_approval_item_ids: Vec::new(),
+                command_execution_statuses: Vec::new(),
+                command_execution_outputs: Vec::new(),
+                command_output_stream: String::new(),
+                command_item_started: false,
+                helper_done_seen: false,
+                turn_completed_before_helper_done: false,
+                unexpected_items_before_helper_done: Vec::new(),
+                last_turn_status: None,
+                last_turn_error_message: None,
+            };
+            let started = Instant::now();
+            drop(client);
+            let elapsed = started.elapsed();
+            if must_wait_for_grace {
+                assert!(elapsed >= APP_SERVER_GRACEFUL_SHUTDOWN_TIMEOUT);
+            } else {
+                assert!(
+                    elapsed < APP_SERVER_GRACEFUL_SHUTDOWN_TIMEOUT,
+                    "a cooperative server must exit before forced termination: {elapsed:?}"
+                );
+            }
+            assert!(elapsed < APP_SERVER_GRACEFUL_SHUTDOWN_TIMEOUT + Duration::from_secs(10));
+            let probe = Command::new("powershell.exe")
+                .args([
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    &format!(
+                        "if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ exit 1 }} else {{ exit 0 }}"
+                    ),
+                ])
+                .creation_flags(0x08000000)
+                .status()
+                .expect("probe server exit");
+            assert!(probe.success(), "shutdown must reap the server process");
+        }
+    }
 
     #[test]
     fn retired_file_change_output_delta_is_not_requested() {

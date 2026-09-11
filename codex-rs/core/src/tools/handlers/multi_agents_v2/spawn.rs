@@ -1308,7 +1308,7 @@ async fn construct_and_attach_task_capsule(
                 "relevant handle {path:?} is outside the assignment read/write scope"
             )));
         }
-        match std::fs::metadata(repo_root.join(&path)) {
+        match tokio::fs::metadata(repo_root.join(&path)).await {
             Ok(metadata) if metadata.is_dir() => {
                 return Err(StoreError::InvalidTaskCapsule(format!(
                     "relevant handle {path:?} resolves to a directory"

@@ -282,10 +282,10 @@ impl ProcessHandle {
         {
             handle.abort();
         }
-        if let Ok(mut h) = self.wait_handle.lock()
-            && let Some(handle) = h.take()
-        {
-            handle.abort();
+        if let Ok(mut h) = self.wait_handle.lock() {
+            // The waiter must still observe termination and publish the exit
+            // status. Dropping its handle detaches it instead of cancelling it.
+            h.take();
         }
         if let Ok(mut handles) = self._pty_handles.lock() {
             handles.take();

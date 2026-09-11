@@ -2072,8 +2072,8 @@ fn final_diff_status_script_is_read_only(script: &str) -> bool {
             .rsplit(['/', '\\'])
             .next()
             .unwrap_or(words[0])
-            .trim_end_matches(".exe")
             .to_ascii_lowercase();
+        let program = program.strip_suffix(".exe").unwrap_or(&program);
         if program != "git" {
             return false;
         }
@@ -2151,14 +2151,14 @@ fn source_invocation_class_from_canonical(
             .rsplit(['/', '\\'])
             .next()
             .unwrap_or(program)
-            .trim_end_matches(".exe")
             .to_ascii_lowercase();
+        let program = program.strip_suffix(".exe").unwrap_or(&program);
         let args = args
             .into_iter()
             .flatten()
             .filter_map(Value::as_str)
             .collect::<Vec<_>>();
-        return classify_read_only_evidence_program(&program, &args);
+        return classify_read_only_evidence_program(program, &args);
     }
     let script = ["cmd", "command", "script_body"]
         .iter()
@@ -2180,9 +2180,9 @@ fn source_invocation_class_from_canonical(
         .rsplit(['/', '\\'])
         .next()
         .unwrap_or(program)
-        .trim_end_matches(".exe")
         .to_ascii_lowercase();
-    classify_read_only_evidence_program(&program, args)
+    let program = program.strip_suffix(".exe").unwrap_or(&program);
+    classify_read_only_evidence_program(program, args)
 }
 
 fn classify_read_only_evidence_program(program: &str, args: &[&str]) -> StructuredActionClass {
@@ -5006,27 +5006,84 @@ mod tests {
     }
 
     #[test]
-    fn one_combined_diff_status_observation_may_follow_fresh_validation() {
-        let mut governor = SamplingReasoningGovernor::new(None);
-        let baselines = governor.baselines(0);
-        let collector =
-            recorded_validation_collector(&governor, &baselines, ToolOutputOutcome::Success);
-        record_invocation_result(
-            &collector,
-            ToolName::plain("exec_command"),
-            final_diff_status_payload(),
-            "final-diff-status",
-            ToolOutputOutcome::Success,
-        );
-        let settled_state = settled(0);
-        governor.settle(&baselines, &collector, &settled_state);
+    fn final_diff_status_observation_requires_exact_git_executable() {
+        for (program, terminalizes) in [
+            ("git", true),
+            ("git.exe", true),
+            ("GIT.EXE", true),
+            ("git.exe.exe", false),
+            ("git.EXE.EXE", false),
+        ] {
+            let mut governor = SamplingReasoningGovernor::new(None);
+            let baselines = governor.baselines(0);
+            let collector =
+                recorded_validation_collector(&governor, &baselines, ToolOutputOutcome::Success);
+            record_invocation_result(
+                &collector,
+                ToolName::plain("exec_command"),
+                ToolPayload::Function {
+                    arguments: json!({
+                        "cmd": format!("{program} diff --check && {program} status --short")
+                    })
+                    .to_string(),
+                },
+                "final-diff-status",
+                ToolOutputOutcome::Success,
+            );
+            let settled_state = settled(0);
+            governor.settle(&baselines, &collector, &settled_state);
+            assert_eq!(
+                governor
+                    .evaluate_convergence(&baselines, &collector, &settled_state)
+                    .continuation
+                    == ContinuationDisposition::TerminalCompletionRequired,
+                terminalizes,
+                "executable: {program}"
+            );
+        }
+    }
 
-        assert_eq!(
-            governor
-                .evaluate_convergence(&baselines, &collector, &settled_state)
-                .continuation,
-            ContinuationDisposition::TerminalCompletionRequired
-        );
+    #[test]
+    fn source_convergence_requires_exact_executable_identity() {
+        for program in ["rg.exe", "RG.EXE", "rg.exe.exe", "rg.EXE.EXE"] {
+            for direct_argv in [true, false] {
+                let mut governor = SamplingReasoningGovernor::new(None);
+                let (baselines, settled) = unchanged_state(&governor);
+                let arguments = if direct_argv {
+                    json!({"kind": "argv", "program": program, "args": ["--files"]})
+                } else {
+                    json!({"command": format!("{program} --files")})
+                };
+                for generation in 0..2 {
+                    let collector = governor.collector(&baselines);
+                    let registration = collector.register_deterministic_tool_call(
+                        &ToolName::plain("exec_command"),
+                        &ToolPayload::Function {
+                            arguments: arguments.to_string(),
+                        },
+                        "source-call",
+                    );
+                    collector.record_response_result(
+                        registration.ordinal,
+                        ToolOutputOutcomeContext::new(ToolOutputOutcome::Success),
+                        None,
+                        &successful_tool_response("source-call", "src/lib.rs"),
+                        false,
+                    );
+                    let decision = governor.evaluate_convergence(&baselines, &collector, &settled);
+                    assert_eq!(
+                        decision
+                            .directive
+                            .as_deref()
+                            .is_some_and(|directive| directive.starts_with(
+                                "Convergence required: the broad source pass repeated"
+                            )),
+                        generation == 1 && matches!(program, "rg.exe" | "RG.EXE"),
+                        "program={program}, direct_argv={direct_argv}, generation={generation}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

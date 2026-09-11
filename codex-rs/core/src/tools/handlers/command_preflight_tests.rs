@@ -612,6 +612,29 @@ fn never_repairs_mutating_command_flag_typos() {
     );
 }
 
+#[tokio::test]
+async fn runtime_preflight_rejects_repairs_that_can_launch_search_helpers() {
+    for args in [
+        strings(&["--ignorecase", "--pre", "helper.exe", "TODO", "src"]),
+        strings(&["--ignorecase", "--pre=helper.exe", "TODO", "src"]),
+        strings(&["--ignorecase", "--hostname-bin=helper.exe", "TODO", "src"]),
+    ] {
+        let invocation = CommandInvocation::Argv {
+            program: "rg".to_string(),
+            args,
+        };
+        let error = preflight_invocation_for_runtime(
+            false,
+            &invocation,
+            &invocation.to_direct_argv().expect("argv"),
+            None,
+        )
+        .await
+        .expect_err("helper execution must not be introduced by automatic repair");
+        assert!(error.contains("--ignorecase"));
+    }
+}
+
 #[test]
 fn never_repairs_script_even_when_first_command_is_read_only() {
     let invocation =

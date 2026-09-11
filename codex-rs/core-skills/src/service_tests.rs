@@ -149,10 +149,10 @@ fn config_stack_with_session_flags(
 fn path_toggle_config(path: &std::path::Path, enabled: bool) -> String {
     format!(
         r#"[[skills.config]]
-path = "{}"
+path = {}
 enabled = {enabled}
 "#,
-        path.display()
+        toml::Value::String(path.to_string_lossy().into_owned())
     )
 }
 
@@ -840,7 +840,6 @@ async fn skills_snapshot_cache_evicts_entries_at_capacity() {
     assert_eq!(cache.len(), MAX_CACHED_SKILL_SNAPSHOTS);
 }
 
-#[ignore]
 #[test]
 fn disabled_paths_for_skills_allows_session_flags_to_override_user_layer() {
     let tempdir = tempfile::tempdir().expect("tempdir");
@@ -875,7 +874,6 @@ fn disabled_paths_for_skills_allows_session_flags_to_override_user_layer() {
     );
 }
 
-#[ignore]
 #[test]
 fn disabled_paths_for_skills_allows_session_flags_to_disable_user_enabled_skill() {
     let tempdir = tempfile::tempdir().expect("tempdir");
@@ -913,7 +911,6 @@ fn disabled_paths_for_skills_allows_session_flags_to_disable_user_enabled_skill(
     );
 }
 
-#[ignore]
 #[test]
 fn disabled_paths_for_skills_disables_matching_name_selectors() {
     let tempdir = tempfile::tempdir().expect("tempdir");
@@ -946,7 +943,6 @@ fn disabled_paths_for_skills_disables_matching_name_selectors() {
     );
 }
 
-#[ignore]
 #[test]
 fn disabled_paths_for_skills_allows_name_selector_to_override_path_selector() {
     let tempdir = tempfile::tempdir().expect("tempdir");
@@ -981,7 +977,6 @@ fn disabled_paths_for_skills_allows_name_selector_to_override_path_selector() {
     );
 }
 
-#[ignore]
 #[tokio::test]
 async fn skills_for_config_ignores_cwd_cache_when_session_flags_reenable_skill() {
     let codex_home = tempfile::tempdir().expect("tempdir");

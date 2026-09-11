@@ -768,13 +768,22 @@ fn replace_plugin_root_atomically(
 }
 
 fn stage_plugin_uninstall(path: &Path) -> Result<PendingPluginUninstall, PluginStoreError> {
-    if !path.exists() {
-        return Ok(PendingPluginUninstall {
-            target_root: path.to_path_buf(),
-            backup_root: None,
-            transaction_dir: None,
-            committed: false,
-        });
+    match fs::symlink_metadata(path) {
+        Ok(_) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            return Ok(PendingPluginUninstall {
+                target_root: path.to_path_buf(),
+                backup_root: None,
+                transaction_dir: None,
+                committed: false,
+            });
+        }
+        Err(err) => {
+            return Err(PluginStoreError::io(
+                "failed to inspect plugin cache entry before removal",
+                err,
+            ));
+        }
     }
     let parent = path.parent().ok_or_else(|| {
         PluginStoreError::Invalid(format!(

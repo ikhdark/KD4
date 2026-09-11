@@ -77,17 +77,21 @@ fn collect_existing_glob_matches(
     max_depth: Option<usize>,
     depth: usize,
 ) -> Result<(), String> {
-    if !path.exists() {
-        return Ok(());
-    }
+    let metadata = match path.metadata() {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(format!(
+                "failed to inspect deny-read scan path {}: {err}",
+                path.display()
+            ));
+        }
+    };
 
     if matcher.is_read_denied(path) {
         push_absolute_path(paths, seen_paths, path.to_path_buf())?;
     }
 
-    let Ok(metadata) = path.metadata() else {
-        return Ok(());
-    };
     if !metadata.is_dir() {
         return Ok(());
     }
@@ -104,10 +108,19 @@ fn collect_existing_glob_matches(
         return Ok(());
     }
 
-    let Ok(entries) = std::fs::read_dir(path) else {
-        return Ok(());
-    };
-    for entry in entries.flatten() {
+    let entries = std::fs::read_dir(path).map_err(|err| {
+        format!(
+            "failed to enumerate deny-read scan path {}: {err}",
+            path.display()
+        )
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|err| {
+            format!(
+                "failed to read deny-read entry in {}: {err}",
+                path.display()
+            )
+        })?;
         collect_existing_glob_matches(
             &entry.path(),
             matcher,
@@ -324,6 +337,67 @@ mod tests {
             "unexpected error: {err}"
         );
         assert!(err.contains("invalid range"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn glob_scan_inspection_errors_are_not_reported_as_no_matches() {
+        let tmp = TempDir::new().expect("tempdir");
+        let cwd = AbsolutePathBuf::from_absolute_path(tmp.path()).expect("absolute cwd");
+        let policy = FileSystemSandboxPolicy::restricted(vec![unreadable_glob_entry(format!(
+            "{}/invalid\0path/*.env",
+            tmp.path().display()
+        ))]);
+
+        let err = resolve_windows_deny_read_paths(&policy, &cwd)
+            .expect_err("an uninspectable scan root must fail closed");
+        assert!(
+            err.contains("failed to inspect deny-read scan path"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn missing_glob_scan_roots_have_no_existing_matches() {
+        let tmp = TempDir::new().expect("tempdir");
+        let cwd = AbsolutePathBuf::from_absolute_path(tmp.path()).expect("absolute cwd");
+        let policy = FileSystemSandboxPolicy::restricted(vec![unreadable_glob_entry(format!(
+            "{}/missing/*.env",
+            tmp.path().display()
+        ))]);
+
+        assert!(
+            resolve_windows_deny_read_paths(&policy, &cwd)
+                .expect("missing scan root")
+                .is_empty()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn glob_scan_enumeration_failure_does_not_return_partial_success() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let tmp = TempDir::new().expect("tempdir");
+        std::fs::write(tmp.path().join("secret.env"), "secret").expect("write secret");
+        let cwd = AbsolutePathBuf::from_absolute_path(tmp.path()).expect("absolute cwd");
+        let policy = FileSystemSandboxPolicy::restricted(vec![unreadable_glob_entry(format!(
+            "{}/*.env",
+            tmp.path().display()
+        ))]);
+        let exclusive_directory = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS)
+            .open(tmp.path())
+            .expect("open directory exclusively");
+
+        let result = resolve_windows_deny_read_paths(&policy, &cwd);
+        drop(exclusive_directory);
+        let err = result.expect_err("unreadable directory must fail closed");
+        assert!(
+            err.contains("failed to enumerate deny-read scan path"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

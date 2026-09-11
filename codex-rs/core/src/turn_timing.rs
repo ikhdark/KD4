@@ -2583,6 +2583,42 @@ impl TurnTimingState {
         }
     }
 
+    /// Keep contended timing bookkeeping off the async tool-dispatch worker.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn record_tool_output_projection_facts_async(
+        self: &Arc<Self>,
+        canonical_bytes: u64,
+        canonical_tokens: u64,
+        model_bytes: u64,
+        model_tokens: u64,
+        artifact_created: bool,
+        artifact_reused: bool,
+        projection_truncated: bool,
+        omitted_sections: u64,
+        provider_visible: bool,
+    ) {
+        let timing = Arc::clone(self);
+        if let Err(error) = tokio::task::spawn_blocking(move || {
+            timing.record_tool_output_projection_facts(
+                canonical_bytes,
+                canonical_tokens,
+                model_bytes,
+                model_tokens,
+                artifact_created,
+                artifact_reused,
+                projection_truncated,
+                omitted_sections,
+                provider_visible,
+            );
+        })
+        .await
+        {
+            // A bookkeeping failure must not skip the accepted tool's terminal
+            // projection and lifecycle publication.
+            tracing::error!(%error, "failed to record tool output projection timing");
+        }
+    }
+
     pub(crate) fn record_tool_output_recovery(&self, retruncation_count: u32) {
         let mut state = self.state();
         state.counters.tool_output_recovery_call_count = state

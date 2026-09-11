@@ -2559,7 +2559,7 @@ async fn load_plugins_returns_empty_when_feature_disabled() {
 }
 
 #[tokio::test]
-async fn plugin_cache_ignores_unrelated_session_overrides() {
+async fn plugin_cache_reuses_shared_config_and_reloads_changed_config() {
     let codex_home = TempDir::new().unwrap();
     let plugin_root = codex_home
         .path()
@@ -2616,16 +2616,19 @@ async fn plugin_cache_ignores_unrelated_session_overrides() {
     };
     let manager = PluginsManager::new(codex_home.path().to_path_buf());
 
-    let first = manager
-        .plugins_for_config(&config(r#"model = "first""#))
-        .await;
+    let first_config = config(r#"model = "first""#);
+    let first = manager.plugins_for_config(&first_config).await;
+    assert_eq!(first.plugins()[0].mcp_servers.len(), 1);
     std::fs::remove_file(plugin_root.join(".mcp.json")).unwrap();
-    let second = manager
-        .plugins_for_config(&config(r#"model = "second""#))
-        .await;
+    let second = manager.plugins_for_config(&first_config.clone()).await;
 
     assert_eq!(second, first);
     assert_eq!(second.plugins()[0].mcp_servers.len(), 1);
+    let refreshed = manager
+        .plugins_for_config(&config(r#"model = "second""#))
+        .await;
+    assert_eq!(refreshed.plugins().len(), 1);
+    assert!(refreshed.plugins()[0].mcp_servers.is_empty());
 }
 
 #[tokio::test]
@@ -3292,6 +3295,46 @@ async fn uninstall_plugin_restores_cache_when_config_update_fails() {
         .expect_err("config update should fail");
 
     assert!(installed_root.join("installed-marker").is_file());
+}
+
+#[tokio::test]
+async fn uninstall_plugin_preserves_config_and_files_when_metadata_is_denied() {
+    let tmp = tempfile::tempdir().unwrap();
+    let plugin_root = tmp.path().join("plugins/cache/debug/sample-plugin");
+    write_plugin(
+        &tmp.path().join("plugins/cache/debug"),
+        "sample-plugin/local",
+        "sample-plugin",
+    );
+    fs::write(plugin_root.join("local/installed-marker"), "installed").unwrap();
+    let config_path = tmp.path().join(CONFIG_TOML_FILE);
+    fs::write(
+        &config_path,
+        "[plugins.\"sample-plugin@debug\"]\nenabled = true\n",
+    )
+    .unwrap();
+    let original_config = fs::read(&config_path).unwrap();
+    let manager = PluginsManager::new(tmp.path().to_path_buf());
+    let denied = crate::test_support::DeniedMetadata::new(&tmp, &plugin_root);
+    assert_eq!(
+        fs::symlink_metadata(&plugin_root).unwrap_err().kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+
+    let result = manager
+        .uninstall_plugin("sample-plugin@debug".to_string())
+        .await;
+    denied.restore();
+
+    assert!(
+        result.is_err(),
+        "metadata failure must not report successful removal"
+    );
+    assert_eq!(fs::read(&config_path).unwrap(), original_config);
+    assert_eq!(
+        fs::read_to_string(plugin_root.join("local/installed-marker")).unwrap(),
+        "installed"
+    );
 }
 
 #[tokio::test]

@@ -3222,7 +3222,8 @@ async fn dispatch_notifies_tool_lifecycle_contributors() -> anyhow::Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn handler_completion_reserves_projection_before_abort_can_claim() -> anyhow::Result<()> {
+async fn cancellation_during_projection_does_not_publish_completed_lifecycle() -> anyhow::Result<()>
+{
     let (mut session, turn) = crate::session::tests::make_session_and_context().await;
     let records = Arc::new(std::sync::Mutex::new(Vec::new()));
     let mut builder = codex_extension_api::ExtensionRegistryBuilder::<crate::config::Config>::new();
@@ -3269,33 +3270,29 @@ async fn handler_completion_reserves_projection_before_abort_can_claim() -> anyh
         .send(())
         .expect("projection materialization should remain in flight");
 
-    let result = dispatch.await.expect("dispatch task should join")?;
+    let err = match dispatch.await.expect("dispatch task should join") {
+        Ok(_) => anyhow::bail!("cancelled projection must not return an ordinary result"),
+        Err(err) => err,
+    };
     assert!(
-        !simulated_abort_claimed,
-        "handler completion must reserve the ordinary projection before an abort can claim it"
+        simulated_abort_claimed,
+        "unfinished projection remains cancellable"
     );
-    assert!(result.model_projection.is_some());
+    assert_eq!(err.to_string(), "tool cancelled after runtime cleanup");
     assert_eq!(
         projection_calls.load(std::sync::atomic::Ordering::Acquire),
         1,
-        "the ordinary terminal transaction materializes exactly one projection"
+        "cancellation must not repeat projection materialization"
     );
     assert_eq!(
         records
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_slice(),
-        &[
-            RecordedToolLifecycle::Start {
-                call_id: "projection-call".to_string(),
-                tool_name: codex_tools::ToolName::plain("blocking_projection_tool"),
-            },
-            RecordedToolLifecycle::Finish {
-                call_id: "projection-call".to_string(),
-                tool_name: codex_tools::ToolName::plain("blocking_projection_tool"),
-                outcome: codex_extension_api::ToolCallOutcome::Completed { success: true },
-            },
-        ]
+        &[RecordedToolLifecycle::Start {
+            call_id: "projection-call".to_string(),
+            tool_name: codex_tools::ToolName::plain("blocking_projection_tool"),
+        },]
     );
 
     Ok(())

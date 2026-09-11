@@ -7,6 +7,7 @@ use std::os::windows::io::OwnedHandle;
 use std::os::windows::process::CommandExt;
 use std::sync::Arc;
 use std::time::Duration;
+use winapi::shared::winerror::WAIT_TIMEOUT;
 use winapi::um::processthreadsapi::OpenProcess;
 use winapi::um::synchapi::WaitForSingleObject;
 use winapi::um::winbase::WAIT_OBJECT_0;
@@ -43,7 +44,7 @@ async fn managed_job_terminates_child_and_grandchild() -> anyhow::Result<()> {
         "-NoProfile".to_string(),
         "-NonInteractive".to_string(),
         "-Command".to_string(),
-        "$child = Start-Process ping.exe -ArgumentList '-n','60','127.0.0.1' -PassThru; \
+        "$child = Start-Process ping.exe -WindowStyle Hidden -ArgumentList '-n','60','127.0.0.1' -PassThru; \
          [Console]::Out.WriteLine($child.Id); [Console]::Out.Flush(); Start-Sleep -Seconds 60"
             .to_string(),
     ];
@@ -62,9 +63,6 @@ async fn managed_job_terminates_child_and_grandchild() -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("managed root closed stdout before reporting child pid"))?;
     let grandchild_pid = std::str::from_utf8(&output)?.trim().parse::<u32>()?;
 
-    session.terminate().expect("terminate pipe process");
-    let _ = tokio::time::timeout(Duration::from_secs(5), exit_rx).await?;
-
     let raw = unsafe {
         OpenProcess(
             SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
@@ -72,14 +70,28 @@ async fn managed_job_terminates_child_and_grandchild() -> anyhow::Result<()> {
             grandchild_pid,
         )
     };
-    if !raw.is_null() {
-        let process = unsafe { OwnedHandle::from_raw_handle(raw.cast()) };
-        let wait = unsafe { WaitForSingleObject(process.as_raw_handle() as _, 2_000) };
-        assert_eq!(
-            wait, WAIT_OBJECT_0,
-            "grandchild remained alive after Job termination"
-        );
-    }
+    anyhow::ensure!(
+        !raw.is_null(),
+        "could not open the running grandchild: {}",
+        std::io::Error::last_os_error()
+    );
+    let process = unsafe { OwnedHandle::from_raw_handle(raw.cast()) };
+    assert_eq!(
+        unsafe { WaitForSingleObject(process.as_raw_handle() as _, 0) },
+        WAIT_TIMEOUT,
+        "grandchild must be alive before termination"
+    );
+
+    session.terminate().expect("terminate pipe process");
+    let exit_code = tokio::time::timeout(Duration::from_secs(5), exit_rx).await??;
+    assert_ne!(exit_code, 0, "terminated root must report failure");
+    assert!(session.has_exited());
+    assert_eq!(session.exit_code(), Some(exit_code));
+    let wait = unsafe { WaitForSingleObject(process.as_raw_handle() as _, 2_000) };
+    assert_eq!(
+        wait, WAIT_OBJECT_0,
+        "grandchild remained alive after Job termination"
+    );
     Ok(())
 }
 

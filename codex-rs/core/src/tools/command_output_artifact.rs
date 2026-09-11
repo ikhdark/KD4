@@ -2681,7 +2681,7 @@ pub(crate) async fn remint_tool_history_artifact_for_thread(
     )
     .await
     {
-        let _ = std::fs::remove_file(active_tool_history_protection_path(&target_path));
+        let _ = tokio::fs::remove_file(active_tool_history_protection_path(&target_path)).await;
         rollback_logical_artifact_creation(&target_retention_token, &target_path);
         return Err(format!("failed to protect reminted artifact: {err}"));
     }

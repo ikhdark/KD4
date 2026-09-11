@@ -152,11 +152,6 @@ impl std::fmt::Debug for TurnEnvironment {
     }
 }
 
-#[derive(Debug, Default)]
-struct PendingPostToolContexts {
-    by_call_id: Mutex<HashMap<String, Vec<ResponseItem>>>,
-}
-
 /// The context needed for a single turn of the thread.
 #[derive(Debug)]
 pub struct TurnContext {
@@ -204,6 +199,9 @@ pub struct TurnContext {
     pub(crate) validation_authorization: crate::validation_admission::SharedValidationAuthorization,
     pub(crate) turn_metadata_state: Arc<TurnMetadataState>,
     pub(crate) extension_data: Arc<codex_extension_api::ExtensionData>,
+    /// Shared by model variants of this turn; tool dispatch and ordered delivery
+    /// access it without entering the synchronous extension type map.
+    pub(crate) pending_post_tool_contexts: Arc<Mutex<HashMap<String, Vec<ResponseItem>>>>,
     pub(crate) turn_skills: TurnSkillsContext,
     pub(crate) turn_timing_state: Arc<TurnTimingState>,
     pub(crate) tool_call_acceptance: Arc<crate::state::ToolCallAcceptanceGate>,
@@ -251,11 +249,7 @@ impl TurnContext {
         if contexts.is_empty() {
             return;
         }
-        let pending = self
-            .extension_data
-            .get_or_init(PendingPostToolContexts::default);
-        pending
-            .by_call_id
+        self.pending_post_tool_contexts
             .lock()
             .await
             .entry(call_id.to_string())
@@ -264,11 +258,7 @@ impl TurnContext {
     }
 
     pub(crate) async fn take_post_tool_contexts(&self, call_id: &str) -> Vec<ResponseItem> {
-        let Some(pending) = self.extension_data.get::<PendingPostToolContexts>() else {
-            return Vec::new();
-        };
-        pending
-            .by_call_id
+        self.pending_post_tool_contexts
             .lock()
             .await
             .remove(call_id)
@@ -582,6 +572,7 @@ impl TurnContext {
             validation_authorization: Arc::clone(&self.validation_authorization),
             turn_metadata_state: self.turn_metadata_state.clone(),
             extension_data: Arc::clone(&self.extension_data),
+            pending_post_tool_contexts: Arc::clone(&self.pending_post_tool_contexts),
             turn_skills: self.turn_skills.clone(),
             turn_timing_state: Arc::clone(&self.turn_timing_state),
             tool_call_acceptance: Arc::clone(&self.tool_call_acceptance),
@@ -873,6 +864,7 @@ impl Session {
             )),
             turn_metadata_state,
             extension_data,
+            pending_post_tool_contexts: Arc::new(Mutex::new(HashMap::new())),
             turn_skills: TurnSkillsContext::new(skills_snapshot),
             turn_timing_state: Arc::new(TurnTimingState::default()),
             tool_call_acceptance: Arc::new(crate::state::ToolCallAcceptanceGate::default()),

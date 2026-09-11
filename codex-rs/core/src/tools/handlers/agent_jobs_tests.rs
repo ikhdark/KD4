@@ -163,6 +163,10 @@ fn ensure_unique_headers_rejects_generated_output_column_collisions() {
 #[tokio::test]
 async fn spawn_rejects_invalid_and_non_object_output_schemas_before_reading_csv() {
     let (session, turn) = crate::session::tests::make_session_and_context().await;
+    crate::session::multi_agents::update_spawn_authorization_from_text(
+        &turn,
+        "Use subagents to process the CSV.",
+    );
     let session = Arc::new(session);
     let turn = Arc::new(turn);
 

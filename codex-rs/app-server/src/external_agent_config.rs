@@ -210,6 +210,20 @@ impl ExternalAgentConfigService {
         &self,
         params: ExternalAgentConfigDetectOptions,
     ) -> io::Result<Vec<ExternalAgentConfigMigrationItem>> {
+        // Detection also traverses directories and calls synchronous migration
+        // readers. Keep that whole operation off the async executor, including
+        // the helpers reached after the asynchronous configuration load.
+        let service = self.clone();
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || runtime.block_on(service.detect_impl(params)))
+            .await
+            .map_err(io::Error::other)?
+    }
+
+    async fn detect_impl(
+        &self,
+        params: ExternalAgentConfigDetectOptions,
+    ) -> io::Result<Vec<ExternalAgentConfigMigrationItem>> {
         let mut items = Vec::new();
         if params.include_home {
             self.detect_migrations(/*repo_root*/ None, &mut items)
@@ -469,7 +483,7 @@ impl ExternalAgentConfigService {
             if !is_empty_toml_table(&migrated) {
                 let mut should_include = true;
                 if target_config.exists() {
-                    let existing_raw = fs::read_to_string(&target_config)?;
+                    let existing_raw = tokio::fs::read_to_string(&target_config).await?;
                     let mut existing = if existing_raw.trim().is_empty() {
                         TomlValue::Table(Default::default())
                     } else {
@@ -510,7 +524,7 @@ impl ExternalAgentConfigService {
         let mut mcp_server_names = migrated_mcp_server_names(&migrated_mcp);
         if !is_empty_toml_table(&migrated_mcp) {
             if target_config.exists() {
-                let existing_raw = fs::read_to_string(&target_config)?;
+                let existing_raw = tokio::fs::read_to_string(&target_config).await?;
                 let mut existing = if existing_raw.trim().is_empty() {
                     TomlValue::Table(Default::default())
                 } else {
