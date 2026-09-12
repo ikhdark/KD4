@@ -665,13 +665,20 @@ impl OauthLoginFlow {
                 token_response: WrappedOAuthTokenResponse(credentials),
                 expires_at,
             };
-            save_oauth_tokens(
-                &self.codex_home,
-                &self.server_name,
-                &stored,
-                self.store_mode,
-                self.keyring_backend_kind,
-            )?;
+            let codex_home = self.codex_home.clone();
+            let server_name = self.server_name.clone();
+            let store_mode = self.store_mode;
+            let keyring_backend_kind = self.keyring_backend_kind;
+            tokio::task::spawn_blocking(move || {
+                save_oauth_tokens(
+                    &codex_home,
+                    &server_name,
+                    &stored,
+                    store_mode,
+                    keyring_backend_kind,
+                )
+            })
+            .await??;
 
             Ok(())
         }
@@ -759,6 +766,7 @@ mod tests {
     use axum::routing::get;
     use codex_exec_server::ReqwestHttpClient;
     use http::HeaderMap;
+    use oauth2::TokenResponse;
     use pretty_assertions::assert_eq;
     use serde_json::json;
     use tokio::net::TcpListener;
@@ -774,7 +782,7 @@ mod tests {
     use super::parse_oauth_callback;
     use super::start_authorization;
 
-    async fn spawn_oauth_metadata_server() -> String {
+    async fn spawn_oauth_metadata_server() -> (String, Arc<tokio::sync::Notify>) {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind metadata listener");
@@ -786,6 +794,8 @@ mod tests {
             "scopes_supported": [""],
         });
         let path_scoped_metadata = metadata.clone();
+        let token_requested = Arc::new(tokio::sync::Notify::new());
+        let token_signal = Arc::clone(&token_requested);
         let app = Router::new()
             .route(
                 "/.well-known/oauth-authorization-server/mcp",
@@ -800,6 +810,20 @@ mod tests {
                     let metadata = metadata.clone();
                     async move { Json(metadata) }
                 }),
+            )
+            .route(
+                "/oauth/token",
+                axum::routing::post(move || {
+                    let token_signal = Arc::clone(&token_signal);
+                    async move {
+                        token_signal.notify_one();
+                        Json(json!({
+                            "access_token": "login-access-token",
+                            "refresh_token": "login-refresh-token",
+                            "token_type": "bearer"
+                        }))
+                    }
+                }),
             );
 
         tokio::spawn(async move {
@@ -808,12 +832,118 @@ mod tests {
                 .expect("serve oauth metadata");
         });
 
-        base_url
+        (base_url, token_requested)
+    }
+
+    #[tokio::test]
+    async fn public_oauth_login_waits_for_persistence_without_blocking_executor()
+    -> anyhow::Result<()> {
+        use codex_config::types::AuthKeyringBackendKind;
+        use codex_config::types::OAuthCredentialsStoreMode;
+        use std::time::Duration;
+
+        let (base_url, token_requested) = spawn_oauth_metadata_server().await;
+        let server_url = format!("{base_url}/mcp");
+        let codex_home = tempfile::tempdir()?;
+        let lock_dir = codex_home.path().join("mcp-oauth-locks");
+        std::fs::create_dir_all(&lock_dir)?;
+        let lock = std::fs::File::options()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(lock_dir.join("file-store.lock"))?;
+        lock.lock()?;
+
+        let handle = super::perform_oauth_login_return_url(
+            codex_home.path(),
+            "login-server",
+            &server_url,
+            OAuthCredentialsStoreMode::File,
+            AuthKeyringBackendKind::Direct,
+            None,
+            None,
+            &[],
+            Some("login-client"),
+            None,
+            Some(10),
+            None,
+            None,
+        )
+        .await?;
+        let (authorization_url, mut completion) = handle.into_parts();
+        let authorization_url = Url::parse(&authorization_url)?;
+        let params: std::collections::HashMap<_, _> = authorization_url.query_pairs().collect();
+        let mut callback = Url::parse(params.get("redirect_uri").expect("redirect URI"))?;
+        callback
+            .query_pairs_mut()
+            .append_pair("code", "login-code")
+            .append_pair("state", params.get("state").expect("CSRF state"));
+
+        let (release, released) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            // A blocking regression releases itself so the test fails instead of hanging.
+            let released_in_time = released.recv_timeout(Duration::from_secs(2)).is_ok();
+            drop(lock);
+            released_in_time
+        });
+        let response = codex_http_client::HttpClientBuilder::new()
+            .build_direct()?
+            .get(callback)
+            .send()
+            .await?;
+        assert!(response.status().is_success());
+        tokio::time::timeout(Duration::from_secs(5), token_requested.notified()).await?;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let pending = matches!(
+            completion.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        );
+        let no_early_write = !codex_home.path().join(".credentials.json").exists();
+        let _ = release.send(());
+        assert!(
+            holder.join().expect("lock holder should exit"),
+            "OAuth persistence blocked the executor until the watchdog released the lock"
+        );
+        assert!(
+            pending,
+            "login must not complete before credentials are saved"
+        );
+        assert!(
+            no_early_write,
+            "credentials must not be written without the store lock"
+        );
+        tokio::time::timeout(Duration::from_secs(5), completion).await???;
+        let stored = crate::load_oauth_tokens(
+            codex_home.path(),
+            "login-server",
+            &server_url,
+            OAuthCredentialsStoreMode::File,
+            AuthKeyringBackendKind::Direct,
+        )?
+        .expect("successful public login must persist credentials");
+        assert_eq!(stored.client_id, "login-client");
+        assert_eq!(
+            stored.token_response.0.access_token().secret(),
+            "login-access-token"
+        );
+        assert_eq!(
+            stored
+                .token_response
+                .0
+                .refresh_token()
+                .expect("refresh token")
+                .secret(),
+            "login-refresh-token"
+        );
+        assert_eq!(stored.server_name, "login-server");
+        assert_eq!(stored.url, server_url);
+        Ok(())
     }
 
     #[tokio::test]
     async fn start_authorization_uses_configured_client_id() {
-        let base_url = spawn_oauth_metadata_server().await;
+        let (base_url, _) = spawn_oauth_metadata_server().await;
         let oauth_state = start_authorization(
             &format!("{base_url}/mcp"),
             Arc::new(OAuthHttpClientAdapter::new(

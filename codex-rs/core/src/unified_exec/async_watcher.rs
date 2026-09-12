@@ -38,8 +38,11 @@ use crate::tools::known_delta_store::PreparedKnownDelta;
 use crate::tools::tool_dispatch_trace::ToolDispatchTiming;
 use crate::unified_exec::head_tail_buffer::HeadTailBuffer;
 use codex_features::Feature;
+use codex_protocol::error::Result as CodexResult;
 use codex_protocol::exec_output::ExecToolCallOutput;
 use codex_protocol::exec_output::StreamOutput;
+use codex_protocol::protocol::CodexErrorInfo;
+use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ExecCommandOutputDeltaEvent;
@@ -305,9 +308,9 @@ async fn emit_process_terminal_event(
     duration: Duration,
     source: &ToolCallSource,
     tracker: Option<&SharedTurnDiffTracker>,
-) {
+) -> Result<(), String> {
     let process_output = Some(process.snapshot_completion_output().await);
-    if let Some(message) = failure_message {
+    let persistence_result = if let Some(message) = failure_message {
         emit_failed_exec_end_for_unified_exec(
             Arc::clone(session_ref),
             Arc::clone(turn_ref),
@@ -325,7 +328,7 @@ async fn emit_process_terminal_event(
             source.clone(),
             tracker.cloned(),
         )
-        .await;
+        .await
     } else {
         emit_exec_end_for_unified_exec(
             Arc::clone(session_ref),
@@ -344,8 +347,23 @@ async fn emit_process_terminal_event(
             source.clone(),
             tracker.cloned(),
         )
-        .await;
+        .await
+    };
+    if let Err(error) = &persistence_result {
+        // Completion describes the process that actually ran. Report the failed
+        // durability barrier separately, then let the watcher finish cleanup.
+        // The session also rejects model dispatch while this failure is pending.
+        session_ref
+            .send_event(
+                turn_ref,
+                EventMsg::Error(ErrorEvent {
+                    message: error.to_string(),
+                    codex_error_info: Some(CodexErrorInfo::Other),
+                }),
+            )
+            .await;
     }
+    persistence_result.map_err(|error| error.to_string())
 }
 
 impl Drop for ProcessOutputWaiterGuard {
@@ -378,6 +396,7 @@ pub(crate) fn spawn_exit_watcher(
 ) {
     let exit_token = process.cancellation_token();
     let output_drained = process.output_drained_token();
+    let terminal_completion = process.register_terminal_completion();
     tokio::spawn(async move {
         turn_ref.turn_timing_state.record_next_sample_block_reason(
             codex_protocol::protocol::NextSampleBlockReason::WaitingForProcessCleanup,
@@ -456,8 +475,9 @@ pub(crate) fn spawn_exit_watcher(
         }
 
         let mut delivered_at = None;
+        let mut terminal_result = Ok(());
         if direct_runtime {
-            emit_process_terminal_event(
+            terminal_result = emit_process_terminal_event(
                 &process,
                 &session_ref,
                 &turn_ref,
@@ -532,7 +552,7 @@ pub(crate) fn spawn_exit_watcher(
                 .await;
         }
         if !direct_runtime {
-            emit_process_terminal_event(
+            terminal_result = emit_process_terminal_event(
                 &process,
                 &session_ref,
                 &turn_ref,
@@ -578,12 +598,19 @@ pub(crate) fn spawn_exit_watcher(
                 .observe_repository_revision(&turn_ref.sub_id, observed_mutation_revision)
                 .await;
         }
+        let previous_completion = terminal_completion.send_replace(Some(terminal_result));
+        debug_assert!(
+            previous_completion.is_none(),
+            "watcher completion is published once"
+        );
         let delivered_at = delivered_at.unwrap_or_else(Instant::now);
         let lifecycle = tool_dispatch_timing
             .as_ref()
             .map(|timing| timing.snapshot(delivered_at));
         tracing::info!(
             event.name = "codex.exec_command.background_lifecycle",
+            declared_validation = ?process.validation(),
+            validation_coverage_status = "unverified",
             conversation.id = %session_ref.thread_id,
             turn_id = %turn_ref.sub_id,
             call_id,
@@ -872,7 +899,7 @@ pub(crate) async fn emit_exec_end_for_unified_exec(
     duration: Duration,
     source: ToolCallSource,
     tracker: Option<SharedTurnDiffTracker>,
-) {
+) -> CodexResult<()> {
     let (aggregated_output, stdout, stderr) = if let Some(output) = process_output {
         (
             String::from_utf8_lossy(&output.aggregated_output).into_owned(),
@@ -914,7 +941,7 @@ pub(crate) async fn emit_exec_end_for_unified_exec(
                 formatted_output: None,
             },
         )
-        .await;
+        .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -934,7 +961,7 @@ pub(crate) async fn emit_failed_exec_end_for_unified_exec(
     duration: Duration,
     source: ToolCallSource,
     tracker: Option<SharedTurnDiffTracker>,
-) {
+) -> CodexResult<()> {
     let (stdout, process_stderr, process_aggregated_output) = if let Some(output) = process_output {
         (
             String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -989,7 +1016,7 @@ pub(crate) async fn emit_failed_exec_end_for_unified_exec(
                 formatted_output: None,
             }),
         )
-        .await;
+        .await
 }
 
 fn split_valid_utf8_prefix_with_max(

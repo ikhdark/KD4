@@ -96,12 +96,14 @@ fn emoji_and_cjk() {
     let lines = vec![text.clone().into()];
     scenario.run_insert(lines);
     let rows = scenario.term.backend().vt100().screen().contents();
-    for ch in text.chars().filter(|c| !c.is_whitespace()) {
-        assert!(
-            rows.contains(ch),
-            "missing character {ch:?} in reconstructed screen"
-        );
-    }
+    assert_eq!(
+        rows.chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect::<String>(),
+        text.chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect::<String>()
+    );
 }
 
 #[test]
@@ -124,9 +126,13 @@ fn cursor_restoration() {
     );
     let mut scenario = TestScenario::new(/*width*/ 20, /*height*/ 6, area);
 
+    scenario.term.set_cursor_position((3, 5)).unwrap();
     let lines = vec!["x".into()];
     scenario.run_insert(lines);
-    assert_eq!(scenario.term.last_known_cursor_pos, (0, 0).into());
+    assert_eq!(scenario.term.last_known_cursor_pos, (3, 5).into());
+    let screen = scenario.term.backend().vt100().screen();
+    assert_eq!(screen.cursor_position(), (5, 3));
+    assert!(screen.contents().contains('x'));
 }
 
 #[test]
@@ -140,6 +146,10 @@ fn word_wrap_no_mid_word_split() {
     let sample = "Years passed, and Willowmere thrived in peace and friendship. Mira’s herb garden flourished with both ordinary and enchanted plants, and travelers spoke of the kindness of the woman who tended them.";
     scenario.run_insert(vec![sample.into()]);
     let joined = scenario.term.backend().vt100().screen().contents();
+    assert_eq!(
+        joined.split_whitespace().collect::<Vec<_>>(),
+        sample.split_whitespace().collect::<Vec<_>>()
+    );
     assert!(
         !joined.contains("bo\nth"),
         "word 'both' should not be split across lines:\n{joined}"
@@ -157,6 +167,10 @@ fn em_dash_and_space_word_wrap() {
     let sample = "Mara found an old key on the shore. Curious, she opened a tarnished box half-buried in sand—and inside lay a single, glowing seed.";
     scenario.run_insert(vec![sample.into()]);
     let joined = scenario.term.backend().vt100().screen().contents();
+    assert_eq!(
+        joined.split_whitespace().collect::<Vec<_>>(),
+        sample.split_whitespace().collect::<Vec<_>>()
+    );
     assert!(
         !joined.contains("insi\nde"),
         "word 'inside' should not be split across lines:\n{joined}"

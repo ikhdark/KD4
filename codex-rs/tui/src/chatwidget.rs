@@ -496,6 +496,8 @@ pub(crate) struct ChatWidget {
     bottom_pane: BottomPane,
     transcript: TranscriptState,
     config: Config,
+    #[cfg(test)]
+    world_writable_scan_for_test: Option<windows_sandbox_prompts::WorldWritableScanForTest>,
     raw_output_mode: bool,
     /// Runtime value resolved by core. `config.service_tier` remains the explicit user choice.
     effective_service_tier: Option<String>,
@@ -541,6 +543,10 @@ pub(crate) struct ChatWidget {
     pending_stream_consolidations: usize,
     /// Holds the platform clipboard lease so copied text remains available while supported.
     clipboard_lease: Option<crate::clipboard_copy::ClipboardLease>,
+    #[cfg(test)]
+    clipboard_image_reader_for_test: Option<crate::clipboard_paste::ClipboardImageReader>,
+    #[cfg(test)]
+    clipboard_image_directory_for_test: Option<PathBuf>,
     copy_last_response_binding: Vec<KeyBinding>,
     running_commands: HashMap<String, RunningCommand>,
     collab_agent_metadata: HashMap<ThreadId, AgentMetadata>,
@@ -1360,7 +1366,7 @@ impl ChatWidget {
         self.transcript.bump_active_cell_revision();
     }
 
-    /// Mark the active cell as failed (✗) and flush it into history.
+    /// Mark the active cell as failed (âœ—) and flush it into history.
     fn finalize_active_cell_as_failed(&mut self) {
         if let Some(mut cell) = self.transcript.active_cell.take() {
             // Insert finalized cell into history and keep grouping consistent.
@@ -1513,7 +1519,7 @@ impl ChatWidget {
 
     fn rename_confirmation_cell(name: &str, thread_id: Option<ThreadId>) -> PlainHistoryCell {
         let mut line = vec![
-            "• ".into(),
+            "â€¢ ".into(),
             "Session renamed to ".into(),
             name.to_string().cyan(),
         ];

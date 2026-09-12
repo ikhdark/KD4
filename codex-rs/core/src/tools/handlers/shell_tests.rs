@@ -451,6 +451,7 @@ fn retained_validation_attempt_preserves_output_and_late_skip_timing() {
 fn legacy_shell_projection_metadata_keeps_exact_bytes_status_and_context() {
     let raw = vec![b'o', b'k', b'\n', 0xff];
     let output = super::LegacyShellToolOutput {
+        validation: None,
         inner: FunctionToolOutput::from_text("bounded shell output".to_string(), Some(false)),
         canonical_output: Some(raw.clone()),
         exit_code: Some(7),
@@ -1262,4 +1263,276 @@ async fn build_post_tool_use_payload_uses_tool_output_wire_value() {
             tool_response: json!("shell output"),
         })
     );
+}
+
+#[tokio::test]
+async fn shell_command_reduced_output_advertises_exact_retained_artifact() {
+    let (session, mut turn) = make_session_and_context().await;
+    turn.model_info.truncation_policy =
+        codex_protocol::openai_models::TruncationPolicyConfig::bytes(256);
+    let input_home = tempfile::tempdir().expect("search input directory");
+    let fixture = input_home.path().join("shell-recovery-notice-input.txt");
+    let expected = (0..256)
+        .map(|i| format!("notice-proof-{i:04} independent retained output bytes\n"))
+        .collect::<String>();
+    tokio::fs::write(&fixture, expected.as_bytes())
+        .await
+        .expect("real search input");
+    let payload = ToolPayload::Function {
+        arguments: json!({
+            "kind": "argv",
+            "program": "rg",
+            "args": ["--no-heading", "--no-filename", "--no-line-number", "--color", "never", ".", fixture.to_string_lossy()]
+        }).to_string(),
+    };
+    let home = turn.config.codex_home.clone();
+    let thread_id = session.thread_id.to_string();
+    let turn = Arc::new(turn);
+    let output = ShellCommandHandler::default()
+        .handle(ToolInvocation {
+            session: session.into(),
+            step_context: StepContext::for_test(turn),
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
+            tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+            call_id: "shell-recovery-notice".to_string(),
+            tool_name: codex_tools::ToolName::plain("shell_command"),
+            source: ToolCallSource::Direct,
+            payload: payload.clone(),
+        })
+        .await
+        .expect("normal shell handler executes actual search");
+    let rendered = output.code_mode_result(&payload).to_string();
+    assert!(
+        rendered.contains(
+            "command output reduced; recover the full retained output with read_tool_output"
+        ),
+        "{rendered}"
+    );
+    assert!(rendered.contains("do not rerun the producer"));
+    assert!(
+        !rendered.contains("notice-proof-0128"),
+        "middle output must actually be reduced"
+    );
+    let artifact_id = rendered
+        .split_once("Raw output artifact: ")
+        .expect("raw artifact metadata")
+        .1
+        .split_whitespace()
+        .next()
+        .expect("artifact ID");
+    let retained = crate::tools::command_output_artifact::read_exact_tool_output_artifact(
+        &home,
+        &thread_id,
+        artifact_id,
+    )
+    .await
+    .expect("normal artifact recovery");
+    assert_eq!(
+        retained,
+        expected.as_bytes(),
+        "the advertised artifact must recover every producer byte"
+    );
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn shell_attempt_fingerprint_distinguishes_non_unicode_workdirs() {
+    use codex_utils_absolute_path::AbsolutePathBuf;
+    use std::os::windows::ffi::OsStringExt;
+
+    let workspace = tempfile::tempdir().unwrap();
+    let dirs = [0xd800, 0xd801].map(|code_unit| {
+        let path = workspace
+            .path()
+            .join(std::ffi::OsString::from_wide(&[code_unit]));
+        std::fs::create_dir(&path).unwrap();
+        AbsolutePathBuf::from_absolute_path(path).unwrap()
+    });
+    assert_ne!(dirs[0], dirs[1]);
+    assert_eq!(dirs[0].to_string_lossy(), dirs[1].to_string_lossy());
+    let uris = dirs.each_ref().map(PathUri::from_abs_path);
+    assert_ne!(uris[0], uris[1]);
+    assert_eq!(uris[0].to_abs_path().unwrap(), dirs[0]);
+    assert_eq!(uris[1].to_abs_path().unwrap(), dirs[1]);
+
+    let (session, base_turn) = make_session_and_context().await;
+    let session = Arc::new(session);
+    let environment = base_turn
+        .environments
+        .primary()
+        .unwrap()
+        .environment
+        .clone();
+    let selected_id = base_turn
+        .environments
+        .primary()
+        .unwrap()
+        .environment_id
+        .clone();
+    let shell = base_turn.environments.primary().unwrap().shell.clone();
+    let patch = "*** Begin Patch\n*** Environment ID: deliberately-other-environment\n*** Add File: forbidden.txt\n+must not be written\n*** End Patch";
+    let expected_verification_error = format!(
+        "apply_patch verification failed: patch environment id `deliberately-other-environment` does not match selected shell environment `{selected_id}`"
+    );
+    let mut turn = Arc::new(base_turn);
+    // Only the cwd changes. The shared session ledger, environment identity, argv and policies stay equal.
+    for (index, expected_block) in [(0, false), (0, true), (1, false)] {
+        let turn_mut =
+            Arc::get_mut(&mut turn).expect("finished rejection releases its turn context");
+        turn_mut.permission_profile = codex_protocol::models::PermissionProfile::Disabled;
+        turn_mut.environments.turn_environments = vec![TurnEnvironment::new(
+            selected_id.clone(),
+            environment.clone(),
+            uris[index].clone(),
+            shell.clone(),
+        )];
+        let error = match ShellCommandHandler::default()
+            .handle(ToolInvocation {
+                session: session.clone(),
+                step_context: StepContext::for_test(turn.clone()),
+                cancellation_token: tokio_util::sync::CancellationToken::new(),
+                tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+                call_id: format!("non-unicode-{index}-{expected_block}"),
+                tool_name: codex_tools::ToolName::plain("shell_command"),
+                source: ToolCallSource::Direct,
+                payload: ToolPayload::Function {
+                    arguments: json!({
+                        "kind": "argv", "program": "apply_patch", "args": [patch],
+                    })
+                    .to_string(),
+                },
+            })
+            .await
+        {
+            Err(crate::FunctionCallError::RespondToModel(error)) => error,
+            Err(error) => panic!("unexpected handler error: {error}"),
+            Ok(_) => panic!("mismatched patch environment must reject without writing"),
+        };
+        if expected_block {
+            assert!(
+                error.contains("apply_patch environment mismatch"),
+                "{error}"
+            );
+            assert_ne!(
+                error, expected_verification_error,
+                "an exact retry must use the saved deterministic refusal"
+            );
+        } else {
+            assert_eq!(
+                error, expected_verification_error,
+                "a distinct native cwd must reach patch verification and cannot reuse another cwd's refusal"
+            );
+        }
+        for dir in &dirs {
+            assert!(
+                !dir.join("forbidden.txt").exists(),
+                "rejected patches cannot mutate either cwd"
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn registered_shell_declared_validation_preserves_scope_without_proof() {
+    let python = which::which("python")
+        .or_else(|_| which::which("python3"))
+        .unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    for (exit_code, tagged, denied) in [
+        (0, true, false),
+        (7, true, false),
+        (0, false, false),
+        (0, true, true),
+    ] {
+        let marker = workspace
+            .path()
+            .join(format!("shell-{exit_code}-{tagged}-{denied}"));
+        let marker_literal = serde_json::to_string(&marker.to_string_lossy()).unwrap();
+        let script = format!(
+            "import pathlib,sys; pathlib.Path({marker_literal}).write_text('executed'); print('SHELL_ACTUAL_OUTPUT'); sys.exit({exit_code})"
+        );
+        let (session, mut turn) = make_session_and_context().await;
+        turn.approval_policy =
+            crate::config::Constrained::allow_any(codex_protocol::protocol::AskForApproval::Never);
+        turn.permission_profile = if denied {
+            codex_protocol::models::PermissionProfile::Managed {
+                file_system: codex_protocol::models::ManagedFileSystemPermissions::Restricted {
+                    entries: vec![],
+                    glob_scan_max_depth: None,
+                },
+                network: codex_protocol::permissions::NetworkSandboxPolicy::Restricted,
+            }
+        } else {
+            codex_protocol::models::PermissionProfile::Disabled
+        };
+        turn.model_info.shell_type =
+            codex_protocol::openai_models::ConfigShellToolType::ShellCommand;
+        let mut config = (*turn.config).clone();
+        config
+            .features
+            .set_enabled(codex_features::Feature::UnifiedExec, false)
+            .unwrap();
+        config.permissions.approval_policy =
+            crate::config::Constrained::allow_any(codex_protocol::protocol::AskForApproval::Never);
+        turn.config = Arc::new(config);
+        let session = Arc::new(session);
+        let step = StepContext::for_test(Arc::new(turn));
+        let router = Arc::new(crate::tools::router::ToolRouter::from_context(
+            step.as_ref(),
+            crate::tools::router::ToolRouterParams {
+                tool_suggest_candidates: None,
+                deferred_mcp_tools: None,
+                mcp_tools: None,
+                extension_tool_executors: Vec::new(),
+                dynamic_tools: &[],
+                exposure_identity: Default::default(),
+            },
+            &Default::default(),
+        ));
+        assert!(step.set_tool_router(router).is_ok());
+        let runtime = crate::tools::parallel::ToolCallRuntime::new(
+            session,
+            step,
+            Arc::new(Mutex::new(TurnDiffTracker::new())),
+        );
+        let mut args = json!({"kind": "argv", "program": python, "args": ["-c", script]});
+        if tagged {
+            args["validation"] = json!({"covered_paths": ["src/declared-shell.rs"]});
+        }
+        if denied {
+            args["sandbox_permissions"] = json!("require_escalated");
+            args["justification"] = json!("verify rejection before launch");
+        }
+        let response = runtime
+            .handle_tool_call(
+                crate::tools::router::ToolCall {
+                    tool_name: codex_tools::ToolName::plain("shell_command"),
+                    call_id: "shell-attribution".into(),
+                    payload: ToolPayload::Function {
+                        arguments: args.to_string(),
+                    },
+                },
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let codex_protocol::models::ResponseInputItem::FunctionCallOutput { output, .. } = response
+        else {
+            panic!("registered shell result")
+        };
+        let text = output.body.to_text().unwrap();
+        if denied {
+            assert_eq!(output.success, Some(false));
+            assert!(!marker.exists(), "denied shell must not execute");
+        } else {
+            assert_eq!(
+                tokio::fs::read_to_string(&marker).await.unwrap(),
+                "executed"
+            );
+            assert!(text.contains("SHELL_ACTUAL_OUTPUT"), "{text}");
+            assert_eq!(output.success, Some(exit_code == 0), "{text}");
+            assert_eq!(text.contains("src/declared-shell.rs"), tagged, "{text}");
+            assert_eq!(text.contains("unverified"), tagged, "{text}");
+        }
+    }
 }

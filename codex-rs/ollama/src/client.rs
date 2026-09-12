@@ -59,11 +59,12 @@ impl OllamaClient {
 
     /// Build a client from a provider definition and verify the server is reachable.
     pub(crate) async fn try_from_provider(provider: &ModelProviderInfo) -> io::Result<Self> {
-        #![expect(clippy::expect_used)]
-        let base_url = provider
-            .base_url
-            .as_ref()
-            .expect("oss provider must have a base_url");
+        let base_url = provider.base_url.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Ollama provider must have a base_url",
+            )
+        })?;
         let uses_openai_compat = is_openai_compatible_base_url(base_url);
         let host_root = base_url_to_host_root(base_url);
         let client = HttpClientBuilder::new()
@@ -263,6 +264,20 @@ mod tests {
     use super::*;
     use assert_matches::assert_matches;
     use pretty_assertions::assert_eq;
+
+    #[tokio::test]
+    async fn responses_support_rejects_missing_base_url() {
+        let mut provider =
+            create_oss_provider_with_base_url("http://localhost:11434/v1", WireApi::Responses);
+        provider.base_url = None;
+
+        let error = crate::ensure_responses_supported(&provider)
+            .await
+            .expect_err("missing base URL must be a configuration error");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(error.to_string(), "Ollama provider must have a base_url");
+    }
 
     // Happy-path tests using a mock HTTP server; skip if sandbox network is disabled.
     #[tokio::test]

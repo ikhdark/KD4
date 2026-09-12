@@ -72,7 +72,7 @@ impl ManagedFeatures {
                 value: feature_requirements,
                 source,
             }) => (
-                parse_feature_requirements(feature_requirements, &source, startup_warnings),
+                parse_feature_requirements(feature_requirements, &source, startup_warnings)?,
                 Some(source),
             ),
             None => (BTreeMap::new(), None),
@@ -207,11 +207,21 @@ fn parse_feature_requirements(
     feature_requirements: FeatureRequirementsToml,
     source: &RequirementSource,
     mut startup_warnings: Option<&mut Vec<String>>,
-) -> BTreeMap<Feature, bool> {
-    let mut pinned_features = BTreeMap::new();
+) -> std::io::Result<BTreeMap<Feature, bool>> {
+    let mut pinned_features: BTreeMap<Feature, (String, bool)> = BTreeMap::new();
     for (key, enabled) in feature_requirements.entries {
         if let Some(feature) = feature_requirement_for_key(&key) {
-            pinned_features.insert(feature, enabled);
+            if let Some((previous_key, previous_enabled)) = pinned_features.get(&feature)
+                && *previous_enabled != enabled
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "Conflicting `features` requirements `{previous_key}={previous_enabled}` and `{key}={enabled}` from {source}"
+                    ),
+                ));
+            }
+            pinned_features.insert(feature, (key, enabled));
             continue;
         }
 
@@ -221,7 +231,10 @@ fn parse_feature_requirements(
         );
     }
 
-    pinned_features
+    Ok(pinned_features
+        .into_iter()
+        .map(|(feature, (_, enabled))| (feature, enabled))
+        .collect())
 }
 
 fn push_feature_requirement_warning(
@@ -263,7 +276,7 @@ pub(crate) fn validate_explicit_feature_settings_in_config_toml(
         feature_requirements.clone(),
         source,
         /*startup_warnings*/ None,
-    );
+    )?;
     if pinned_features.is_empty() {
         return Ok(());
     }

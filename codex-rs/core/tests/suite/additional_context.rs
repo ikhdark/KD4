@@ -700,3 +700,151 @@ async fn task_model_guidance_is_injected_only_when_the_feature_is_enabled() -> R
 
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn additional_context_overflow_resets_stale_values_in_the_model_request() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let first = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
+    )
+    .await;
+    let second = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp-2"), ev_completed("resp-2")]),
+    )
+    .await;
+    let third = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp-3"), ev_completed("resp-3")]),
+    )
+    .await;
+    let test = test_codex()
+        .with_config(|config| config.include_environment_context = false)
+        .build(&server)
+        .await?;
+    let unchanged = AdditionalContextEntry {
+        value: "unchanged context remains available".to_string(),
+        kind: AdditionalContextKind::Application,
+    };
+    let initial = IndexMap::from([
+        ("unchanged".to_string(), unchanged.clone()),
+        (
+            "target".to_string(),
+            AdditionalContextEntry {
+                value: "old developer value".to_string(),
+                kind: AdditionalContextKind::Application,
+            },
+        ),
+    ]);
+    let mut updated = IndexMap::from([("unchanged".to_string(), unchanged)]);
+    for index in 0..80 {
+        updated.insert(
+            format!("long-source-{index:02}-{}", "\"\n\\".repeat(8_000)),
+            AdditionalContextEntry {
+                value: "a".repeat(20_000),
+                kind: AdditionalContextKind::Application,
+            },
+        );
+    }
+    updated.insert(
+        "target".to_string(),
+        AdditionalContextEntry {
+            value: "new untrusted value".to_string(),
+            kind: AdditionalContextKind::Untrusted,
+        },
+    );
+
+    for (text, additional_context) in [
+        ("first turn", initial),
+        ("second turn", updated.clone()),
+        ("third turn", updated),
+    ] {
+        test.codex
+            .submit(Op::UserInput {
+                items: vec![UserInput::Text {
+                    text: text.to_string(),
+                    text_elements: Vec::new(),
+                }],
+                final_output_json_schema: None,
+                responsesapi_client_metadata: None,
+                additional_context,
+                thread_settings: Default::default(),
+            })
+            .await?;
+        wait_for_event_match(&test.codex, |event| {
+            matches!(event, EventMsg::TurnComplete(_)).then_some(())
+        })
+        .await;
+    }
+
+    let first_request = first.single_request();
+    assert!(
+        first_request
+            .message_input_texts("developer")
+            .contains(&application_context("target", "old developer value"))
+    );
+
+    // Keep model-request order and roles. The mock replaces only the external
+    // model; Op::UserInput, context merging, history and request assembly are real.
+    fn context_messages(request: &responses::ResponsesRequest) -> Vec<(String, String)> {
+        request.body_json()["input"]
+            .as_array()
+            .expect("model input array")
+            .iter()
+            .filter_map(|item| {
+                let role = item["role"].as_str()?;
+                let content = item["content"].as_array()?;
+                let [content] = content.as_slice() else {
+                    return None;
+                };
+                let text = content["text"].as_str()?;
+                (text.starts_with("<application_context source=")
+                    || text.starts_with("<external_context source="))
+                .then(|| (role.to_string(), text.to_string()))
+            })
+            .collect()
+    }
+    let second_messages = context_messages(&second.single_request());
+    let reset_index = second_messages
+        .iter()
+        .position(|(_, text)| text.contains("__codex_additional_context_reset__"))
+        .expect("overflow reset must reach the model");
+    let current = &second_messages[reset_index..];
+    assert_eq!(current[0].0, "developer");
+    assert!(
+        current[0]
+            .1
+            .contains("All previously supplied additional context values are obsolete")
+    );
+    assert!(current[0].1.contains("previous_value_obsolete=\"true\""));
+    assert!(
+        current[0]
+            .1
+            .contains("Only additional-context entries following this reset")
+    );
+    assert!(current[0].1.len() < 1_024);
+    assert!(current.len() <= 256);
+    assert!(current.iter().map(|(_, text)| text.len()).sum::<usize>() <= 160_000);
+    assert!(current.iter().skip(1).any(|(role, text)| {
+        role == "developer"
+            && text == &application_context("unchanged", "unchanged context remains available")
+    }));
+    assert!(
+        current
+            .iter()
+            .all(|(_, text)| !text.contains("old developer value"))
+    );
+    assert_eq!(
+        second_messages
+            .iter()
+            .filter(|(_, text)| text.contains("__codex_additional_context_reset__"))
+            .count(),
+        1
+    );
+    assert_eq!(context_messages(&third.single_request()), second_messages);
+
+    Ok(())
+}

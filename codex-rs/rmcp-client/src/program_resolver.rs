@@ -50,8 +50,10 @@ mod tests {
     use super::*;
     use crate::utils::create_env_for_mcp_server;
     use anyhow::Result;
+    use pretty_assertions::assert_eq;
     use std::fs;
     use std::path::Path;
+    use std::path::PathBuf;
     use tempfile::TempDir;
     use tokio::process::Command;
 
@@ -81,10 +83,11 @@ mod tests {
         let mut cmd = Command::new(&program_with_ext);
         cmd.envs(&env.mcp_env);
 
-        let output = cmd.output().await;
-        assert!(
-            output.is_ok(),
-            "Windows should execute scripts when the extension is provided"
+        let output = cmd.output().await?;
+        assert_eq!(output.status.code(), Some(0));
+        assert_eq!(
+            String::from_utf8(output.stdout)?.trim(),
+            "mcp-resolver-fixture"
         );
         Ok(())
     }
@@ -97,15 +100,19 @@ mod tests {
 
         // Apply platform-specific resolution
         let resolved = resolve(program, &env.mcp_env, std::env::current_dir()?.as_path())?;
+        assert_eq!(
+            PathBuf::from(&resolved),
+            env._temp_dir.path().join("test_mcp_server.cmd")
+        );
 
         // Verify resolved path executes successfully
         let mut cmd = Command::new(resolved);
         cmd.envs(&env.mcp_env);
-        let output = cmd.output().await;
-
-        assert!(
-            output.is_ok(),
-            "Resolved program should execute successfully"
+        let output = cmd.output().await?;
+        assert_eq!(output.status.code(), Some(0));
+        assert_eq!(
+            String::from_utf8(output.stdout)?.trim(),
+            "mcp-resolver-fixture"
         );
         Ok(())
     }
@@ -146,7 +153,7 @@ mod tests {
         fn create_executable(dir: &Path) -> Result<()> {
             {
                 let file = dir.join(format!("{}.cmd", Self::TEST_PROGRAM));
-                fs::write(&file, "@echo off\nexit 0")?;
+                fs::write(&file, "@echo off\necho mcp-resolver-fixture\nexit 0")?;
             }
 
             Ok(())

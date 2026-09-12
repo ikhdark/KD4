@@ -1611,9 +1611,10 @@ mod tests {
         let runtime = StateRuntime::init(home.path().to_path_buf(), "test-provider".into()).await?;
         let thread_id = ThreadId::new();
         let metadata = test_thread_metadata(home.path(), thread_id, home.path().to_path_buf());
+        let updated_rollout_path = home.path().join("updated-rollout.jsonl");
         let builder = ThreadMetadataBuilder::new(
             thread_id,
-            metadata.rollout_path.clone(),
+            updated_rollout_path.clone(),
             metadata.created_at,
             SessionSource::Cli,
         );
@@ -1625,7 +1626,14 @@ mod tests {
             },
         ))];
         for operation in 0..3 {
-            runtime.upsert_thread(&metadata).await?;
+            let mut initial = metadata.clone();
+            if operation == 2 {
+                initial.archived_at = Some(metadata.updated_at);
+            }
+            runtime.upsert_thread(&initial).await?;
+            let stored = runtime.get_thread(thread_id).await?.expect("seeded thread");
+            assert_ne!(stored.rollout_path, updated_rollout_path);
+            assert_eq!(stored.archived_at.is_some(), operation == 2);
             // Simulate an independent writer that has changed metadata but has
             // not committed yet. WAL readers can still see the previous row.
             let mut writer = runtime.pool.begin_with("BEGIN IMMEDIATE").await?;
@@ -1640,12 +1648,12 @@ mod tests {
                     }
                     1 => {
                         runtime
-                            .mark_archived(thread_id, &metadata.rollout_path, metadata.updated_at)
+                            .mark_archived(thread_id, &updated_rollout_path, metadata.updated_at)
                             .await
                     }
                     _ => {
                         runtime
-                            .mark_unarchived(thread_id, &metadata.rollout_path)
+                            .mark_unarchived(thread_id, &updated_rollout_path)
                             .await
                     }
                 }
@@ -1664,6 +1672,7 @@ mod tests {
                 .expect("thread remains stored");
             assert_eq!(actual.title, "concurrent title");
             assert_eq!(actual.model.as_deref(), Some("concurrent model"));
+            assert_eq!(actual.rollout_path, updated_rollout_path);
             assert_eq!(actual.archived_at.is_some(), operation == 1);
         }
         Ok(())

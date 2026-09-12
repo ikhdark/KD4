@@ -110,7 +110,7 @@ async fn spawn_runner_transport_task(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn spawn_windows_sandbox_session_elevated_for_permission_profile(
+fn prepare_runner_transport_request(
     permission_profile: &PermissionProfile,
     workspace_roots: &[AbsolutePathBuf],
     codex_home: &Path,
@@ -129,7 +129,7 @@ pub(crate) async fn spawn_windows_sandbox_session_elevated_for_permission_profil
     tty: bool,
     stdin_open: bool,
     use_private_desktop: bool,
-) -> Result<SpawnedProcess> {
+) -> Result<(SandboxCreds, RunnerTransportRequest)> {
     let deny_read_paths_override = deny_read_paths_override
         .iter()
         .map(AbsolutePathBuf::to_path_buf)
@@ -193,6 +193,74 @@ pub(crate) async fn spawn_windows_sandbox_session_elevated_for_permission_profil
         proxy_enforced,
         proxy_settings_mode,
     };
+    Ok((sandbox_creds, request))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn spawn_windows_sandbox_session_elevated_for_permission_profile(
+    permission_profile: &PermissionProfile,
+    workspace_roots: &[AbsolutePathBuf],
+    codex_home: &Path,
+    command: Vec<String>,
+    cwd: &Path,
+    env_map: HashMap<String, String>,
+    proxy_enforced: bool,
+    proxy_settings_mode: crate::WindowsSandboxProxySettingsMode,
+    timeout_ms: Option<u64>,
+    read_roots_override: Option<&[PathBuf]>,
+    additional_read_roots: &[AbsolutePathBuf],
+    read_roots_include_platform_defaults: bool,
+    write_roots_override: Option<&[PathBuf]>,
+    deny_read_paths_override: &[AbsolutePathBuf],
+    deny_write_paths_override: &[AbsolutePathBuf],
+    tty: bool,
+    stdin_open: bool,
+    use_private_desktop: bool,
+) -> Result<SpawnedProcess> {
+    let permission_profile = permission_profile.clone();
+    let workspace_roots = workspace_roots.to_vec();
+    let codex_home = codex_home.to_path_buf();
+    let cwd = cwd.to_path_buf();
+    let read_roots_override = read_roots_override.map(<[PathBuf]>::to_vec);
+    let additional_read_roots = additional_read_roots.to_vec();
+    let write_roots_override = write_roots_override.map(<[PathBuf]>::to_vec);
+    let deny_read_paths_override = deny_read_paths_override.to_vec();
+    let deny_write_paths_override = deny_write_paths_override.to_vec();
+    let (prepared_tx, prepared_rx) = oneshot::channel();
+    tokio::task::spawn_blocking(move || {
+        // A dropped request must not start queued persistent setup. Once setup
+        // starts this worker finishes its owned security operations; it never
+        // launches the requested command before the async receiver accepts it.
+        if prepared_tx.is_closed() {
+            return;
+        }
+        let prepared = prepare_runner_transport_request(
+            &permission_profile,
+            &workspace_roots,
+            &codex_home,
+            command,
+            &cwd,
+            env_map,
+            proxy_enforced,
+            proxy_settings_mode,
+            timeout_ms,
+            read_roots_override.as_deref(),
+            &additional_read_roots,
+            read_roots_include_platform_defaults,
+            write_roots_override.as_deref(),
+            &deny_read_paths_override,
+            &deny_write_paths_override,
+            tty,
+            stdin_open,
+            use_private_desktop,
+        );
+        // The prepared value owns strings/configuration only. Cancellation
+        // drops it here without losing a child process or a native token handle.
+        let _ = prepared_tx.send(prepared);
+    });
+    let (sandbox_creds, request) = prepared_rx.await.map_err(|error| {
+        anyhow::anyhow!("Windows elevated preparation worker stopped: {error}")
+    })??;
     let transport = spawn_runner_transport_task(sandbox_creds, request).await?;
     let (pipe_write, pipe_read) = transport.into_files();
 

@@ -28,6 +28,7 @@ use codex_tools::ToolSpec;
 use super::ExecContext;
 use super::WAIT_TOOL_NAME;
 use super::emit_failed_code_mode_cell_item;
+use super::execute_handler::CellDispatchLease;
 use super::handle_runtime_response;
 use super::wait_spec::create_wait_tool;
 
@@ -152,7 +153,15 @@ impl CodeModeWaitHandler {
                         Err(error) => {
                             record_internally_drained_waits(&exec, error.drained_observations);
                             if error.timed_out || cancellation_token.is_cancelled() {
-                                terminate_interrupted_cell(&exec, &cell_id).await;
+                                terminate_interrupted_cell(
+                                    &exec,
+                                    &cell_id,
+                                    CellDispatchLease::new(
+                                        Arc::clone(&exec.session),
+                                        cell_id.clone(),
+                                    ),
+                                )
+                                .await;
                             }
                             return Err(FunctionCallError::RespondToModel(error.message));
                         }
@@ -192,18 +201,23 @@ impl CodeModeWaitHandler {
                         .services
                         .code_mode_service
                         .cell_parent_call_id(runtime_cell_id);
-                    exec.session
-                        .services
-                        .rollout_thread_trace
-                        .code_cell_trace_context(
-                            exec.turn.sub_id.as_str(),
-                            runtime_cell_id.as_str(),
-                        )
-                        .record_ended(response);
-                    exec.session
-                        .services
-                        .code_mode_service
-                        .finish_cell_dispatch(runtime_cell_id);
+                    let dispatch_lease =
+                        CellDispatchLease::new(Arc::clone(&exec.session), runtime_cell_id.clone());
+                    if exec.session.services.rollout_thread_trace.is_enabled() {
+                        let trace = exec
+                            .session
+                            .services
+                            .rollout_thread_trace
+                            .code_cell_trace_context(
+                                exec.turn.sub_id.as_str(),
+                                runtime_cell_id.as_str(),
+                            );
+                        let response = response.clone();
+                        dispatch_lease
+                            .record_trace(move || trace.record_ended(&response))
+                            .await;
+                    }
+                    drop(dispatch_lease);
                 }
                 exec.session.services.elicitations.wait_until_clear().await;
                 if let codex_code_mode::WaitOutcome::LiveCell(response) = &wait_response {
@@ -243,6 +257,7 @@ fn failed_cell_owner_call_id<'a>(
 pub(super) async fn terminate_interrupted_cell(
     exec: &ExecContext,
     cell_id: &codex_code_mode::CellId,
+    dispatch_lease: CellDispatchLease,
 ) {
     let termination = tokio::time::timeout(
         INTERRUPTED_CELL_TERMINATION_GRACE,
@@ -254,11 +269,16 @@ pub(super) async fn terminate_interrupted_cell(
     .await;
     match termination {
         Ok(Ok(codex_code_mode::WaitOutcome::LiveCell(response))) => {
-            exec.session
-                .services
-                .rollout_thread_trace
-                .code_cell_trace_context(exec.turn.sub_id.as_str(), cell_id.as_str())
-                .record_ended(&response);
+            if exec.session.services.rollout_thread_trace.is_enabled() {
+                let trace = exec
+                    .session
+                    .services
+                    .rollout_thread_trace
+                    .code_cell_trace_context(exec.turn.sub_id.as_str(), cell_id.as_str());
+                dispatch_lease
+                    .record_trace(move || trace.record_ended(&response))
+                    .await;
+            }
         }
         Ok(Ok(codex_code_mode::WaitOutcome::MissingCell(_))) => {}
         Ok(Err(error)) => {
@@ -278,10 +298,7 @@ pub(super) async fn terminate_interrupted_cell(
             );
         }
     }
-    exec.session
-        .services
-        .code_mode_service
-        .finish_cell_dispatch(cell_id);
+    drop(dispatch_lease);
 }
 
 fn terminal_wait_owner_signal(

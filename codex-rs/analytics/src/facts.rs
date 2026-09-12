@@ -694,10 +694,7 @@ mod tests {
     #[test]
     fn compaction_strategy_has_only_memento_variant() {
         let strategy = CompactionStrategy::Memento;
-        let serialized_name = match strategy {
-            CompactionStrategy::Memento => "memento",
-        };
-
-        assert_eq!(serialized_name, "memento");
+        let serialized = serde_json::to_value(strategy).expect("serialize compaction strategy");
+        assert_eq!(serialized, serde_json::json!("memento"));
     }
 }

@@ -6403,3 +6403,135 @@ async fn build_agent_resume_config_clears_base_instructions() {
         .expect("permission profile set");
     assert_eq!(config, expected);
 }
+
+#[tokio::test]
+async fn registered_legacy_wait_completion_preserves_requested_target_order() {
+    let (mut session, mut turn, events) = make_session_and_context_with_rx().await;
+    let turn_mut = Arc::get_mut(&mut turn).expect("unique turn fixture");
+    let mut config = (*turn_mut.config).clone();
+    config
+        .features
+        .disable(Feature::MultiAgentV2)
+        .expect("legacy multi-agent mode");
+    config
+        .features
+        .enable(Feature::Collab)
+        .expect("enable normal legacy tool registration");
+    set_turn_config(turn_mut, config);
+    assert_eq!(turn.multi_agent_version, MultiAgentVersion::V1);
+    let manager = thread_manager();
+    Arc::get_mut(&mut session)
+        .expect("unique session fixture")
+        .services
+        .agent_control = manager.agent_control();
+    let ids = (1..=8)
+        .map(|index| parse_agent_id(&format!("00000000-0000-4000-8000-{index:012}")))
+        .collect::<Vec<_>>();
+    // Two non-sorted request orders reject both hash iteration and global ID sorting.
+    for (iteration, order) in [[5usize, 1, 6, 2, 7, 0, 4, 3], [3usize, 4, 0, 7, 2, 6, 1, 5]]
+        .into_iter()
+        .enumerate()
+    {
+        let expected = order.map(|index| ids[index]).to_vec();
+        let mut targets = expected.iter().map(ToString::to_string).collect::<Vec<_>>();
+        targets.insert(2, expected[0].to_string());
+        targets.push(expected[1].to_string());
+        let mut call = invocation(
+            Arc::clone(&session),
+            Arc::clone(&turn),
+            "wait_agent",
+            function_payload(json!({"targets": targets, "return_when": "all"})),
+        );
+        call.call_id = format!("ordered-legacy-wait-{iteration}");
+        call.tool_name = codex_tools::ToolName::namespaced(MULTI_AGENT_V1_NAMESPACE, "wait_agent");
+        let call_id = call.call_id.clone();
+        let router = Arc::new(crate::tools::router::ToolRouter::from_context(
+            call.step_context.as_ref(),
+            crate::tools::router::ToolRouterParams {
+                tool_suggest_candidates: None,
+                deferred_mcp_tools: None,
+                mcp_tools: None,
+                extension_tool_executors: Vec::new(),
+                dynamic_tools: &[],
+                exposure_identity: Default::default(),
+            },
+            &Default::default(),
+        ));
+        assert!(
+            router
+                .registered_tool_names_for_test()
+                .contains(&call.tool_name)
+        );
+        assert!(call.step_context.set_tool_router(router).is_ok());
+        let runtime = crate::tools::parallel::ToolCallRuntime::new(
+            call.session,
+            call.step_context,
+            call.tracker,
+        );
+        let response = timeout(
+            Duration::from_secs(5),
+            runtime.handle_tool_call(
+                crate::tools::router::ToolCall {
+                    tool_name: call.tool_name,
+                    call_id: call.call_id,
+                    payload: call.payload,
+                },
+                call.cancellation_token,
+            ),
+        )
+        .await
+        .expect("normal registered legacy wait completes")
+        .expect("wait output");
+        let ResponseInputItem::FunctionCallOutput { output, .. } = response else {
+            panic!("function result expected");
+        };
+        let FunctionCallOutputBody::Text(text) = output.body else {
+            panic!("JSON text result expected");
+        };
+        let result: wait::WaitAgentResult = serde_json::from_str(&text).expect("legacy result");
+        assert!(!result.timed_out);
+        assert_eq!(result.status.len(), 8);
+        for id in &expected {
+            assert_eq!(
+                result.status.get(&id.to_string()),
+                Some(&AgentStatus::NotFound)
+            );
+        }
+        let started = timeout(Duration::from_secs(1), async {
+            loop {
+                let event = events.recv().await.expect("normal lifecycle event");
+                if let EventMsg::ItemStarted(event) = event.msg
+                    && let TurnItem::CollabAgentToolCall(item) = event.item
+                    && item.id == call_id
+                {
+                    break item;
+                }
+            }
+        })
+        .await
+        .expect("wait emits started event before completion");
+        assert_eq!(started.receiver_thread_ids, expected);
+        assert_eq!(started.tool, CollabAgentTool::Wait);
+        assert_eq!(started.status, CollabAgentToolCallStatus::InProgress);
+        let item = completed_collab_item(&events, &call_id).await;
+        assert_eq!(item.tool, CollabAgentTool::Wait);
+        assert_eq!(item.status, CollabAgentToolCallStatus::Completed);
+        assert_eq!(
+            item.receiver_thread_ids, expected,
+            "completed event must retain first-occurrence request order, which the app-server and UI preserve"
+        );
+        assert_eq!(
+            item.receiver_agents
+                .iter()
+                .map(|agent| agent.thread_id)
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(item.agents_states.len(), 8);
+        assert!(
+            item.agents_states
+                .values()
+                .all(|status| *status == AgentStatus::NotFound)
+        );
+    }
+}

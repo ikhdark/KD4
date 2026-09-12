@@ -786,9 +786,12 @@ impl crate::render::renderable::Renderable for AppLinkView {
         let content_rows = Paragraph::new(content_lines)
             .wrap(Wrap { trim: false })
             .line_count(content_width)
-            .max(1) as u16;
+            .max(1);
+        let content_rows = u16::try_from(content_rows).unwrap_or(u16::MAX);
         let action_rows_height = self.action_rows_height(content_width);
-        content_rows + action_rows_height + 3
+        content_rows
+            .saturating_add(action_rows_height)
+            .saturating_add(3)
     }
 
     fn render(&self, area: Rect, buf: &mut Buffer) {
@@ -1018,6 +1021,30 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn desired_height_saturates_for_long_app_description() {
+        for (description_lines, width) in [(65_531, 80), (65_535, 5)] {
+            let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
+            let view = AppLinkView::new(
+                AppLinkViewParams {
+                    app_id: "connector_1".to_string(),
+                    title: "Notion".to_string(),
+                    description: Some("x\n".repeat(description_lines)),
+                    instructions: String::new(),
+                    url: "https://example.test/notion".to_string(),
+                    is_installed: false,
+                    is_enabled: false,
+                    suggest_reason: None,
+                    suggestion_type: None,
+                    elicitation_target: None,
+                },
+                AppEventSender::new(tx_raw),
+            );
+
+            assert_eq!(view.desired_height(width), u16::MAX);
+        }
     }
 
     #[test]

@@ -114,6 +114,11 @@ async fn write_outgoing_messages<W>(
                     output_failed.cancel();
                     break;
                 }
+                if let Err(err) = stdout.flush().await {
+                    error!("Failed to flush stdout: {err}");
+                    output_failed.cancel();
+                    break;
+                }
             }
             Err(err) => error!("Failed to serialize JSON-RPC message: {err}"),
         }
@@ -255,7 +260,7 @@ pub async fn run_main(
                     JsonRpcMessage::Request(r) => processor.process_request(r).await,
                     JsonRpcMessage::Response(r) => processor.process_response(r).await,
                     JsonRpcMessage::Notification(n) => processor.process_notification(n).await,
-                    JsonRpcMessage::Error(e) => processor.process_error(e),
+                    JsonRpcMessage::Error(e) => processor.process_error(e).await,
                 }
             }
 
@@ -288,9 +293,41 @@ mod tests {
     use std::collections::HashMap;
     use tempfile::TempDir;
 
-    #[test]
-    fn mcp_server_defaults_analytics_to_enabled() {
-        assert_eq!(DEFAULT_ANALYTICS_ENABLED, true);
+    #[tokio::test]
+    async fn mcp_server_defaults_analytics_to_enabled() -> anyhow::Result<()> {
+        let codex_home = TempDir::new()?;
+        let mut config = ConfigBuilder::default()
+            .codex_home(codex_home.path().to_path_buf())
+            .build()
+            .await?;
+        config.otel.exporter = OtelExporterKind::None;
+        config.otel.trace_exporter = OtelExporterKind::None;
+        config.otel.metrics_exporter = OtelExporterKind::OtlpGrpc {
+            endpoint: "http://localhost:4317".to_string(),
+            headers: HashMap::new(),
+            tls: None,
+        };
+        for (configured, expected_enabled) in [(None, true), (Some(false), false)] {
+            config.analytics_enabled = configured;
+            let provider = codex_core::otel_init::build_provider(
+                &config,
+                "0.0.0-test",
+                Some(OTEL_SERVICE_NAME),
+                DEFAULT_ANALYTICS_ENABLED,
+            )
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            assert_eq!(
+                provider
+                    .as_ref()
+                    .and_then(|provider| provider.metrics())
+                    .is_some(),
+                expected_enabled,
+            );
+            if let Some(provider) = provider {
+                provider.shutdown();
+            }
+        }
+        Ok(())
     }
 
     #[tokio::test]

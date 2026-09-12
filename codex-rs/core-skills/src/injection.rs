@@ -598,38 +598,6 @@ pub fn is_common_env_var(name: &str) -> bool {
     )
 }
 
-#[cfg(test)]
-fn text_mentions_skill(text: &str, skill_name: &str) -> bool {
-    if skill_name.is_empty() {
-        return false;
-    }
-
-    let text_bytes = text.as_bytes();
-    let skill_bytes = skill_name.as_bytes();
-
-    for (index, byte) in text_bytes.iter().copied().enumerate() {
-        if byte != b'$' {
-            continue;
-        }
-
-        let name_start = index + 1;
-        let Some(rest) = text_bytes.get(name_start..) else {
-            continue;
-        };
-        if !rest.starts_with(skill_bytes) {
-            continue;
-        }
-
-        let after_index = name_start + skill_bytes.len();
-        let after = text_bytes.get(after_index).copied();
-        if after.is_none_or(|b| !is_mention_name_char(b)) {
-            return true;
-        }
-    }
-
-    false
-}
-
 pub fn is_mention_name_char(byte: u8) -> bool {
     matches!(byte, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'-' | b':')
 }

@@ -104,6 +104,7 @@ async fn request_permissions_routes_to_guardian_when_reviewer_is_enabled() {
         .expect("test setup should allow enabling guardian approvals");
     config.approvals_reviewer = ApprovalsReviewer::AutoReview;
     config.model_provider.base_url = Some(format!("{}/v1", server.uri()));
+    config.model_provider.supports_websockets = false;
     let config = Arc::new(config);
     let models_manager = models_manager_with_provider(
         config.codex_home.to_path_buf(),
@@ -404,6 +405,7 @@ async fn strict_auto_review_turn_grant_forces_guardian_for_shell_command_policy_
             },
             codex_exec_server::LOCAL_ENVIRONMENT_ID,
             Some(&originating_turn_state),
+            &CancellationToken::new(),
         )
         .await;
 
@@ -415,6 +417,7 @@ async fn strict_auto_review_turn_grant_forces_guardian_for_shell_command_policy_
     let mut config = (*turn_context_raw.config).clone();
     config.approvals_reviewer = ApprovalsReviewer::User;
     config.model_provider.base_url = Some(format!("{}/v1", server.uri()));
+    config.model_provider.supports_websockets = false;
     let config = Arc::new(config);
     let models_manager = models_manager_with_provider(
         config.codex_home.to_path_buf(),
@@ -526,7 +529,12 @@ async fn process_compacted_history_preserves_separate_guardian_developer_message
     turn_context.developer_instructions = Some(guardian_policy.clone());
     let turn_context = Arc::new(turn_context);
     let world_state = Arc::new(build_world_state_from_turn_context(&session, &turn_context).await);
-    let initial_context_injection = InitialContextInjection::BeforeLastUserMessage(world_state);
+    let initial_context_injection = InitialContextInjection::AtStart(world_state);
+    let checkpoint = ResponseItem::Compaction {
+        id: None,
+        encrypted_content: "guardian replacement checkpoint".to_string(),
+        internal_chat_message_metadata_passthrough: None,
+    };
 
     let (refreshed, _, _) = crate::compact_remote::process_compacted_history(
         &session,
@@ -550,6 +558,7 @@ async fn process_compacted_history_preserves_separate_guardian_developer_message
                 phase: None,
                 internal_chat_message_metadata_passthrough: None,
             },
+            checkpoint.clone(),
         ],
         &initial_context_injection,
     )
@@ -571,7 +580,35 @@ async fn process_compacted_history_preserves_separate_guardian_developer_message
             .any(|message| message.contains("stale developer message"))
     );
     assert!(developer_messages.len() >= 2);
-    assert_eq!(developer_messages.last(), Some(&guardian_policy));
+    // The marker is part of the current configured-instruction contract. Keep the
+    // expected wire text independent of the production section-building helper.
+    let expected_policy =
+        format!("<configured_developer_instructions state=\"present\" />\n{guardian_policy}");
+    assert_eq!(developer_messages.last(), Some(&expected_policy));
+    assert_eq!(
+        developer_messages
+            .iter()
+            .filter(|message| message.contains(&guardian_policy))
+            .count(),
+        1,
+        "guardian policy must occur in one separate developer message"
+    );
+    assert_eq!(refreshed.last(), Some(&checkpoint));
+    assert_eq!(
+        refreshed
+            .iter()
+            .filter(|item| matches!(item, ResponseItem::Compaction { .. }))
+            .count(),
+        1
+    );
+    assert!(refreshed.iter().all(|item| !matches!(
+        item,
+        ResponseItem::Message { content, .. }
+            if content.iter().any(|content| matches!(
+                content,
+                ContentItem::InputText { text } if text == "summary"
+            ))
+    )));
 }
 
 #[tokio::test]

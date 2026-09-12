@@ -245,11 +245,9 @@ async fn session_loop_termination_closes_proxy_with_live_child_event_sender() {
         Err(CodexErr::InternalAgentDied)
     ));
     let (tx_bridge, rx_bridge) = bounded(SUBMISSION_CHANNEL_CAPACITY);
-    let ops_tx = outer.tx_sub.clone();
     let bridge = tokio::spawn(bridge_one_shot_events(
         outer,
         tx_bridge,
-        ops_tx,
         CancellationToken::new(),
     ));
     timeout(Duration::from_secs(1), bridge)
@@ -674,4 +672,144 @@ async fn delegated_mcp_user_reviewer_returns_none_without_metadata() {
     )
     .await;
     assert_eq!(response, None);
+}
+
+#[tokio::test]
+async fn prepared_one_shot_cancels_blocked_output_and_preserves_terminal_delivery() {
+    for stalled_receiver in [true, false] {
+        let (session, ctx, _rx_evt) =
+            crate::session::tests::make_session_and_context_with_rx().await;
+        let (tx_child_sub, rx_child_sub) = bounded(SUBMISSION_CHANNEL_CAPACITY);
+        let (tx_child_events, rx_child_events) = bounded(SUBMISSION_CHANNEL_CAPACITY);
+        let (_agent_status_tx, agent_status) = watch::channel(AgentStatus::PendingInit);
+        let child = Arc::new(Codex {
+            tx_sub: tx_child_sub,
+            rx_event: rx_child_events,
+            agent_status,
+            session: Arc::clone(&session),
+            session_loop_termination: completed_session_loop_termination(),
+        });
+        let (tx_outer_events, rx_outer_events) = bounded(SUBMISSION_CHANNEL_CAPACITY);
+        let outer_events_observer = rx_outer_events.clone();
+        let (tx_outer_ops, rx_outer_ops) = bounded(SUBMISSION_CHANNEL_CAPACITY);
+        let parent_cancel = CancellationToken::new();
+        let child_cancel = parent_cancel.child_token();
+        let delegate_liveness = child_cancel.child_token();
+        let events = tokio::spawn(forward_events(
+            Arc::clone(&child),
+            tx_outer_events,
+            Arc::clone(&session),
+            ctx,
+            Arc::new(Mutex::new(HashMap::new())),
+            delegate_liveness.clone(),
+        ));
+        let ops = tokio::spawn(forward_ops(
+            Arc::clone(&child),
+            rx_outer_ops,
+            delegate_liveness,
+        ));
+        // Replace only the external child process with channels. submit_once,
+        // its output bridge and both interactive forwarders run unchanged.
+        let prepared = PreparedCodexOneShot {
+            io: Codex {
+                tx_sub: tx_outer_ops,
+                rx_event: rx_outer_events,
+                agent_status: child.agent_status.clone(),
+                session,
+                session_loop_termination: completed_session_loop_termination(),
+            },
+            child_cancel: child_cancel.clone(),
+            submitted: false,
+        };
+        let one_shot = prepared.submit_once(Vec::new(), None).await.unwrap();
+        let submitted = timeout(Duration::from_secs(1), rx_child_sub.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(submitted.op, Op::UserInput { .. }));
+        assert!(one_shot.submit(Op::Interrupt).await.is_err());
+
+        let terminal = Event {
+            id: "one-shot-terminal".to_string(),
+            msg: EventMsg::TurnAborted(TurnAbortedEvent {
+                turn_id: Some("one-shot-turn".to_string()),
+                reason: TurnAbortReason::Interrupted,
+                completed_at: None,
+                duration_ms: None,
+                timing: None,
+            }),
+        };
+        if stalled_receiver {
+            for index in 0..SUBMISSION_CHANNEL_CAPACITY + 2 {
+                tx_child_events
+                    .send(Event {
+                        id: format!("visible-{index}"),
+                        msg: EventMsg::RawResponseItem(RawResponseItemEvent {
+                            item: ResponseItem::CustomToolCall {
+                                id: None,
+                                status: None,
+                                call_id: format!("call-{index}"),
+                                name: "tool".to_string(),
+                                namespace: None,
+                                input: "{}".to_string(),
+                                internal_chat_message_metadata_passthrough: None,
+                            },
+                        }),
+                    })
+                    .await
+                    .unwrap();
+            }
+            timeout(Duration::from_secs(1), async {
+                while one_shot.rx_event.len() != SUBMISSION_CHANNEL_CAPACITY
+                    || outer_events_observer.is_empty()
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("bridge never reached output backpressure");
+            parent_cancel.cancel();
+        } else {
+            tx_child_events.send(terminal.clone()).await.unwrap();
+            let delivered = timeout(Duration::from_secs(1), one_shot.next_event())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(delivered.id, "one-shot-terminal");
+            let EventMsg::TurnAborted(delivered) = delivered.msg else {
+                panic!("terminal event was not preserved");
+            };
+            assert_eq!(delivered.turn_id.as_deref(), Some("one-shot-turn"));
+            assert!(matches!(delivered.reason, TurnAbortReason::Interrupted));
+        }
+
+        // Shutdown must reach the external child, not merely cancel the bridge.
+        for expected_interrupt in [true, false] {
+            let submission = timeout(Duration::from_secs(1), rx_child_sub.recv())
+                .await
+                .expect("child shutdown was not delivered")
+                .unwrap();
+            if expected_interrupt {
+                assert!(matches!(submission.op, Op::Interrupt));
+            } else {
+                assert!(matches!(submission.op, Op::Shutdown));
+            }
+        }
+        tx_child_events.send(terminal).await.unwrap();
+        timeout(Duration::from_secs(1), async {
+            events.await.unwrap();
+            ops.await.unwrap();
+            while !one_shot.rx_event.is_closed() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("one-shot bridge or child forwarder survived shutdown");
+        assert!(child_cancel.is_cancelled());
+        if stalled_receiver {
+            assert_eq!(one_shot.rx_event.len(), SUBMISSION_CHANNEL_CAPACITY);
+        } else {
+            assert!(one_shot.next_event().await.is_err());
+        }
+    }
 }

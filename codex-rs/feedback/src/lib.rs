@@ -728,20 +728,93 @@ mod tests {
     }
 
     #[test]
-    fn configured_sentry_transport_can_be_constructed() {
+    fn configured_sentry_transport_delivers_envelope() {
+        use std::io::Read;
+        use std::net::TcpListener;
+        use std::time::Instant;
+
         use sentry::TransportFactory;
+        use sentry::protocol::Envelope;
+        use sentry::protocol::EnvelopeItem;
         use sentry::transports::DefaultTransportFactory;
 
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local Sentry endpoint");
+        let address = listener.local_addr().expect("local endpoint address");
+        listener.set_nonblocking(true).expect("nonblocking accept");
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "transport sent no request");
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("accept local request: {error}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .expect("bound request read");
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let read = stream.read(&mut chunk).expect("read envelope request");
+                assert!(read > 0, "request ended before complete envelope");
+                request.extend_from_slice(&chunk[..read]);
+                assert!(request.len() <= 64 * 1024, "unexpected request size");
+                if let Some(header_end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let body_start = header_end + 4;
+                    let headers = String::from_utf8_lossy(&request[..header_end]);
+                    let body_len: usize = headers
+                        .lines()
+                        .filter_map(|line| line.split_once(':'))
+                        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                        .expect("envelope content length")
+                        .1
+                        .trim()
+                        .parse()
+                        .expect("numeric content length");
+                    if request.len() >= body_start + body_len {
+                        stream
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+                            .expect("acknowledge envelope");
+                        return request;
+                    }
+                }
+            }
+        });
         let options = sentry::ClientOptions {
             dsn: Some(
-                "https://public@example.invalid/1"
+                format!("http://public@{address}/1")
                     .parse()
                     .expect("test DSN should parse"),
             ),
             ..Default::default()
         };
 
-        let _transport = DefaultTransportFactory.create_transport(&options);
+        let transport = DefaultTransportFactory.create_transport(&options);
+        let mut envelope = Envelope::new();
+        envelope.add_item(EnvelopeItem::Event(sentry::protocol::Event {
+            message: Some("configured-feedback-transport-marker".to_string()),
+            ..Default::default()
+        }));
+        transport.send_envelope(envelope);
+        assert!(transport.flush(Duration::from_secs(10)));
+        let request = server.join().expect("local endpoint completed");
+        let request = String::from_utf8(request).expect("UTF-8 envelope request");
+        assert!(
+            request.starts_with("POST /api/1/envelope/ HTTP/1.1\r\n"),
+            "{request}"
+        );
+        assert!(
+            request.contains("configured-feedback-transport-marker"),
+            "{request}"
+        );
+        assert!(
+            request.to_ascii_lowercase().contains("x-sentry-auth:"),
+            "{request}"
+        );
     }
 
     #[test]

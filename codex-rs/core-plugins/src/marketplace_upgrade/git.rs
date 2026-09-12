@@ -2,8 +2,9 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::process::Output;
-use std::process::Stdio;
 use std::time::Duration;
+
+use crate::startup_sync::run_git_command_with_timeout;
 
 pub(super) fn git_remote_revision(
     source: &str,
@@ -156,49 +157,6 @@ fn strip_windows_verbatim_path_prefix(path: &str) -> Option<String> {
     Some(stripped)
 }
 
-fn run_git_command_with_timeout(
-    command: &mut Command,
-    context: &str,
-    timeout: Duration,
-) -> Result<Output, String> {
-    let mut child = command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|err| format!("failed to run {context}: {err}"))?;
-    let start = std::time::Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => {
-                return child
-                    .wait_with_output()
-                    .map_err(|err| format!("failed to wait for {context}: {err}"));
-            }
-            Ok(None) => {}
-            Err(err) => return Err(format!("failed to poll {context}: {err}")),
-        }
-
-        if start.elapsed() >= timeout {
-            let _ = child.kill();
-            let output = child
-                .wait_with_output()
-                .map_err(|err| format!("failed to wait for {context} after timeout: {err}"))?;
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            return if stderr.is_empty() {
-                Err(format!("{context} timed out after {}s", timeout.as_secs()))
-            } else {
-                Err(format!(
-                    "{context} timed out after {}s: {stderr}",
-                    timeout.as_secs()
-                ))
-            };
-        }
-
-        std::thread::sleep(Duration::from_millis(100));
-    }
-}
-
 fn ensure_git_success(output: &Output, context: &str) -> Result<(), String> {
     if output.status.success() {
         return Ok(());
@@ -217,10 +175,61 @@ fn ensure_git_success(output: &Output, context: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::git_command;
+    use super::git_remote_revision;
     use super::is_full_git_sha;
     use super::strip_windows_verbatim_path_prefix;
     use pretty_assertions::assert_eq;
     use std::ffi::OsStr;
+
+    #[test]
+    fn plugin_git_large_output_remote_revision() {
+        let repo = tempfile::tempdir().expect("repository");
+        let run = |args: &[&str]| {
+            let output = git_command()
+                .arg("-C")
+                .arg(repo.path())
+                .args(args)
+                .output()
+                .expect("run git");
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout)
+                .expect("Git UTF-8 output")
+                .trim()
+                .to_string()
+        };
+        run(&["init"]);
+        run(&[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "initial",
+        ]);
+        let revision = run(&["rev-parse", "HEAD"]);
+        let refs = (0..10_000)
+            .map(|index| format!("{revision} refs/heads/branch-{index:05}\n"))
+            .collect::<String>();
+        std::fs::write(repo.path().join(".git/packed-refs"), refs).expect("many remote refs");
+
+        // The real upload-pack process emits far more than a pipe buffer before
+        // ls-remote can finish. Exercise the normal marketplace query boundary.
+        assert_eq!(
+            git_remote_revision(
+                repo.path().to_str().expect("repository path"),
+                Some("refs/heads/*"),
+                std::time::Duration::from_secs(10)
+            )
+            .expect("query large remote"),
+            revision,
+        );
+    }
 
     #[test]
     fn full_git_sha_ref_is_already_a_remote_revision() {

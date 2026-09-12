@@ -259,6 +259,23 @@ impl GoalAccountingState {
         }
     }
 
+    pub(crate) fn pending_turn_ids(&self) -> Vec<String> {
+        let inner = self.inner();
+        inner
+            .turns
+            .keys()
+            .filter(|turn_id| inner.current_turn_id.as_ref() != Some(*turn_id))
+            .cloned()
+            .collect()
+    }
+
+    pub(crate) fn defer_turn_finish(&self, turn_id: &str) {
+        let mut inner = self.inner();
+        if inner.current_turn_id.as_deref() == Some(turn_id) {
+            inner.current_turn_id = None;
+        }
+    }
+
     pub(crate) fn finish_turn(&self, turn_id: &str) {
         let mut inner = self.inner();
         inner.turns.remove(turn_id);

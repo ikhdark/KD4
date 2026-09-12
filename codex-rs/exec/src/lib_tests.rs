@@ -23,9 +23,37 @@ fn test_tracing_subscriber() -> impl tracing::Subscriber + Send + Sync {
     tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(tracer))
 }
 
-#[test]
-fn exec_defaults_analytics_to_enabled() {
-    assert_eq!(DEFAULT_ANALYTICS_ENABLED, true);
+#[tokio::test]
+async fn exec_defaults_analytics_to_enabled() {
+    let codex_home = tempdir().expect("create temp codex home");
+    let cwd = tempdir().expect("create temp cwd");
+    let mut config = ConfigBuilder::default()
+        .codex_home(codex_home.path().to_path_buf())
+        .fallback_cwd(Some(cwd.path().to_path_buf()))
+        .build()
+        .await
+        .expect("build default config");
+    config.analytics_enabled = None;
+    config.otel.exporter = codex_config::types::OtelExporterKind::None;
+    config.otel.trace_exporter = codex_config::types::OtelExporterKind::None;
+    config.otel.metrics_exporter = codex_config::types::OtelExporterKind::OtlpGrpc {
+        endpoint: "http://127.0.0.1:1".to_string(),
+        headers: Default::default(),
+        tls: None,
+    };
+
+    let provider = build_exec_otel_provider(&config)
+        .expect("build metrics provider")
+        .expect("exec enables the configured metrics exporter by default");
+    assert!(provider.metrics().is_some());
+    provider.shutdown();
+    config.analytics_enabled = Some(false);
+    assert!(
+        build_exec_otel_provider(&config)
+            .expect("build explicitly disabled metrics provider")
+            .is_none(),
+        "explicit analytics opt-out must prevent exporter initialization"
+    );
 }
 
 #[derive(Clone)]

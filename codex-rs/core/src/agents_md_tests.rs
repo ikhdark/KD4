@@ -847,14 +847,14 @@ async fn source_byte_limit_includes_mandatory_truncation_notice() {
     let res = get_user_instructions(&make_config(&tmp, LIMIT, /*instructions*/ None).await)
         .await
         .expect("doc expected");
-    let retained = res.bytes().take_while(|byte| *byte == b'A').count();
-    let notice = project_doc_truncation_notice(
-        &PathUri::from_abs_path(&source.abs()),
-        (LIMIT * 2) as u64,
-        retained,
+    assert_eq!(
+        res,
+        format!(
+            "## AGENTS.md instructions from {path}\n\n{retained}\n\n[Project documentation truncation notice: source path: {path}; original byte count: 2048; retained byte count: 1024; omitted byte count: 1024.]",
+            path = source.display(),
+            retained = "A".repeat(LIMIT)
+        )
     );
-
-    assert_eq!(res, format!("{}\n\n{notice}", &huge[..retained]));
     assert!(
         res.len() > LIMIT,
         "the notice does not consume source budget"

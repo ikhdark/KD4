@@ -546,6 +546,8 @@ async fn dynamic_tool_call_round_trip_sends_text_content_items_to_model() -> Res
     let bodies = responses_bodies(&server).await?;
     let namespace = find_tool(&bodies[0], tool_namespace)
         .context("expected explicit dynamic tool namespace in first request")?;
+    // Direct function schemas preserve client descriptions. Exec declarations
+    // belong to code-mode nested-tool metadata, not these model-visible functions.
     assert_eq!(
         namespace,
         &json!({
@@ -556,14 +558,14 @@ async fn dynamic_tool_call_round_trip_sends_text_content_items_to_model() -> Res
                 {
                     "type": "function",
                     "name": tool_name,
-                    "description": "Demo dynamic tool\n\nexec tool declaration:\n```ts\ndeclare const tools: { codex_app__demo_tool(args: { city: string; }, options?: { timeout_ms?: number }): Promise<unknown>; };\n```",
+                    "description": "Demo dynamic tool",
                     "strict": false,
                     "parameters": input_schema,
                 },
                 {
                     "type": "function",
                     "name": "lookup_status",
-                    "description": "Look up ticket status\n\nexec tool declaration:\n```ts\ndeclare const tools: { codex_app__lookup_status(args: { ticket_id: string; }, options?: { timeout_ms?: number }): Promise<unknown>; };\n```",
+                    "description": "Look up ticket status",
                     "strict": false,
                     "parameters": status_schema,
                 },

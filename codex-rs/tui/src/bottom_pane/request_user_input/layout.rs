@@ -22,7 +22,7 @@ impl RequestUserInputOverlay {
         let footer_pref = self.footer_required_height(area.width);
         let notes_pref_height = self.notes_input_height(area.width);
         let mut question_lines = self.wrapped_question_lines(area.width);
-        let question_height = question_lines.len() as u16;
+        let question_height = u16::try_from(question_lines.len()).unwrap_or(u16::MAX);
 
         let layout = if has_options {
             self.layout_with_options(

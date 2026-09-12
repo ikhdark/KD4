@@ -1736,9 +1736,12 @@ fn windows_console_details() -> Vec<String> {
     details.push(format!("console output code page: {}", unsafe {
         GetConsoleOutputCP()
     }));
+    // SAFETY: GetStdHandle accepts this constant and returns a borrowed OS handle;
+    // console_mode_detail checks null/invalid values before querying it.
     details.push(console_mode_detail("stdout console mode", unsafe {
         GetStdHandle(STD_OUTPUT_HANDLE)
     }));
+    // SAFETY: The standard error selector is valid; no handle ownership is taken.
     details.push(console_mode_detail("stderr console mode", unsafe {
         GetStdHandle(STD_ERROR_HANDLE)
     }));
@@ -1748,6 +1751,8 @@ fn windows_console_details() -> Vec<String> {
             return format!("{label}: unavailable");
         }
         let mut mode = 0_u32;
+        // SAFETY: mode is a live, aligned writable u32 for the synchronous call.
+        // Non-console or closed borrowed handles are reported as API failure.
         if unsafe { GetConsoleMode(handle, &mut mode) } == 0 {
             return format!("{label}: unavailable");
         }

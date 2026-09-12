@@ -1248,10 +1248,10 @@ impl TurnRequestProcessor {
 
         // Record turn interrupts so we can reply when TurnAborted arrives. Startup
         // interrupts do not have a turn and are acknowledged after submission.
-        if !is_startup_interrupt {
+        let interrupt_reservation = if !is_startup_interrupt {
             let thread_state = self.thread_state_manager.thread_state(thread_uuid).await;
             let is_running = matches!(thread.agent_status().await, AgentStatus::Running);
-            {
+            let reservation = {
                 let mut thread_state = thread_state.lock().await;
                 let latest_turn = thread_state.active_turn_snapshot();
                 validate_turn_interrupt_target(
@@ -1261,13 +1261,16 @@ impl TurnRequestProcessor {
                     is_running,
                     &turn_id,
                 )?;
-                thread_state.pending_interrupts.push(request_id.clone());
-            }
+                thread_state.reserve_interrupt(request_id.clone())
+            };
 
             self.outgoing
                 .record_request_turn_id(request_id, &turn_id)
                 .await;
-        }
+            Some(reservation)
+        } else {
+            None
+        };
 
         // Submit the interrupt. Turn interrupts respond upon TurnAborted; startup
         // interrupts respond here because startup cancellation has no turn event.
@@ -1276,15 +1279,14 @@ impl TurnRequestProcessor {
             .await
         {
             Ok(_) if is_startup_interrupt => Ok(Some(TurnInterruptResponse {})),
-            Ok(_) => Ok(None),
-            Err(err) => {
-                if !is_startup_interrupt {
-                    let thread_state = self.thread_state_manager.thread_state(thread_uuid).await;
-                    let mut thread_state = thread_state.lock().await;
-                    thread_state
-                        .pending_interrupts
-                        .retain(|pending_request_id| pending_request_id != request_id);
+            Ok(_) => {
+                if let Some(reservation) = interrupt_reservation {
+                    reservation.disarm();
                 }
+                Ok(None)
+            }
+            Err(err) => {
+                drop(interrupt_reservation);
                 let interrupt_target = if is_startup_interrupt {
                     "startup"
                 } else {

@@ -3,7 +3,65 @@
 use super::*;
 
 impl ChatWidget {
+    #[cfg(test)]
     pub(crate) fn handle_key_event(&mut self, key_event: KeyEvent) {
+        assert!(
+            !self.handle_key_event_inner(key_event),
+            "image-paste tests must await handle_key_event_with_image_paste"
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_clipboard_image_reader_for_test(
+        &mut self,
+        reader: crate::clipboard_paste::ClipboardImageReader,
+        directory: PathBuf,
+    ) {
+        self.clipboard_image_reader_for_test = Some(reader);
+        self.clipboard_image_directory_for_test = Some(directory);
+    }
+
+    pub(crate) async fn handle_key_event_with_image_paste(&mut self, key_event: KeyEvent) {
+        if !self.handle_key_event_inner(key_event) {
+            return;
+        }
+        let result = paste_image_to_temp_png(
+            #[cfg(test)]
+            self.clipboard_image_reader_for_test.take(),
+            #[cfg(test)]
+            self.clipboard_image_directory_for_test.take(),
+        )
+        .await;
+        match result {
+            Ok((mut temporary_path, info)) => {
+                tracing::debug!(
+                    "pasted image size={}x{} format={}",
+                    info.width,
+                    info.height,
+                    info.encoded_format.label()
+                );
+                let path = temporary_path.to_path_buf();
+                if self.current_model_supports_images() {
+                    // keep() ran in the worker. Transfer the existing persisted-file lifecycle
+                    // only once the composer can accept the image; cancellation keeps cleanup armed.
+                    temporary_path.disable_cleanup(true);
+                    self.attach_image(path);
+                } else {
+                    self.attach_image(path);
+                    let _ = tokio::task::spawn_blocking(move || drop(temporary_path)).await;
+                }
+            }
+            Err(err) => {
+                tracing::warn!("failed to paste image: {err}");
+                self.add_to_history(history_cell::new_error_event(format!(
+                    "Failed to paste image: {err}",
+                )));
+            }
+        }
+    }
+
+    /// Route the key synchronously; true asks the async caller to finish clipboard image paste.
+    fn handle_key_event_inner(&mut self, key_event: KeyEvent) -> bool {
         if self.bottom_pane.has_active_view()
             && !matches!(
                 key_event,
@@ -27,18 +85,18 @@ impl ChatWidget {
             if self.bottom_pane.no_modal_or_popup_active() {
                 self.on_modal_or_popup_closed();
             }
-            return;
+            return false;
         }
 
         if self.handle_reasoning_shortcut(key_event) {
-            return;
+            return false;
         }
 
         if key_event.kind == KeyEventKind::Press
             && self.copy_last_response_binding.is_pressed(key_event)
         {
             self.copy_last_agent_markdown();
-            return;
+            return false;
         }
 
         match key_event {
@@ -49,7 +107,7 @@ impl ChatWidget {
                 ..
             } if modifiers.contains(KeyModifiers::CONTROL) && c.eq_ignore_ascii_case(&'c') => {
                 self.on_ctrl_c();
-                return;
+                return false;
             }
             KeyEvent {
                 code: KeyCode::Char(c),
@@ -60,7 +118,7 @@ impl ChatWidget {
                 && c.eq_ignore_ascii_case(&'d')
                 && self.on_ctrl_d() =>
             {
-                return;
+                return false;
             }
             KeyEvent {
                 code: KeyCode::Char(c),
@@ -70,24 +128,7 @@ impl ChatWidget {
             } if modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
                 && c.eq_ignore_ascii_case(&'v') =>
             {
-                match paste_image_to_temp_png() {
-                    Ok((path, info)) => {
-                        tracing::debug!(
-                            "pasted image size={}x{} format={}",
-                            info.width,
-                            info.height,
-                            info.encoded_format.label()
-                        );
-                        self.attach_image(path);
-                    }
-                    Err(err) => {
-                        tracing::warn!("failed to paste image: {err}");
-                        self.add_to_history(history_cell::new_error_event(format!(
-                            "Failed to paste image: {err}",
-                        )));
-                    }
-                }
-                return;
+                return true;
             }
             _ => {}
         }
@@ -102,7 +143,7 @@ impl ChatWidget {
                 self.refresh_pending_input_preview();
                 self.request_redraw();
             }
-            return;
+            return false;
         }
 
         const REVIEW_STEER_UNAVAILABLE_MESSAGE: &str = "Steer messages aren't supported during /review. Press Ctrl+C now to cancel the review.";
@@ -116,7 +157,7 @@ impl ChatWidget {
             && !self.should_handle_vim_insert_escape(key_event)
         {
             self.add_warning_message(REVIEW_STEER_UNAVAILABLE_MESSAGE.to_string());
-            return;
+            return false;
         }
 
         if self.chat_keymap.interrupt_turn.is_pressed(key_event)
@@ -131,7 +172,7 @@ impl ChatWidget {
             } else {
                 self.input_queue.submit_pending_steers_after_interrupt = false;
             }
-            return;
+            return false;
         }
 
         if matches!(key_event.code, KeyCode::Esc)
@@ -139,11 +180,11 @@ impl ChatWidget {
             && self.should_show_plan_mode_nudge()
         {
             self.dismiss_plan_mode_nudge();
-            return;
+            return false;
         }
 
         if self.handle_plugins_popup_key_event(key_event) {
-            return;
+            return false;
         }
 
         match key_event {
@@ -169,6 +210,7 @@ impl ChatWidget {
                 self.handle_composer_input_result(input_result, had_modal_or_popup);
             }
         }
+        false
     }
 
     /// Attach a local image to the composer when the active model supports image inputs.

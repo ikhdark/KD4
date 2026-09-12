@@ -167,8 +167,7 @@ install:
 [no-cd]
 [windows]
 publish-local-codex-final *args:
-    @just test-release-tooling
-    @powershell -NoProfile -ExecutionPolicy Bypass -File "{{ justfile_directory() }}\scripts\publish-local-codex.ps1" -AutoSkipBuild -Profile release -RunDoctor -DoctorOnNoop -CloseRunningTargetTimeoutSeconds 30 -ConfigureDesktopLocalCli -DesktopCliEnvironmentTarget User -RestartDesktop {args}
+    @powershell -NoProfile -ExecutionPolicy Bypass -File "{{ justfile_directory() }}\scripts\publish-local-codex.ps1" -Concise -AutoSkipBuild -Profile release -CloseRunningTargetTimeoutSeconds 30 -ConfigureDesktopLocalCli -DesktopCliEnvironmentTarget User -RestartDesktop {args}
 
 [no-cd]
 [windows]

@@ -1,5 +1,5 @@
 use crate::acl::add_deny_read_ace;
-use crate::acl::revoke_ace;
+use crate::acl::revoke_deny_read_ace;
 use crate::path_normalization::canonicalize_path;
 use anyhow::Context;
 use anyhow::Result;
@@ -50,6 +50,17 @@ pub(crate) fn lexical_path_key(path: &Path) -> String {
 /// Caller must pass a valid SID pointer for the sandbox principal being denied.
 pub unsafe fn apply_deny_read_acls(paths: &[PathBuf], psid: *mut c_void) -> Result<Vec<PathBuf>> {
     let planned = plan_deny_read_acl_paths(paths);
+    unsafe { apply_planned_deny_read_acls(planned, psid) }
+}
+
+/// Apply an already resolved plan without introducing new canonical targets.
+///
+/// # Safety
+/// Caller must pass a valid SID pointer for the sandbox principal being denied.
+pub(crate) unsafe fn apply_planned_deny_read_acls(
+    planned: Vec<PathBuf>,
+    psid: *mut c_void,
+) -> Result<Vec<PathBuf>> {
     let mut applied = Vec::new();
     let mut seen = HashSet::new();
     let mut added_in_this_call: Vec<PathBuf> = Vec::new();
@@ -67,7 +78,7 @@ pub unsafe fn apply_deny_read_acls(paths: &[PathBuf], psid: *mut c_void) -> Resu
             Err(err) => {
                 let mut rollback_errors = Vec::new();
                 for added_path in &added_in_this_call {
-                    if let Err(rollback_error) = revoke_ace(added_path, psid) {
+                    if let Err(rollback_error) = revoke_deny_read_ace(added_path, psid) {
                         rollback_errors.push(format!("{}: {rollback_error}", added_path.display()));
                     }
                 }
@@ -124,5 +135,38 @@ mod tests {
         .collect();
 
         assert_eq!(planned, expected);
+    }
+
+    #[test]
+    fn failed_deny_read_application_revokes_only_new_denies() -> anyhow::Result<()> {
+        let home = TempDir::new()?;
+        let workspace = TempDir::new()?;
+        let existing = workspace.path().join("existing");
+        let added = workspace.path().join("added");
+        let blocker = workspace.path().join("file-not-directory");
+        for path in [&existing, &added, &blocker] {
+            std::fs::write(path, b"original bytes")?;
+        }
+        let principal = crate::cap::load_or_create_cap_sids(home.path())?.readonly;
+        let sid = crate::token::LocalSid::from_string(&principal)?;
+        unsafe {
+            assert!(crate::acl::add_deny_read_ace(&existing, sid.as_ptr())?);
+            let error = super::apply_deny_read_acls(
+                &[existing.clone(), added.clone(), blocker.join("child")],
+                sid.as_ptr(),
+            )
+            .expect_err("a file parent cannot materialize a deny directory");
+            assert!(format!("{error:#}").contains("create deny-read path"));
+            for (path, expected) in [(&existing, true), (&added, false)] {
+                let (dacl, descriptor) = crate::acl::fetch_dacl_handle(path)?;
+                let denied = crate::acl::dacl_has_read_deny_for_sid(dacl, sid.as_ptr());
+                windows_sys::Win32::Foundation::LocalFree(descriptor);
+                assert_eq!(denied, expected, "{}", path.display());
+                assert_eq!(std::fs::read(path)?, b"original bytes");
+            }
+        }
+        assert_eq!(std::fs::read(&blocker)?, b"original bytes");
+        assert!(!blocker.join("child").exists());
+        Ok(())
     }
 }

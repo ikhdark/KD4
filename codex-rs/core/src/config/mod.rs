@@ -1313,7 +1313,7 @@ impl ConfigBuilder {
         } = self;
         let codex_home = match codex_home {
             Some(codex_home) => AbsolutePathBuf::from_absolute_path(codex_home)?,
-            None => find_codex_home()?,
+            None => find_codex_home_async().await?,
         };
         let cli_overrides = cli_overrides.unwrap_or_default();
         let mut harness_overrides = harness_overrides.unwrap_or_default();
@@ -1695,7 +1695,7 @@ impl Config {
     pub async fn load_default_with_cli_overrides(
         cli_overrides: Vec<(String, TomlValue)>,
     ) -> std::io::Result<Self> {
-        let codex_home = find_codex_home()?;
+        let codex_home = find_codex_home_async().await?;
         Self::load_default_with_cli_overrides_for_codex_home(
             codex_home.to_path_buf(),
             cli_overrides,
@@ -4113,6 +4113,13 @@ fn normalize_guardian_policy_config(value: Option<&str>) -> Option<String> {
 ///   directory exists.
 pub fn find_codex_home() -> std::io::Result<AbsolutePathBuf> {
     codex_utils_home_dir::find_codex_home()
+}
+
+/// Resolve the configuration directory without blocking an async runtime worker.
+pub async fn find_codex_home_async() -> std::io::Result<AbsolutePathBuf> {
+    tokio::task::spawn_blocking(find_codex_home)
+        .await
+        .map_err(std::io::Error::other)?
 }
 
 /// Returns the path to the folder where Codex logs are stored. Does not verify

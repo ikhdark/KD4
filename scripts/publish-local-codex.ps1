@@ -1,6 +1,8 @@
 [CmdletBinding()]
 param(
     [switch]$DryRun,
+    # The just recipe opts into compact status; -Verbose restores all proof output.
+    [switch]$Concise,
     [switch]$SkipBuild,
     [switch]$AutoSkipBuild,
     [switch]$NoSccache,
@@ -1418,6 +1420,14 @@ function Write-ProofLine {
         [string]$Name,
         [object]$Value
     )
+
+    if ($Concise -and $VerbosePreference -ne "Continue" -and $Name -notin @(
+        "action", "targetPath", "buildCommand", "replace", "publishCommitted",
+        "desktopRestart", "restartRequired", "rollback", "bundleTransactionRecovery",
+        "doctorCommand"
+    )) {
+        return
+    }
 
     Write-Output "$Name`: $(Format-ProofValue $Value)"
 }
@@ -4178,9 +4188,14 @@ foreach ($backupPruneSpec in $backupPruneSpecs) {
     }
 }
 
-Write-Output "Restart Codex Desktop from the Start menu or run: $(Get-CodexDesktopLaunchCommand)"
-Write-Output "Published codex.exe, codex-code-mode-host.exe, and Windows sandbox helpers as one local runtime bundle."
-Write-Output "Do not launch targetPath directly; it is the CLI/TUI payload and opens a terminal."
+if (-not $Concise -or $VerbosePreference -eq "Continue") {
+    Write-Output "Restart Codex Desktop from the Start menu or run: $(Get-CodexDesktopLaunchCommand)"
+    Write-Output "Published codex.exe, codex-code-mode-host.exe, and Windows sandbox helpers as one local runtime bundle."
+    Write-Output "Do not launch targetPath directly; it is the CLI/TUI payload and opens a terminal."
+}
+elseif (-not $RestartDesktop) {
+    Write-Output "Published local runtime bundle. Restart Codex Desktop to use it."
+}
 if ($null -ne $restartFailure) {
     throw "Publish committed but Desktop restart failed (publishCommitted=true, restartFailed=true): $($restartFailure.Message)"
 }

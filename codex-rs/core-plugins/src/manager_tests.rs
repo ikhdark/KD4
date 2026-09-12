@@ -2624,6 +2624,11 @@ async fn plugin_cache_reuses_shared_config_and_reloads_changed_config() {
 
     assert_eq!(second, first);
     assert_eq!(second.plugins()[0].mcp_servers.len(), 1);
+    let independently_loaded = manager
+        .plugins_for_config(&config(r#"model = "first""#))
+        .await;
+    assert_eq!(independently_loaded, first);
+    assert_eq!(independently_loaded.plugins()[0].mcp_servers.len(), 1);
     let refreshed = manager
         .plugins_for_config(&config(r#"model = "second""#))
         .await;
@@ -2802,6 +2807,68 @@ async fn install_plugin_updates_config_with_relative_path_and_plugin_key() {
 }
 
 #[tokio::test]
+async fn install_plugin_cancellation_keeps_persisted_config_and_cache_consistent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_root = tmp.path().join("repo");
+    write_plugin(&repo_root, "sample-plugin", "sample-plugin");
+    let marketplace_path = repo_root.join(".agents/plugins/marketplace.json");
+    write_file(
+        &marketplace_path,
+        r#"{"name":"debug","plugins":[{"name":"sample-plugin","source":{"source":"local","path":"./sample-plugin"}}]}"#,
+    );
+    let config_path = tmp.path().join(CONFIG_TOML_FILE);
+    let config_lock = codex_file_system::acquire_atomic_write_lock(&config_path).unwrap();
+    let installed_manifest = tmp
+        .path()
+        .join("plugins/cache/debug/sample-plugin/local/.codex-plugin/plugin.json");
+    let codex_home = tmp.path().to_path_buf();
+    let install = tokio::spawn(async move {
+        PluginsManager::new(codex_home)
+            .install_plugin(
+                &unrestricted_config_layer_stack(),
+                PluginInstallRequest {
+                    plugin_name: "sample-plugin".to_string(),
+                    marketplace_path: AbsolutePathBuf::try_from(marketplace_path).unwrap(),
+                },
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !installed_manifest.is_file() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("install should reach config persistence while its file lock is held");
+    // Give the caller time to enter the config write, which the real file lock blocks.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!install.is_finished());
+    assert!(!config_path.exists());
+    install.abort();
+    assert!(install.await.unwrap_err().is_cancelled());
+    drop(config_lock);
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !config_path.is_file() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the started transaction should finish persisting config");
+    let config: Value = toml::from_str(&fs::read_to_string(config_path).unwrap()).unwrap();
+    assert_eq!(
+        config["plugins"]["sample-plugin@debug"]["enabled"],
+        Value::Boolean(true)
+    );
+    let manifest: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(installed_manifest)
+            .expect("enabled plugin must retain its installed files"),
+    )
+    .unwrap();
+    assert_eq!(manifest["name"], "sample-plugin");
+}
+
+#[tokio::test]
 async fn install_plugin_restores_previous_cache_when_config_update_fails() {
     let tmp = tempfile::tempdir().unwrap();
     let repo_root = tmp.path().join("repo");
@@ -2941,19 +3008,37 @@ async fn install_openai_curated_plugin_uses_short_sha_cache_version() {
     let tmp = tempfile::tempdir().unwrap();
     let curated_root = curated_plugins_repo_path(tmp.path());
     write_openai_curated_marketplace(&curated_root, &["slack"]);
-    write_curated_plugin_sha(tmp.path(), TEST_CURATED_PLUGIN_SHA);
-
-    let result = PluginsManager::new(tmp.path().to_path_buf())
-        .install_plugin(
-            &unrestricted_config_layer_stack(),
-            PluginInstallRequest {
-                plugin_name: "slack".to_string(),
-                marketplace_path: AbsolutePathBuf::try_from(
-                    curated_root.join(".agents/plugins/marketplace.json"),
-                )
-                .unwrap(),
-            },
+    let manager = PluginsManager::new(tmp.path().to_path_buf());
+    let request = PluginInstallRequest {
+        plugin_name: "slack".to_string(),
+        marketplace_path: AbsolutePathBuf::try_from(
+            curated_root.join(".agents/plugins/marketplace.json"),
         )
+        .unwrap(),
+    };
+    let error = manager
+        .install_plugin(&unrestricted_config_layer_stack(), request.clone())
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("local curated marketplace sha is not available")
+    );
+    assert!(
+        !tmp.path()
+            .join("plugins/cache/openai-curated/slack")
+            .exists(),
+        "missing version must not publish an installed plugin"
+    );
+    assert!(
+        !tmp.path().join(CONFIG_TOML_FILE).exists(),
+        "missing version must not enable the plugin in config"
+    );
+
+    write_curated_plugin_sha(tmp.path(), TEST_CURATED_PLUGIN_SHA);
+    let result = manager
+        .install_plugin(&unrestricted_config_layer_stack(), request)
         .await
         .unwrap();
 
@@ -3275,6 +3360,61 @@ enabled = true
     );
     let config = fs::read_to_string(tmp.path().join(CONFIG_TOML_FILE)).unwrap();
     assert!(!config.contains(r#"[plugins."sample-plugin@debug"]"#));
+}
+
+#[tokio::test]
+async fn uninstall_plugin_cancellation_keeps_persisted_config_and_cache_consistent() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_plugin(
+        &tmp.path().join("plugins/cache/debug"),
+        "sample-plugin/local",
+        "sample-plugin",
+    );
+    let installed_root = tmp.path().join("plugins/cache/debug/sample-plugin");
+    let config_path = tmp.path().join(CONFIG_TOML_FILE);
+    let original_config =
+        "[features]\nplugins = true\n[plugins.\"sample-plugin@debug\"]\nenabled = true\n";
+    write_file(&config_path, original_config);
+    let config_lock = codex_file_system::acquire_atomic_write_lock(&config_path).unwrap();
+    let codex_home = tmp.path().to_path_buf();
+    let uninstall = tokio::spawn(async move {
+        PluginsManager::new(codex_home)
+            .uninstall_plugin("sample-plugin@debug".to_string())
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while installed_root.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("uninstall should reach config persistence while its file lock is held");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!uninstall.is_finished());
+    assert_eq!(fs::read_to_string(&config_path).unwrap(), original_config);
+    uninstall.abort();
+    assert!(uninstall.await.unwrap_err().is_cancelled());
+    drop(config_lock);
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while fs::read_to_string(&config_path).unwrap() == original_config {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the started transaction should finish removing plugin config");
+    let config: Value = toml::from_str(&fs::read_to_string(config_path).unwrap()).unwrap();
+    assert!(
+        config
+            .get("plugins")
+            .and_then(|plugins| plugins.get("sample-plugin@debug"))
+            .is_none()
+    );
+    assert_eq!(config["features"]["plugins"], Value::Boolean(true));
+    assert!(
+        !installed_root.exists(),
+        "removed plugin config must not restore uninstalled files"
+    );
 }
 
 #[tokio::test]
@@ -3845,6 +3985,8 @@ plugins = true
 "#,
     );
 
+    let original_manifest = fs::read(plugin_root.join(".codex-plugin/plugin.json")).unwrap();
+    let original_config = fs::read(tmp.path().join(CONFIG_TOML_FILE)).unwrap();
     let config = load_config(tmp.path(), &repo_root).await;
     let err = PluginsManager::new(tmp.path().to_path_buf())
         .read_plugin_for_config(
@@ -3861,6 +4003,18 @@ plugins = true
         .unwrap_err();
 
     assert_eq!(err.to_string(), "missing or invalid plugin.json");
+    assert_eq!(
+        fs::read(plugin_root.join(".codex-plugin/plugin.json")).unwrap(),
+        original_manifest
+    );
+    assert_eq!(
+        fs::read(tmp.path().join(CONFIG_TOML_FILE)).unwrap(),
+        original_config
+    );
+    assert!(
+        !tmp.path().join("plugins/cache").exists(),
+        "invalid source must not be materialized as an installed plugin"
+    );
 }
 
 #[tokio::test]

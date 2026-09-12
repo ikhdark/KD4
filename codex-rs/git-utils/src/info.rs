@@ -444,6 +444,48 @@ pub async fn git_diff_to_remote(cwd: &Path) -> Option<GitDiffToRemote> {
     })
 }
 
+/// Return the sorted root commits used to identify a project's history.
+pub async fn get_root_commit_hashes(cwd: &Path) -> Option<Vec<String>> {
+    // Even this metadata query can fetch missing objects in a partial clone.
+    // Use the contained runner so cancellation also stops remote helpers.
+    let output =
+        run_git_command_with_timeout(&["rev-list", "--max-parents=0", "HEAD"], cwd).await?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    let mut roots = stdout.lines().map(str::to_owned).collect::<Vec<_>>();
+    if roots.is_empty()
+        || roots.iter().any(|root| {
+            root.len() < 40 || root.len() > 64 || !root.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+    {
+        return None;
+    }
+    roots.sort_unstable();
+    Some(roots)
+}
+
+/// Read staged index entries for literal paths using the bounded Git runner.
+/// A timeout or failed query leaves callers free to use their fallback modes.
+pub async fn git_index_entries(cwd: &Path, paths: &[PathBuf]) -> Option<Vec<u8>> {
+    if paths.is_empty() {
+        return Some(Vec::new());
+    }
+    let mut args = ["--literal-pathspecs", "ls-files", "--stage", "-z", "--"]
+        .map(OsString::from)
+        .to_vec();
+    args.extend(paths.iter().map(|path| path.as_os_str().to_owned()));
+    let output = run_git_command_with_timeout_os_from(
+        Path::new("git"),
+        &args,
+        cwd,
+        crate::FsmonitorOverride::Disabled,
+    )
+    .await?;
+    output.status.success().then_some(output.stdout)
+}
+
 /// Run a git command with a timeout to prevent blocking on large repositories
 async fn run_git_command_with_timeout(args: &[&str], cwd: &Path) -> Option<std::process::Output> {
     // These callers only inspect repository metadata. Worktree workflows probe
@@ -599,45 +641,61 @@ async fn run_git_command_attempt(
     command
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .creation_flags(codex_utils_pty::WINDOWS_CREATE_SUSPENDED);
-    let result = timeout(GIT_COMMAND_TIMEOUT, async move {
-        let managed = codex_utils_pty::ManagedRootProcess::reserve_with_reclaim().await?;
-        managed.require_descendant_containment()?;
-        // Git can launch clean/process filters even when hooks, external diffs,
-        // and text conversion are disabled. Attach the root before it can run,
-        // and retain ownership across both output collection and cancellation.
-        let mut child = tokio::task::spawn_blocking(move || command.spawn())
-            .await
-            .map_err(std::io::Error::other)??;
-        let pid = child
-            .id()
-            .ok_or_else(|| std::io::Error::other("missing Git process id"))?;
-        if let Err(error) = managed.attach_and_resume(pid) {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
-            return Err(error);
-        }
-        let output = child.wait_with_output().await?;
-        if fsmonitor == crate::FsmonitorOverride::BuiltIn
-            && output
-                .status
-                .code()
-                .is_some_and(|code| code == 0 || code == 1)
-        {
-            // A completed inspection may intentionally have started Git's
-            // built-in fsmonitor daemon. Timeout and cancellation never reach
-            // this transfer of ownership.
-            managed.preserve_descendants()?;
-        }
-        Ok(output)
-    })
-    .await;
+        .stderr(std::process::Stdio::piped());
+    let result = timeout(GIT_COMMAND_TIMEOUT, run_git_child(command, fsmonitor)).await;
 
     match result {
         Ok(Ok(output)) => Some(output),
         _ => None, // Timeout or error
     }
+}
+
+/// Runs the prepared Git child inside a Windows Job so descendants such as
+/// clean filters and remote helpers end with the command on timeout or
+/// cancellation. Other platforms keep the plain kill-on-drop child.
+#[cfg(windows)]
+async fn run_git_child(
+    mut command: Command,
+    fsmonitor: crate::FsmonitorOverride,
+) -> std::io::Result<std::process::Output> {
+    command.creation_flags(codex_utils_pty::WINDOWS_CREATE_SUSPENDED);
+    let managed = codex_utils_pty::ManagedRootProcess::reserve_with_reclaim().await?;
+    managed.require_descendant_containment()?;
+    // Git can launch clean/process filters even when hooks, external diffs,
+    // and text conversion are disabled. Attach the root before it can run,
+    // and retain ownership across both output collection and cancellation.
+    let mut child = tokio::task::spawn_blocking(move || command.spawn())
+        .await
+        .map_err(std::io::Error::other)??;
+    let pid = child
+        .id()
+        .ok_or_else(|| std::io::Error::other("missing Git process id"))?;
+    if let Err(error) = managed.attach_and_resume(pid) {
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        return Err(error);
+    }
+    let output = child.wait_with_output().await?;
+    if fsmonitor == crate::FsmonitorOverride::BuiltIn
+        && output
+            .status
+            .code()
+            .is_some_and(|code| code == 0 || code == 1)
+    {
+        // A completed inspection may intentionally have started Git's
+        // built-in fsmonitor daemon. Timeout and cancellation never reach
+        // this transfer of ownership.
+        managed.preserve_descendants()?;
+    }
+    Ok(output)
+}
+
+#[cfg(not(windows))]
+async fn run_git_child(
+    mut command: Command,
+    _fsmonitor: crate::FsmonitorOverride,
+) -> std::io::Result<std::process::Output> {
+    command.output().await
 }
 
 async fn get_git_remotes(cwd: &Path) -> Option<Vec<String>> {
@@ -1150,6 +1208,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn index_entries_preserve_literal_paths_and_staged_modes() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let repo = temp.path();
+        run_git(repo, &["init", "--quiet"]);
+        std::fs::write(repo.join("literal[1].txt"), "literal\n").unwrap();
+        std::fs::write(repo.join("literal1.txt"), "other\n").unwrap();
+        run_git(repo, &["add", "."]);
+        run_git(repo, &["update-index", "--chmod=+x", "literal[1].txt"]);
+        let output = git_index_entries(repo, &[PathBuf::from("literal[1].txt")])
+            .await
+            .expect("read staged entry");
+        let records = output
+            .split(|byte| *byte == 0)
+            .filter(|record| !record.is_empty())
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 1);
+        assert!(records[0].starts_with(b"100755 "));
+        assert!(records[0].ends_with(b" 0\tliteral[1].txt"));
+        assert_eq!(git_index_entries(repo, &[]).await, Some(Vec::new()));
+        assert_eq!(
+            std::fs::read_to_string(repo.join("literal1.txt")).unwrap(),
+            "other\n"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn index_entries_timeout_while_native_spawn_worker_is_occupied() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        run_git(temp.path(), &["init", "--quiet"]);
+        std::fs::write(temp.path().join("tracked.txt"), "content\n").unwrap();
+        run_git(temp.path(), &["add", "tracked.txt"]);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        let (occupied_tx, occupied_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker = runtime.spawn_blocking(move || {
+            occupied_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        occupied_rx.recv().unwrap();
+        let result = runtime.block_on(git_index_entries(
+            temp.path(),
+            &[PathBuf::from("tracked.txt")],
+        ));
+        release_tx.send(()).unwrap();
+        runtime.block_on(worker).unwrap();
+        assert_eq!(
+            result, None,
+            "a queued native spawn must honor the Git deadline"
+        );
+        let healthy = runtime
+            .block_on(git_index_entries(
+                temp.path(),
+                &[PathBuf::from("tracked.txt")],
+            ))
+            .expect("query after releasing the native worker");
+        assert!(healthy.ends_with(b" 0\ttracked.txt\0"));
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("tracked.txt")).unwrap(),
+            "content\n"
+        );
+    }
+
+    #[tokio::test]
     async fn repository_context_distinguishes_linked_worktree_identity() {
         let temp = tempfile::tempdir().expect("temp dir");
         let repo = temp.path().join("repo");
@@ -1209,16 +1335,121 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn root_commits_timeout_terminates_lazy_fetch_and_descendant() {
+        assert_root_commits_cleans_lazy_fetch_tree(false).await;
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn root_commits_cancellation_terminates_lazy_fetch_and_descendant() {
+        assert_root_commits_cleans_lazy_fetch_tree(true).await;
+    }
+
+    #[cfg(windows)]
+    async fn assert_root_commits_cleans_lazy_fetch_tree(cancel_after_spawn: bool) {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path();
+        run_git(repo, &["init", "-q"]);
+        run_git(repo, &["config", "user.name", "Codex Tests"]);
+        run_git(repo, &["config", "user.email", "tests@example.com"]);
+        run_git(repo, &["commit", "--allow-empty", "-qm", "root"]);
+        let root = run_git(repo, &["rev-parse", "HEAD"]);
+        assert_eq!(get_root_commit_hashes(repo).await, Some(vec![root.clone()]));
+
+        let helper = repo.join("remote.ps1");
+        let pids = repo.join("remote-pids.txt");
+        let pids_literal = pids.display().to_string().replace('\'', "''");
+        std::fs::write(
+            &helper,
+            format!(
+                "$child = Start-Process powershell.exe -ArgumentList '-NoProfile', '-Command', 'Start-Sleep -Seconds 60' -WindowStyle Hidden -PassThru\n[IO.File]::WriteAllText('{pids_literal}', \"$PID $($child.Id)\")\nStart-Sleep -Seconds 60\n"
+            ),
+        )
+        .expect("write remote helper");
+        // remote-ext uses percent-space escaping rather than shell quoting.
+        let helper_arg = helper
+            .display()
+            .to_string()
+            .replace('\\', "/")
+            .replace('%', "%%")
+            .replace(' ', "% ");
+        run_git(
+            repo,
+            &[
+                "config",
+                "remote.origin.url",
+                &format!("ext::powershell.exe -NoProfile -File {helper_arg}"),
+            ],
+        );
+        run_git(repo, &["config", "remote.origin.promisor", "true"]);
+        run_git(repo, &["config", "protocol.ext.allow", "always"]);
+        // Removing the promised HEAD forces a real Git metadata query to fetch it.
+        // Move the read-only loose object instead of changing its permissions.
+        std::fs::rename(
+            repo.join(".git/objects").join(&root[..2]).join(&root[2..]),
+            repo.join("saved-head-object"),
+        )
+        .expect("remove promised HEAD from object database");
+
+        let result = if cancel_after_spawn {
+            let operation = get_root_commit_hashes(repo);
+            tokio::pin!(operation);
+            tokio::select! {
+                result = &mut operation => panic!("root query completed before cancellation: {result:?}"),
+                _ = async {
+                    while !std::fs::read_to_string(&pids).is_ok_and(|contents| {
+                        contents.split_whitespace().filter_map(|pid| pid.parse::<u32>().ok()).count() == 2
+                    }) {
+                        tokio::time::sleep(TokioDuration::from_millis(10)).await;
+                    }
+                } => {}
+            }
+            None
+        } else {
+            get_root_commit_hashes(repo).await
+        };
+        let ids = std::fs::read_to_string(&pids)
+            .expect("Git must launch the lazy-fetch helper")
+            .split_whitespace()
+            .map(|pid| pid.parse::<u32>().expect("recorded process id").to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(ids.len(), 2);
+        let ids = ids.join(",");
+        let observed = StdCommand::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-Command",
+                &format!("$live = @(Get-Process -Id {ids} -ErrorAction SilentlyContinue); $live | ForEach-Object {{ $_.Id }}; $live | Stop-Process -Force -ErrorAction SilentlyContinue"),
+            ])
+            .output()
+            .expect("observe and clean up lazy-fetch processes");
+        assert!(
+            result.is_none(),
+            "incomplete history must not produce root commits"
+        );
+        assert!(observed.status.success());
+        assert!(
+            observed.stdout.is_empty(),
+            "root query left lazy-fetch processes alive: {}",
+            String::from_utf8_lossy(&observed.stdout)
+        );
+    }
+
+    #[cfg(windows)]
     #[tokio::test]
     async fn diff_to_remote_timeout_terminates_clean_filter_and_descendant() {
         assert_diff_to_remote_cleans_filter_tree(false).await;
     }
 
+    #[cfg(windows)]
     #[tokio::test]
     async fn diff_to_remote_cancellation_terminates_clean_filter_and_descendant() {
         assert_diff_to_remote_cleans_filter_tree(true).await;
     }
 
+    #[cfg(windows)]
     async fn assert_diff_to_remote_cleans_filter_tree(cancel_after_spawn: bool) {
         let temp = tempfile::tempdir().expect("tempdir");
         let (repo, _remote, _branch, _base_sha) = init_repo_with_remote(&temp);
@@ -1310,6 +1541,7 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[tokio::test]
     async fn successful_status_preserves_builtin_fsmonitor_daemon() {
         let temp = tempfile::tempdir().expect("tempdir");

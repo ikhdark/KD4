@@ -134,6 +134,7 @@ async fn list_cached_accessible_connectors_from_tools_cache(
                 config.apps_mcp_product_sku.as_deref(),
             ),
         )
+        .await
         .map(|snapshot| accessible_connectors_status_from_tools_snapshot(&snapshot).connectors)
 }
 
@@ -224,8 +225,9 @@ pub async fn list_accessible_connectors_from_mcp_tools_with_mcp_manager(
     );
     let tool_plugin_provenance = tool_plugin_provenance(&mcp_config);
     if !force_refetch
-        && let Some(snapshot) =
-            tools_cache.current_snapshot(config.codex_home.to_path_buf(), tools_cache_key.clone())
+        && let Some(snapshot) = tools_cache
+            .current_snapshot(config.codex_home.to_path_buf(), tools_cache_key.clone())
+            .await
         && snapshot.is_fresh_for(codex_connectors::CONNECTORS_CACHE_TTL)
     {
         let mut cached_status = accessible_connectors_status_from_tools_snapshot(&snapshot);
@@ -347,8 +349,9 @@ pub async fn list_accessible_connectors_from_mcp_tools_with_mcp_manager(
     }
 
     mcp_connection_manager.shutdown().await;
-    if let Some(snapshot) =
-        tools_cache.current_snapshot(config.codex_home.to_path_buf(), tools_cache_key)
+    if let Some(snapshot) = tools_cache
+        .current_snapshot(config.codex_home.to_path_buf(), tools_cache_key)
+        .await
         && snapshot.codex_apps_ready()
     {
         tools = snapshot.tools().to_vec();

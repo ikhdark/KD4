@@ -29,6 +29,7 @@ use crate::hooks_rpc::fetch_hooks_list;
 use crate::hooks_rpc::write_hook_trust;
 use crate::hooks_rpc::write_hook_trusts;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use std::collections::HashSet;
 
 const TOKEN_ACTIVITY_FETCH_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(/*secs*/ 15);
@@ -718,6 +719,7 @@ pub(super) async fn fetch_all_mcp_server_statuses(
     thread_id: Option<ThreadId>,
 ) -> Result<Vec<McpServerStatus>> {
     let mut cursor = None;
+    let mut seen_cursors = HashSet::new();
     let mut statuses = Vec::new();
     let thread_id = thread_id.map(|id| id.to_string());
 
@@ -737,6 +739,9 @@ pub(super) async fn fetch_all_mcp_server_statuses(
             .wrap_err("mcpServerStatus/list failed in TUI")?;
         statuses.extend(response.data);
         if let Some(next_cursor) = response.next_cursor {
+            if !seen_cursors.insert(next_cursor.clone()) {
+                color_eyre::eyre::bail!("mcpServerStatus/list returned a repeated cursor");
+            }
             cursor = Some(next_cursor);
         } else {
             break;
@@ -1264,6 +1269,133 @@ mod tests {
     use codex_protocol::mcp::Tool;
     use codex_utils_absolute_path::AbsolutePathBuf;
     use pretty_assertions::assert_eq;
+
+    #[tokio::test]
+    async fn mcp_inventory_preserves_pages_and_rejects_repeated_cursors() {
+        use codex_app_server_client::AppServerClient;
+        use codex_app_server_client::RemoteAppServerClient;
+        use codex_app_server_client::RemoteAppServerConnectArgs;
+        use codex_app_server_client::RemoteAppServerEndpoint;
+        use futures::SinkExt;
+        use futures::StreamExt;
+        use tokio_tungstenite::tungstenite::Message;
+
+        for repeat_cursor in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind inventory server");
+            let endpoint = format!("ws://{}", listener.local_addr().expect("server address"));
+            let thread_id = ThreadId::new();
+            let expected_thread_id = thread_id.to_string();
+            let peer = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.expect("accept inventory client");
+                let mut socket = tokio_tungstenite::accept_async(stream)
+                    .await
+                    .expect("upgrade websocket");
+                let initialize = socket.next().await.expect("initialize").expect("frame");
+                let initialize: serde_json::Value =
+                    serde_json::from_str(initialize.to_text().expect("text")).expect("JSON");
+                assert_eq!(initialize["method"], "initialize");
+                socket
+                    .send(Message::Text(
+                        serde_json::json!({"id": initialize["id"], "result": {}})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
+                    .expect("initialize response");
+                let initialized = socket.next().await.expect("initialized").expect("frame");
+                let initialized: serde_json::Value =
+                    serde_json::from_str(initialized.to_text().expect("text")).expect("JSON");
+                assert_eq!(initialized["method"], "initialized");
+                for (index, name) in ["first-server", "second-server"].into_iter().enumerate() {
+                    let request = tokio::time::timeout(Duration::from_secs(5), socket.next())
+                        .await
+                        .expect("inventory request deadline")
+                        .expect("inventory request")
+                        .expect("frame");
+                    let request: serde_json::Value =
+                        serde_json::from_str(request.to_text().expect("text")).expect("JSON");
+                    assert_eq!(request["method"], "mcpServerStatus/list");
+                    assert_eq!(request["params"]["limit"], 100);
+                    assert_eq!(request["params"]["detail"], "full");
+                    assert_eq!(request["params"]["threadId"], expected_thread_id);
+                    assert_eq!(
+                        request["params"]["cursor"],
+                        if index == 0 {
+                            serde_json::Value::Null
+                        } else {
+                            serde_json::json!("second-page")
+                        }
+                    );
+                    let next_cursor = (index == 0 || repeat_cursor).then_some("second-page");
+                    socket
+                        .send(Message::Text(
+                            serde_json::json!({
+                                "id": request["id"],
+                                "result": {
+                                    "data": [{"name": name, "serverInfo": null, "tools": {},
+                                        "resources": [], "resourceTemplates": [], "authStatus": "unsupported"}],
+                                    "nextCursor": next_cursor
+                                }
+                            })
+                            .to_string()
+                            .into(),
+                        ))
+                        .await
+                        .expect("inventory response");
+                }
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(100), socket.next())
+                        .await
+                        .is_err(),
+                    "a terminal or repeated cursor must not trigger a third request"
+                );
+            });
+            let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+                endpoint: RemoteAppServerEndpoint::WebSocket {
+                    websocket_url: endpoint,
+                    auth_token: None,
+                },
+                client_name: "codex-tui-test".to_string(),
+                client_version: "0.0.0-test".to_string(),
+                experimental_api: true,
+                mcp_server_openai_form_elicitation: false,
+                opt_out_notification_methods: Vec::new(),
+                channel_capacity: 8,
+            })
+            .await
+            .expect("connect inventory client");
+            let client = AppServerClient::Remote(client);
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                fetch_all_mcp_server_statuses(
+                    client.request_handle(),
+                    McpServerStatusDetail::Full,
+                    Some(thread_id),
+                ),
+            )
+            .await
+            .expect("inventory fetch must terminate");
+            if repeat_cursor {
+                assert_eq!(
+                    result.expect_err("repeated cursor must fail").to_string(),
+                    "mcpServerStatus/list returned a repeated cursor"
+                );
+            } else {
+                assert_eq!(
+                    result
+                        .expect("valid pages")
+                        .into_iter()
+                        .map(|status| status.name)
+                        .collect::<Vec<_>>(),
+                    ["first-server", "second-server"]
+                );
+            }
+            peer.await.expect("server assertions");
+            client.shutdown().await.expect("client shutdown");
+        }
+    }
 
     fn test_absolute_path(path: &str) -> AbsolutePathBuf {
         AbsolutePathBuf::try_from(PathBuf::from(path)).expect("absolute test path")

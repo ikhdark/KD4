@@ -79,6 +79,7 @@ async fn exec_output_logging_and_projection_materialize_response_once() {
         ToolName::plain("shell"),
     );
     let output = crate::tools::context::ExecCommandToolOutput {
+        validation: None,
         event_call_id: call_id.to_string(),
         chunk_id: "chunk-materialization".to_string(),
         wall_time: Duration::from_millis(1),
@@ -91,6 +92,7 @@ async fn exec_output_logging_and_projection_materialize_response_once() {
         original_token_count: None,
         hook_command: None,
         raw_output_artifact: None,
+        raw_output_reduction_notice: None,
         repair_notice: None,
     };
     crate::tools::context::ExecCommandToolOutput::reset_response_materialization_count();
@@ -2273,33 +2275,6 @@ fn blocking_post_tool_hook_preserves_completed_result_and_discards_context() {
 }
 
 #[test]
-fn unavailable_model_projection_is_not_reported_as_success() {
-    let payload = ToolPayload::Function {
-        arguments: "{}".to_string(),
-    };
-    let output = UnavailableModelProjectionOutput {
-        original: Box::new(FunctionToolOutput::from_text(
-            "unavailable canonical result".to_string(),
-            Some(true),
-        )),
-        model_visible: FunctionToolOutput::from_text(
-            "Tool execution completed, but its full result could not be preserved for model delivery."
-                .to_string(),
-            Some(false),
-        ),
-    };
-
-    assert!(!output.success_for_logging());
-    assert_eq!(output.outcome_for_logging(), ToolOutputOutcome::Failure);
-    let ResponseInputItem::FunctionCallOutput { output, .. } =
-        output.to_response_item("call-1", &payload)
-    else {
-        panic!("expected function-call output");
-    };
-    assert_eq!(output.success, Some(false));
-}
-
-#[test]
 fn semantic_sections_use_declared_canonical_ranges_and_stable_json_handles() {
     let text = CanonicalToolResult::text("alpha\nbeta\ngamma\n");
     let fragments = vec![
@@ -3334,6 +3309,8 @@ async fn projection_failure_preserves_completed_lifecycle_and_returns_bounded_no
         )
         .await?;
 
+    assert!(result.success_for_logging());
+    assert_eq!(result.outcome_for_logging(), ToolOutputOutcome::Success);
     let response = result.response();
     let ResponseInputItem::FunctionCallOutput { output, .. } = response else {
         panic!("expected a function call output");

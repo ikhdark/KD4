@@ -213,7 +213,10 @@ impl Session {
         Ok(())
     }
 
-    async fn clear_reserved_idle_turn(&self, turn_state: &Arc<tokio::sync::Mutex<TurnState>>) {
+    async fn clear_reserved_idle_turn(
+        self: &Arc<Self>,
+        turn_state: &Arc<tokio::sync::Mutex<TurnState>>,
+    ) {
         self.clear_taskless_placeholder(turn_state).await;
     }
 
@@ -241,22 +244,30 @@ impl Session {
     /// starting a turn. Internal context is drained normally for model
     /// projection, but it is never treated as fresh user steering.
     pub(crate) async fn inject_internal_no_new_turn(
-        &self,
+        self: &Arc<Self>,
         items: Vec<ResponseItem>,
-        current_turn_context: Option<&TurnContext>,
-    ) {
+        current_turn_context: Option<&Arc<TurnContext>>,
+    ) -> std::io::Result<()> {
         let Err(items) = self.inject_internal_if_running(items).await else {
-            return;
+            return Ok(());
         };
         let default_turn_context;
         let turn_context = match current_turn_context {
             Some(turn_context) => turn_context,
             None => {
                 default_turn_context = self.new_default_turn().await;
-                default_turn_context.as_ref()
+                &default_turn_context
             }
         };
-        self.record_conversation_items(turn_context, &items).await;
+        // Once fallback recording is accepted, own both physical and live history
+        // across notification cancellation. Active-turn queue admission above
+        // remains cancellation-safe before it inserts any item.
+        // Each notification is a distinct emission, including repeated text from
+        // the same cell. Assign its normal response IDs before the commit retry key
+        // is formed so intentional repeated notifications are not deduplicated.
+        let items = self.prepare_conversation_items_for_history(turn_context, &items);
+        self.record_conversation_items_ordered(turn_context, &items)
+            .await
     }
 }
 

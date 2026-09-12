@@ -471,32 +471,45 @@ impl<'a> SandboxAttempt<'a> {
         fallback.map(|fallback| self.network_proxy.unwrap_or(fallback))
     }
 
-    pub fn env_for(
+    pub async fn env_for(
         &self,
         command: SandboxCommand,
         options: ExecOptions,
         network: Option<&NetworkProxy>,
         environment_id: Option<&str>,
     ) -> Result<crate::sandboxing::ExecRequest, CodexErr> {
-        let network = self.network_proxy(network);
-        let request = transform(SandboxTransformRequest {
-            command,
-            permissions: self.permissions,
-            sandbox: self.sandbox,
-            enforce_managed_network: self.enforce_managed_network,
-            environment_id,
-            network,
-            sandbox_policy_cwd: self.sandbox_cwd,
-            windows_sandbox_level: self.windows_sandbox_level,
-            windows_sandbox_private_desktop: self.windows_sandbox_private_desktop,
+        let network = self.network_proxy(network).cloned();
+        let environment_id = environment_id.map(str::to_owned);
+        let permissions = self.permissions.clone();
+        let sandbox = self.sandbox;
+        let enforce_managed_network = self.enforce_managed_network;
+        let sandbox_cwd = self.sandbox_cwd.clone();
+        let windows_sandbox_level = self.windows_sandbox_level;
+        let windows_sandbox_private_desktop = self.windows_sandbox_private_desktop;
+        let workspace_roots = self.workspace_roots.to_vec();
+        let codex_home = self.codex_home.clone();
+        tokio::task::spawn_blocking(move || {
+            let request = transform(SandboxTransformRequest {
+                command,
+                permissions: &permissions,
+                sandbox,
+                enforce_managed_network,
+                environment_id: environment_id.as_deref(),
+                network: network.as_ref(),
+                sandbox_policy_cwd: &sandbox_cwd,
+                windows_sandbox_level,
+                windows_sandbox_private_desktop,
+            })
+            .map_err(CodexErr::from)?;
+            crate::sandboxing::ExecRequest::from_sandbox_exec_request(
+                request,
+                options,
+                workspace_roots,
+                codex_home,
+            )
         })
-        .map_err(CodexErr::from)?;
-        crate::sandboxing::ExecRequest::from_sandbox_exec_request(
-            request,
-            options,
-            self.workspace_roots.to_vec(),
-            self.codex_home.clone(),
-        )
+        .await
+        .map_err(|error| CodexErr::Fatal(format!("sandbox preparation worker failed: {error}")))?
     }
 
     pub fn env_for_exec_server(

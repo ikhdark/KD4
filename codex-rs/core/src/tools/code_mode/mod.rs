@@ -1983,6 +1983,109 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn artifact_recovery_leaves_space_for_the_outer_exec_envelope() {
+        use crate::tools::command_output_artifact::ToolOutputSelector;
+        use crate::tools::command_output_artifact::ToolOutputSelectorStatus;
+        use crate::tools::command_output_artifact::create_canonical_output_artifact;
+        use crate::tools::handlers::execute_recovery_transaction;
+        use codex_tools::CanonicalToolResult;
+
+        let home = tempfile::tempdir().expect("artifact home");
+        // Both fixtures fit automatic direct recovery. The larger body exceeds the
+        // nested aggregate budget, exercising the outer envelope reserve itself.
+        for size in [9_000, 14_000] {
+            let text = "x".repeat(size);
+            let artifact = create_canonical_output_artifact(
+                home.path(),
+                "envelope-thread",
+                &CanonicalToolResult::text(&text),
+            )
+            .await;
+            let id = artifact.artifact_id().expect("canonical artifact admitted");
+            let selectors = vec![ToolOutputSelector::Bytes {
+                start: 0,
+                end: size as u64,
+            }];
+            let (direct, _) = execute_recovery_transaction(
+                home.path(),
+                "envelope-thread",
+                &id,
+                selectors.clone(),
+                false,
+            )
+            .await
+            .expect("direct recovery");
+            assert!(direct.complete);
+            assert_eq!(direct.results[0].status, ToolOutputSelectorStatus::Ok);
+            assert_eq!(direct.results[0].exact_bytes, Some(size as u64));
+            assert_eq!(direct.results[0].text.as_deref(), Some(text.as_str()));
+            let direct_tokens = codex_utils_string::approx_token_count(
+                &serde_json::to_string(&direct).expect("serialize direct recovery"),
+            );
+            if size == 9_000 {
+                assert!(
+                    direct_tokens <= 3_000,
+                    "fitting body must enter nested exact recovery"
+                );
+            } else {
+                assert!(
+                    direct_tokens > 3_128 && direct_tokens <= 10_000,
+                    "actual serialized body must exceed nested recovery plus retry margin while fitting direct recovery"
+                );
+            }
+            let (nested, _) =
+                execute_recovery_transaction(home.path(), "envelope-thread", &id, selectors, true)
+                    .await
+                    .expect("code-mode recovery");
+            if size == 9_000 {
+                assert_eq!(nested.results[0].status, ToolOutputSelectorStatus::Ok);
+                assert_eq!(nested.results[0].text.as_deref(), Some(text.as_str()));
+            } else {
+                assert_ne!(nested.results[0].status, ToolOutputSelectorStatus::Ok);
+                assert!(
+                    nested.results[0].text.is_none(),
+                    "overflow must not clip exact text"
+                );
+                assert!(
+                    !nested.results[0].child_selectors.is_empty()
+                        || nested.results[0].continuation.is_some(),
+                    "overflow must remain recoverable"
+                );
+            }
+            let rendered = serde_json::to_string(&nested).expect("serialize nested recovery");
+            let outer = format_runtime_response(
+                RuntimeResponse::Result {
+                    cell_id: CellId::new("recovery-envelope".to_string()),
+                    content_items: vec![
+                        codex_code_mode::FunctionCallOutputContentItem::InputText {
+                            text: rendered.clone(),
+                        },
+                    ],
+                    error_text: None,
+                },
+                Some(4_000),
+                4_000,
+                false,
+                std::time::Instant::now(),
+                Vec::new(),
+                Vec::new(),
+            );
+            let projected =
+                codex_protocol::models::function_call_output_content_items_to_text(&outer.body)
+                    .expect("outer exec output");
+            assert!(
+                projected.contains(&rendered),
+                "outer formatting must preserve the whole recovery JSON"
+            );
+            assert!(!projected.contains("Warning: truncated output"));
+            assert!(
+                codex_utils_string::approx_token_count(&projected) <= 4_000,
+                "actual outer status plus recovery must fit the requested exec budget"
+            );
+        }
+    }
+
     #[test]
     fn code_mode_truncation_preserves_full_canonical_recovery() {
         let sentinel = "CANONICAL_SENTINEL_AFTER_THE_MODEL_LIMIT";

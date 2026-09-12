@@ -144,7 +144,12 @@ fn normalize_thread_path(path: PathBuf) -> PathBuf {
         match component {
             Component::CurDir => {}
             Component::ParentDir => {
-                if !normalized.pop() {
+                if matches!(
+                    normalized.components().next_back(),
+                    Some(Component::Normal(_))
+                ) {
+                    normalized.pop();
+                } else if !normalized.has_root() {
                     normalized.push(component.as_os_str());
                 }
             }
@@ -547,6 +552,32 @@ mod tests {
         );
 
         assert_eq!(aliased, direct);
+
+        // A missing rollout cannot be canonicalized. Its leading parent components
+        // still identify a different path and must not cancel each other out.
+        let missing_name = format!("missing-thread-{}.jsonl", uuid::Uuid::new_v4());
+        let unresolved_path = PathBuf::from("..").join("..").join(&missing_name);
+        let (unresolved, access) = RequestSerializationQueueKey::from_scope(
+            ConnectionId(1),
+            ClientRequestSerializationScope::ThreadPath {
+                path: unresolved_path.clone(),
+            },
+        );
+        assert_eq!(
+            unresolved,
+            RequestSerializationQueueKey::ThreadPath {
+                path: unresolved_path,
+            }
+        );
+        assert_eq!(access, RequestSerializationAccess::Exclusive);
+
+        let (current_directory, _) = RequestSerializationQueueKey::from_scope(
+            ConnectionId(2),
+            ClientRequestSerializationScope::ThreadPath {
+                path: PathBuf::from(missing_name),
+            },
+        );
+        assert_ne!(unresolved, current_directory);
     }
 
     #[tokio::test]

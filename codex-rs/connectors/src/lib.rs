@@ -466,6 +466,7 @@ fn directory_app_to_app_info(app: DirectoryApp) -> AppInfo {
 
 fn connector_install_url(name: &str, connector_id: &str) -> String {
     let slug = connector_name_slug(name);
+    let connector_id = urlencoding::encode(connector_id);
     format!("https://chatgpt.com/apps/{slug}/{connector_id}")
 }
 
@@ -692,7 +693,10 @@ mod tests {
                         })
                     } else {
                         Ok(DirectoryListResponse {
-                            apps: vec![app("alpha", " Alpha "), app("beta", "Beta")],
+                            apps: vec![
+                                app("alpha", " Alpha "),
+                                app("beta/雪?query#fragment%", "Beta"),
+                            ],
                             next_token: None,
                         })
                     }
@@ -720,8 +724,12 @@ mod tests {
                 .and_then(|branding| branding.category.as_deref()),
             Some("calendar")
         );
-        assert_eq!(connectors[1].id, "beta");
+        assert_eq!(connectors[1].id, "beta/雪?query#fragment%");
         assert_eq!(connectors[1].name, "Beta");
+        assert_eq!(
+            connectors[1].install_url.as_deref(),
+            Some("https://chatgpt.com/apps/beta/beta%2F%E9%9B%AA%3Fquery%23fragment%25")
+        );
         Ok(())
     }
 

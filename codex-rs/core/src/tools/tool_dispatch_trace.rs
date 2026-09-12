@@ -7,6 +7,7 @@
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use std::sync::Once;
 use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU32;
@@ -332,16 +333,36 @@ impl ToolDispatchTiming {
     }
 
     pub(crate) fn mark_relay_delivery(&self, execution_id: &ToolExecutionId) -> bool {
-        if execution_id != &self.execution_id
-            || !self.has_boundary(ToolLifecycleBoundary::RelayEnqueue)
-            || self.has_boundary(ToolLifecycleBoundary::RelayDelivery)
+        if execution_id != &self.execution_id {
+            return false;
+        }
+        let Some(turn_timing) = self.turn_timing.as_ref() else {
+            return false;
+        };
+        let mut events = self
+            .lifecycle_events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !events
+            .iter()
+            .any(|event| event.boundary == ToolLifecycleBoundary::RelayEnqueue)
+            || events
+                .iter()
+                .any(|event| event.boundary == ToolLifecycleBoundary::RelayDelivery)
         {
             return false;
         }
-        if let Some(turn_timing) = self.turn_timing.as_ref() {
-            turn_timing.adjust_relay_queue_depth(-1);
-        }
-        self.record_boundary(ToolLifecycleBoundary::RelayDelivery)
+        // Delivery admission and queue accounting form one transition. Competing
+        // deliveries must not decrement another tool's outstanding relay count.
+        turn_timing.adjust_relay_queue_depth(-1);
+        events.push(TurnTimingToolLifecycleEvent {
+            boundary: ToolLifecycleBoundary::RelayDelivery,
+            at_ms: turn_timing.monotonic_offset_ms(),
+            context: turn_timing.lifecycle_context(),
+            retry_count: self.retry_count.load(Ordering::Acquire),
+            reentry_count: self.reentry_count.load(Ordering::Acquire),
+        });
+        true
     }
 
     #[cfg(test)]
@@ -575,22 +596,54 @@ use codex_rollout_trace::ToolDispatchRequester;
 use codex_rollout_trace::ToolDispatchResult;
 use codex_rollout_trace::ToolDispatchTraceContext;
 
-/// Keeps registry early-return paths paired with trace end events.
+/// Shares one trace terminal between registry results and supervised cancellation.
+#[derive(Clone, Debug)]
 pub(crate) struct ToolDispatchTrace {
-    context: ToolDispatchTraceContext,
+    context: tokio::sync::watch::Receiver<Option<ToolDispatchTraceContext>>,
+    enabled: bool,
     terminal_tasks: tokio_util::task::TaskTracker,
+    terminal_recording: Arc<Once>,
 }
 
 impl ToolDispatchTrace {
     pub(crate) fn start(invocation: &ToolInvocation) -> Self {
-        let context = invocation
-            .session
-            .services
-            .rollout_thread_trace
-            .start_tool_dispatch_trace(|| tool_dispatch_invocation(invocation));
+        let thread_trace = invocation.session.services.rollout_thread_trace.clone();
+        let enabled = thread_trace.is_enabled();
+        let terminal_tasks = invocation.session.terminal_tasks.clone();
+        let (sender, context) = tokio::sync::watch::channel(None);
+        if enabled {
+            let invocation = invocation.clone();
+            // Publish a handle before awaiting the accepted write. Cancellation
+            // can then wait on the same initialization and record its terminal
+            // after the start, even if the registry waiter has been dropped.
+            drop(terminal_tasks.spawn_blocking(move || {
+                let context = thread_trace
+                    .start_tool_dispatch_trace(|| tool_dispatch_invocation(&invocation));
+                sender.send_replace(Some(context));
+            }));
+        } else {
+            sender.send_replace(Some(thread_trace.start_tool_dispatch_trace(|| None)));
+        }
         Self {
             context,
-            terminal_tasks: invocation.session.terminal_tasks.clone(),
+            enabled,
+            terminal_tasks,
+            terminal_recording: Arc::new(Once::new()),
+        }
+    }
+
+    pub(crate) async fn wait_for_start(&self) {
+        let _ = self.started_context().await;
+    }
+
+    async fn started_context(&self) -> Option<ToolDispatchTraceContext> {
+        let mut context = self.context.clone();
+        match context.wait_for(Option::is_some).await {
+            Ok(context) => context.as_ref().cloned(),
+            Err(error) => {
+                tracing::warn!(%error, "tool dispatch trace initialization failed");
+                None
+            }
         }
     }
 
@@ -601,7 +654,7 @@ impl ToolDispatchTrace {
         payload: &ToolPayload,
         result: &dyn ToolOutput,
     ) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
-        if !self.context.is_enabled() {
+        if !self.enabled {
             return Box::pin(async {});
         }
 
@@ -609,12 +662,18 @@ impl ToolDispatchTrace {
         else {
             return Box::pin(async {});
         };
+        let terminal_recording = Arc::clone(&self.terminal_recording);
         let status = execution_status_for_outcome(result.outcome_context());
-        let context = self.context.clone();
+        let trace = self.clone();
         let terminal_tasks = self.terminal_tasks.clone();
         Box::pin(async move {
+            let Some(context) = trace.started_context().await else {
+                return;
+            };
             defer_trace_recording(&terminal_tasks, move || {
-                context.record_completed(status, result_payload);
+                terminal_recording.call_once(|| {
+                    context.record_completed(status, result_payload);
+                });
             })
             .await;
         })
@@ -624,15 +683,42 @@ impl ToolDispatchTrace {
         &self,
         error: &FunctionCallError,
     ) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
-        if !self.context.is_enabled() {
+        if !self.enabled {
             return Box::pin(async {});
         }
-        let context = self.context.clone();
+        let trace = self.clone();
         let error = error.to_string();
+        let terminal_recording = Arc::clone(&self.terminal_recording);
         let terminal_tasks = self.terminal_tasks.clone();
         Box::pin(async move {
-            defer_trace_recording(&terminal_tasks, move || context.record_failed(error)).await;
+            let Some(context) = trace.started_context().await else {
+                return;
+            };
+            defer_trace_recording(&terminal_tasks, move || {
+                terminal_recording.call_once(|| {
+                    context.record_failed(error);
+                });
+            })
+            .await;
         })
+    }
+
+    pub(crate) async fn record_cancelled(&self) {
+        if !self.enabled {
+            return;
+        }
+        let Some(context) = self.started_context().await else {
+            return;
+        };
+        let terminal_recording = Arc::clone(&self.terminal_recording);
+        defer_trace_recording(&self.terminal_tasks, move || {
+            // Elect inside the owned write. A competing terminal writer waits
+            // here for the accepted write to finish before cleanup can return.
+            terminal_recording.call_once(|| {
+                context.record_cancelled("tool dispatch cancelled after runtime cleanup");
+            });
+        })
+        .await;
     }
 }
 
@@ -640,12 +726,25 @@ async fn defer_trace_recording(
     terminal_tasks: &tokio_util::task::TaskTracker,
     record: impl FnOnce() + Send + 'static,
 ) {
+    let _ = run_trace_recording(terminal_tasks, record).await;
+}
+
+/// Owns each accepted trace write until completion and returns any produced trace handle.
+/// Awaiting preserves producer order; dropping the waiter leaves the write tracked for shutdown.
+pub(crate) async fn run_trace_recording<T: Send + 'static>(
+    terminal_tasks: &tokio_util::task::TaskTracker,
+    record: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
     if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-        if let Err(err) = terminal_tasks.spawn_blocking_on(record, &runtime).await {
-            tracing::warn!("rollout trace recording task failed: {err}");
+        match terminal_tasks.spawn_blocking_on(record, &runtime).await {
+            Ok(result) => Some(result),
+            Err(err) => {
+                tracing::warn!("rollout trace recording task failed: {err}");
+                None
+            }
         }
     } else {
-        record();
+        Some(record())
     }
 }
 

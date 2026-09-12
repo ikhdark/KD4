@@ -272,6 +272,20 @@ impl App {
             return;
         }
 
+        let thread_id = match server_request_thread_id(&request) {
+            Ok(thread_id) => thread_id,
+            Err(message) => {
+                self.chat_widget.add_error_message(message.clone());
+                if let Err(err) = self
+                    .reject_app_server_request(app_server_client, request.id().clone(), message)
+                    .await
+                {
+                    tracing::warn!("{err}");
+                }
+                return;
+            }
+        };
+
         if let Some(unsupported) = self
             .pending_app_server_requests
             .note_server_request(&request)
@@ -296,7 +310,7 @@ impl App {
             return;
         }
 
-        let Some(thread_id) = server_request_thread_id(&request) else {
+        let Some(thread_id) = thread_id else {
             tracing::warn!("ignoring threadless app-server request");
             return;
         };

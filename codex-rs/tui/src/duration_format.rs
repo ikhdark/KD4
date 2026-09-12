@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 pub(crate) fn format_duration(duration: Duration) -> String {
-    let millis = duration.as_millis() as i64;
+    let millis = duration.as_millis();
     if millis < 1000 {
         format!("{millis}ms")
     } else if millis < 60_000 {
@@ -23,5 +23,6 @@ mod tests {
         assert_eq!(format_duration(Duration::from_millis(1_500)), "1.50s");
         assert_eq!(format_duration(Duration::from_millis(75_000)), "1m 15s");
         assert_eq!(format_duration(Duration::from_millis(3_600_000)), "60m 00s");
+        assert_eq!(format_duration(Duration::MAX), "307445734561825860m 15s");
     }
 }

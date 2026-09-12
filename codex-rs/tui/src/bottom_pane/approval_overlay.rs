@@ -521,8 +521,8 @@ impl ApprovalOverlay {
                 }
             }
         }
-        self.queue.clear();
-        self.done = true;
+        self.current_complete = true;
+        self.advance_queue();
     }
 
     /// Apply approval-specific shortcuts before delegating to list navigation.
@@ -1271,17 +1271,6 @@ mod tests {
             request_id: RequestId::String("request-1".to_string()),
             message: "Need more information".to_string(),
         }
-    }
-
-    #[test]
-    fn ctrl_c_aborts_and_clears_queue() {
-        let (tx, _rx) = unbounded_channel::<AppEvent>();
-        let tx = AppEventSender::new(tx);
-        let mut view = make_overlay(make_exec_request(), tx, Features::with_defaults());
-        view.enqueue_request(make_exec_request());
-        assert_eq!(CancellationEvent::Handled, view.on_ctrl_c());
-        assert!(view.queue.is_empty());
-        assert!(view.is_complete());
     }
 
     #[test]

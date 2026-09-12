@@ -262,7 +262,7 @@ if (-not $script:disposed) {{
         )
         self.assertIn("Set-CodexRustMsvcLinkerEnvironment", publish_script)
 
-    def test_final_publish_dry_run_plans_required_checks(
+    def test_final_publish_dry_run_only_plans_local_publish(
         self,
     ) -> None:
         result = subprocess.run(
@@ -279,13 +279,15 @@ if (-not $script:disposed) {{
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         commands = result.stdout + result.stderr
-        self.assertIn("just test-release-tooling", commands)
+        self.assertEqual(len(commands.strip().splitlines()), 1, commands)
+        self.assertNotIn("test-release-tooling", commands)
+        self.assertNotIn("-RunDoctor", commands)
+        self.assertNotIn("-DoctorOnNoop", commands)
         self.assertIn("publish-local-codex.ps1", commands)
         for argument in (
             "-AutoSkipBuild",
             "-Profile release",
-            "-RunDoctor",
-            "-DoctorOnNoop",
+            "-Concise",
             "-CloseRunningTargetTimeoutSeconds 30",
             "-ConfigureDesktopLocalCli",
             "-DesktopCliEnvironmentTarget User",

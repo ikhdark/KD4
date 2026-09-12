@@ -351,12 +351,15 @@ impl App {
             && self.chat_widget.composer_is_empty()
             && let Some(parent_thread_id) = self.active_side_parent_thread_id()
         {
-            if self
+            if let Err(err) = self
                 .select_agent_thread_and_discard_side(tui, app_server, parent_thread_id)
                 .await
-                .is_err()
             {
-                return false;
+                self.chat_widget.add_error_message(format!(
+                    "Failed to return to parent thread {parent_thread_id}: {err}"
+                ));
+                // This was a side-return command; do not also interpret it as interrupt or exit.
+                return true;
             }
             self.active_side_parent_thread_id().is_none()
         } else {

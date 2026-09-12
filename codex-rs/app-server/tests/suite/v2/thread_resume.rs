@@ -2029,7 +2029,10 @@ async fn thread_goal_lifecycle_emits_analytics_and_clear_deletes_goal() -> Resul
     let config = std::fs::read_to_string(&config_path)?;
     std::fs::write(
         &config_path,
-        config.replace("personality = true\n", "personality = true\ngoals = true\n"),
+        format!(
+            "{}\n[analytics]\nenabled = true\n",
+            config.replace("personality = true\n", "personality = true\ngoals = true\n"),
+        ),
     )?;
     mount_analytics_capture(&analytics_server, codex_home.path()).await?;
 

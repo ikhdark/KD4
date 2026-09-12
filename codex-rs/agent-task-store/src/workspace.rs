@@ -31,6 +31,7 @@ use crate::scope::normalize_repo_path;
 use crate::scope::path_comparison_key;
 use crate::scope::relative_path_identity;
 use crate::scope::repository_identity;
+use crate::scope::repository_identity_async;
 
 /// Reserved scope for repository-wide revision capture and workspace event coverage.
 pub const REPOSITORY_WIDE_PATH: &str = ":repository:";
@@ -90,8 +91,15 @@ pub(crate) async fn capture_revision_tx(
     repo_root: &Path,
     paths: Vec<String>,
 ) -> StoreResult<WorkspaceRevision> {
-    let repository = repository_identity(repo_root)?;
-    let normalized = normalize_paths(repo_root, paths)?;
+    let repo_root = repo_root.to_path_buf();
+    let (repository, normalized) = tokio::task::spawn_blocking(move || {
+        Ok::<_, StoreError>((
+            repository_identity(&repo_root)?,
+            normalize_paths(&repo_root, paths)?,
+        ))
+    })
+    .await
+    .map_err(|error| StoreError::CorruptData(format!("repository task failed: {error}")))??;
     ensure_workspace_tx(transaction, &repository).await?;
     // Acquire the SQLite writer lane before observing the filesystem. Every capture for a
     // workspace therefore scans in the same order in which its epoch can be published.
@@ -117,7 +125,7 @@ pub(crate) async fn read_events(
     repo_root: &Path,
     after_epoch: u64,
 ) -> StoreResult<Vec<crate::WorkspaceEvent>> {
-    let repository = repository_identity(repo_root)?;
+    let repository = repository_identity_async(repo_root).await?;
     let rows = sqlx::query(
         "SELECT workspace_id, epoch, actor_id, actor_kind, attribution_confidence,
                 paths_json, contracts_json, created_at
@@ -159,7 +167,7 @@ pub(crate) async fn register_actor(
             "workspace actor and root session identities are required".to_string(),
         ));
     }
-    let repository = repository_identity(repo_root)?;
+    let repository = repository_identity_async(repo_root).await?;
     let mut transaction = pool.begin().await?;
     ensure_workspace_tx(&mut transaction, &repository).await?;
     let now = Utc::now();
@@ -956,13 +964,14 @@ async fn include_missing_observed_entries_tx(
     .bind(workspace_id)
     .fetch_all(&mut **transaction)
     .await?;
+    let mut snapshot_paths = Vec::new();
     for row in rows {
         let path = row.get::<String, _>("path");
         if present.contains(&path_comparison_key(&path)) {
             continue;
         }
         if repository_wide {
-            entries.push(snapshot_file(repository_root, path)?);
+            snapshot_paths.push(path);
         } else if observed_paths
             .iter()
             .any(|observed| observed_path_covers(observed, &path))
@@ -973,6 +982,18 @@ async fn include_missing_observed_entries_tx(
                 existed: false,
             });
         }
+    }
+    if !snapshot_paths.is_empty() {
+        let repository_root = repository_root.to_path_buf();
+        let snapshots = tokio::task::spawn_blocking(move || {
+            snapshot_paths
+                .into_iter()
+                .map(|path| snapshot_file(&repository_root, path))
+                .collect::<StoreResult<Vec<_>>>()
+        })
+        .await
+        .map_err(|error| StoreError::CorruptData(format!("manifest task failed: {error}")))??;
+        entries.extend(snapshots);
     }
     entries.sort();
     Ok(())

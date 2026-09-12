@@ -1226,13 +1226,21 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     #[test]
-    fn collaboration_mode_indicator_has_only_plan_variant() {
-        let indicator = CollaborationModeIndicator::Plan;
-        let mode_name = match indicator {
-            CollaborationModeIndicator::Plan => "Plan",
-        };
-
-        assert_eq!(mode_name, "Plan");
+    fn collaboration_mode_indicator_renders_plan_and_cycle_hint() {
+        let indicator = Some(CollaborationModeIndicator::Plan);
+        assert_eq!(
+            mode_indicator_line(indicator, /*show_cycle_hint*/ false)
+                .expect("plan indicator")
+                .to_string(),
+            "Plan mode"
+        );
+        assert_eq!(
+            mode_indicator_line(indicator, /*show_cycle_hint*/ true)
+                .expect("plan indicator with shortcut")
+                .to_string(),
+            "Plan mode (shift+tab to cycle)"
+        );
+        assert!(mode_indicator_line(None, /*show_cycle_hint*/ true).is_none());
     }
 
     fn snapshot_footer(name: &str, props: FooterProps) {

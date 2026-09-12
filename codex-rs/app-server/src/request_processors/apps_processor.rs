@@ -127,6 +127,7 @@ impl AppsRequestProcessor {
                         config.apps_mcp_product_sku.as_deref(),
                     ),
                 )
+                .await
                 .unwrap_or_default();
             app_tool_summaries_by_connector(&tools)
         } else {

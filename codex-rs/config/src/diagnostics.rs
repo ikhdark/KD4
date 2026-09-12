@@ -492,14 +492,30 @@ mod consolidated_type_tests {
     use super::TextRange;
 
     #[test]
-    fn diagnostic_coordinates_are_execpolicy_owned() {
-        let range = TextRange {
-            start: TextPosition { line: 1, column: 2 },
-            end: TextPosition { line: 3, column: 4 },
-        };
-        let execpolicy_range: codex_execpolicy::TextRange = range;
-
-        assert_eq!(execpolicy_range.start.line, 1);
-        assert_eq!(execpolicy_range.end.column, 4);
+    fn invalid_config_value_has_exact_coordinates_and_rendered_highlight() {
+        let contents = "# settings\nallow_login_shell = 123\n";
+        let error = super::config_error_from_typed_toml::<crate::config_toml::ConfigToml>(
+            "config.toml",
+            contents,
+        )
+        .expect("an integer is invalid for a boolean option");
+        let range: codex_execpolicy::TextRange = error.range;
+        assert_eq!(
+            range,
+            TextRange {
+                start: TextPosition {
+                    line: 2,
+                    column: 21
+                },
+                end: TextPosition {
+                    line: 2,
+                    column: 23
+                },
+            }
+        );
+        let rendered = super::format_config_error(&error, contents);
+        assert!(rendered.starts_with("config.toml:2:21: "));
+        assert!(rendered.contains("2 | allow_login_shell = 123\n"));
+        assert!(rendered.ends_with(&format!("  | {}^^^", " ".repeat(20))));
     }
 }

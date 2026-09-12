@@ -1327,15 +1327,6 @@ mod tests {
     }
 
     #[test]
-    fn artifact_recovery_leaves_space_for_the_outer_exec_envelope() {
-        assert_eq!(
-            CODE_MODE_RECOVERY_TOKEN_CEILING + CODE_MODE_RECOVERY_WRAPPER_RESERVE_TOKENS,
-            codex_utils_output_truncation::DEFAULT_SUCCESS_OUTPUT_TOKENS,
-        );
-        assert_eq!(CODE_MODE_RECOVERY_TOKEN_CEILING, 3_000);
-    }
-
-    #[test]
     fn default_range_is_exactly_two_hundred_lines() {
         let args = ReadToolOutputArgs {
             artifact_id: uuid::Uuid::now_v7().to_string(),

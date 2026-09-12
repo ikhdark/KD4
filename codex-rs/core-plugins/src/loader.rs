@@ -1000,21 +1000,33 @@ fn default_mcp_config_paths(plugin_root: &Path) -> Vec<AbsolutePathBuf> {
 }
 
 pub async fn load_plugin_apps(plugin_root: &Path) -> Vec<AppDeclaration> {
-    if let Some(manifest) = load_plugin_manifest(plugin_root) {
-        return load_plugin_apps_from_manifest(plugin_root, &manifest.paths).await;
-    }
-    load_apps_from_paths(plugin_root, default_app_config_paths(plugin_root)).await
+    let root = plugin_root.to_path_buf();
+    let paths = tokio::task::spawn_blocking(move || match load_plugin_manifest(&root) {
+        Some(manifest) => plugin_app_config_paths(&root, &manifest.paths),
+        None => default_app_config_paths(&root),
+    })
+    .await
+    .unwrap_or_else(|err| {
+        warn!(error = %err, "failed to inspect plugin app manifest");
+        Vec::new()
+    });
+    load_apps_from_paths(plugin_root, paths).await
 }
 
 pub(crate) async fn load_plugin_apps_from_manifest(
     plugin_root: &Path,
     manifest_paths: &PluginManifestPaths,
 ) -> Vec<AppDeclaration> {
-    load_apps_from_paths(
-        plugin_root,
-        plugin_app_config_paths(plugin_root, manifest_paths),
-    )
-    .await
+    let root = plugin_root.to_path_buf();
+    let manifest_paths = manifest_paths.clone();
+    let paths =
+        tokio::task::spawn_blocking(move || plugin_app_config_paths(&root, &manifest_paths))
+            .await
+            .unwrap_or_else(|err| {
+                warn!(error = %err, "failed to inspect plugin app paths");
+                Vec::new()
+            });
+    load_apps_from_paths(plugin_root, paths).await
 }
 
 pub fn plugin_app_declarations_from_value(value: &JsonValue) -> Vec<AppDeclaration> {
@@ -1199,10 +1211,20 @@ pub async fn plugin_capability_summary_from_root(
     plugin_id: &PluginId,
     plugin_root: &AbsolutePathBuf,
 ) -> Option<PluginCapabilitySummary> {
-    let manifest = load_plugin_manifest(plugin_root.as_path())?;
+    let root = plugin_root.clone();
+    let (manifest, has_skills, app_paths) = tokio::task::spawn_blocking(move || {
+        let manifest = load_plugin_manifest(root.as_path())?;
+        let has_skills = !plugin_skill_roots(&root, &manifest.paths).is_empty();
+        let app_paths = plugin_app_config_paths(root.as_path(), &manifest.paths);
+        Some((manifest, has_skills, app_paths))
+    })
+    .await
+    .unwrap_or_else(|err| {
+        warn!(error = %err, "failed to inspect plugin capabilities");
+        None
+    })?;
 
     let manifest_paths = &manifest.paths;
-    let has_skills = !plugin_skill_roots(plugin_root, manifest_paths).is_empty();
     let mut mcp_server_names = load_plugin_mcp_servers_from_manifest(
         plugin_root.as_path(),
         manifest_paths,
@@ -1214,11 +1236,7 @@ pub async fn plugin_capability_summary_from_root(
     mcp_server_names.sort_unstable();
     mcp_server_names.dedup();
 
-    let app_declarations = load_apps_from_paths(
-        plugin_root.as_path(),
-        plugin_app_config_paths(plugin_root.as_path(), manifest_paths),
-    )
-    .await;
+    let app_declarations = load_apps_from_paths(plugin_root.as_path(), app_paths).await;
     let app_connector_ids = app_connector_ids_from_declarations(&app_declarations);
 
     Some(PluginCapabilitySummary {
@@ -1251,7 +1269,14 @@ pub async fn load_plugin_mcp_servers(
 }
 
 async fn load_declared_plugin_mcp_servers(plugin_root: &Path) -> HashMap<String, McpServerConfig> {
-    let Some(manifest) = load_plugin_manifest(plugin_root) else {
+    let root = plugin_root.to_path_buf();
+    let Some(manifest) = tokio::task::spawn_blocking(move || load_plugin_manifest(&root))
+        .await
+        .unwrap_or_else(|err| {
+            warn!(error = %err, "failed to inspect plugin MCP manifest");
+            None
+        })
+    else {
         return HashMap::new();
     };
 
@@ -1282,7 +1307,17 @@ pub(crate) async fn load_plugin_mcp_servers_from_manifest(
             }
         }
         Some(PluginManifestMcpServers::Path(_)) | None => {
-            for mcp_config_path in plugin_mcp_config_paths(plugin_root, manifest_paths) {
+            let root = plugin_root.to_path_buf();
+            let manifest_paths = manifest_paths.clone();
+            let paths = tokio::task::spawn_blocking(move || {
+                plugin_mcp_config_paths(&root, &manifest_paths)
+            })
+            .await
+            .unwrap_or_else(|err| {
+                warn!(error = %err, "failed to inspect plugin MCP paths");
+                Vec::new()
+            });
+            for mcp_config_path in paths {
                 let plugin_mcp = load_mcp_servers_from_file(plugin_root, &mcp_config_path).await;
                 for (name, mut config) in plugin_mcp.mcp_servers {
                     if let Some(policy) = plugin_policy.and_then(|policy| policy.get(&name)) {

@@ -99,11 +99,34 @@ mod tests {
 
     #[test]
     fn exporter_value_types_are_protocol_owned() {
-        let protocol: codex_protocol::config_types::OtelHttpProtocol = OtelHttpProtocol::Json;
+        let protocol: codex_protocol::config_types::OtelHttpProtocol =
+            serde_json::from_value(serde_json::json!("json")).expect("protocol wire value");
         let tls: codex_protocol::config_types::OtelTlsConfig = OtelTlsConfig::default();
-
+        let configured = OtelExporter::OtlpHttp {
+            endpoint: "http://localhost:4318/v1/metrics".to_string(),
+            headers: std::collections::HashMap::from([(
+                "test-header".to_string(),
+                "test-value".to_string(),
+            )]),
+            protocol,
+            tls: Some(tls),
+        };
+        let OtelExporter::OtlpHttp {
+            endpoint,
+            headers,
+            protocol,
+            tls,
+        } = resolve_exporter(&configured)
+        else {
+            panic!("explicit HTTP exporter must survive resolution");
+        };
+        assert_eq!(endpoint, "http://localhost:4318/v1/metrics");
+        assert_eq!(
+            headers.get("test-header").map(String::as_str),
+            Some("test-value")
+        );
         assert_eq!(protocol, OtelHttpProtocol::Json);
-        assert_eq!(tls, OtelTlsConfig::default());
+        assert!(tls.is_some(), "explicit TLS configuration must be retained");
     }
 
     #[test]

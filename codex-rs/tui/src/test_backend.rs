@@ -20,6 +20,7 @@ use ratatui::layout::Size;
 /// - getting the cursor position
 pub struct VT100Backend {
     crossterm_backend: CrosstermBackend<vt100::Parser>,
+    fail_next_write_of: Option<Vec<u8>>,
 }
 
 impl VT100Backend {
@@ -28,7 +29,13 @@ impl VT100Backend {
         crossterm::style::force_color_output(true);
         Self {
             crossterm_backend: CrosstermBackend::new(vt100::Parser::new(height, width, 0)),
+            fail_next_write_of: None,
         }
+    }
+
+    /// Fail one external raw write of this payload; all other bytes still reach VT100.
+    pub fn fail_next_write_of(&mut self, payload: &[u8]) {
+        self.fail_next_write_of = Some(payload.to_vec());
     }
 
     pub fn vt100(&self) -> &vt100::Parser {
@@ -38,6 +45,10 @@ impl VT100Backend {
 
 impl Write for VT100Backend {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if self.fail_next_write_of.as_deref() == Some(buf) {
+            self.fail_next_write_of = None;
+            return Err(io::Error::other("injected terminal write failure"));
+        }
         self.crossterm_backend.writer_mut().write(buf)
     }
 

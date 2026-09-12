@@ -1,6 +1,7 @@
 use anyhow::Result;
 use std::io::Write;
 
+use windows::Win32::Foundation::ERROR_FILE_NOT_FOUND;
 use windows::Win32::Foundation::S_OK;
 use windows::Win32::Foundation::VARIANT_TRUE;
 use windows::Win32::NetworkManagement::WindowsFirewall::INetFwPolicy2;
@@ -202,15 +203,27 @@ fn remove_rule_if_present(
     log: &mut dyn Write,
 ) -> Result<()> {
     let name = BSTR::from(internal_name);
-    if unsafe { rules.Item(&name) }.is_ok() {
-        unsafe { rules.Remove(&name) }.map_err(|err| {
-            anyhow::Error::new(SetupFailure::new(
-                SetupErrorCode::HelperFirewallRuleCreateOrAddFailed,
-                format!("Rules::Remove failed for {internal_name}: {err:?}"),
-            ))
-        })?;
-        log_line(log, &format!("firewall rule removed name={internal_name}"))?;
+    match unsafe { rules.Item(&name) } {
+        Ok(_) => {}
+        Err(error)
+            if error.code() == windows::core::HRESULT::from_win32(ERROR_FILE_NOT_FOUND.0) =>
+        {
+            return Ok(());
+        }
+        Err(error) => {
+            return Err(anyhow::Error::new(SetupFailure::new(
+                SetupErrorCode::HelperFirewallPolicyAccessFailed,
+                format!("Rules::Item failed for {internal_name}: {error:?}"),
+            )));
+        }
     }
+    unsafe { rules.Remove(&name) }.map_err(|err| {
+        anyhow::Error::new(SetupFailure::new(
+            SetupErrorCode::HelperFirewallRuleCreateOrAddFailed,
+            format!("Rules::Remove failed for {internal_name}: {err:?}"),
+        ))
+    })?;
+    log_line(log, &format!("firewall rule removed name={internal_name}"))?;
     Ok(())
 }
 
@@ -493,6 +506,45 @@ mod tests {
     use super::*;
 
     #[test]
+    fn remove_rule_propagates_native_lookup_errors_and_preserves_missing_idempotence() {
+        let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+        assert!(hr.is_ok(), "CoInitializeEx failed: {hr:?}");
+        let result = (|| -> Result<()> {
+            let policy: INetFwPolicy2 =
+                unsafe { CoCreateInstance(&NetFwPolicy2, None, CLSCTX_INPROC_SERVER) }?;
+            let rules = unsafe { policy.Rules() }?;
+            let mut log = Vec::new();
+            // Native Item rejects an empty BSTR with E_INVALIDARG. No policy is
+            // mutated: lookup failure must return before Rules::Remove.
+            let error = remove_rule_if_present(&rules, "", &mut log)
+                .expect_err("invalid lookup cannot be reported as absent");
+            let failure = error
+                .downcast_ref::<SetupFailure>()
+                .expect("typed setup failure");
+            assert_eq!(
+                failure.code,
+                SetupErrorCode::HelperFirewallPolicyAccessFailed
+            );
+            assert!(format!("{error:#}").contains("Rules::Item failed"));
+            assert!(log.is_empty(), "failed removal must not emit success");
+            let missing = format!(
+                "codex-kd4-absent-{}-{}",
+                std::process::id(),
+                rand::random::<u64>()
+            );
+            for _ in 0..2 {
+                remove_rule_if_present(&rules, &missing, &mut log)?;
+            }
+            assert!(log.is_empty(), "absent rule is an idempotent no-op");
+            Ok(())
+        })();
+        unsafe {
+            CoUninitialize();
+        }
+        result.expect("native removal boundary");
+    }
+
+    #[test]
     fn configured_remote_address_literals_are_accepted_by_firewall_com() {
         let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
         assert!(hr.is_ok(), "CoInitializeEx failed: {hr:?}");
@@ -564,15 +616,33 @@ mod tests {
             configure_rule(&rule, spec)?;
             let owner = rule.LocalUserOwner()?.to_string();
             let authorized_users = rule.LocalUserAuthorizedList()?.to_string();
-            Ok::<_, anyhow::Error>((owner, authorized_users))
+            let protocol = rule.Protocol()?;
+            let remote_addresses = rule.RemoteAddresses()?.to_string();
+            let remote_ports = rule.RemotePorts()?.to_string();
+            Ok::<_, anyhow::Error>((
+                owner,
+                authorized_users,
+                protocol,
+                remote_addresses,
+                remote_ports,
+            ))
         });
 
         unsafe {
             CoUninitialize();
         }
 
-        for (spec, result) in specs.into_iter().zip(results) {
-            let (owner, authorized_users) = result.unwrap_or_else(|err| {
+        let expected_scopes = [
+            (17, "127.0.0.0/255.0.0.0,::/127", "*"),
+            (6, "127.0.0.0/255.0.0.0,::/127", "1-8079,8081-65535"),
+            (
+                256,
+                "0.0.0.0-126.255.255.255,128.0.0.0-255.255.255.255,::-::,::2-ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+                "",
+            ),
+        ];
+        for ((spec, result), expected) in specs.into_iter().zip(results).zip(expected_scopes) {
+            let (owner, authorized_users, protocol, remote_addresses, remote_ports) = result.unwrap_or_else(|err| {
                 panic!(
                     "firewall rejected rule={} protocol={} remote_addresses={:?} remote_ports={:?}: {err:#}",
                     spec.internal_name, spec.protocol, spec.remote_addresses, spec.remote_ports
@@ -580,6 +650,9 @@ mod tests {
             });
             assert_eq!(owner, offline_sid);
             assert_eq!(authorized_users, "");
+            assert_eq!(protocol, expected.0);
+            assert_eq!(remote_addresses, expected.1);
+            assert_eq!(remote_ports, expected.2);
         }
     }
 

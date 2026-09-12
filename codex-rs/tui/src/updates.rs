@@ -6,7 +6,7 @@ use crate::npm_registry::NpmPackageInfo;
 use crate::update_action;
 use crate::update_action::UpdateAction;
 use crate::updates_cache::VersionInfo;
-use crate::updates_cache::read_version_info;
+use crate::updates_cache::read_version_info_async;
 use crate::updates_cache::version_filepath;
 use chrono::Duration;
 use chrono::Utc;
@@ -23,14 +23,14 @@ use crate::version::CODEX_CLI_VERSION;
 
 pub(crate) use crate::updates_cache::dismiss_version;
 
-pub fn get_upgrade_version(config: &Config) -> Option<String> {
+pub async fn get_upgrade_version(config: &Config) -> Option<String> {
     if !config.check_for_update_on_startup || is_source_build_version(CODEX_CLI_VERSION) {
         return None;
     }
 
     let action = update_action::get_update_action();
     let version_file = version_filepath(config);
-    let info = read_version_info(&version_file).ok();
+    let info = read_version_info_async(&version_file).await.ok();
 
     if match &info {
         None => true,
@@ -89,7 +89,7 @@ async fn check_for_update(
     };
 
     // Preserve any previously dismissed version if present.
-    let prev_info = read_version_info(version_file).ok();
+    let prev_info = read_version_info_async(version_file).await.ok();
     let info = VersionInfo {
         latest_version,
         last_checked_at: Utc::now(),
@@ -139,6 +139,91 @@ mod tests {
     use wiremock::ResponseTemplate;
     use wiremock::matchers::method;
 
+    #[test]
+    fn cached_upgrade_getters_yield_and_preserve_version_and_dismissal_behavior() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .expect("current-thread runtime");
+        runtime.block_on(async {
+            let home = tempfile::tempdir().expect("isolated update cache");
+            let mut config = crate::legacy_core::config::ConfigBuilder::default()
+                .codex_home(home.path().to_path_buf())
+                .build()
+                .await
+                .expect("config");
+            config.check_for_update_on_startup = true;
+            let cache = home.path().join("version.json");
+            let fresh = serde_json::json!({
+                "latest_version": "9999.0.0",
+                "last_checked_at": Utc::now(),
+                "dismissed_version": null
+            });
+            let bytes = serde_json::to_vec(&fresh).expect("cache JSON");
+            tokio::fs::write(&cache, &bytes).await.expect("fresh cache");
+            if is_source_build_version(CODEX_CLI_VERSION) {
+                // Ordinary source release builds intentionally suppress update checks.
+                // Worker placement below requires a nonzero numeric release version at build time.
+                assert_eq!(get_upgrade_version(&config).await, None);
+                assert_eq!(get_upgrade_version_for_popup(&config).await, None);
+                assert_eq!(tokio::fs::read(&cache).await.unwrap(), bytes);
+                return;
+            }
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let blocker = tokio::task::spawn_blocking(move || {
+                started_tx.send(()).expect("blocking pool occupied");
+                let _ = release_rx.recv_timeout(std::time::Duration::from_secs(5));
+            });
+            started_rx.await.expect("worker started");
+            let mut latest = Box::pin(get_upgrade_version(&config));
+            assert!(
+                futures::poll!(tokio::task::unconstrained(latest.as_mut())).is_pending(),
+                "public cached getter must yield until its file I/O worker is available"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            assert!(futures::poll!(tokio::task::unconstrained(latest.as_mut())).is_pending());
+            release_tx.send(()).expect("release file I/O worker");
+            assert_eq!(latest.await.as_deref(), Some("9999.0.0"));
+            blocker.await.expect("worker finished");
+            assert_eq!(tokio::fs::read(&cache).await.unwrap(), bytes);
+            assert_eq!(
+                get_upgrade_version_for_popup(&config).await.as_deref(),
+                Some("9999.0.0")
+            );
+
+            dismiss_version(&config, "9999.0.0")
+                .await
+                .expect("persist dismissal");
+            let dismissed: serde_json::Value =
+                serde_json::from_slice(&tokio::fs::read(&cache).await.expect("persisted cache"))
+                    .expect("dismissed JSON");
+            assert_eq!(dismissed["dismissed_version"], "9999.0.0");
+            assert_eq!(dismissed["latest_version"], "9999.0.0");
+            assert_eq!(dismissed["last_checked_at"], fresh["last_checked_at"]);
+            assert_eq!(
+                get_upgrade_version(&config).await.as_deref(),
+                Some("9999.0.0")
+            );
+            assert_eq!(get_upgrade_version_for_popup(&config).await, None);
+
+            let same_version = serde_json::json!({
+                "latest_version": CODEX_CLI_VERSION,
+                "last_checked_at": Utc::now(),
+                "dismissed_version": null
+            });
+            tokio::fs::write(&cache, serde_json::to_vec(&same_version).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(get_upgrade_version(&config).await, None);
+            config.check_for_update_on_startup = false;
+            tokio::fs::write(&cache, &bytes).await.unwrap();
+            assert_eq!(get_upgrade_version_for_popup(&config).await, None);
+            assert_eq!(tokio::fs::read(&cache).await.unwrap(), bytes);
+        });
+    }
+
     #[tokio::test]
     async fn github_update_check_uses_effective_proxy_route() {
         let proxy = MockServer::start().await;
@@ -165,15 +250,15 @@ mod tests {
 
 /// Returns the latest version to show in a popup, if it should be shown.
 /// This respects the user's dismissal choice for the current latest version.
-pub fn get_upgrade_version_for_popup(config: &Config) -> Option<String> {
+pub async fn get_upgrade_version_for_popup(config: &Config) -> Option<String> {
     if !config.check_for_update_on_startup || is_source_build_version(CODEX_CLI_VERSION) {
         return None;
     }
 
     let version_file = version_filepath(config);
-    let latest = get_upgrade_version(config)?;
+    let latest = get_upgrade_version(config).await?;
     // If the user dismissed this exact version previously, do not show the popup.
-    if let Ok(info) = read_version_info(&version_file)
+    if let Ok(info) = read_version_info_async(&version_file).await
         && info.dismissed_version.as_deref() == Some(latest.as_str())
     {
         return None;

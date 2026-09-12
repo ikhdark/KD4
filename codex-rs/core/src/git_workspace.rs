@@ -174,11 +174,27 @@ impl GitWorkspaceMetadata {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct WorkspaceEvidenceIdentity {
+    /// Repository discovery or capture failed. Unlike a proven non-Git `None`, this
+    /// value never authorizes reuse, even when two failed captures are equal.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) unavailable: bool,
     #[serde(default)]
     pub(crate) repository_root: Option<String>,
     pub(crate) head_identity: Option<String>,
     pub(crate) index_identity: Option<String>,
     pub(crate) worktree_identity: Option<String>,
+}
+
+impl WorkspaceEvidenceIdentity {
+    fn unavailable(repository_root: Option<&Path>) -> Self {
+        Self {
+            unavailable: true,
+            repository_root: repository_root.map(|root| root.to_string_lossy().into_owned()),
+            head_identity: None,
+            index_identity: None,
+            worktree_identity: None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -217,8 +233,16 @@ pub(crate) async fn capture_workspace_evidence_identity(
 async fn capture_workspace_evidence_identity_with_attribution(
     cwd: &Path,
 ) -> WorkspaceEvidenceCapture {
-    let Some(repo_root) = resolve_workspace_evidence_root(cwd).await else {
-        return WorkspaceEvidenceCapture::default();
+    let repo_root = match resolve_workspace_evidence_root(cwd).await {
+        Ok(Some(root)) => root,
+        result => {
+            return WorkspaceEvidenceCapture {
+                identity: result
+                    .err()
+                    .map(|_| WorkspaceEvidenceIdentity::unavailable(None)),
+                timed_out_git_dependencies: Vec::new(),
+            };
+        }
     };
     capture_workspace_evidence_identity_for_repo_root_with_attribution(repo_root).await
 }
@@ -233,6 +257,7 @@ async fn capture_workspace_evidence_with_cancellation(
     repo_root: PathBuf,
     cancellation: CancellationToken,
 ) -> WorkspaceEvidenceCapture {
+    let unavailable = WorkspaceEvidenceIdentity::unavailable(Some(&repo_root));
     match within_workspace_generation_deadline(
         WORKSPACE_GENERATION_DEADLINE,
         capture_workspace_generation_marker(repo_root, cancellation),
@@ -240,11 +265,11 @@ async fn capture_workspace_evidence_with_cancellation(
     .await
     {
         Ok(identity) => WorkspaceEvidenceCapture {
-            identity,
+            identity: Some(identity.unwrap_or(unavailable)),
             timed_out_git_dependencies: Vec::new(),
         },
         Err(_) => WorkspaceEvidenceCapture {
-            identity: None,
+            identity: Some(unavailable),
             timed_out_git_dependencies: vec![
                 WorkspaceEvidenceGitDependency::Head,
                 WorkspaceEvidenceGitDependency::Index,
@@ -255,16 +280,29 @@ async fn capture_workspace_evidence_with_cancellation(
     }
 }
 
-async fn resolve_workspace_evidence_root(cwd: &Path) -> Option<PathBuf> {
+async fn resolve_workspace_evidence_root(cwd: &Path) -> std::io::Result<Option<PathBuf>> {
     let cwd = cwd.to_path_buf();
     tokio::task::spawn_blocking(move || {
-        get_git_repo_root(&cwd)
-            .as_deref()
-            .map(canonical_workspace_evidence_root)
+        // Only an exhaustive, successful ancestor walk proves absence. Missing
+        // cwd, unreadable metadata and worker failure must not look like non-Git.
+        let cwd = dunce::canonicalize(cwd)?;
+        let base = if std::fs::metadata(&cwd)?.is_dir() {
+            cwd.as_path()
+        } else {
+            cwd.parent()
+                .ok_or_else(|| std::io::Error::other("cwd has no parent"))?
+        };
+        for root in base.ancestors() {
+            match std::fs::symlink_metadata(root.join(".git")) {
+                Ok(_) => return Ok(Some(root.to_path_buf())),
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(None)
     })
     .await
-    .ok()
-    .flatten()
+    .map_err(std::io::Error::other)?
 }
 
 async fn within_workspace_generation_deadline<T, Capture>(
@@ -281,6 +319,7 @@ fn workspace_generation_status_args() -> &'static [&'static str] {
     &[
         "status",
         "--porcelain=v2",
+        "--branch",
         "-z",
         "--untracked-files=all",
         "--",
@@ -298,11 +337,8 @@ async fn capture_workspace_generation_marker(
         deadline: Instant::now() + WORKSPACE_GENERATION_DEADLINE,
         cancellation,
     };
-    let (head, status) = tokio::join!(
-        workspace_generation_git_output(&repo_root, &["rev-parse", "--verify", "HEAD"]),
-        workspace_generation_status(&repo_root),
-    );
-    let (status, paths) = status?;
+    let (status, paths) = workspace_generation_status(&repo_root).await?;
+    let head_identity = workspace_head_identity(&status)?;
     let metadata = capture_workspace_metadata(repo_root.clone(), paths, control).await?;
 
     let mut index_hasher = Sha256::new();
@@ -314,13 +350,11 @@ async fn capture_workspace_generation_marker(
     worktree_hasher.update(&metadata.manifest);
 
     Some(WorkspaceEvidenceIdentity {
-        repository_root: Some(
-            dunce::canonicalize(&repo_root)
-                .unwrap_or(repo_root)
-                .to_string_lossy()
-                .into_owned(),
-        ),
-        head_identity: workspace_head_identity(head),
+        unavailable: false,
+        // Both capture entry points obtain this canonical root from the
+        // blocking discovery worker. Reuse that same captured repository.
+        repository_root: Some(repo_root.to_string_lossy().into_owned()),
+        head_identity,
         index_identity: Some(format!("{:x}", index_hasher.finalize())),
         worktree_identity: Some(format!("{:x}", worktree_hasher.finalize())),
     })
@@ -369,6 +403,7 @@ impl WorkspaceStatusReader {
                 continue;
             }
             let (path, deleted) = match record.first().copied()? {
+                b'#' if record.get(1) == Some(&b' ') => continue,
                 b'?' if record.get(1) == Some(&b' ') => (record.get(2..)?, false),
                 kind @ (b'1' | b'2' | b'u') => {
                     let count = match kind {
@@ -422,18 +457,48 @@ impl WorkspaceStatusReader {
 async fn workspace_generation_status(
     repo_root: &Path,
 ) -> Option<(Vec<u8>, Vec<WorkspaceGenerationPath>)> {
-    let mut child = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .arg("-c")
         .arg(format!("core.hooksPath={DISABLED_HOOKS_PATH}"))
         .args(["-c", "core.fsmonitor=false"])
         .args(workspace_generation_status_args())
         .env("GIT_OPTIONAL_LOCKS", "0")
         .current_dir(repo_root)
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .ok()?;
+        .kill_on_drop(true);
+    // Status may run clean filters when stat information alone cannot establish
+    // whether a tracked file changed. Keep their tree owned across the outer
+    // workspace-capture deadline, cancellation, and rejected partial output.
+    #[cfg(windows)]
+    let (_managed, mut child) = {
+        command.creation_flags(codex_utils_pty::WINDOWS_CREATE_SUSPENDED);
+        let managed = codex_utils_pty::ManagedRootProcess::reserve_with_reclaim()
+            .await
+            .ok()?;
+        managed.require_descendant_containment().ok()?;
+        // Carry both owners through the blocking operation. If capture is
+        // cancelled while spawning, the abandoned result still owns the job
+        // and kill-on-drop child, including before it reaches this await.
+        tokio::task::spawn_blocking(move || {
+            let mut child = command.spawn()?;
+            let pid = child
+                .id()
+                .ok_or_else(|| std::io::Error::other("missing Git process id"))?;
+            if let Err(error) = managed.attach_and_resume(pid) {
+                let _ = child.start_kill();
+                return Err(error);
+            }
+            Ok((managed, child))
+        })
+        .await
+        .ok()?
+        .ok()?
+    };
+    #[cfg(not(windows))]
+    let mut child = command.spawn().ok()?;
     let mut stdout = child.stdout.take()?;
     let mut reader = WorkspaceStatusReader::new();
     let mut buffer = [0; 8192];
@@ -453,13 +518,15 @@ async fn workspace_generation_status(
     reader.finish()
 }
 
-fn workspace_head_identity(head: Option<Vec<u8>>) -> Option<String> {
-    head.and_then(|head| {
-        String::from_utf8(head)
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-    })
+fn workspace_head_identity(status: &[u8]) -> Option<Option<String>> {
+    let head = status
+        .split(|byte| *byte == 0)
+        .find_map(|record| record.strip_prefix(b"# branch.oid "))?;
+    if head == b"(initial)" {
+        return Some(None);
+    }
+    let head = std::str::from_utf8(head).ok()?;
+    (!head.is_empty()).then(|| Some(head.to_string()))
 }
 
 struct WorkspaceGenerationMetadata {
@@ -589,6 +656,7 @@ async fn capture_workspace_metadata(
     }).await.ok()?
 }
 
+#[cfg(test)]
 async fn workspace_generation_git_output(repo_root: &Path, args: &[&str]) -> Option<Vec<u8>> {
     let mut command = Command::new("git");
     command
@@ -646,26 +714,281 @@ struct StableGitMetadata {
     latest_git_commit_hash: Option<String>,
 }
 
+// Only this worker owns raw watcher registrations/subscribers. Requests and
+// returned leases contain no native resource, including abandoned replies.
+const GIT_WATCH_REQUEST_CAPACITY: usize = 64;
+
+#[derive(Clone, Copy)]
+enum GitWatchKind {
+    Metadata,
+    Source,
+}
+
+struct GitWatchWorker {
+    sender: tokio::sync::mpsc::Sender<GitWatchCommand>,
+    #[cfg(test)]
+    probe: Arc<GitWatchWorkerProbe>,
+}
+
+enum GitWatchCommand {
+    Register {
+        kind: GitWatchKind,
+        paths: Vec<WatchPath>,
+        sender: tokio::sync::mpsc::Sender<GitWatchCommand>,
+        reply: tokio::sync::oneshot::Sender<Result<GitWatchLease, String>>,
+    },
+    Sweep,
+}
+
+#[derive(Default)]
+struct GitWatchLease {
+    alive: Option<Arc<()>>,
+    sender: Option<tokio::sync::mpsc::Sender<GitWatchCommand>>,
+}
+
+impl Drop for GitWatchLease {
+    fn drop(&mut self) {
+        // Release before waking: otherwise the worker can observe a live lease,
+        // go idle, and never receive another command for this retirement.
+        drop(self.alive.take());
+        if let Some(sender) = self.sender.take() {
+            // Full means a queued command already guarantees a subsequent sweep.
+            // Closed means the worker is already retiring its owned registrations.
+            let _ = sender.try_send(GitWatchCommand::Sweep);
+        }
+    }
+}
+
+// Test controls pause immediately before the real native-operation boundary;
+// they retain the actual WatchRegistration and do not replace registration logic.
+#[cfg(test)]
+#[derive(Default)]
+struct GitWatchWorkerProbe {
+    registered: std::sync::atomic::AtomicUsize,
+    retired: std::sync::atomic::AtomicUsize,
+    stopped: AtomicBool,
+    thread: StdMutex<Option<std::thread::ThreadId>>,
+    changed: tokio::sync::Notify,
+    before_reply: StdMutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            std::sync::mpsc::Receiver<()>,
+        )>,
+    >,
+    before_retire: StdMutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            std::sync::mpsc::Receiver<()>,
+        )>,
+    >,
+}
+
+#[cfg(test)]
+impl GitWatchWorkerProbe {
+    fn pause(
+        slot: &StdMutex<
+            Option<(
+                tokio::sync::oneshot::Sender<()>,
+                std::sync::mpsc::Receiver<()>,
+            )>,
+        >,
+    ) {
+        let pause = slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some((started, release)) = pause {
+            let _ = started.send(());
+            // Dropping the test's release sender also releases a failed test.
+            let _ = release.recv();
+        }
+    }
+
+    fn arm(
+        slot: &StdMutex<
+            Option<(
+                tokio::sync::oneshot::Sender<()>,
+                std::sync::mpsc::Receiver<()>,
+            )>,
+        >,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (started, started_receiver) = tokio::sync::oneshot::channel();
+        let (release, release_receiver) = std::sync::mpsc::channel();
+        *slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((started, release_receiver));
+        (started_receiver, release)
+    }
+
+    async fn wait_for(&self, retired: usize, stopped: bool) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let changed = self.changed.notified();
+                if self.retired.load(Ordering::Acquire) >= retired
+                    && (!stopped || self.stopped.load(Ordering::Acquire))
+                {
+                    return;
+                }
+                changed.await;
+            }
+        })
+        .await
+        .expect("watch worker must finish the owned native retirement");
+    }
+}
+
+impl GitWatchWorker {
+    fn start(
+        metadata: Option<FileWatcherSubscriber>,
+        source: Option<FileWatcherSubscriber>,
+    ) -> std::io::Result<Self> {
+        let (sender, mut receiver) =
+            tokio::sync::mpsc::channel::<GitWatchCommand>(GIT_WATCH_REQUEST_CAPACITY);
+        #[cfg(test)]
+        let probe = Arc::new(GitWatchWorkerProbe::default());
+        #[cfg(test)]
+        let worker_probe = Arc::clone(&probe);
+        std::thread::Builder::new()
+            .name("codex-git-watches".to_string())
+            .spawn(move || {
+                #[cfg(test)]
+                {
+                    *worker_probe
+                        .thread
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        Some(std::thread::current().id());
+                }
+                let mut registrations: Vec<(std::sync::Weak<()>, Option<WatchRegistration>)> =
+                    Vec::new();
+                let retire_dead =
+                    |registrations: &mut Vec<(std::sync::Weak<()>, Option<WatchRegistration>)>| {
+                        registrations.retain_mut(|(alive, registration)| {
+                            if alive.strong_count() != 0 {
+                                return true;
+                            }
+                            #[cfg(test)]
+                            GitWatchWorkerProbe::pause(&worker_probe.before_retire);
+                            drop(registration.take());
+                            #[cfg(test)]
+                            {
+                                worker_probe.retired.fetch_add(1, Ordering::AcqRel);
+                                worker_probe.changed.notify_one();
+                            }
+                            false
+                        });
+                    };
+                while let Some(command) = receiver.blocking_recv() {
+                    // Drop dead guards on this worker before accepting new work.
+                    retire_dead(&mut registrations);
+                    match command {
+                        GitWatchCommand::Register {
+                            kind,
+                            paths,
+                            sender,
+                            reply,
+                        } => {
+                            if reply.is_closed() {
+                                continue;
+                            }
+                            let subscriber = match kind {
+                                GitWatchKind::Metadata => metadata.as_ref(),
+                                GitWatchKind::Source => source.as_ref(),
+                            };
+                            let result = subscriber
+                                .ok_or_else(|| "Git watch subscriber unavailable".to_string())
+                                .and_then(|subscriber| {
+                                    subscriber
+                                        .register_paths(paths)
+                                        .map_err(|error| error.to_string())
+                                })
+                                .map(|registration| {
+                                    let alive = Arc::new(());
+                                    registrations
+                                        .push((Arc::downgrade(&alive), Some(registration)));
+                                    #[cfg(test)]
+                                    {
+                                        worker_probe.registered.fetch_add(1, Ordering::AcqRel);
+                                    }
+                                    GitWatchLease {
+                                        alive: Some(alive),
+                                        sender: Some(sender),
+                                    }
+                                });
+                            // If cancellation won, the returned lease is dropped
+                            // here. The native guard never leaves registrations.
+                            #[cfg(test)]
+                            GitWatchWorkerProbe::pause(&worker_probe.before_reply);
+                            let _ = reply.send(result);
+                        }
+                        GitWatchCommand::Sweep => {}
+                    }
+                    retire_dead(&mut registrations);
+                }
+                // Field order at cache destruction is irrelevant: no native
+                // owner remains in the cache, and pending leases keep this
+                // channel alive until their final retirement request is sent.
+                retire_dead(&mut registrations);
+                drop(registrations);
+                drop(metadata);
+                drop(source);
+                #[cfg(test)]
+                {
+                    worker_probe.stopped.store(true, Ordering::Release);
+                    worker_probe.changed.notify_one();
+                }
+            })?;
+        Ok(Self {
+            sender,
+            #[cfg(test)]
+            probe,
+        })
+    }
+
+    async fn register(
+        &self,
+        kind: GitWatchKind,
+        paths: Vec<WatchPath>,
+    ) -> Result<GitWatchLease, String> {
+        let (reply, receiver) = tokio::sync::oneshot::channel();
+        self.sender
+            .send(GitWatchCommand::Register {
+                kind,
+                paths,
+                sender: self.sender.clone(),
+                reply,
+            })
+            .await
+            .map_err(|_| "Git watch worker unavailable".to_string())?;
+        receiver
+            .await
+            .map_err(|_| "Git watch registration interrupted".to_string())?
+    }
+}
+
 struct RootCacheEntry {
     key: RootCacheKey,
     dependencies: Vec<DependencyFingerprint>,
     watcher_generation: u64,
     entries: Vec<GitWorkspaceEntry>,
-    _registration: WatchRegistration,
+    _registration: GitWatchLease,
 }
 
 struct MetadataCacheEntry {
     dependencies: StableMetadataDependencies,
     watcher_generation: u64,
     metadata: StableGitMetadata,
-    _registration: WatchRegistration,
+    _registration: GitWatchLease,
 }
 
 struct ProjectNamespaceCacheEntry {
     dependencies: StableMetadataDependencies,
     watcher_generation: u64,
     namespace: Option<String>,
-    _registration: WatchRegistration,
+    _registration: GitWatchLease,
 }
 
 #[derive(Default)]
@@ -683,7 +1006,7 @@ struct CachedWorkspaceEvidenceIdentity {
 
 struct RetainedSourceWatchRegistration {
     generation: u64,
-    _registration: WatchRegistration,
+    _registration: GitWatchLease,
 }
 
 #[derive(Default)]
@@ -788,15 +1111,16 @@ pub(crate) struct GitWorkspaceCache {
     watcher_generation: AtomicU64,
     host_mutation_generation: AtomicU64,
     watcher_reliable: AtomicBool,
-    watcher_subscriber: Option<FileWatcherSubscriber>,
+    watcher_worker: Option<GitWatchWorker>,
     source_watcher_generation: AtomicU64,
     source_watcher_reliable: AtomicBool,
-    source_watcher_subscriber: Option<FileWatcherSubscriber>,
     repository_retention: StdMutex<RepositoryRetention>,
     source_change_journal: StdMutex<SourceChangeJournal>,
     in_flight_workspace_evidence:
         StdMutex<HashMap<WorkspaceEvidenceCaptureKey, InFlightWorkspaceEvidenceCapture>>,
     workspace_evidence_capture_sequence: AtomicU64,
+    #[cfg(test)]
+    host_mutation_worker_hook: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
     workspace_evidence_capture_count: AtomicU64,
     #[cfg(test)]
@@ -1006,6 +1330,19 @@ impl GitWorkspaceCache {
                 }
                 None => (None, None, None, None),
             };
+        let watcher_worker = if watcher_subscriber.is_some() || source_watcher_subscriber.is_some()
+        {
+            match GitWatchWorker::start(watcher_subscriber, source_watcher_subscriber) {
+                Ok(worker) => Some(worker),
+                Err(error) => {
+                    warn!(%error, "Git workspace cache disabled because watch worker could not start");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let watcher_available = watcher_worker.is_some();
         let watcher_epoch = (u64::from(std::process::id()) << 32)
             | NEXT_WATCHER_EPOCH.fetch_add(1, Ordering::Relaxed);
         let cache = Arc::new(Self {
@@ -1013,15 +1350,16 @@ impl GitWorkspaceCache {
             watcher_epoch,
             watcher_generation: AtomicU64::new(0),
             host_mutation_generation: AtomicU64::new(0),
-            watcher_reliable: AtomicBool::new(watcher_subscriber.is_some()),
-            watcher_subscriber,
+            watcher_reliable: AtomicBool::new(watcher_available),
+            watcher_worker,
             source_watcher_generation: AtomicU64::new(0),
-            source_watcher_reliable: AtomicBool::new(source_watcher_subscriber.is_some()),
-            source_watcher_subscriber,
+            source_watcher_reliable: AtomicBool::new(watcher_available),
             repository_retention: StdMutex::new(RepositoryRetention::default()),
             source_change_journal: StdMutex::new(SourceChangeJournal::default()),
             in_flight_workspace_evidence: StdMutex::new(HashMap::new()),
             workspace_evidence_capture_sequence: AtomicU64::new(0),
+            #[cfg(test)]
+            host_mutation_worker_hook: StdMutex::new(None),
             #[cfg(test)]
             workspace_evidence_capture_count: AtomicU64::new(0),
             #[cfg(test)]
@@ -1106,25 +1444,40 @@ impl GitWorkspaceCache {
         &self,
         cwd: &Path,
     ) -> WorkspaceEvidenceCapture {
-        let Some(repo_root) = resolve_workspace_evidence_root(cwd).await else {
-            let cwd = canonical_workspace_evidence_root(cwd);
-            let mut retention = self
-                .repository_retention
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let sequence = self
-                .workspace_evidence_capture_sequence
-                .fetch_add(1, Ordering::AcqRel)
-                .saturating_add(1);
-            for (root, cached) in &mut retention.latest_workspace_evidence {
-                if cwd.starts_with(root) {
-                    cached.identity = None;
-                    cached.capture_sequence = sequence;
+        let discovery = resolve_workspace_evidence_root(cwd).await;
+        let repo_root = match discovery {
+            Ok(Some(root)) => root,
+            result => {
+                let identity = result
+                    .err()
+                    .map(|_| WorkspaceEvidenceIdentity::unavailable(None));
+                let fallback_cwd = cwd.to_path_buf();
+                let cwd = tokio::task::spawn_blocking(move || {
+                    canonical_workspace_evidence_root(&fallback_cwd)
+                })
+                .await
+                .unwrap_or_else(|_| cwd.to_path_buf());
+                let mut retention = self
+                    .repository_retention
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let sequence = self
+                    .workspace_evidence_capture_sequence
+                    .fetch_add(1, Ordering::AcqRel)
+                    .saturating_add(1);
+                for (root, cached) in &mut retention.latest_workspace_evidence {
+                    if cwd.starts_with(root) {
+                        cached.identity = identity.clone();
+                        cached.capture_sequence = sequence;
+                    }
                 }
+                // A later successful discovery must not rejoin a capture from before this failure.
+                self.host_mutation_generation.fetch_add(1, Ordering::AcqRel);
+                return WorkspaceEvidenceCapture {
+                    identity,
+                    timed_out_git_dependencies: Vec::new(),
+                };
             }
-            // A later successful discovery must not rejoin a capture from before this failure.
-            self.host_mutation_generation.fetch_add(1, Ordering::AcqRel);
-            return WorkspaceEvidenceCapture::default();
         };
         let key = WorkspaceEvidenceCaptureKey {
             repo_root: repo_root.clone(),
@@ -1244,11 +1597,15 @@ impl GitWorkspaceCache {
     /// repository. Sampling refreshes this cache before the model can issue
     /// tools, so proven read-only children can reuse it without launching a
     /// second set of Git subprocesses at dispatch time.
-    pub(crate) fn latest_workspace_evidence_identity(
+    pub(crate) async fn latest_workspace_evidence_identity(
         &self,
         repo_root: &Path,
     ) -> Option<WorkspaceEvidenceIdentity> {
-        let repo_root = canonical_workspace_evidence_root(repo_root);
+        let repo_root = repo_root.to_path_buf();
+        let repo_root =
+            tokio::task::spawn_blocking(move || canonical_workspace_evidence_root(&repo_root))
+                .await
+                .ok()?;
         let mut retention = self
             .repository_retention
             .lock()
@@ -1257,7 +1614,9 @@ impl GitWorkspaceCache {
         if cached.is_some() {
             retention.touch(&repo_root);
         }
-        cached.and_then(|cached| cached.identity)
+        cached
+            .and_then(|cached| cached.identity)
+            .filter(|identity| !identity.unavailable)
     }
 
     #[cfg(test)]
@@ -1397,7 +1756,7 @@ impl GitWorkspaceCache {
                 && self.watcher_reliable.load(Ordering::Acquire)
                 && self.watcher_generation.load(Ordering::Acquire) == watcher_generation
             {
-                let registration = self.register_dependencies(&before_dependencies);
+                let registration = self.register_dependencies(&before_dependencies).await;
                 self.state.lock().await.root = Some(RootCacheEntry {
                     key: key.clone(),
                     dependencies: before_dependencies,
@@ -1452,7 +1811,7 @@ impl GitWorkspaceCache {
                 && self.watcher_reliable.load(Ordering::Acquire)
                 && self.watcher_generation.load(Ordering::Acquire) == watcher_generation
             {
-                let registration = self.register_dependencies(&before_dependencies.files);
+                let registration = self.register_dependencies(&before_dependencies.files).await;
                 self.state.lock().await.metadata.insert(
                     source.repo_root.to_path_buf(),
                     MetadataCacheEntry {
@@ -1492,7 +1851,7 @@ impl GitWorkspaceCache {
                 && self.watcher_reliable.load(Ordering::Acquire)
                 && self.watcher_generation.load(Ordering::Acquire) == watcher_generation
             {
-                let registration = self.register_dependencies(&before_dependencies.files);
+                let registration = self.register_dependencies(&before_dependencies.files).await;
                 self.state.lock().await.project_namespaces.insert(
                     source.repo_root.to_path_buf(),
                     ProjectNamespaceCacheEntry {
@@ -1507,25 +1866,29 @@ impl GitWorkspaceCache {
         namespace
     }
 
-    fn register_dependencies(&self, dependencies: &[DependencyFingerprint]) -> WatchRegistration {
-        let Some(subscriber) = self.watcher_subscriber.as_ref() else {
-            return WatchRegistration::default();
+    async fn register_dependencies(&self, dependencies: &[DependencyFingerprint]) -> GitWatchLease {
+        let Some(worker) = self.watcher_worker.as_ref() else {
+            return GitWatchLease::default();
         };
-        match subscriber.register_paths(
-            dependencies
-                .iter()
-                .map(|dependency| WatchPath {
-                    path: dependency.path.clone(),
-                    recursive: false,
-                })
-                .collect(),
-        ) {
+        match worker
+            .register(
+                GitWatchKind::Metadata,
+                dependencies
+                    .iter()
+                    .map(|dependency| WatchPath {
+                        path: dependency.path.clone(),
+                        recursive: false,
+                    })
+                    .collect(),
+            )
+            .await
+        {
             Ok(registration) => registration,
             Err(err) => {
                 warn!("Git workspace cache disabled after watch registration failed: {err}");
                 self.watcher_reliable.store(false, Ordering::Release);
                 self.watcher_generation.fetch_add(1, Ordering::AcqRel);
-                WatchRegistration::default()
+                GitWatchLease::default()
             }
         }
     }
@@ -1566,7 +1929,7 @@ impl GitWorkspaceCache {
     /// The returned token is safe to persist in model-visible tool output: it
     /// is accepted only by this live watcher epoch and only while the bounded
     /// journal proves that the path and its ancestors were untouched.
-    pub(crate) fn begin_source_path_change_observation(
+    pub(crate) async fn begin_source_path_change_observation(
         &self,
         repo_root: &Path,
         path: &Path,
@@ -1575,28 +1938,58 @@ impl GitWorkspaceCache {
         if !self.source_watcher_reliable.load(Ordering::Acquire) {
             return None;
         }
-        let repo_root = dunce::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
-        let path = dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let repo_root = repo_root.to_path_buf();
+        let path = path.to_path_buf();
+        let (repo_root, path) = tokio::task::spawn_blocking(move || {
+            let repo_root = dunce::canonicalize(&repo_root).unwrap_or(repo_root);
+            let path = dunce::canonicalize(&path).unwrap_or(path);
+            (repo_root, path)
+        })
+        .await
+        .ok()?;
         if !path_is_same_or_descendant(&path, &repo_root) {
             return None;
         }
-        let registration_generation = {
+        let existing_generation = {
+            let mut retention = self
+                .repository_retention
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let generation = retention
+                .source_watch_registrations
+                .get(&repo_root)
+                .map(|registration| registration.generation);
+            if generation.is_some() {
+                retention.touch(&repo_root);
+            }
+            generation
+        };
+        let registration_generation = if let Some(generation) = existing_generation {
+            generation
+        } else {
+            // Never wait for backend registration with the retention mutex held.
+            // The candidate is a lease; cancellation and a losing insertion race
+            // retire its raw registration on the worker.
+            let registration = self
+                .watcher_worker
+                .as_ref()?
+                .register(
+                    GitWatchKind::Source,
+                    vec![WatchPath {
+                        path: repo_root.clone(),
+                        recursive: true,
+                    }],
+                )
+                .await
+                .ok()?;
             let mut retention = self
                 .repository_retention
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let generation =
-                if let Some(registration) = retention.source_watch_registrations.get(&repo_root) {
-                    registration.generation
+                if let Some(existing) = retention.source_watch_registrations.get(&repo_root) {
+                    existing.generation
                 } else {
-                    let registration = self
-                        .source_watcher_subscriber
-                        .as_ref()?
-                        .register_paths(vec![WatchPath {
-                            path: repo_root.clone(),
-                            recursive: true,
-                        }])
-                        .ok()?;
                     let generation = retention.allocate_registration_generation();
                     retention.source_watch_registrations.insert(
                         repo_root.clone(),
@@ -1679,11 +2072,37 @@ impl GitWorkspaceCache {
         self.record_source_change_event(None);
     }
 
-    pub(crate) fn note_host_workspace_mutation_paths(
-        &self,
+    pub(crate) async fn note_host_workspace_mutation_paths(
+        self: &Arc<Self>,
         repo_root: &Path,
         changed_paths: &[String],
     ) {
+        let cache = Arc::clone(self);
+        let repo_root = repo_root.to_path_buf();
+        let changed_paths = changed_paths.to_vec();
+        // The worker owns publication as well as filesystem observation: a
+        // cancelled caller must not discard a completed mutation invalidation.
+        if let Err(error) = tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            let hook = cache
+                .host_mutation_worker_hook
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            #[cfg(test)]
+            if let Some(hook) = hook {
+                hook();
+            }
+            cache.record_host_workspace_mutation_paths(&repo_root, &changed_paths);
+        })
+        .await
+        {
+            warn!(%error, "Host mutation path worker failed; invalidating coarse workspace evidence");
+            self.note_host_workspace_mutation();
+        }
+    }
+
+    fn record_host_workspace_mutation_paths(&self, repo_root: &Path, changed_paths: &[String]) {
         let repo_root = dunce::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
         let paths = changed_paths
             .iter()
@@ -1911,31 +2330,7 @@ where
 }
 
 async fn collect_project_namespace(cwd: &Path) -> Option<String> {
-    let mut command = Command::new("git");
-    command
-        .arg("-c")
-        .arg(format!("core.hooksPath={DISABLED_HOOKS_PATH}"))
-        .args(["-c", "core.fsmonitor=false"])
-        .args(["rev-list", "--max-parents=0", "HEAD"])
-        .current_dir(cwd)
-        .kill_on_drop(true);
-    let output = timeout(GIT_DEPENDENCY_TIMEOUT, command.output())
-        .await
-        .ok()?
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let stdout = String::from_utf8(output.stdout).ok()?;
-    let mut roots = stdout.lines().map(str::to_owned).collect::<Vec<_>>();
-    if roots.is_empty()
-        || roots.iter().any(|root| {
-            root.len() < 40 || root.len() > 64 || !root.bytes().all(|byte| byte.is_ascii_hexdigit())
-        })
-    {
-        return None;
-    }
-    roots.sort_unstable();
+    let roots = codex_git_utils::get_root_commit_hashes(cwd).await?;
     Some(format!(
         "{:x}",
         Sha256::digest(format!("git-project-roots-v1\0{}", roots.join("\0")).as_bytes())
@@ -2068,9 +2463,17 @@ fn file_dependency_state(mut file: File, hash_contents: bool) -> Option<Dependen
     let metadata = file.metadata().ok()?;
     let stable_id = stable_file_identity(&file);
     let digest = if hash_contents {
-        let mut contents = Vec::new();
-        file.read_to_end(&mut contents).ok()?;
-        Some(Sha256::digest(contents).into())
+        let mut hasher = Sha256::new();
+        let mut buffer = [0u8; 8192];
+        loop {
+            match file.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(count) => hasher.update(&buffer[..count]),
+                Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                Err(_) => return None,
+            }
+        }
+        Some(hasher.finalize().into())
     } else {
         None
     };
@@ -2091,6 +2494,8 @@ fn stable_file_identity(file: &File) -> Option<StableFileIdentity> {
     use windows_sys::Win32::Storage::FileSystem::GetFileInformationByHandleEx;
 
     let mut info = MaybeUninit::<FILE_ID_INFO>::zeroed();
+    // SAFETY: `file` owns a live handle for this call, and `info` is an aligned
+    // FILE_ID_INFO buffer whose exact size is supplied to the matching query class.
     let success = unsafe {
         GetFileInformationByHandleEx(
             file.as_raw_handle(),
@@ -2102,6 +2507,7 @@ fn stable_file_identity(file: &File) -> Option<StableFileIdentity> {
     if success == 0 {
         return None;
     }
+    // SAFETY: the successful FileIdInfo query initialized the complete buffer above.
     let info = unsafe { info.assume_init() };
     let index = info.FileId.Identifier;
     (info.VolumeSerialNumber != 0 || index.iter().any(|byte| *byte != 0)).then_some(

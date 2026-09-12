@@ -123,6 +123,8 @@ pub(crate) struct TurnTerminalCoordinator {
     sampling_admission_waiters: AtomicU32,
     #[cfg(test)]
     panic_before_worker_cancellation: AtomicBool,
+    #[cfg(test)]
+    panic_after_terminal_publication: AtomicBool,
 }
 
 /// The interrupt durability fence is one state machine, not three independent
@@ -253,6 +255,8 @@ impl TurnTerminalCoordinator {
             sampling_admission_waiters: AtomicU32::new(0),
             #[cfg(test)]
             panic_before_worker_cancellation: AtomicBool::new(false),
+            #[cfg(test)]
+            panic_after_terminal_publication: AtomicBool::new(false),
         })
     }
 
@@ -316,14 +320,21 @@ impl TurnTerminalCoordinator {
 
     /// Establish a pre-terminal fence. This deliberately does not claim or
     /// terminalize the turn; it only closes provider sampling admission.
+    #[cfg(test)]
     pub(crate) async fn mark_interrupt_pending(&self) -> bool {
+        self.mark_interrupt_pending_if(|| true).await
+    }
+
+    /// Deliver an interruption while admission is locked, fencing only an
+    /// accepted delivery before its consumer can claim terminal completion.
+    pub(crate) async fn mark_interrupt_pending_if(&self, accept: impl FnOnce() -> bool) -> bool {
         let _waiter = TerminalWaiterGuard::new(&self.sampling_admission_waiters);
         let _admission_gate = self.sampling_admission_gate.lock().await;
         let _decision = self
             .terminal_decision_gate
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if self.claimed.load(Ordering::Acquire) {
+        if !accept() || self.claimed.load(Ordering::Acquire) {
             return false;
         }
         self.wake_generation.fetch_add(1, Ordering::AcqRel);
@@ -457,6 +468,29 @@ impl TurnTerminalCoordinator {
     }
 
     #[cfg(test)]
+    pub(crate) fn request_panic_after_terminal_publication(&self) {
+        self.panic_after_terminal_publication
+            .store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn panic_after_terminal_publication_was_consumed_for_test(&self) -> bool {
+        !self
+            .panic_after_terminal_publication
+            .load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn panic_after_terminal_publication_if_requested(&self) {
+        if self
+            .panic_after_terminal_publication
+            .swap(false, Ordering::AcqRel)
+        {
+            panic!("injected panic after terminal publication before parent dispatch");
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn request_panic_before_worker_cancellation(&self) {
         self.panic_before_worker_cancellation
             .store(true, Ordering::Release);
@@ -538,6 +572,7 @@ pub(crate) struct TurnState {
 
 pub(crate) struct PendingRequestPermissions {
     pub(crate) tx_response: oneshot::Sender<RequestPermissionsResponse>,
+    pub(crate) cancellation_token: Arc<CancellationToken>,
     pub(crate) requested_permissions: RequestPermissionProfile,
     pub(crate) environment: TurnEnvironmentSelection,
     pub(crate) approval_scope_id: String,
@@ -559,6 +594,21 @@ impl TurnState {
         self.pending_approvals.remove(key)
     }
 
+    pub(crate) fn remove_closed_pending_approval(&mut self, key: &str) {
+        if self
+            .pending_approvals
+            .get(key)
+            .is_some_and(oneshot::Sender::is_closed)
+        {
+            self.pending_approvals.remove(key);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_pending_approval(&self, key: &str) -> bool {
+        self.pending_approvals.contains_key(key)
+    }
+
     pub(crate) fn clear_pending_waiters(&mut self) {
         self.pending_approvals.clear();
         self.pending_request_permissions.clear();
@@ -576,11 +626,30 @@ impl TurnState {
             .insert(key, pending_request_permissions)
     }
 
+    #[cfg(test)]
+    pub(crate) fn has_pending_request_permissions(&self, key: &str) -> bool {
+        self.pending_request_permissions.contains_key(key)
+    }
+
     pub(crate) fn remove_pending_request_permissions(
         &mut self,
         key: &str,
     ) -> Option<PendingRequestPermissions> {
         self.pending_request_permissions.remove(key)
+    }
+
+    pub(crate) fn remove_pending_request_permissions_if_same(
+        &mut self,
+        key: &str,
+        cancellation_token: &Arc<CancellationToken>,
+    ) {
+        if self
+            .pending_request_permissions
+            .get(key)
+            .is_some_and(|pending| Arc::ptr_eq(&pending.cancellation_token, cancellation_token))
+        {
+            self.pending_request_permissions.remove(key);
+        }
     }
 
     pub(crate) fn insert_pending_user_input(
@@ -596,6 +665,21 @@ impl TurnState {
         key: &str,
     ) -> Option<oneshot::Sender<RequestUserInputResponse>> {
         self.pending_user_input.remove(key)
+    }
+
+    pub(crate) fn remove_closed_pending_user_input(&mut self, key: &str) {
+        if self
+            .pending_user_input
+            .get(key)
+            .is_some_and(oneshot::Sender::is_closed)
+        {
+            self.pending_user_input.remove(key);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_pending_user_input(&self, key: &str) -> bool {
+        self.pending_user_input.contains_key(key)
     }
 
     pub(crate) fn insert_pending_elicitation(
@@ -617,6 +701,27 @@ impl TurnState {
             .remove(&(server_name.to_string(), request_id.clone()))
     }
 
+    pub(crate) fn remove_closed_pending_elicitation(
+        &mut self,
+        server_name: &str,
+        request_id: &RequestId,
+    ) {
+        if self
+            .pending_elicitations
+            .get(&(server_name.to_string(), request_id.clone()))
+            .is_some_and(oneshot::Sender::is_closed)
+        {
+            self.pending_elicitations
+                .remove(&(server_name.to_string(), request_id.clone()));
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_pending_elicitation(&self, server_name: &str, request_id: &RequestId) -> bool {
+        self.pending_elicitations
+            .contains_key(&(server_name.to_string(), request_id.clone()))
+    }
+
     pub(crate) fn try_insert_pending_dynamic_tool(
         &mut self,
         key: String,
@@ -636,6 +741,21 @@ impl TurnState {
         key: &str,
     ) -> Option<oneshot::Sender<DynamicToolResponse>> {
         self.pending_dynamic_tools.remove(key)
+    }
+
+    pub(crate) fn remove_closed_pending_dynamic_tool(&mut self, key: &str) {
+        if self
+            .pending_dynamic_tools
+            .get(key)
+            .is_some_and(oneshot::Sender::is_closed)
+        {
+            self.pending_dynamic_tools.remove(key);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_pending_dynamic_tool(&self, key: &str) -> bool {
+        self.pending_dynamic_tools.contains_key(key)
     }
 
     pub(crate) fn accept_mailbox_delivery_for_current_turn(&mut self) {

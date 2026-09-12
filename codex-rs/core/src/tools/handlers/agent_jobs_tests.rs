@@ -464,6 +464,7 @@ async fn runner_settles_non_limit_spawn_failure_without_retrying() {
             job.id.clone(),
             options,
             CancellationToken::new(),
+            &mut HashMap::new(),
         ),
     )
     .await
@@ -503,7 +504,16 @@ async fn parent_cancellation_settles_running_item_and_exports_snapshot() {
         .await
         .expect("bind running job item")
     );
-    let (session, turn, _events) = crate::session::tests::make_session_and_context_with_rx().await;
+    let (mut session, turn, _events) =
+        crate::session::tests::make_session_and_context_with_rx().await;
+    let manager = crate::ThreadManager::with_models_provider_for_tests(
+        codex_login::CodexAuth::from_api_key("dummy"),
+        turn.config.model_provider.clone(),
+    );
+    Arc::get_mut(&mut session)
+        .expect("unique session")
+        .services
+        .agent_control = manager.agent_control();
     let options = JobRunnerOptions {
         max_concurrency: 1,
         spawn_config: (*turn.config).clone(),
@@ -520,6 +530,7 @@ async fn parent_cancellation_settles_running_item_and_exports_snapshot() {
             job.id.clone(),
             options,
             cancellation_token,
+            &mut HashMap::new(),
         ),
     )
     .await
@@ -624,6 +635,7 @@ async fn worker_stop_cancels_job_settles_other_worker_and_requests_shutdown() {
             job.id.clone(),
             options,
             CancellationToken::new(),
+            &mut HashMap::new(),
         ),
     )
     .await
@@ -659,6 +671,13 @@ async fn worker_stop_cancels_job_settles_other_worker_and_requests_shutdown() {
     assert_eq!(progress.completed_items, 1);
     assert_eq!(progress.failed_items, 1);
     assert_eq!(progress.running_items, 0);
+    assert!(
+        matches!(
+            manager.get_thread(other_worker_thread_id).await,
+            Err(CodexErr::ThreadNotFound(id)) if id == other_worker_thread_id
+        ),
+        "successful job cleanup must remove the terminated worker"
+    );
     assert!(manager.captured_ops().into_iter().any(|(thread_id, op)| {
         thread_id == other_worker_thread_id && matches!(op, codex_protocol::protocol::Op::Shutdown)
     }));
@@ -667,4 +686,596 @@ async fn worker_stop_cancels_job_settles_other_worker_and_requests_shutdown() {
             .await
             .expect("check exported snapshot")
     );
+}
+
+#[derive(Clone, Copy)]
+enum BlockedJobCleanupRoute {
+    RecoveredTimeout,
+    ActiveTimeout,
+    FinishedWorker,
+    ParentCancellation,
+}
+
+async fn assert_runner_preserves_worker_until_cleanup(route: BlockedJobCleanupRoute) {
+    use sqlx::Connection;
+
+    let item_count = if matches!(route, BlockedJobCleanupRoute::ParentCancellation) {
+        2
+    } else {
+        1
+    };
+    let (tempdir, db, job) = create_running_job(item_count).await;
+    let (mut session, turn, _events) =
+        crate::session::tests::make_session_and_context_with_rx().await;
+    let manager = crate::ThreadManager::with_models_provider_for_tests(
+        codex_login::CodexAuth::from_api_key("dummy"),
+        turn.config.model_provider.clone(),
+    );
+    let worker = manager
+        .start_thread((*turn.config).clone())
+        .await
+        .expect("start actual worker");
+    let thread_id = worker.thread_id;
+    Arc::get_mut(&mut session)
+        .expect("unique runner session")
+        .services
+        .agent_control = manager.agent_control();
+    assert!(
+        db.mark_agent_job_item_running_with_thread(&job.id, "item-0", &thread_id.to_string())
+            .await
+            .expect("bind worker")
+    );
+    let other_worker = if matches!(route, BlockedJobCleanupRoute::ParentCancellation) {
+        let other = manager
+            .start_thread((*turn.config).clone())
+            .await
+            .expect("start other worker");
+        assert!(
+            db.mark_agent_job_item_running_with_thread(
+                &job.id,
+                "item-1",
+                &other.thread_id.to_string()
+            )
+            .await
+            .expect("bind other worker")
+        );
+        Some(other)
+    } else {
+        None
+    };
+    let sqlite_options = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(codex_state::state_db_path(&tempdir.path().join("state")));
+    let mut connection = sqlx::SqliteConnection::connect_with(&sqlite_options)
+        .await
+        .expect("open fault connection");
+    match route {
+        BlockedJobCleanupRoute::RecoveredTimeout => {
+            sqlx::query("UPDATE agent_jobs SET max_runtime_seconds = 1 WHERE id = ?")
+                .bind(&job.id)
+                .execute(&mut connection)
+                .await
+                .expect("set persisted runtime");
+            sqlx::query("UPDATE agent_job_items SET updated_at = 0 WHERE job_id = ?")
+                .bind(&job.id)
+                .execute(&mut connection)
+                .await
+                .expect("make recovery item stale");
+        }
+        BlockedJobCleanupRoute::ActiveTimeout => {
+            assert!(
+                !is_final(&worker.thread.agent_status().await),
+                "active-timeout scenario must enter the active runner loop"
+            );
+            sqlx::query("UPDATE agent_jobs SET max_runtime_seconds = 1 WHERE id = ?")
+                .bind(&job.id)
+                .execute(&mut connection)
+                .await
+                .expect("set runtime");
+            // Persisted freshness keeps recovery from taking the stale-item path.
+            sqlx::query("UPDATE agent_job_items SET updated_at = ? WHERE job_id = ?")
+                .bind(chrono::Utc::now().timestamp() + 60)
+                .bind(&job.id)
+                .execute(&mut connection)
+                .await
+                .expect("keep recovery item fresh");
+        }
+        BlockedJobCleanupRoute::FinishedWorker => {
+            let worker_turn = worker.thread.codex.session.new_default_turn().await;
+            worker
+                .thread
+                .codex
+                .session
+                .send_event(
+                    worker_turn.as_ref(),
+                    codex_protocol::protocol::EventMsg::TurnComplete(
+                        codex_protocol::protocol::TurnCompleteEvent {
+                            surfaced_result: None,
+                            turn_id: worker_turn.sub_id.clone(),
+                            last_agent_message: Some("finished without reporting".to_string()),
+                            error: None,
+                            completed_at: None,
+                            duration_ms: None,
+                            time_to_first_token_ms: None,
+                            timing: None,
+                        },
+                    ),
+                )
+                .await;
+            assert!(is_final(&worker.thread.agent_status().await));
+        }
+        BlockedJobCleanupRoute::ParentCancellation => {}
+    }
+    // Shutdown must acquire this real session lock to schedule turn termination.
+    // Unlike the terminal-task wait, this boundary has no competing ten-second timeout.
+    let shutdown_guard = worker.thread.codex.session.active_turn.lock().await;
+    let other_shutdown_guard = if let Some(other) = other_worker.as_ref() {
+        Some(other.thread.codex.session.active_turn.lock().await)
+    } else {
+        None
+    };
+    let cancellation = CancellationToken::new();
+    if matches!(route, BlockedJobCleanupRoute::ParentCancellation) {
+        cancellation.cancel();
+    }
+    let options = JobRunnerOptions {
+        max_concurrency: 1,
+        spawn_config: (*turn.config).clone(),
+    };
+    let runner = tokio::spawn({
+        let session = session.clone();
+        let db = db.clone();
+        let job_id = job.id.clone();
+        async move {
+            let mut active_items = HashMap::new();
+            let result = run_agent_job_loop(
+                session,
+                turn,
+                db,
+                job_id,
+                options,
+                cancellation,
+                &mut active_items,
+            )
+            .await;
+            (result, active_items)
+        }
+    });
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if manager.captured_ops().iter().any(|(id, op)| {
+                (*id == thread_id
+                    || other_worker
+                        .as_ref()
+                        .is_some_and(|other| *id == other.thread_id))
+                    && matches!(op, codex_protocol::protocol::Op::Shutdown)
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("normal runner must request worker shutdown");
+    let item = db
+        .get_agent_job_item(&job.id, "item-0")
+        .await
+        .expect("read pending cleanup item")
+        .expect("item exists");
+    assert_eq!(item.status, codex_state::AgentJobItemStatus::Running);
+    assert_eq!(
+        item.assigned_thread_id.as_deref(),
+        Some(thread_id.to_string().as_str())
+    );
+    assert!(
+        !runner.is_finished(),
+        "cleanup cannot succeed while terminal work remains"
+    );
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(11)).await;
+    tokio::time::resume();
+    if let Some(other) = other_worker.as_ref() {
+        timeout(Duration::from_secs(5), async {
+            loop {
+                assert!(
+                    !runner.is_finished(),
+                    "one failed shutdown must not skip another worker"
+                );
+                let ops = manager.captured_ops();
+                if [thread_id, other.thread_id].iter().all(|expected| {
+                    ops.iter().any(|(id, op)| {
+                        id == expected && matches!(op, codex_protocol::protocol::Op::Shutdown)
+                    })
+                }) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("cleanup must attempt both workers regardless of iteration order");
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(11)).await;
+        tokio::time::resume();
+    }
+    let (result, mut active_items) = timeout(Duration::from_secs(5), runner)
+        .await
+        .expect("shutdown deadline returns")
+        .expect("runner joins");
+    let error = result
+        .expect_err("unfinished worker cleanup must be reported")
+        .to_string();
+    assert!(
+        error.contains("timed out") && error.contains(&thread_id.to_string()),
+        "{error}"
+    );
+    assert_eq!(
+        active_items
+            .get(&thread_id)
+            .expect("retain caller cleanup ownership")
+            .item_id,
+        "item-0"
+    );
+    assert!(
+        manager.get_thread(thread_id).await.is_ok(),
+        "late cleanup retains actual worker ownership"
+    );
+    let item = db
+        .get_agent_job_item(&job.id, "item-0")
+        .await
+        .expect("read retained binding")
+        .expect("item exists");
+    assert_eq!(item.status, codex_state::AgentJobItemStatus::Running);
+    assert_eq!(
+        item.assigned_thread_id.as_deref(),
+        Some(thread_id.to_string().as_str())
+    );
+    if let Some(other) = other_worker.as_ref() {
+        assert!(
+            error.contains(&other.thread_id.to_string()),
+            "each failed shutdown must be reported: {error}"
+        );
+        assert!(manager.get_thread(other.thread_id).await.is_ok());
+        let pending = db
+            .get_agent_job_item(&job.id, "item-1")
+            .await
+            .expect("read other item")
+            .expect("other item exists");
+        assert_eq!(pending.status, codex_state::AgentJobItemStatus::Running);
+        assert_eq!(
+            pending.assigned_thread_id.as_deref(),
+            Some(other.thread_id.to_string().as_str())
+        );
+        assert_eq!(pending.result_json, None);
+        assert_eq!(active_items.len(), 2);
+    }
+    let stored_job = db
+        .get_agent_job(&job.id)
+        .await
+        .expect("load job")
+        .expect("job exists");
+    assert_ne!(stored_job.status, codex_state::AgentJobStatus::Completed);
+    if !matches!(route, BlockedJobCleanupRoute::ParentCancellation) {
+        assert!(
+            !tokio::fs::try_exists(&job.output_csv_path)
+                .await
+                .expect("check forbidden successful export")
+        );
+    }
+    drop(shutdown_guard);
+    drop(other_shutdown_guard);
+    timeout(
+        Duration::from_secs(5),
+        worker.thread.wait_until_terminated(),
+    )
+    .await
+    .expect("worker actually terminates");
+    timeout(Duration::from_secs(5), async {
+        while manager.get_thread(thread_id).await.is_ok() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("late owner removes terminated worker");
+    if let Some(other) = other_worker.as_ref() {
+        timeout(Duration::from_secs(5), other.thread.wait_until_terminated())
+            .await
+            .expect("other worker actually terminates");
+        timeout(Duration::from_secs(5), async {
+            while manager.get_thread(other.thread_id).await.is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("late owner removes other worker");
+    }
+    terminate_agent_job_workers(
+        session,
+        db.clone(),
+        &job.id,
+        &mut active_items,
+        "retry after worker termination",
+    )
+    .await
+    .expect("cleanup retry settles retained item");
+    assert!(active_items.is_empty());
+    if other_worker.is_some() {
+        let item = db
+            .get_agent_job_item(&job.id, "item-1")
+            .await
+            .expect("load other settled item")
+            .expect("item exists");
+        assert_eq!(item.status, codex_state::AgentJobItemStatus::Failed);
+        assert_eq!(item.assigned_thread_id, None);
+    }
+    let item = db
+        .get_agent_job_item(&job.id, "item-0")
+        .await
+        .expect("load settled item")
+        .expect("item exists");
+    assert_eq!(item.status, codex_state::AgentJobItemStatus::Failed);
+    assert_eq!(item.assigned_thread_id, None);
+    assert_eq!(item.result_json, None);
+    assert_eq!(
+        db.get_agent_job_progress(&job.id)
+            .await
+            .expect("load settled progress")
+            .running_items,
+        0
+    );
+}
+
+#[tokio::test]
+async fn runner_recovered_timeout_retains_worker_until_cleanup() {
+    assert_runner_preserves_worker_until_cleanup(BlockedJobCleanupRoute::RecoveredTimeout).await;
+}
+
+#[tokio::test]
+async fn runner_active_timeout_retains_worker_until_cleanup() {
+    assert_runner_preserves_worker_until_cleanup(BlockedJobCleanupRoute::ActiveTimeout).await;
+}
+
+#[tokio::test]
+async fn runner_finished_item_retains_worker_until_cleanup() {
+    assert_runner_preserves_worker_until_cleanup(BlockedJobCleanupRoute::FinishedWorker).await;
+}
+
+#[tokio::test]
+async fn runner_cancellation_retains_worker_until_cleanup() {
+    assert_runner_preserves_worker_until_cleanup(BlockedJobCleanupRoute::ParentCancellation).await;
+}
+
+use sqlx::Connection as _;
+
+struct CsvJobSqlFaultFixture {
+    _tempdir: tempfile::TempDir,
+    db: Arc<codex_state::StateRuntime>,
+    connection: sqlx::SqliteConnection,
+    session: Arc<Session>,
+    turn: Arc<TurnContext>,
+    arguments: String,
+    output_path: PathBuf,
+}
+
+async fn csv_job_sql_fault_fixture(
+    mode: MultiAgentVersion,
+) -> anyhow::Result<CsvJobSqlFaultFixture> {
+    let tempdir = tempfile::tempdir()?;
+    let sqlite_home = tempdir.path().join("state");
+    let db =
+        codex_state::StateRuntime::init(sqlite_home.clone(), "test-provider".to_string()).await?;
+    let connection = sqlx::SqliteConnection::connect_with(
+        &sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(codex_state::state_db_path(&sqlite_home)),
+    )
+    .await?;
+    let input_path = tempdir.path().join("input.csv");
+    let output_path = tempdir.path().join("output.csv");
+    tokio::fs::write(&input_path, "value\nfirst\n").await?;
+    let (mut session, mut turn) = crate::session::tests::make_session_and_context().await;
+    session.services.state_db = Some(db.clone());
+    // The default unavailable AgentControl is the real failed-spawn prerequisite used by
+    // runner_settles_non_limit_spawn_failure_without_retrying; no successful worker is faked.
+    turn.multi_agent_version = mode;
+    crate::session::multi_agents::update_spawn_authorization_from_text(
+        &turn,
+        "Use subagents to process the CSV.",
+    );
+    if mode == MultiAgentVersion::V2 {
+        assert!(crate::session::multi_agents::spawn_is_authorized(&turn));
+    }
+    let arguments = json!({
+        "csv_path": input_path.to_str().expect("temporary input path must be UTF-8"),
+        "output_csv_path": output_path.to_str().expect("temporary output path must be UTF-8"),
+        "instruction": "Process {value}",
+        "max_concurrency": 1,
+    })
+    .to_string();
+    Ok(CsvJobSqlFaultFixture {
+        _tempdir: tempdir,
+        db,
+        connection,
+        session: Arc::new(session),
+        turn: Arc::new(turn),
+        arguments,
+        output_path,
+    })
+}
+
+async fn csv_job_fault_handler_error(fixture: &CsvJobSqlFaultFixture) -> String {
+    match spawn_agents_on_csv::handle(
+        fixture.session.clone(),
+        fixture.turn.clone(),
+        fixture.arguments.clone(),
+        CancellationToken::new(),
+    )
+    .await
+    {
+        Err(error) => error.to_string(),
+        Ok(output) => panic!(
+            "database fault must remain visible as a tool error, got {}",
+            output.into_text()
+        ),
+    }
+}
+
+async fn assert_no_csv_worker_binding_or_result(
+    connection: &mut sqlx::SqliteConnection,
+) -> anyhow::Result<()> {
+    let (bound_items, reported_items): (i64, i64) = sqlx::query_as(
+        "SELECT COALESCE(SUM(assigned_thread_id IS NOT NULL), 0), \
+         COALESCE(SUM(result_json IS NOT NULL), 0) FROM agent_job_items",
+    )
+    .fetch_one(&mut *connection)
+    .await?;
+    assert_eq!((bound_items, reported_items), (0, 0));
+    let persisted_threads: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM threads")
+        .fetch_one(&mut *connection)
+        .await?;
+    assert_eq!(
+        persisted_threads, 0,
+        "failed admission must not persist a worker thread"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn csv_setup_error_reports_failed_job_persistence() -> anyhow::Result<()> {
+    let mut fixture = csv_job_sql_fault_fixture(MultiAgentVersion::Disabled).await?;
+    sqlx::query(
+        "CREATE TRIGGER reject_job_failure BEFORE UPDATE OF status ON agent_jobs \
+         WHEN NEW.status = 'failed' \
+         BEGIN SELECT RAISE(FAIL, 'injected terminal write'); END",
+    )
+    .execute(&mut fixture.connection)
+    .await?;
+
+    let error = csv_job_fault_handler_error(&fixture).await;
+    assert!(error.contains("multi-agent runtime is disabled"), "{error}");
+    assert!(error.contains("injected terminal write"), "{error}");
+    let jobs: Vec<(String, String, Option<String>)> =
+        sqlx::query_as("SELECT id, status, last_error FROM agent_jobs")
+            .fetch_all(&mut fixture.connection)
+            .await?;
+    assert_eq!(
+        jobs.len(),
+        1,
+        "the fault must occur after actual job creation"
+    );
+    assert_eq!(jobs[0].1, "pending");
+    assert_eq!(jobs[0].2, None);
+    assert_no_csv_worker_binding_or_result(&mut fixture.connection).await?;
+    assert!(!tokio::fs::try_exists(&fixture.output_path).await?);
+
+    fixture.connection.close().await?;
+    fixture.db.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn csv_runner_error_preserves_terminal_persistence_failure() -> anyhow::Result<()> {
+    let mut fixture = csv_job_sql_fault_fixture(MultiAgentVersion::V2).await?;
+    sqlx::query(
+        "CREATE TRIGGER reject_item_failure BEFORE UPDATE OF status ON agent_job_items \
+         WHEN NEW.status = 'failed' \
+         BEGIN SELECT RAISE(FAIL, 'injected item write'); END",
+    )
+    .execute(&mut fixture.connection)
+    .await?;
+    sqlx::query(
+        "CREATE TRIGGER reject_job_failure BEFORE UPDATE OF status ON agent_jobs \
+         WHEN NEW.status = 'failed' \
+         BEGIN SELECT RAISE(FAIL, 'injected terminal write'); END",
+    )
+    .execute(&mut fixture.connection)
+    .await?;
+
+    let error = csv_job_fault_handler_error(&fixture).await;
+    assert!(error.contains("injected item write"), "{error}");
+    assert!(error.contains("injected terminal write"), "{error}");
+    let jobs: Vec<(String, String, Option<String>)> =
+        sqlx::query_as("SELECT id, status, last_error FROM agent_jobs")
+            .fetch_all(&mut fixture.connection)
+            .await?;
+    assert_eq!(jobs.len(), 1);
+    assert!(
+        error.contains(&jobs[0].0),
+        "the error must identify the job: {error}"
+    );
+    assert_eq!(
+        jobs[0].1, "running",
+        "failed persistence must not be reported as durable completion"
+    );
+    assert_eq!(jobs[0].2, None);
+    let item_statuses: Vec<String> = sqlx::query_scalar("SELECT status FROM agent_job_items")
+        .fetch_all(&mut fixture.connection)
+        .await?;
+    assert_eq!(item_statuses, vec!["pending".to_string()]);
+    assert_no_csv_worker_binding_or_result(&mut fixture.connection).await?;
+
+    fixture.connection.close().await?;
+    fixture.db.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn csv_failed_detail_read_error_is_not_reported_as_missing_evidence() -> anyhow::Result<()> {
+    let mut fixture = csv_job_sql_fault_fixture(MultiAgentVersion::V2).await?;
+    // Export happens before the completed transition. Corrupt only the subsequent failed-item
+    // read, preserving real failure text, progress counts, and the already-written snapshot.
+    sqlx::query(
+        "CREATE TRIGGER corrupt_failed_row_after_completion \
+         AFTER UPDATE OF status ON agent_jobs WHEN NEW.status = 'completed' \
+         BEGIN UPDATE agent_job_items SET row_json = 'not-json' \
+         WHERE job_id = NEW.id AND status = 'failed'; END",
+    )
+    .execute(&mut fixture.connection)
+    .await?;
+
+    let error = csv_job_fault_handler_error(&fixture).await;
+    assert!(
+        error.contains("failed") && error.contains("item"),
+        "{error}"
+    );
+    assert!(!error.contains("no error details were recorded"), "{error}");
+    let jobs: Vec<(String, String)> = sqlx::query_as("SELECT id, status FROM agent_jobs")
+        .fetch_all(&mut fixture.connection)
+        .await?;
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].1, "completed");
+    let failed_rows: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT status, row_json, last_error FROM agent_job_items WHERE status = 'failed'",
+    )
+    .fetch_all(&mut fixture.connection)
+    .await?;
+    assert_eq!(failed_rows.len(), 1);
+    assert_eq!(failed_rows[0].0, "failed");
+    assert_eq!(failed_rows[0].1, "not-json");
+    assert!(failed_rows[0].2.starts_with("failed to spawn worker:"));
+    let progress = fixture.db.get_agent_job_progress(&jobs[0].0).await?;
+    assert_eq!(progress.total_items, 1);
+    assert_eq!(progress.failed_items, 1);
+    assert_eq!(progress.completed_items, 0);
+    assert!(
+        fixture
+            .db
+            .list_agent_job_items(
+                &jobs[0].0,
+                Some(codex_state::AgentJobItemStatus::Failed),
+                Some(5),
+            )
+            .await
+            .is_err(),
+        "the injected persisted row must exercise the actual failed-detail decoder"
+    );
+    let csv = tokio::fs::read_to_string(&fixture.output_path).await?;
+    let (_headers, exported_rows) =
+        parse_csv(&csv).expect("the pre-fault export must remain valid");
+    assert_eq!(exported_rows.len(), 1);
+    assert_eq!(exported_rows[0][0], "first");
+    assert_eq!(exported_rows[0][5], "failed");
+    assert_no_csv_worker_binding_or_result(&mut fixture.connection).await?;
+
+    fixture.connection.close().await?;
+    fixture.db.close().await;
+    Ok(())
 }

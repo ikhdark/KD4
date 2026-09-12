@@ -167,7 +167,6 @@ use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyEventKind;
 use crossterm::event::KeyModifiers;
-use ratatui::backend::Backend;
 use ratatui::layout::Rect;
 use ratatui::style::Stylize;
 use ratatui::text::Line;
@@ -176,7 +175,6 @@ use ratatui::widgets::Wrap;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::VecDeque;
-use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -402,14 +400,14 @@ pub enum ExitReason {
     Fatal(String),
 }
 
-fn session_summary(
+async fn session_summary(
     token_usage: TokenUsage,
     thread_id: Option<ThreadId>,
     thread_name: Option<String>,
     rollout_path: Option<&Path>,
 ) -> Option<SessionSummary> {
     let usage_line = (!token_usage.is_zero()).then(|| format_token_usage(token_usage));
-    let resume_hint = resume_hint_for_resumable_thread(thread_id, thread_name, rollout_path);
+    let resume_hint = resume_hint_for_resumable_thread(thread_id, thread_name, rollout_path).await;
 
     if usage_line.is_none() && resume_hint.is_none() {
         return None;
@@ -427,30 +425,34 @@ struct ResumableThread {
     thread_name: Option<String>,
 }
 
-fn resumable_thread(
+async fn resumable_thread(
     thread_id: Option<ThreadId>,
     thread_name: Option<String>,
     rollout_path: Option<&Path>,
 ) -> Option<ResumableThread> {
     let thread_id = thread_id?;
     let rollout_path = rollout_path?;
-    rollout_path_is_resumable(rollout_path).then_some(ResumableThread {
-        thread_id,
-        thread_name,
-    })
+    rollout_path_is_resumable(rollout_path)
+        .await
+        .then_some(ResumableThread {
+            thread_id,
+            thread_name,
+        })
 }
 
-fn resume_hint_for_resumable_thread(
+async fn resume_hint_for_resumable_thread(
     thread_id: Option<ThreadId>,
     thread_name: Option<String>,
     rollout_path: Option<&Path>,
 ) -> Option<String> {
-    let thread = resumable_thread(thread_id, thread_name, rollout_path)?;
+    let thread = resumable_thread(thread_id, thread_name, rollout_path).await?;
     codex_utils_cli::resume_hint(thread.thread_name.as_deref(), Some(thread.thread_id))
 }
 
-fn rollout_path_is_resumable(rollout_path: &Path) -> bool {
-    std::fs::metadata(rollout_path).is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)
+async fn rollout_path_is_resumable(rollout_path: &Path) -> bool {
+    tokio::fs::metadata(rollout_path)
+        .await
+        .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)
 }
 
 fn errors_for_cwd(cwd: &Path, response: &SkillsListResponse) -> Vec<SkillErrorInfo> {
@@ -475,6 +477,9 @@ struct InitialHistoryReplayBuffer {
 }
 
 pub(crate) struct App {
+    #[cfg(test)]
+    desktop_thread_open_command_for_test:
+        Option<Box<dyn FnOnce(&str) -> tokio::process::Command + Send + Sync>>,
     model_catalog: Arc<ModelCatalog>,
     pub(crate) session_telemetry: SessionTelemetry,
     pub(crate) app_event_tx: AppEventSender,
@@ -991,9 +996,11 @@ See the Codex keymap documentation for supported actions and examples."
             )
         })?;
         #[cfg(not(debug_assertions))]
-        let upgrade_version = crate::updates::get_upgrade_version(&config);
+        let upgrade_version = crate::updates::get_upgrade_version(&config).await;
 
         let mut app = Self {
+            #[cfg(test)]
+            desktop_thread_open_command_for_test: None,
             model_catalog,
             session_telemetry: session_telemetry.clone(),
             app_event_tx,
@@ -1074,19 +1081,7 @@ See the Codex keymap documentation for supported actions and examples."
                     .hide_world_writable_warning
                     .unwrap_or(false);
             if should_check {
-                let cwd = app.config.cwd.clone();
-                let workspace_roots = app.config.effective_workspace_roots();
-                let env_map: std::collections::HashMap<String, String> = std::env::vars().collect();
-                let tx = app.app_event_tx.clone();
-                let logs_base_dir = app.config.codex_home.clone();
-                Self::spawn_world_writable_scan(
-                    cwd,
-                    workspace_roots,
-                    env_map,
-                    logs_base_dir,
-                    startup_permission_profile,
-                    tx,
-                );
+                app.spawn_world_writable_scan();
             }
         }
 
@@ -1224,7 +1219,8 @@ See the Codex keymap documentation for supported actions and examples."
             thread_id,
             app.chat_widget.thread_name(),
             app.chat_widget.rollout_path().as_deref(),
-        );
+        )
+        .await;
         Ok(AppExitInfo {
             token_usage: app.token_usage(),
             thread_id,

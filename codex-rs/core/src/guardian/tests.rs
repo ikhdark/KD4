@@ -426,6 +426,8 @@ async fn guardian_test_session_and_turn_with_base_url(
     session.thread_id = fixed_guardian_parent_session_id();
     let mut config = (*turn.config).clone();
     config.model_provider.base_url = Some(format!("{base_url}/v1"));
+    // These fixtures expose the Responses HTTP endpoint, without WebSocket upgrade.
+    config.model_provider.supports_websockets = false;
     let config = Arc::new(config);
     let models_manager = test_support::models_manager_with_provider(
         config.codex_home.to_path_buf(),
@@ -511,6 +513,8 @@ fn guardian_snapshot_options() -> ContextSnapshotOptions {
 fn normalize_guardian_snapshot_paths(text: String) -> String {
     let mut text = text;
     for canonical_path in ["/repo/codex-rs/core", "/repo"] {
+        let platform_uri = PathUri::from_abs_path(&test_path_buf(canonical_path).abs());
+        text = text.replace(&platform_uri.to_string(), &format!("file://{canonical_path}"));
         let platform_path = test_path_buf(canonical_path).display().to_string();
         if platform_path == canonical_path {
             continue;
@@ -1238,7 +1242,7 @@ fn guardian_approval_request_to_json_renders_network_access_trigger() -> serde_j
             call_id: "call-1".to_string(),
             tool_name: "shell".to_string(),
             command: vec!["curl".to_string(), "https://example.com".to_string()],
-            cwd: cwd.clone(),
+            cwd: cwd.clone().into(),
             sandbox_permissions: crate::sandboxing::SandboxPermissions::UseDefault,
             additional_permissions: None,
             justification: Some("Fetch the release metadata.".to_string()),
@@ -1258,7 +1262,7 @@ fn guardian_approval_request_to_json_renders_network_access_trigger() -> serde_j
                 "callId": "call-1",
                 "toolName": "shell",
                 "command": ["curl", "https://example.com"],
-                "cwd": cwd.to_string_lossy().to_string(),
+                "cwd": PathUri::from_abs_path(&cwd),
                 "sandboxPermissions": "use_default",
                 "justification": "Fetch the release metadata.",
             },
@@ -1288,7 +1292,7 @@ async fn build_guardian_prompt_items_explains_network_access_review_scope() -> a
                 call_id: "call-1".to_string(),
                 tool_name: "shell".to_string(),
                 command: vec!["curl".to_string(), "https://example.com".to_string()],
-                cwd,
+                cwd: cwd.into(),
                 sandbox_permissions: crate::sandboxing::SandboxPermissions::UseDefault,
                 additional_permissions: None,
                 justification: Some("Fetch the release metadata.".to_string()),
@@ -1430,7 +1434,7 @@ fn guardian_request_target_item_id_omits_network_access_trigger_call_id() {
             call_id: "call-1".to_string(),
             tool_name: "shell".to_string(),
             command: vec!["curl".to_string(), "https://example.com".to_string()],
-            cwd: test_path_buf("/repo").abs(),
+            cwd: test_path_buf("/repo").abs().into(),
             sandbox_permissions: crate::sandboxing::SandboxPermissions::UseDefault,
             additional_permissions: None,
             justification: None,
@@ -2821,11 +2825,18 @@ fn guardian_review_does_not_retry_parse_failure() -> anyhow::Result<()> {
         let server = start_mock_server().await;
         let request_log = mount_sse_sequence(
             &server,
-            vec![sse(vec![
-                ev_response_created("resp-parse-failure"),
-                ev_assistant_message("msg-parse-failure", "not valid guardian json"),
-                ev_completed("resp-parse-failure"),
-            ])],
+            vec![
+                sse(vec![
+                    ev_response_created("resp-parse-failure"),
+                    ev_assistant_message("msg-parse-failure", "not valid guardian json"),
+                    ev_completed("resp-parse-failure"),
+                ]),
+                sse(vec![
+                    ev_response_created("resp-parse-failure-reused"),
+                    ev_assistant_message("msg-parse-failure-reused", "still not guardian json"),
+                    ev_completed("resp-parse-failure-reused"),
+                ]),
+            ],
         )
         .await;
         let (session, turn) = guardian_test_session_and_turn(&server).await;
@@ -2851,9 +2862,37 @@ fn guardian_review_does_not_retry_parse_failure() -> anyhow::Result<()> {
         assert_eq!(metadata.attempt_count, 1);
         assert!(matches!(
             metadata.guardian_session_kind,
-            Some(codex_analytics::GuardianReviewSessionKind::TrunkReused)
+            Some(codex_analytics::GuardianReviewSessionKind::TrunkNew)
         ));
         assert_eq!(request_log.requests().len(), 1);
+        assert!(metadata.guardian_thread_id.is_some());
+
+        // A separate caller review reuses the completed trunk. Neither malformed
+        // assessment may consume the caller's remaining retry budget.
+        let (second_outcome, second_metadata) = run_guardian_review_session_for_test(
+            Arc::clone(&session),
+            Arc::clone(&turn),
+            guardian_shell_request("shell-parse-reused"),
+            /*retry_reason*/ None,
+            guardian_output_schema(),
+            /*external_cancel*/ None,
+            /*max_attempts*/ 3,
+        )
+        .await;
+        assert!(matches!(
+            second_outcome,
+            GuardianReviewOutcome::Error(
+                crate::guardian::review::GuardianReviewError::Parse { .. }
+            )
+        ));
+        assert_eq!(second_metadata.attempt_count, 1);
+        assert!(matches!(
+            second_metadata.guardian_session_kind,
+            Some(codex_analytics::GuardianReviewSessionKind::TrunkReused)
+        ));
+        assert_eq!(second_metadata.guardian_thread_id, metadata.guardian_thread_id);
+        assert_eq!(request_log.requests().len(), 2);
+        session.guardian_review_session.shutdown().await;
         Ok(())
     })
 }
@@ -3012,11 +3051,13 @@ async fn guardian_ephemeral_retry_preserves_parallel_trunk_and_fork_history() ->
             ],
             vec![StreamingSseChunk {
                 gate: None,
-                body: sse(vec![
-                    ev_response_created("resp-guardian-3"),
-                    ev_assistant_message("msg-guardian-3", "not valid guardian json"),
-                    ev_completed("resp-guardian-3"),
-                ]),
+                // Malformed assessments fail closed without retry. Exercise the
+                // actual transient-session retry path while the trunk stays busy.
+                body: sse_failed(
+                    "resp-guardian-3",
+                    "server_is_overloaded",
+                    "temporary ephemeral reviewer overload",
+                ),
             }],
             vec![StreamingSseChunk {
                 gate: None,
@@ -3049,7 +3090,9 @@ async fn guardian_ephemeral_retry_preserves_parallel_trunk_and_fork_history() ->
                 /*retry_reason*/ None
             )
             .await,
-            ReviewDecision::Approved
+            ReviewDecision::Approved,
+            "{}",
+            guardian_rejection_message(session.as_ref(), "review-shell-guardian-1").await
         );
         session
             .record_conversation_items(
@@ -3150,7 +3193,12 @@ async fn guardian_ephemeral_retry_preserves_parallel_trunk_and_fork_history() ->
             Some("parallel follow-up".to_string()),
         )
         .await;
-        assert_eq!(third_decision, ReviewDecision::Approved);
+        assert_eq!(
+            third_decision,
+            ReviewDecision::Approved,
+            "{}",
+            guardian_rejection_message(session.as_ref(), "review-shell-guardian-3").await
+        );
         let requests = server.requests().await;
         assert_eq!(requests.len(), 4);
         let second_request_body = serde_json::from_slice::<serde_json::Value>(&requests[1])?;
@@ -3531,4 +3579,190 @@ async fn guardian_review_session_config_uses_default_guardian_policy_without_req
         guardian_config.base_instructions,
         Some(guardian_policy_prompt())
     );
+}
+
+#[tokio::test]
+async fn guardian_review_preflight_honors_deadline_and_cancel_during_live_config_reload()
+-> anyhow::Result<()> {
+    use codex_network_proxy::ConfigReloader;
+    use codex_network_proxy::ConfigReloaderFuture;
+    use codex_network_proxy::ConfigState;
+    use codex_network_proxy::NetworkProxy;
+    use codex_network_proxy::NetworkProxyConstraints;
+    use codex_network_proxy::NetworkProxyState;
+    use codex_network_proxy::build_config_state_with_codex_home;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+
+    struct GatedConfigReloader {
+        enabled: AtomicBool,
+        calls: AtomicUsize,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+    impl ConfigReloader for GatedConfigReloader {
+        fn source_label(&self) -> String {
+            "guardian preflight external config".to_string()
+        }
+        fn maybe_reload(&self) -> ConfigReloaderFuture<'_, Option<ConfigState>> {
+            Box::pin(async {
+                if !self.enabled.load(Ordering::SeqCst) {
+                    return Ok(None);
+                }
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.entered.notify_one();
+                self.release.notified().await;
+                Err(anyhow::anyhow!("live network config could not be loaded"))
+            })
+        }
+        fn reload_now(&self) -> ConfigReloaderFuture<'_, ConfigState> {
+            Box::pin(async { Err(anyhow::anyhow!("unexpected forced reload")) })
+        }
+    }
+
+    // The third case preserves completed configuration errors; only timeout/cancellation change.
+    for stop in ["deadline", "cancel", "pre_cancelled", "config_error"] {
+        let server = start_mock_server().await;
+        let (session, turn, rx) = Box::pin(guardian_test_session_turn_and_rx(&server)).await;
+        let proxy_home = tempfile::tempdir()?;
+        let reloader = Arc::new(GatedConfigReloader {
+            enabled: AtomicBool::new(false),
+            calls: AtomicUsize::new(0),
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let config_state = build_config_state_with_codex_home(
+            NetworkProxyConfig {
+                enabled: false,
+                mitm: false,
+                credential_broker: false,
+                ..Default::default()
+            },
+            NetworkProxyConstraints::default(),
+            proxy_home.path(),
+        )?;
+        let proxy = NetworkProxy::builder()
+            .state(Arc::new(NetworkProxyState::with_reloader(
+                config_state,
+                reloader.clone(),
+            )))
+            .codex_home(proxy_home.path().to_path_buf().abs())
+            .managed_by_codex(false)
+            .build()
+            .await?;
+        let handle = proxy.run().await?;
+        session.services.network_proxy.store(Some(Arc::new(
+            crate::config::StartedNetworkProxy::from_running_proxy_for_test(
+                proxy,
+                handle,
+                proxy_home.path().to_path_buf(),
+            ),
+        )));
+        assert!(
+            session
+                .guardian_review_session
+                .trunk_rollout_path()
+                .await
+                .is_none()
+        );
+        while rx.try_recv().is_ok() {}
+        reloader.enabled.store(true, Ordering::SeqCst);
+        let external_cancel = CancellationToken::new();
+        if stop == "pre_cancelled" {
+            external_cancel.cancel();
+        }
+        // Pause only after real fixture/proxy setup. Advancing now expires the production's
+        // one absolute 90-second review deadline without waiting in wall-clock time.
+        tokio::time::pause();
+        let mut pending = Box::pin(review::run_guardian_review_session_with_retry(
+            Arc::clone(&session),
+            Arc::clone(&turn),
+            guardian_shell_request("blocked-preflight"),
+            None,
+            prompt::guardian_output_schema(),
+            Some(external_cancel.clone()),
+            3,
+        ));
+        if stop != "pre_cancelled" {
+            tokio::select! {
+                result = &mut pending => panic!("review escaped blocked live configuration: {result:?}"),
+                _ = reloader.entered.notified() => {},
+            }
+            assert_eq!(reloader.calls.load(Ordering::SeqCst), 1);
+            assert!(
+                rx.try_recv().is_err(),
+                "preflight must not emit session/review events"
+            );
+            match stop {
+                "deadline" => {
+                    tokio::time::advance(GUARDIAN_REVIEW_TIMEOUT + Duration::from_millis(1)).await
+                }
+                "cancel" => external_cancel.cancel(),
+                "config_error" => reloader.release.notify_one(),
+                _ => unreachable!(),
+            }
+        }
+        let (outcome, analytics) = tokio::time::timeout(Duration::from_secs(1), pending)
+            .await
+            .expect("normal retry entry must finish while live config remains blocked");
+        tokio::time::resume();
+        match stop {
+            "deadline" => assert!(matches!(
+                outcome,
+                review::GuardianReviewOutcome::Error(review::GuardianReviewError::Timeout)
+            )),
+            "cancel" | "pre_cancelled" => assert!(matches!(
+                outcome,
+                review::GuardianReviewOutcome::Error(review::GuardianReviewError::Cancelled)
+            )),
+            "config_error" => assert!(
+                matches!(outcome, review::GuardianReviewOutcome::Error(review::GuardianReviewError::PromptBuild { message }) if message == "live network config could not be loaded")
+            ),
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            analytics.attempt_count, 1,
+            "preflight failures must not retry or spawn sessions"
+        );
+        assert!(matches!(
+            analytics.decision,
+            codex_analytics::GuardianReviewDecision::Denied
+        ));
+        assert!(matches!(
+            analytics.terminal_status,
+            codex_analytics::GuardianReviewTerminalStatus::FailedClosed
+        ));
+        assert!(analytics.guardian_thread_id.is_none());
+        assert!(analytics.guardian_session_kind.is_none());
+        assert!(analytics.guardian_model.is_none());
+        assert!(analytics.token_usage.is_none());
+        assert!(analytics.tool_call_count.is_none());
+        assert!(
+            session
+                .guardian_review_session
+                .trunk_rollout_path()
+                .await
+                .is_none(),
+            "failed preflight must not create a reusable review session"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "failed preflight must not publish spawned review work"
+        );
+        assert_eq!(
+            reloader.calls.load(Ordering::SeqCst),
+            usize::from(stop != "pre_cancelled")
+        );
+        assert!(
+            server
+                .received_requests()
+                .await
+                .expect("model request log")
+                .is_empty(),
+            "preflight failure must not send model/catalog requests"
+        );
+        session.services.network_proxy.store(None);
+    }
+    Ok(())
 }

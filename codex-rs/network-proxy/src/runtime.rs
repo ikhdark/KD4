@@ -449,6 +449,7 @@ impl NetworkProxyState {
                 {
                     let mut guard = self.state.write().await;
                     new_state.blocked = guard.blocked.clone();
+                    new_state.blocked_total = guard.blocked_total;
                     *guard = new_state;
                 }
                 let source = self.reloader.source_label();
@@ -608,14 +609,9 @@ impl NetworkProxyState {
 
         loop {
             self.reload_if_needed().await?;
-            let (previous_cfg, constraints, blocked, blocked_total) = {
+            let (previous_cfg, constraints) = {
                 let guard = self.state.read().await;
-                (
-                    guard.config.clone(),
-                    guard.constraints.clone(),
-                    guard.blocked.clone(),
-                    guard.blocked_total,
-                )
+                (guard.config.clone(), guard.constraints.clone())
             };
 
             let mut candidate = previous_cfg.clone();
@@ -641,17 +637,21 @@ impl NetworkProxyState {
                 .map_err(NetworkProxyConstraintError::into_anyhow)
                 .with_context(|| format!("{constraint_field} constrained by managed config"))?;
 
-            let mut new_state = build_config_state(candidate.clone(), constraints.clone())
-                .with_context(|| format!("failed to compile updated network {list_name}"))?;
-            new_state.blocked = blocked;
-            new_state.blocked_total = blocked_total;
-
+            let config_to_build = candidate.clone();
+            let constraints_to_build = constraints.clone();
+            let mut new_state = run_blocking_policy_io(move || {
+                build_config_state(config_to_build, constraints_to_build)
+            })
+            .await?
+            .with_context(|| format!("failed to compile updated network {list_name}"))?;
             let mut guard = self.state.write().await;
             if guard.constraints != constraints || guard.config != previous_cfg {
                 drop(guard);
                 continue;
             }
 
+            new_state.blocked = guard.blocked.clone();
+            new_state.blocked_total = guard.blocked_total;
             log_policy_changes(&guard.config, &candidate);
             *guard = new_state;
             info!("updated network {list_name} with {normalized_host}");
@@ -664,19 +664,11 @@ impl NetworkProxyState {
             None => Ok(()),
             Some(mut new_state) => {
                 self.ensure_credential_broker_enablement_unchanged(&new_state)?;
-                let (previous_cfg, blocked, blocked_total) = {
-                    let guard = self.state.read().await;
-                    (
-                        guard.config.clone(),
-                        guard.blocked.clone(),
-                        guard.blocked_total,
-                    )
-                };
-                log_policy_changes(&previous_cfg, &new_state.config);
-                new_state.blocked = blocked;
-                new_state.blocked_total = blocked_total;
                 {
                     let mut guard = self.state.write().await;
+                    log_policy_changes(&guard.config, &new_state.config);
+                    new_state.blocked = guard.blocked.clone();
+                    new_state.blocked_total = guard.blocked_total;
                     *guard = new_state;
                 }
                 let source = self.reloader.source_label();
@@ -1124,14 +1116,26 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn confirmed_performance_policy_filesystem_work_uses_blocking_pool() {
-        let async_thread = std::thread::current().id();
+    async fn policy_filesystem_worker_resolves_aliases_and_rejects_unlisted_paths() {
+        let home = tempfile::tempdir().unwrap();
+        let directory = home.path().join("sockets");
+        std::fs::create_dir(&directory).unwrap();
+        let allowed_path = home.path().join("allowed.sock");
+        let denied_path = home.path().join("denied.sock");
+        std::fs::write(&allowed_path, []).unwrap();
+        std::fs::write(&denied_path, []).unwrap();
+        let alias = directory.join("..").join("allowed.sock");
+        let allowed = vec![allowed_path.to_string_lossy().into_owned()];
+        let decisions = run_blocking_policy_io(move || {
+            [
+                unix_socket_path_is_allowed(&alias.to_string_lossy(), &allowed),
+                unix_socket_path_is_allowed(&denied_path.to_string_lossy(), &allowed),
+            ]
+        })
+        .await
+        .unwrap();
 
-        let blocking_thread = run_blocking_policy_io(|| std::thread::current().id())
-            .await
-            .unwrap();
-
-        assert_ne!(blocking_thread, async_thread);
+        assert_eq!(decisions, [true, false]);
     }
 
     fn network_settings(allowed_domains: &[&str], denied_domains: &[&str]) -> NetworkProxyConfig {
@@ -1189,6 +1193,42 @@ mod tests {
         );
         assert_eq!(env["OPENAI_API_KEY"], "sk-real");
         assert!(!state.credential_broker.enabled());
+    }
+
+    #[tokio::test]
+    async fn force_reload_preserves_blocked_history_and_total() {
+        let initial = build_config_state(
+            NetworkProxyConfig::default(),
+            NetworkProxyConstraints::default(),
+        )
+        .unwrap();
+        let mut reloaded = initial.clone();
+        reloaded.config.mode = NetworkMode::Limited;
+        let state =
+            NetworkProxyState::with_reloader(initial, Arc::new(StaticReloader { state: reloaded }));
+        state
+            .record_blocked(BlockedRequest::new(BlockedRequestArgs {
+                host: "blocked.example".to_string(),
+                reason: "not_allowed".to_string(),
+                client: None,
+                method: Some("POST".to_string()),
+                mode: None,
+                protocol: "http".to_string(),
+                decision: None,
+                source: None,
+                port: Some(80),
+            }))
+            .await
+            .unwrap();
+        state.force_reload().await.unwrap();
+        assert_eq!(
+            state.current_cfg().await.unwrap().mode,
+            NetworkMode::Limited
+        );
+        let blocked = state.drain_blocked().await.unwrap();
+        assert_eq!(blocked.len(), 1);
+        assert_eq!(blocked[0].host, "blocked.example");
+        assert_eq!(state.state.read().await.blocked_total, 1);
     }
 
     #[tokio::test]

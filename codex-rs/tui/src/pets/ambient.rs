@@ -504,13 +504,14 @@ mod tests {
 
     #[test]
     fn animation_frame_uses_per_frame_duration() {
-        let animation = test_animation();
+        let mut animation = test_animation();
+        animation.frames[1].duration = Duration::from_millis(30);
 
         assert_eq!(
-            current_animation_frame(&animation, Duration::from_millis(/*millis*/ 15)),
+            current_animation_frame(&animation, Duration::from_millis(/*millis*/ 25)),
             Some(AnimationFrameTick {
                 sprite_index: 1,
-                delay: Some(Duration::from_millis(/*millis*/ 5)),
+                delay: Some(Duration::from_millis(/*millis*/ 15)),
             })
         );
     }

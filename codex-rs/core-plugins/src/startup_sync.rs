@@ -241,8 +241,9 @@ fn sync_openai_plugins_repo_via_git(
     }
 
     ensure_marketplace_manifest_exists(staged_repo_dir.path())?;
-    activate_curated_repo(&repo_path, staged_repo_dir)?;
-    write_curated_plugins_sha(&sha_path, &remote_sha)?;
+    activate_curated_repo(&repo_path, staged_repo_dir, || {
+        write_curated_plugins_sha(&sha_path, &remote_sha)
+    })?;
     Ok(remote_sha)
 }
 
@@ -355,8 +356,9 @@ fn sync_openai_plugins_repo_via_http_with_clients(
     ))?;
     extract_zipball_to_dir(&zipball_bytes, staged_repo_dir.path())?;
     ensure_marketplace_manifest_exists(staged_repo_dir.path())?;
-    activate_curated_repo(&repo_path, staged_repo_dir)?;
-    write_curated_plugins_sha(&sha_path, &remote_sha)?;
+    activate_curated_repo(&repo_path, staged_repo_dir, || {
+        write_curated_plugins_sha(&sha_path, &remote_sha)
+    })?;
     Ok(remote_sha)
 }
 
@@ -380,8 +382,9 @@ fn sync_openai_plugins_repo_via_backup_archive(
     ensure_marketplace_manifest_exists(staged_repo_dir.path())?;
     let export_version = read_extracted_backup_archive_git_sha(staged_repo_dir.path())?
         .unwrap_or_else(|| CURATED_PLUGINS_BACKUP_ARCHIVE_FALLBACK_VERSION.to_string());
-    activate_curated_repo(&repo_path, staged_repo_dir)?;
-    write_curated_plugins_sha(&sha_path, &export_version)?;
+    activate_curated_repo(&repo_path, staged_repo_dir, || {
+        write_curated_plugins_sha(&sha_path, &export_version)
+    })?;
     Ok(export_version)
 }
 
@@ -542,7 +545,11 @@ fn ensure_marketplace_manifest_exists(repo_path: &Path) -> Result<(), String> {
     ))
 }
 
-fn activate_curated_repo(repo_path: &Path, staged_repo_dir: TempDir) -> Result<(), String> {
+fn activate_curated_repo(
+    repo_path: &Path,
+    staged_repo_dir: TempDir,
+    publish_revision: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
     let staged_repo_path = staged_repo_dir.path();
     if repo_path.exists() {
         let parent = repo_path.parent().ok_or_else(|| {
@@ -586,6 +593,24 @@ fn activate_curated_repo(repo_path: &Path, staged_repo_dir: TempDir) -> Result<(
                 }
             };
         }
+
+        // Retain the previous checkout until its replacement revision is also
+        // published. Failed publication must not leave new files under an old SHA.
+        if let Err(err) = publish_revision() {
+            let rollback_result = std::fs::rename(repo_path, staged_repo_path)
+                .and_then(|()| std::fs::rename(&backup_repo_path, repo_path));
+            return match rollback_result {
+                Ok(()) => Err(err),
+                Err(rollback_err) => {
+                    let backup_path = backup_dir.keep().join("repo");
+                    Err(format!(
+                        "{err}; failed to restore previous curated plugins repo at {} (left at {}): {rollback_err}",
+                        repo_path.display(),
+                        backup_path.display()
+                    ))
+                }
+            };
+        }
     } else {
         std::fs::rename(staged_repo_path, repo_path).map_err(|err| {
             format!(
@@ -593,21 +618,37 @@ fn activate_curated_repo(repo_path: &Path, staged_repo_dir: TempDir) -> Result<(
                 repo_path.display()
             )
         })?;
+        if let Err(err) = publish_revision() {
+            return match std::fs::rename(repo_path, staged_repo_path) {
+                Ok(()) => Err(err),
+                Err(rollback_err) => Err(format!(
+                    "{err}; failed to remove unpublished curated plugins repo at {}: {rollback_err}",
+                    repo_path.display()
+                )),
+            };
+        }
     }
 
     Ok(())
 }
 
 fn write_curated_plugins_sha(sha_path: &Path, remote_sha: &str) -> Result<(), String> {
-    if let Some(parent) = sha_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|err| {
-            format!(
-                "failed to create curated plugins sha directory {}: {err}",
-                parent.display()
-            )
+    use std::io::Write;
+
+    let write_revision = || -> std::io::Result<()> {
+        let parent = sha_path.parent().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "SHA path has no parent")
         })?;
-    }
-    std::fs::write(sha_path, format!("{remote_sha}\n")).map_err(|err| {
+        std::fs::create_dir_all(parent)?;
+        let mut staged_sha = tempfile::NamedTempFile::new_in(parent)?;
+        writeln!(staged_sha, "{remote_sha}")?;
+        staged_sha.as_file().sync_all()?;
+        // Commit last: no fallible work may follow this replacement because an
+        // error tells the caller to restore the previous checkout.
+        staged_sha.persist(sha_path).map_err(|err| err.error)?;
+        Ok(())
+    };
+    write_revision().map_err(|err| {
         format!(
             "failed to write curated plugins sha file {}: {err}",
             sha_path.display()
@@ -658,18 +699,15 @@ fn git_ls_remote_head_sha(git_binary: &Path) -> Result<String, String> {
 }
 
 fn git_head_sha(repo_path: &Path, git_binary: &Path) -> Result<String, String> {
-    let output = git_command(git_binary)
-        .arg("-C")
-        .arg(repo_path)
-        .arg("rev-parse")
-        .arg("HEAD")
-        .output()
-        .map_err(|err| {
-            format!(
-                "failed to run git rev-parse HEAD in {}: {err}",
-                repo_path.display()
-            )
-        })?;
+    let output = run_git_command_with_timeout(
+        git_command(git_binary)
+            .arg("-C")
+            .arg(repo_path)
+            .arg("rev-parse")
+            .arg("HEAD"),
+        &format!("git rev-parse HEAD in {}", repo_path.display()),
+        CURATED_PLUGINS_GIT_TIMEOUT,
+    )?;
     ensure_git_success(&output, "git rev-parse HEAD")?;
 
     let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -691,46 +729,171 @@ fn git_command(git_binary: &Path) -> Command {
     command
 }
 
-fn run_git_command_with_timeout(
+// Retain process-tree ownership until every error path has terminated and reaped
+// the root. Unix polling must leave the exited root unreaped: its identity pins
+// the process-group ID through output handling and failure cleanup. Successful
+// commands may intentionally leave a Git daemon running.
+struct GitChild {
+    child: std::process::Child,
+    #[cfg(windows)]
+    managed: codex_utils_pty::ManagedRootProcess,
+    completed: bool,
+}
+
+impl GitChild {
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        #[cfg(unix)]
+        {
+            let result = poll_git_exit_without_reaping(self.child.id());
+            if result
+                .as_ref()
+                .is_err_and(|error| error.raw_os_error() == Some(libc::ECHILD))
+            {
+                // Another reaper has already removed our child. Its numeric ID
+                // no longer establishes ownership of a process group.
+                self.completed = true;
+            }
+            result
+        }
+        #[cfg(not(unix))]
+        self.child.try_wait()
+    }
+}
+
+#[cfg(unix)]
+fn poll_git_exit_without_reaping(pid: u32) -> std::io::Result<Option<std::process::ExitStatus>> {
+    use std::os::unix::process::ExitStatusExt;
+
+    // SAFETY: zero initialization is valid for siginfo_t; waitid receives a
+    // writable buffer and the PID of our owned child. WNOWAIT retains it for
+    // the eventual std::process::Child::wait, rather than consuming ownership.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // SAFETY: info is writable and pid names this owner's child. WNOWAIT
+    // observes termination without releasing the root's process identity.
+    let result = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if result == -1 {
+        let error = std::io::Error::last_os_error();
+        return if error.kind() == std::io::ErrorKind::Interrupted {
+            Ok(None)
+        } else {
+            Err(error)
+        };
+    }
+    // SAFETY: successful waitid initializes these SIGCHLD fields, and the
+    // zero PID denotes that WNOHANG found no exited child.
+    if unsafe { info.si_pid() } == 0 {
+        return Ok(None);
+    }
+    // SAFETY: a nonzero SIGCHLD PID from successful waitid makes si_status valid.
+    let status = unsafe { info.si_status() };
+    // ExitStatusExt uses the platform's waitpid encoding: normal exit occupies
+    // the high byte, signal termination the low byte, and bit 7 marks a core dump.
+    let raw = match info.si_code {
+        libc::CLD_EXITED => status << 8,
+        libc::CLD_KILLED => status,
+        libc::CLD_DUMPED => status | 0x80,
+        code => {
+            return Err(std::io::Error::other(format!(
+                "unexpected child exit code {code}"
+            )));
+        }
+    };
+    Ok(Some(std::process::ExitStatus::from_raw(raw)))
+}
+
+impl Drop for GitChild {
+    fn drop(&mut self) {
+        if !self.completed {
+            #[cfg(windows)]
+            let _ = self.managed.terminate();
+            #[cfg(unix)]
+            let _ = codex_utils_pty::process_group::kill_process_group(self.child.id());
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+pub(crate) fn run_git_command_with_timeout(
     command: &mut Command,
     context: &str,
     timeout: Duration,
 ) -> Result<Output, String> {
-    let mut child = command
+    use std::io::Read;
+    use std::io::Seek;
+
+    // Pipes cannot be collected only after try_wait: Git may fill a pipe before
+    // exiting, and descendants may retain its write end after timeout. Anonymous
+    // files let the synchronous caller poll without either kind of pipe wait.
+    let capture =
+        || tempfile::tempfile().map_err(|err| format!("failed to capture {context}: {err}"));
+    let mut stdout = capture()?;
+    let mut stderr = capture()?;
+    command
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(
+            stdout
+                .try_clone()
+                .map_err(|err| format!("failed to capture {context}: {err}"))?,
+        )
+        .stderr(
+            stderr
+                .try_clone()
+                .map_err(|err| format!("failed to capture {context}: {err}"))?,
+        );
+    #[cfg(windows)]
+    let managed = {
+        use std::os::windows::process::CommandExt;
+        let managed = codex_utils_pty::ManagedRootProcess::reserve()
+            .map_err(|err| format!("failed to contain {context}: {err}"))?;
+        managed
+            .require_descendant_containment()
+            .map_err(|err| format!("failed to contain {context}: {err}"))?;
+        command.creation_flags(codex_utils_pty::WINDOWS_CREATE_SUSPENDED);
+        managed
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let child = command
         .spawn()
         .map_err(|err| format!("failed to run {context}: {err}"))?;
-
+    let mut child = GitChild {
+        child,
+        #[cfg(windows)]
+        managed,
+        completed: false,
+    };
+    #[cfg(windows)]
+    child
+        .managed
+        .attach_and_resume(child.child.id())
+        .map_err(|err| format!("failed to contain {context}: {err}"))?;
     let start = std::time::Instant::now();
-    loop {
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(_)) => {
-                return child
-                    .wait_with_output()
-                    .map_err(|err| format!("failed to wait for {context}: {err}"));
-            }
+            Ok(Some(status)) => break status,
             Ok(None) => {}
             Err(err) => return Err(format!("failed to poll {context}: {err}")),
         }
-
         if start.elapsed() >= timeout {
-            match child.try_wait() {
-                Ok(Some(_)) => {
-                    return child
-                        .wait_with_output()
-                        .map_err(|err| format!("failed to wait for {context}: {err}"));
-                }
-                Ok(None) => {}
-                Err(err) => return Err(format!("failed to poll {context}: {err}")),
-            }
-
-            let _ = child.kill();
-            let output = child
-                .wait_with_output()
-                .map_err(|err| format!("failed to wait for {context} after timeout: {err}"))?;
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            drop(child);
+            let mut bytes = Vec::new();
+            stderr
+                .rewind()
+                .and_then(|()| stderr.read_to_end(&mut bytes))
+                .map_err(|err| format!("failed to read {context} output: {err}"))?;
+            let stderr = String::from_utf8_lossy(&bytes);
+            let stderr = stderr.trim();
             return if stderr.is_empty() {
                 Err(format!("{context} timed out after {}s", timeout.as_secs()))
             } else {
@@ -740,9 +903,37 @@ fn run_git_command_with_timeout(
                 ))
             };
         }
-
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(100).min(timeout.saturating_sub(start.elapsed())));
+    };
+    let mut output = Output {
+        status,
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+    };
+    stdout
+        .rewind()
+        .and_then(|()| stdout.read_to_end(&mut output.stdout))
+        .map_err(|err| format!("failed to read {context} output: {err}"))?;
+    stderr
+        .rewind()
+        .and_then(|()| stderr.read_to_end(&mut output.stderr))
+        .map_err(|err| format!("failed to read {context} output: {err}"))?;
+    if output.status.success() {
+        #[cfg(windows)]
+        child
+            .managed
+            .preserve_descendants()
+            .map_err(|err| format!("failed to release {context}: {err}"))?;
+        child.completed = true;
+        // Successful output handling transfers descendant ownership. Disarm
+        // numeric group cleanup before the operation that releases the root ID.
+        #[cfg(unix)]
+        child
+            .child
+            .wait()
+            .map_err(|err| format!("failed to reap {context}: {err}"))?;
     }
+    Ok(output)
 }
 
 fn ensure_git_success(output: &Output, context: &str) -> Result<(), String> {

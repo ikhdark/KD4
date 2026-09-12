@@ -184,24 +184,36 @@ async fn request_dynamic_tool(
 ) -> Result<DynamicToolResponse, String> {
     let namespace = tool_name.namespace;
     let tool = tool_name.name;
-    let (tx_response, rx_response) = oneshot::channel();
+    let cleanup = tokio_util::sync::CancellationToken::new();
+    let _cleanup_on_drop = cleanup.clone().drop_guard();
+    let (tx_response, mut rx_response) = oneshot::channel();
     let event_id = call_id.clone();
-    let registered = {
+    let originating_turn_state = {
         let mut active = session.active_turn.lock().await;
         match active.as_mut() {
             Some(at) => {
                 let mut ts = at.turn_state.lock().await;
                 ts.try_insert_pending_dynamic_tool(call_id.clone(), tx_response)
-                    .is_ok()
+                    .ok()
+                    .map(|()| Arc::clone(&at.turn_state))
             }
-            None => false,
+            None => None,
         }
     };
-    if !registered {
+    let Some(originating_turn_state) = originating_turn_state else {
         return Err(format!(
             "dynamic tool call id {event_id} is already pending or the turn is no longer active"
         ));
-    }
+    };
+    let cleanup_turn_state = Arc::clone(&originating_turn_state);
+    let cleanup_key = call_id.clone();
+    session.terminal_tasks.spawn(async move {
+        cleanup.cancelled().await;
+        cleanup_turn_state
+            .lock()
+            .await
+            .remove_closed_pending_dynamic_tool(&cleanup_key);
+    });
 
     let started_at = Instant::now();
     session
@@ -221,16 +233,13 @@ async fn request_dynamic_tool(
         )
         .await;
     let response = tokio::select! {
-        response = rx_response => response.ok(),
+        response = &mut rx_response => response.ok(),
         () = cancellation_token.cancelled() => {
-            let mut active = session.active_turn.lock().await;
-            if let Some(active_turn) = active.as_mut() {
-                active_turn
-                    .turn_state
-                    .lock()
-                    .await
-                    .remove_pending_dynamic_tool(&call_id);
-            }
+            rx_response.close();
+            originating_turn_state
+                .lock()
+                .await
+                .remove_closed_pending_dynamic_tool(&call_id);
             None
         }
     };
@@ -355,17 +364,179 @@ mod tests {
         );
     }
 
-    #[test]
-    fn dynamic_handler_waits_for_runtime_cancellation_cleanup() {
-        let tool = DynamicToolFunctionSpec {
-            name: "dynamic_cleanup".to_string(),
-            description: "Dynamic cancellation cleanup fixture".to_string(),
-            input_schema: serde_json::json!({ "type": "object" }),
-            defer_loading: false,
-        };
-        let handler = DynamicToolHandler::new(&tool).expect("valid dynamic tool schema");
+    #[tokio::test]
+    async fn registered_dynamic_request_drop_retires_blocked_and_delivered_registration() {
+        use crate::session::step_context::StepContext;
+        use crate::tools::context::{ToolCallSource, ToolDispatchState};
+        use crate::tools::router::{ToolCall, ToolRouter, ToolRouterParams};
+        use crate::turn_diff_tracker::TurnDiffTracker;
+        use codex_protocol::dynamic_tools::DynamicToolSpec;
+        use codex_protocol::protocol::{Event, EventMsg, WarningEvent};
+        use std::time::Duration;
+        use tokio_util::sync::CancellationToken;
 
-        assert!(handler.waits_for_runtime_cancellation());
+        for blocked in [true, false] {
+            let (session, turn, events_tx, events) =
+                crate::session::tests::make_session_and_context_with_event_capacity(if blocked {
+                    1
+                } else {
+                    64
+                })
+                .await;
+            let active = ActiveTurn::default();
+            let state = Arc::clone(&active.turn_state);
+            *session.active_turn.lock().await = Some(active);
+            if blocked {
+                events_tx
+                    .send(Event {
+                        id: "sentinel".into(),
+                        msg: EventMsg::Warning(WarningEvent {
+                            message: "occupied".into(),
+                        }),
+                    })
+                    .await
+                    .unwrap();
+            }
+            let step = StepContext::for_test(Arc::clone(&turn));
+            let specs = [DynamicToolSpec::Function(DynamicToolFunctionSpec {
+                name: "dynamic_cleanup".into(),
+                description: "Dynamic cleanup".into(),
+                input_schema: serde_json::json!({"type":"object"}),
+                defer_loading: false,
+            })];
+            let router = ToolRouter::from_context(
+                step.as_ref(),
+                ToolRouterParams {
+                    tool_suggest_candidates: None,
+                    deferred_mcp_tools: None,
+                    mcp_tools: None,
+                    extension_tool_executors: Vec::new(),
+                    dynamic_tools: &specs,
+                    exposure_identity: Default::default(),
+                },
+                &Default::default(),
+            );
+            let mut request = Box::pin(router.dispatch_tool_call_with_terminal_outcome(
+                Arc::clone(&session),
+                step,
+                CancellationToken::new(),
+                Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+                ToolCall {
+                    tool_name: ToolName::plain("dynamic_cleanup"),
+                    call_id: "drop-dynamic".into(),
+                    payload: ToolPayload::Function {
+                        arguments: "{}".into(),
+                    },
+                },
+                ToolCallSource::Direct,
+                Arc::new(ToolDispatchState::new()),
+            ));
+            tokio::time::timeout(Duration::from_secs(3), async {
+                tokio::select! {
+                    result = &mut request => panic!("registered request must remain pending; succeeded={}", result.is_ok()),
+                    () = async {
+                        while !state.lock().await.has_pending_dynamic_tool("drop-dynamic") {
+                            tokio::task::yield_now().await;
+                        }
+                    } => {}
+                }
+            }).await.expect("registered handler reaches actual keyed pending state");
+            if !blocked {
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    loop {
+                        tokio::select! {
+                            result = &mut request => panic!("request completed before response; succeeded={}", result.is_ok()),
+                            event = events.recv() => {
+                                if let EventMsg::DynamicToolCallRequest(event) = event.unwrap().msg {
+                                    assert_eq!(event.call_id, "drop-dynamic");
+                                    assert_eq!(event.arguments, serde_json::json!({}));
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }).await.expect("normal dynamic client request delivered");
+            }
+            drop(request);
+            session.terminal_tasks.close();
+            tokio::time::timeout(Duration::from_secs(3), session.terminal_tasks.wait())
+                .await
+                .expect("dropped registered handler cleanup completes");
+            assert!(!state.lock().await.has_pending_dynamic_tool("drop-dynamic"));
+            if blocked {
+                assert_eq!(events.recv().await.unwrap().id, "sentinel");
+                assert!(
+                    events.try_recv().is_err(),
+                    "dropped ItemStarted cannot leak delayed request"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn dynamic_cancellation_cleans_original_turn_and_preserves_new_turn_response() {
+        use codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem;
+        use tokio_util::sync::CancellationToken;
+        let (session, turn, events) = make_session_and_context_with_rx().await;
+        let active = ActiveTurn::default();
+        let original_state = Arc::clone(&active.turn_state);
+        *session.active_turn.lock().await = Some(active);
+        let token = CancellationToken::new();
+        let mut first = Box::pin(request_dynamic_tool(
+            &session,
+            &turn,
+            "same-dynamic".into(),
+            ToolName::plain("dynamic_cleanup"),
+            serde_json::json!({}),
+            token.clone(),
+        ));
+        assert!(futures::poll!(&mut first).is_pending());
+        while events.try_recv().is_ok() {}
+        *session.active_turn.lock().await = Some(ActiveTurn::default());
+        let mut replacement = Box::pin(request_dynamic_tool(
+            &session,
+            &turn,
+            "same-dynamic".into(),
+            ToolName::plain("dynamic_cleanup"),
+            serde_json::json!({}),
+            CancellationToken::new(),
+        ));
+        assert!(futures::poll!(&mut replacement).is_pending());
+        token.cancel();
+        assert!(
+            first
+                .await
+                .expect_err("original request cancelled")
+                .contains("cancelled")
+        );
+        assert!(
+            !original_state
+                .lock()
+                .await
+                .has_pending_dynamic_tool("same-dynamic")
+        );
+        let expected = DynamicToolResponse {
+            success: true,
+            content_items: vec![DynamicToolCallOutputContentItem::InputText {
+                text: "replacement 42".into(),
+            }],
+        };
+        session
+            .notify_dynamic_tool_response("same-dynamic", expected.clone())
+            .await;
+        assert_eq!(
+            replacement
+                .await
+                .expect("new turn response remains connected"),
+            expected
+        );
+        session.terminal_tasks.close();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            session.terminal_tasks.wait(),
+        )
+        .await
+        .unwrap();
     }
 
     #[test]

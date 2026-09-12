@@ -4059,6 +4059,7 @@ async fn make_test_app() -> App {
     let session_telemetry = test_session_telemetry(&config, model.as_str());
 
     App {
+        desktop_thread_open_command_for_test: None,
         model_catalog: chat_widget.model_catalog(),
         session_telemetry,
         app_event_tx,
@@ -4125,6 +4126,7 @@ async fn make_test_app_with_channels() -> (
 
     (
         App {
+            desktop_thread_open_command_for_test: None,
             model_catalog: chat_widget.model_catalog(),
             session_telemetry,
             app_event_tx,
@@ -4184,7 +4186,7 @@ async fn make_test_app_with_channels() -> (
 #[tokio::test]
 async fn set_thread_goal_draft_materializes_long_objective_and_confirms_before_paste() -> Result<()>
 {
-    let mut app = make_test_app().await;
+    let (mut app, mut events, _op_rx) = make_test_app_with_channels().await;
     let mut app_server =
         crate::start_embedded_app_server_for_picker(app.chat_widget.config_ref()).await?;
     let started = app_server
@@ -4381,7 +4383,79 @@ async fn set_thread_goal_draft_materializes_long_objective_and_confirms_before_p
     assert!(objective.contains(
         "Referenced image URLs:\n- [Image #1]: https://example.com/first.png\n- [Image #2]: https://example.com/second.png"
     ));
+    // An invalid derived file reference must be rejected before any attachment write or
+    // replacement of the existing goal. The long server-home path is input to the same
+    // App consumer; the already-running embedded server supplies real filesystem operations.
+    let untouched_goal_root = tempfile::tempdir()?;
+    app.config.codex_home =
+        AbsolutePathBuf::try_from(untouched_goal_root.path().join("x".repeat(4000)))?;
+    while events.try_recv().is_ok() {}
+    app.set_thread_goal_draft(
+        &mut app_server,
+        thread_id,
+        crate::goal_files::GoalDraft {
+            objective: format!("Use {placeholder}"),
+            text_elements: vec![TextElement::new(
+                (4..4 + placeholder.len()).into(),
+                Some(placeholder.to_string()),
+            )],
+            pending_pastes: vec![(placeholder.to_string(), "hello".to_string())],
+            ..Default::default()
+        },
+        crate::app_event::ThreadGoalSetMode::ReplaceExisting,
+    )
+    .await;
+    let mut errors = String::new();
+    while let Ok(event) = events.try_recv() {
+        if let AppEvent::InsertHistoryCell(cell) = event {
+            errors.push_str(&lines_to_single_string(&cell.transcript_lines(400)));
+        }
+    }
+    assert!(
+        errors.contains("Goal objective file reference is too long:"),
+        "{errors}"
+    );
+    assert!(
+        !errors.contains("Could not create goal attachment directory"),
+        "{errors}"
+    );
+    assert_eq!(std::fs::read_dir(untouched_goal_root.path())?.count(), 0);
+    assert_eq!(
+        app_server
+            .thread_goal_get(thread_id)
+            .await?
+            .goal
+            .expect("existing goal retained")
+            .objective,
+        objective
+    );
+
+    // Short goals need no file reference and remain valid for the same server home.
+    app.set_thread_goal_draft(
+        &mut app_server,
+        thread_id,
+        crate::goal_files::GoalDraft {
+            objective: "small goal without files".to_string(),
+            ..Default::default()
+        },
+        crate::app_event::ThreadGoalSetMode::ReplaceExisting,
+    )
+    .await;
+    assert_eq!(
+        app_server
+            .thread_goal_get(thread_id)
+            .await?
+            .goal
+            .expect("short goal set")
+            .objective,
+        "small goal without files"
+    );
     app_server.shutdown().await?;
+    assert_eq!(
+        std::fs::read_dir(untouched_goal_root.path())?.count(),
+        0,
+        "rejected materialization must not schedule delayed filesystem effects"
+    );
     Ok(())
 }
 
@@ -4743,6 +4817,185 @@ fn request_user_input_request(thread_id: ThreadId, turn_id: &str, item_id: &str)
             auto_resolution_ms: None,
         },
     }
+}
+
+#[tokio::test]
+async fn malformed_thread_request_is_rejected_without_pending_state() {
+    use codex_app_server_client::AppServerClient;
+    use codex_app_server_client::RemoteAppServerClient;
+    use codex_app_server_client::RemoteAppServerConnectArgs;
+    use codex_app_server_client::RemoteAppServerEndpoint;
+    use futures::SinkExt;
+    use futures::StreamExt;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let mut app = make_test_app().await;
+    let mut requests = vec![
+        exec_approval_request(ThreadId::new(), "turn-invalid", "exec-invalid", None),
+        request_user_input_request(ThreadId::new(), "turn-invalid", "input-invalid"),
+    ];
+    for request in &mut requests {
+        match request {
+            ServerRequest::CommandExecutionRequestApproval { params, .. } => {
+                params.thread_id = "invalid-thread-id".to_string();
+            }
+            ServerRequest::ToolRequestUserInput { params, .. } => {
+                params.thread_id = "invalid-thread-id".to_string();
+            }
+            _ => unreachable!(),
+        }
+    }
+    let duplicate_question = codex_app_server_protocol::ToolRequestUserInputQuestion {
+        id: "q1".to_string(),
+        header: "Choice".to_string(),
+        question: "First question".to_string(),
+        is_other: false,
+        is_secret: false,
+        options: None,
+    };
+    let mut duplicate_request =
+        request_user_input_request(ThreadId::new(), "turn-input", "duplicate-input");
+    if let ServerRequest::ToolRequestUserInput { request_id, params } = &mut duplicate_request {
+        *request_id = AppServerRequestId::Integer(3);
+        let mut second_question = duplicate_question.clone();
+        second_question.question = "Second question".to_string();
+        params.questions = vec![duplicate_question, second_question];
+    }
+    let mut valid_request = duplicate_request.clone();
+    if let ServerRequest::ToolRequestUserInput { request_id, params } = &mut valid_request {
+        *request_id = AppServerRequestId::Integer(4);
+        params.item_id = "valid-input".to_string();
+        params.questions[1].id = "q2".to_string();
+    }
+    requests.push(duplicate_request);
+    let (release_peer, peer_release) = tokio::sync::oneshot::channel();
+    let valid_outbound = valid_request.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind test server");
+    let endpoint = format!("ws://{}", listener.local_addr().expect("server address"));
+    let outbound = requests.clone().into_iter().zip([
+        "invalid app-server request thread id `invalid-thread-id`",
+        "invalid app-server request thread id `invalid-thread-id`",
+        "duplicate user-input question id `q1`",
+    ]);
+    let peer = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept client");
+        let mut socket = tokio_tungstenite::accept_async(stream)
+            .await
+            .expect("upgrade websocket");
+        let initialize = socket.next().await.expect("initialize").expect("frame");
+        let initialize: serde_json::Value =
+            serde_json::from_str(initialize.to_text().expect("text")).expect("initialize JSON");
+        assert_eq!(initialize["method"], "initialize");
+        socket
+            .send(Message::Text(
+                serde_json::json!({"id": initialize["id"], "result": {}})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .expect("initialize response");
+        let initialized = socket.next().await.expect("initialized").expect("frame");
+        let initialized: serde_json::Value =
+            serde_json::from_str(initialized.to_text().expect("text")).expect("initialized JSON");
+        assert_eq!(initialized["method"], "initialized");
+        for (request, expected_error) in outbound {
+            socket
+                .send(Message::Text(
+                    serde_json::to_string(&request)
+                        .expect("request JSON")
+                        .into(),
+                ))
+                .await
+                .expect("send malformed request");
+            let response = tokio::time::timeout(Duration::from_secs(5), socket.next())
+                .await
+                .expect("request must receive a rejection")
+                .expect("response")
+                .expect("response frame");
+            let response: serde_json::Value =
+                serde_json::from_str(response.to_text().expect("text")).expect("response JSON");
+            assert_eq!(
+                response["id"],
+                serde_json::to_value(request.id()).expect("request id JSON")
+            );
+            assert_eq!(response["error"]["code"], -32000);
+            assert!(
+                response["error"]["message"]
+                    .as_str()
+                    .expect("error message")
+                    .contains(expected_error)
+            );
+            assert!(response.get("result").is_none());
+        }
+        socket
+            .send(Message::Text(
+                serde_json::to_string(&valid_outbound)
+                    .expect("valid request JSON")
+                    .into(),
+            ))
+            .await
+            .expect("send valid question request");
+        tokio::time::timeout(Duration::from_secs(5), peer_release)
+            .await
+            .expect("valid request must reach the application")
+            .expect("release peer");
+    });
+    let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+        endpoint: RemoteAppServerEndpoint::WebSocket {
+            websocket_url: endpoint,
+            auth_token: None,
+        },
+        client_name: "codex-tui-test".to_string(),
+        client_version: "0.0.0-test".to_string(),
+        experimental_api: true,
+        mcp_server_openai_form_elicitation: false,
+        opt_out_notification_methods: Vec::new(),
+        channel_capacity: 8,
+    })
+    .await
+    .expect("connect remote client");
+    let mut session = AppServerSession::new(
+        AppServerClient::Remote(client),
+        crate::app_server_session::ThreadParamsMode::Remote,
+    );
+    for request in requests {
+        let event = tokio::time::timeout(Duration::from_secs(5), session.next_event())
+            .await
+            .expect("request event")
+            .expect("open event stream");
+        assert!(
+            matches!(&event, codex_app_server_client::AppServerEvent::ServerRequest(received) if received == &request)
+        );
+        app.handle_app_server_event(&session, event).await;
+        assert!(
+            !app.pending_app_server_requests
+                .contains_server_request(&request)
+        );
+        assert!(app.thread_event_channels.is_empty());
+        assert!(app.pending_primary_events.is_empty());
+        assert!(!app.chat_widget.has_active_view());
+    }
+    let event = tokio::time::timeout(Duration::from_secs(5), session.next_event())
+        .await
+        .expect("valid request event")
+        .expect("open event stream");
+    assert!(
+        matches!(&event, codex_app_server_client::AppServerEvent::ServerRequest(received) if received == &valid_request)
+    );
+    app.handle_app_server_event(&session, event).await;
+    assert!(
+        app.pending_app_server_requests
+            .contains_server_request(&valid_request)
+    );
+    assert_eq!(app.pending_primary_events.len(), 1);
+    assert!(
+        matches!(app.pending_primary_events.front(), Some(ThreadBufferedEvent::Request(request)) if request == &valid_request)
+    );
+    release_peer.send(()).expect("release server");
+    peer.await.expect("server assertions");
+    session.shutdown().await.expect("client shutdown");
 }
 
 #[tokio::test]
@@ -6328,4 +6581,1486 @@ async fn side_backtrack_rejection_reports_unavailable_message_snapshot() {
 }
 async fn start_config_write_test_app_server(app: &App) -> Result<AppServerSession> {
     Box::pin(crate::start_embedded_app_server_for_picker(&app.config)).await
+}
+
+#[tokio::test]
+async fn navigation_key_clear_failure_preserves_visible_thread_and_receiver() -> Result<()> {
+    use crossterm::event::KeyCode;
+    use crossterm::event::KeyEvent;
+    use crossterm::event::KeyModifiers;
+    use std::io::ErrorKind;
+
+    for (key, side_return) in [
+        (KeyEvent::new(KeyCode::Left, KeyModifiers::ALT), false),
+        (KeyEvent::new(KeyCode::Right, KeyModifiers::ALT), false),
+        (
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            true,
+        ),
+        (
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+            true,
+        ),
+    ] {
+        let (mut app, mut app_event_rx, mut op_rx) = Box::pin(make_test_app_with_channels()).await;
+        let mut app_server = Box::pin(crate::start_embedded_app_server_for_picker(
+            app.chat_widget.config_ref(),
+        ))
+        .await?;
+        let previous_id = ThreadId::new();
+        let target_id = ThreadId::new();
+        let cwd = app.chat_widget.config_ref().cwd.to_path_buf();
+        let mut previous_session = test_thread_session(previous_id, cwd.clone());
+        previous_session.model = "previous-visible-model".to_string();
+        let mut target_session = test_thread_session(target_id, cwd);
+        target_session.model = "target-visible-model".to_string();
+        for session in [previous_session.clone(), target_session] {
+            let thread_id = session.thread_id;
+            let mut channel = ThreadEventChannel::new_with_session(16, session, Vec::new());
+            channel.mark_replay_only();
+            app.thread_event_channels.insert(thread_id, channel);
+            app.agent_navigation
+                .upsert(thread_id, None, None, /*is_closed*/ true);
+        }
+        app.primary_thread_id = Some(if side_return { target_id } else { previous_id });
+        app.activate_thread_channel(previous_id).await;
+        app.chat_widget.handle_thread_session(previous_session);
+        if side_return {
+            app.side_threads
+                .insert(previous_id, SideThreadState::new(target_id));
+            app.sync_side_thread_ui();
+        }
+        app.thread_event_channels[&target_id]
+            .store
+            .lock()
+            .await
+            .push_notification(ServerNotification::ConfigWarning(
+                ConfigWarningNotification {
+                    summary: "target snapshot remains replayable".to_string(),
+                    details: None,
+                    path: None,
+                    range: None,
+                },
+            ));
+        let sentinel = plain_line_cell("previous visible transcript");
+        app.transcript_cells = vec![sentinel.clone()];
+        while app_event_rx.try_recv().is_ok() {}
+        while op_rx.try_recv().is_ok() {}
+        assert!(app.chat_widget.composer_text_with_pending().is_empty());
+        assert!(app.chat_widget.no_modal_or_popup_active());
+        let mut tui = crate::tui::test_support::make_test_tui()?;
+        let previous_viewport = ratatui::layout::Rect::new(0, 3, 80, 20);
+        tui.terminal.set_viewport_area(previous_viewport);
+        tui.thread_switch_clear_error = Some(ErrorKind::BrokenPipe);
+
+        Box::pin(app.handle_key_event(&mut tui, &mut app_server, key)).await;
+
+        assert_eq!(app.active_thread_id, Some(previous_id));
+        assert_eq!(app.chat_widget.thread_id(), Some(previous_id));
+        assert_eq!(app.chat_widget.current_model(), "previous-visible-model");
+        assert_eq!(tui.terminal.viewport_area, previous_viewport);
+        assert!(
+            tui.thread_switch_clear_error.is_none(),
+            "the real navigation branch must consume the I/O fault"
+        );
+        assert_eq!(app.transcript_cells.len(), 1);
+        assert!(Arc::ptr_eq(&app.transcript_cells[0], &sentinel));
+        assert_eq!(
+            app.transcript_cells[0].display_lines(80)[0].to_string(),
+            "previous visible transcript"
+        );
+        assert!(app.active_thread_rx.is_some());
+        assert!(app.thread_event_channels[&previous_id].receiver.is_none());
+        assert!(app.thread_event_channels[&target_id].receiver.is_some());
+        assert!(
+            app.thread_event_channels[&previous_id]
+                .store
+                .lock()
+                .await
+                .active
+        );
+        assert!(
+            !app.thread_event_channels[&target_id]
+                .store
+                .lock()
+                .await
+                .active
+        );
+        if side_return {
+            assert_eq!(app.active_side_parent_thread_id(), Some(target_id));
+            assert!(app.side_threads.contains_key(&previous_id));
+        }
+        assert!(app.pending_shutdown_exit_thread_id.is_none());
+        assert!(
+            op_rx.try_recv().is_err(),
+            "navigation failure must not interrupt or exit the prior thread"
+        );
+        let events = std::iter::from_fn(|| app_event_rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                AppEvent::Exit(_)
+                    | AppEvent::FatalExitRequest(_)
+                    | AppEvent::CodexOp(_)
+                    | AppEvent::SubmitThreadOp { .. }
+            )),
+            "failed navigation must consume the shortcut without posting an exit/interrupt/command"
+        );
+        let error_text = events
+            .iter()
+            .filter_map(|event| match event {
+                AppEvent::InsertHistoryCell(cell) => Some(
+                    cell.display_lines(120)
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                ),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            error_text.contains("thread-switch terminal clear failed"),
+            "{error_text:?}"
+        );
+
+        // Send through the actual old channel and consume through the normal App
+        // drain path: checking only Some(receiver) could miss a swapped receiver.
+        app.thread_event_channels[&previous_id].forwarder.try_send(
+            previous_id,
+            ThreadBufferedEvent::Notification(ServerNotification::ConfigWarning(
+                ConfigWarningNotification {
+                    summary: "previous thread is still receiving events".to_string(),
+                    details: None,
+                    path: None,
+                    range: None,
+                },
+            )),
+        );
+        app.drain_active_thread_events(&mut tui).await?;
+        let received_text = std::iter::from_fn(|| app_event_rx.try_recv().ok())
+            .filter_map(|event| match event {
+                AppEvent::InsertHistoryCell(cell) => Some(
+                    cell.display_lines(120)
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                ),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            received_text.contains("previous thread is still receiving events"),
+            "{received_text:?}"
+        );
+
+        // One-shot fault is gone. Both Alt directions must now traverse the same
+        // normal key boundary, clear actual terminal I/O, and replay the target.
+        if !side_return {
+            Box::pin(app.handle_key_event(&mut tui, &mut app_server, key)).await;
+            assert_eq!(app.active_thread_id, Some(target_id));
+            assert_eq!(app.chat_widget.thread_id(), Some(target_id));
+            assert_eq!(app.chat_widget.current_model(), "target-visible-model");
+            assert_eq!(tui.terminal.viewport_area.y, 0);
+            assert!(app.thread_event_channels[&previous_id].receiver.is_some());
+            assert!(app.thread_event_channels[&target_id].receiver.is_none());
+            assert!(
+                !app.thread_event_channels[&previous_id]
+                    .store
+                    .lock()
+                    .await
+                    .active
+            );
+            assert!(
+                app.thread_event_channels[&target_id]
+                    .store
+                    .lock()
+                    .await
+                    .active
+            );
+            assert!(
+                !app.transcript_cells
+                    .iter()
+                    .any(|cell| Arc::ptr_eq(cell, &sentinel))
+            );
+            let replay_text = std::iter::from_fn(|| app_event_rx.try_recv().ok())
+                .filter_map(|event| match event {
+                    AppEvent::InsertHistoryCell(cell) => Some(
+                        cell.display_lines(120)
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    ),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                replay_text.contains("target snapshot remains replayable"),
+                "{replay_text:?}"
+            );
+        }
+        app_server.shutdown().await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn auto_review_denial_approval_waits_for_ack_and_survives_transport_failure() -> Result<()> {
+    use codex_app_server_client::AppServerClient;
+    use codex_app_server_client::RemoteAppServerClient;
+    use codex_app_server_client::RemoteAppServerConnectArgs;
+    use codex_app_server_client::RemoteAppServerEndpoint;
+    use codex_app_server_protocol::AutoReviewDecisionSource;
+    use codex_app_server_protocol::GuardianApprovalReview;
+    use codex_app_server_protocol::GuardianApprovalReviewAction;
+    use codex_app_server_protocol::GuardianApprovalReviewStatus;
+    use codex_app_server_protocol::GuardianCommandSource;
+    use codex_app_server_protocol::ItemGuardianApprovalReviewCompletedNotification;
+    use futures::SinkExt;
+    use futures::StreamExt;
+    use tokio_tungstenite::tungstenite::Message;
+
+    async fn accept_guardian_client(
+        listener: &tokio::net::TcpListener,
+    ) -> tokio_tungstenite::WebSocketStream<tokio::net::TcpStream> {
+        let (stream, _) = listener.accept().await.expect("accept guardian client");
+        let mut socket = tokio_tungstenite::accept_async(stream)
+            .await
+            .expect("websocket handshake");
+        let initialize = socket
+            .next()
+            .await
+            .expect("initialize")
+            .expect("initialize frame");
+        let initialize: serde_json::Value =
+            serde_json::from_str(initialize.to_text().expect("initialize text"))
+                .expect("initialize JSON");
+        assert_eq!(initialize["method"], "initialize");
+        socket
+            .send(Message::Text(
+                serde_json::json!({"id": initialize["id"], "result": {}})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .expect("initialize ACK");
+        let initialized = socket
+            .next()
+            .await
+            .expect("initialized")
+            .expect("initialized frame");
+        let initialized: serde_json::Value =
+            serde_json::from_str(initialized.to_text().expect("initialized text"))
+                .expect("initialized JSON");
+        assert_eq!(initialized["method"], "initialized");
+        socket
+    }
+
+    async fn connect_guardian_session(endpoint: &str) -> AppServerSession {
+        let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+            endpoint: RemoteAppServerEndpoint::WebSocket {
+                websocket_url: endpoint.to_string(),
+                auth_token: None,
+            },
+            client_name: "guardian-approval-test".to_string(),
+            client_version: "0.0.0-test".to_string(),
+            experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
+            opt_out_notification_methods: Vec::new(),
+            channel_capacity: 8,
+        })
+        .await
+        .expect("connect real remote client");
+        AppServerSession::new(
+            AppServerClient::Remote(client),
+            crate::app_server_session::ThreadParamsMode::Remote,
+        )
+    }
+
+    const SUCCESS: &str = "Approval submitted for one retry of the selected auto-review denial.";
+    for disconnect_before_response in [false, true] {
+        let (mut app, mut app_event_rx, _op_rx) = Box::pin(make_test_app_with_channels()).await;
+        let thread_id = ThreadId::new();
+        let review_id = "review-to-retry";
+        let cwd = app.chat_widget.config_ref().cwd.to_path_buf();
+        app.active_thread_id = Some(thread_id);
+        app.primary_thread_id = Some(thread_id);
+        app.chat_widget
+            .handle_thread_session(test_thread_session(thread_id, cwd.clone()));
+        app.chat_widget.handle_server_notification(
+            ServerNotification::ItemGuardianApprovalReviewCompleted(
+                ItemGuardianApprovalReviewCompletedNotification {
+                    thread_id: thread_id.to_string(),
+                    turn_id: "review-turn".to_string(),
+                    started_at_ms: 11,
+                    completed_at_ms: 22,
+                    review_id: review_id.to_string(),
+                    target_item_id: None,
+                    decision_source: AutoReviewDecisionSource::Agent,
+                    review: GuardianApprovalReview {
+                        status: GuardianApprovalReviewStatus::Denied,
+                        risk_level: None,
+                        user_authorization: None,
+                        rationale: Some("Approval needs user review.".to_string()),
+                    },
+                    action: GuardianApprovalReviewAction::Command {
+                        source: GuardianCommandSource::Shell,
+                        command: "echo guardian-retry".to_string(),
+                        cwd: cwd.clone().abs().into(),
+                    },
+                },
+            ),
+            None,
+        );
+        // Independent serialized protocol expectation, not a copy of the emitted request.
+        let expected_event = serde_json::json!({
+            "id": "review-to-retry",
+            "turn_id": "review-turn",
+            "started_at_ms": 11,
+            "completed_at_ms": 22,
+            "status": "denied",
+            "rationale": "Approval needs user review.",
+            "decision_source": "agent",
+            "action": {"type": "command", "source": "shell", "command": "echo guardian-retry", "cwd": cwd.to_string_lossy()}
+        });
+        let denial = app
+            .chat_widget
+            .recent_auto_review_denial(thread_id, review_id)
+            .expect("notification must register denial");
+        assert_eq!(serde_json::to_value(denial)?, expected_event);
+        while app_event_rx.try_recv().is_ok() {}
+        let mut tui = crate::tui::test_support::make_test_tui()?;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("ws://{}", listener.local_addr()?);
+        let expected_params =
+            serde_json::json!({"threadId": thread_id.to_string(), "event": expected_event});
+        let (request_observed_tx, request_observed_rx) = tokio::sync::oneshot::channel();
+        let (release_ack_tx, release_ack_rx) = tokio::sync::oneshot::channel();
+        let (duplicate_done_tx, duplicate_done_rx) = tokio::sync::oneshot::channel();
+        let peer = tokio::spawn(async move {
+            let mut first = accept_guardian_client(&listener).await;
+            let request = tokio::time::timeout(std::time::Duration::from_secs(5), first.next())
+                .await
+                .expect("first approval request")
+                .expect("open socket")
+                .expect("request frame");
+            let request: serde_json::Value =
+                serde_json::from_str(request.to_text().expect("request text"))
+                    .expect("request JSON");
+            assert_eq!(request["method"], "thread/approveGuardianDeniedAction");
+            assert_eq!(request["params"], expected_params);
+            if !disconnect_before_response {
+                first.send(Message::Text(serde_json::json!({"id": request["id"], "error": {"code": -32000, "message": "guardian approval rejected"}}).to_string().into())).await.expect("reject approval");
+            }
+            first.close(None).await.expect("close first transport");
+            drop(first);
+
+            let mut retry = accept_guardian_client(&listener).await;
+            let request = tokio::time::timeout(std::time::Duration::from_secs(5), retry.next())
+                .await
+                .expect("retry approval request")
+                .expect("open retry socket")
+                .expect("retry frame");
+            let request: serde_json::Value =
+                serde_json::from_str(request.to_text().expect("retry text")).expect("retry JSON");
+            assert_eq!(request["method"], "thread/approveGuardianDeniedAction");
+            assert_eq!(
+                request["params"], expected_params,
+                "retry must preserve exact thread and Guardian action"
+            );
+            request_observed_tx.send(()).expect("report pending retry");
+            release_ack_rx.await.expect("release server ACK");
+            retry
+                .send(Message::Text(
+                    serde_json::json!({"id": request["id"], "result": {}})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .expect("accept retry exactly once");
+            duplicate_done_rx
+                .await
+                .expect("duplicate selection completed");
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(200), retry.next())
+                    .await
+                    .is_err(),
+                "already acknowledged denial must not generate another RPC"
+            );
+        });
+        let mut session = connect_guardian_session(&endpoint).await;
+        let event = |thread_id| AppEvent::ApproveRecentAutoReviewDenial {
+            thread_id,
+            id: review_id.to_string(),
+        };
+
+        // Stale-thread UI events must not consume this thread's review or send RPC.
+        Box::pin(app.handle_event(&mut tui, &mut session, event(ThreadId::new()))).await?;
+        assert!(
+            app.chat_widget
+                .recent_auto_review_denial(thread_id, review_id)
+                .is_some()
+        );
+        let stale_text = std::iter::from_fn(|| app_event_rx.try_recv().ok())
+            .filter_map(|event| match event {
+                AppEvent::InsertHistoryCell(cell) => Some(
+                    cell.display_lines(160)
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                ),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!stale_text.contains(SUCCESS));
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            Box::pin(app.handle_event(&mut tui, &mut session, event(thread_id))),
+        )
+        .await
+        .expect("failed transport must resolve the selection")?;
+        let retained = app
+            .chat_widget
+            .recent_auto_review_denial(thread_id, review_id)
+            .expect("failed approval must remain selectable");
+        assert_eq!(serde_json::to_value(retained)?, expected_event);
+        let failure_events =
+            std::iter::from_fn(|| app_event_rx.try_recv().ok()).collect::<Vec<_>>();
+        let failure_text = failure_events
+            .iter()
+            .filter_map(|event| match event {
+                AppEvent::InsertHistoryCell(cell) => Some(
+                    cell.display_lines(160)
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                ),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            failure_text.contains("Failed to submit auto-review approval"),
+            "{failure_text:?}"
+        );
+        if !disconnect_before_response {
+            assert!(
+                failure_text.contains("guardian approval rejected"),
+                "RPC rejection must reach the transcript: {failure_text:?}"
+            );
+        }
+        assert!(!failure_text.contains(SUCCESS), "{failure_text:?}");
+        assert!(
+            !failure_events
+                .iter()
+                .any(|event| matches!(event, AppEvent::SubmitThreadOp { .. })),
+            "approval must use the awaited submission path"
+        );
+        session.shutdown().await?;
+
+        let mut session = connect_guardian_session(&endpoint).await;
+        {
+            let mut pending = Box::pin(app.handle_event(&mut tui, &mut session, event(thread_id)));
+            tokio::select! {
+                result = &mut pending => panic!("selection completed before server ACK: {result:?}"),
+                observed = request_observed_rx => observed.expect("server observed retry"),
+                _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => panic!("retry did not reach real server"),
+            }
+            let pending_events =
+                std::iter::from_fn(|| app_event_rx.try_recv().ok()).collect::<Vec<_>>();
+            assert!(
+                !pending_events
+                    .iter()
+                    .any(|event| matches!(event, AppEvent::SubmitThreadOp { .. })),
+                "queued-only handoff is not acknowledgement"
+            );
+            let pending_text = pending_events
+                .iter()
+                .filter_map(|event| match event {
+                    AppEvent::InsertHistoryCell(cell) => Some(
+                        cell.display_lines(160)
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    ),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                !pending_text.contains(SUCCESS),
+                "success must wait for server ACK: {pending_text:?}"
+            );
+            release_ack_tx
+                .send(())
+                .expect("release successful response");
+            tokio::time::timeout(std::time::Duration::from_secs(5), pending)
+                .await
+                .expect("ACK must finish selection")?;
+        }
+        Box::pin(app.handle_event(&mut tui, &mut session, event(thread_id))).await?;
+        assert!(
+            app.chat_widget
+                .recent_auto_review_denial(thread_id, review_id)
+                .is_none(),
+            "acknowledged denial must be consumed"
+        );
+        let completed_events =
+            std::iter::from_fn(|| app_event_rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(
+            !completed_events
+                .iter()
+                .any(|event| matches!(event, AppEvent::SubmitThreadOp { .. }))
+        );
+        let completed_text = completed_events
+            .iter()
+            .filter_map(|event| match event {
+                AppEvent::InsertHistoryCell(cell) => Some(
+                    cell.display_lines(160)
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                ),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            completed_text.matches(SUCCESS).count(),
+            1,
+            "{completed_text:?}"
+        );
+        duplicate_done_tx
+            .send(())
+            .expect("release duplicate assertion");
+        tokio::time::timeout(std::time::Duration::from_secs(5), peer)
+            .await
+            .expect("peer must finish")
+            .expect("peer assertions");
+        session.shutdown().await?;
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn permission_popup_scan_runs_off_executor_and_applies_only_after_result() -> Result<()> {
+    use codex_config::types::WindowsSandboxModeToml;
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    for failed_scan in [true, false] {
+        let (mut app, mut events, mut op_rx) = Box::pin(make_test_app_with_channels()).await;
+        let workspace = tempdir()?;
+        app.config.cwd = workspace.path().to_path_buf().abs();
+        app.config
+            .permissions
+            .set_permission_profile(PermissionProfile::read_only())?;
+        app.config
+            .permissions
+            .approval_policy
+            .set(AskForApproval::OnRequest.to_core())?;
+        app.config.approvals_reviewer = ApprovalsReviewer::User;
+        // Thread startup is ordinary embedded startup; only the permission scan's ACL I/O is replaced.
+        app.config.set_windows_sandbox_enabled(false);
+        let config_path = app.config.codex_home.join("config.toml");
+        let config_bytes = b"# permission scan regression: do not persist selection\n";
+        std::fs::write(&config_path, config_bytes)?;
+        let mut app_server = start_config_write_test_app_server(&app).await?;
+        let started = app_server.start_thread(&app.config).await?;
+        let thread_id = started.session.thread_id;
+        app.active_thread_id = Some(thread_id);
+        app.primary_thread_id = Some(thread_id);
+        app.chat_widget.handle_thread_session(started.session);
+        app.chat_widget
+            .set_approval_policy(AskForApproval::OnRequest);
+        app.chat_widget.set_permission_profile_with_active_profile(
+            PermissionProfile::read_only(),
+            Some(ActivePermissionProfile::new(":read-only")),
+        )?;
+        app.chat_widget
+            .set_approvals_reviewer(ApprovalsReviewer::User);
+        app.chat_widget
+            .set_world_writable_warning_acknowledged(false);
+        app.chat_widget
+            .set_windows_sandbox_mode(Some(WindowsSandboxModeToml::Unelevated));
+        app.config.permissions.windows_sandbox_mode = Some(WindowsSandboxModeToml::Unelevated);
+        app.config.notices.hide_world_writable_warning = Some(false);
+        while events.try_recv().is_ok() {}
+        while op_rx.try_recv().is_ok() {}
+        let ui_thread = std::thread::current().id();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let worker_calls = Arc::clone(&calls);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let started_tx = Mutex::new(Some(started_tx));
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let (rescan_tx, rescan_rx) = tokio::sync::oneshot::channel();
+        let rescan_tx = Mutex::new(Some(rescan_tx));
+        app.chat_widget
+            .set_world_writable_scan_for_test(move |config| {
+                assert_ne!(
+                    std::thread::current().id(),
+                    ui_thread,
+                    "ACL work must run off the UI thread"
+                );
+                let call = worker_calls.fetch_add(1, Ordering::SeqCst);
+                if call == 0 {
+                    assert_eq!(
+                        config.permissions.permission_profile(),
+                        &PermissionProfile::read_only()
+                    );
+                    started_tx.lock().unwrap().take().unwrap().send(()).unwrap();
+                    release_rx
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("async UI heartbeat must release worker before watchdog");
+                } else {
+                    assert_eq!(call, 1, "one preflight and one scan of the applied policy");
+                    assert!(!failed_scan, "failed preflight must not apply permissions");
+                    assert_eq!(
+                        config.permissions.permission_profile(),
+                        &PermissionProfile::workspace_write()
+                    );
+                    rescan_tx.lock().unwrap().take().unwrap().send(()).unwrap();
+                }
+                failed_scan.then(|| (Vec::new(), 0, true))
+            });
+        let mut tui = crate::tui::test_support::make_test_tui()?;
+        Box::pin(app.handle_event(&mut tui, &mut app_server, AppEvent::OpenPermissionsPopup))
+            .await?;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "opening popup must not scan"
+        );
+        let popup = render_bottom_popup(&app.chat_widget, 120);
+        assert!(
+            popup
+                .lines()
+                .any(|line| line.contains("Read Only") && line.contains('›')),
+            "{popup}"
+        );
+        Box::pin(app.handle_key_event(&mut tui, &mut app_server, KeyEvent::from(KeyCode::Down)))
+            .await;
+        let popup = render_bottom_popup(&app.chat_widget, 120);
+        assert!(
+            popup
+                .lines()
+                .any(|line| line.contains("Ask for approval") && line.contains('›')),
+            "{popup}"
+        );
+        Box::pin(app.handle_key_event(&mut tui, &mut app_server, KeyEvent::from(KeyCode::Enter)))
+            .await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "selection queues the check; popup construction does not perform it"
+        );
+        let check = events
+            .try_recv()
+            .expect("normal Enter queues permission scan");
+        assert!(
+            matches!(&check, AppEvent::CheckWorldWritablePermissionMode { preset, approvals_reviewer: ApprovalsReviewer::User, profile_selection: None, .. } if preset.id == "auto")
+        );
+        assert!(events.try_recv().is_err(), "no apply callbacks before scan");
+        {
+            let mut pending = Box::pin(app.handle_event(&mut tui, &mut app_server, check));
+            tokio::select! {
+                result = &mut pending => panic!("scan finished before external I/O released: {result:?}"),
+                started = started_rx => started.expect("worker started"),
+                _ = tokio::time::sleep(Duration::from_secs(5)) => panic!("scan worker did not start"),
+            }
+            // This timer must advance on the same single UI executor while actual scan work is held.
+            tokio::select! {
+                result = &mut pending => panic!("scan finished before UI heartbeat: {result:?}"),
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+            }
+            assert!(
+                events.try_recv().is_err(),
+                "pending scan must not update policy or history"
+            );
+            assert!(
+                op_rx.try_recv().is_err(),
+                "pending scan must not submit an operation"
+            );
+            assert_eq!(std::fs::read(&config_path)?, config_bytes);
+            release_tx
+                .send(())
+                .expect("UI heartbeat releases external I/O");
+            tokio::time::timeout(Duration::from_secs(5), pending)
+                .await
+                .expect("scan completes")?;
+        }
+        assert_eq!(
+            app.config.permissions.permission_profile(),
+            &PermissionProfile::read_only()
+        );
+        assert_eq!(
+            app.chat_widget
+                .config_ref()
+                .permissions
+                .permission_profile(),
+            &PermissionProfile::read_only()
+        );
+        assert!(app.runtime_approval_policy_override.is_none());
+        assert!(app.runtime_permission_profile_override.is_none());
+        let mut permission_ops = 0;
+        let mut history = String::new();
+        while let Ok(event) = events.try_recv() {
+            match &event {
+                AppEvent::CodexOp(op) => {
+                    permission_ops += 1;
+                    assert!(!failed_scan, "failed scan must not submit policy changes");
+                    assert_eq!(
+                        op,
+                        &Op::OverrideTurnContext {
+                            cwd: None,
+                            approval_policy: Some(AskForApproval::OnRequest),
+                            approvals_reviewer: Some(ApprovalsReviewer::User),
+                            permission_profile: Some(PermissionProfile::workspace_write()),
+                            active_permission_profile: Some(ActivePermissionProfile::new(
+                                ":workspace"
+                            )),
+                            windows_sandbox_level: None,
+                            model: None,
+                            effort: None,
+                            summary: None,
+                            service_tier: None,
+                            collaboration_mode: None,
+                            personality: None,
+                        }
+                    );
+                }
+                AppEvent::InsertHistoryCell(cell) => {
+                    assert!(
+                        !failed_scan,
+                        "failed scan must not announce permissions update"
+                    );
+                    history.push_str(
+                        &cell
+                            .display_lines(160)
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    );
+                }
+                AppEvent::UpdateAskForApprovalPolicy(_)
+                | AppEvent::UpdateActivePermissionProfile(_)
+                | AppEvent::UpdateApprovalsReviewer(_) => assert!(!failed_scan),
+                _ => {}
+            }
+            Box::pin(app.handle_event(&mut tui, &mut app_server, event)).await?;
+        }
+        if failed_scan {
+            let popup = render_bottom_popup(&app.chat_widget, 160);
+            assert!(
+                popup.contains("We couldn't complete the world-writable scan"),
+                "{popup}"
+            );
+            assert!(popup.contains("protections cannot be verified"), "{popup}");
+            assert_eq!(permission_ops, 0);
+            Box::pin(app.handle_key_event(&mut tui, &mut app_server, KeyEvent::from(KeyCode::Esc)))
+                .await;
+            assert!(
+                events.try_recv().is_err(),
+                "cancel must not queue permission changes"
+            );
+            assert!(app.chat_widget.no_modal_or_popup_active());
+            assert_eq!(
+                app.config.permissions.permission_profile(),
+                &PermissionProfile::read_only()
+            );
+            assert_eq!(
+                app.chat_widget
+                    .config_ref()
+                    .permissions
+                    .permission_profile(),
+                &PermissionProfile::read_only()
+            );
+            assert!(app.runtime_permission_profile_override.is_none());
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert!(history.is_empty());
+        } else {
+            tokio::time::timeout(Duration::from_secs(5), rescan_rx)
+                .await
+                .expect("applied policy is scanned")
+                .expect("second scan ran");
+            assert_eq!(permission_ops, 1);
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+            assert_eq!(
+                app.config.permissions.permission_profile(),
+                &PermissionProfile::workspace_write()
+            );
+            assert_eq!(
+                app.chat_widget
+                    .config_ref()
+                    .permissions
+                    .permission_profile(),
+                &PermissionProfile::workspace_write()
+            );
+            assert_eq!(
+                app.config.permissions.active_permission_profile(),
+                Some(ActivePermissionProfile::new(":workspace"))
+            );
+            assert_eq!(
+                app.chat_widget
+                    .config_ref()
+                    .permissions
+                    .active_permission_profile(),
+                Some(ActivePermissionProfile::new(":workspace"))
+            );
+            assert_eq!(
+                AskForApproval::from(app.config.permissions.approval_policy.value()),
+                AskForApproval::OnRequest
+            );
+            assert_eq!(app.config.approvals_reviewer, ApprovalsReviewer::User);
+            assert_eq!(
+                history
+                    .matches("Permissions updated to Ask for approval")
+                    .count(),
+                1,
+                "{history}"
+            );
+            assert!(
+                !history.contains("Failed to update thread settings"),
+                "{history}"
+            );
+            let notification = next_thread_settings_updated(&mut app_server, thread_id).await;
+            assert_eq!(
+                notification.thread_settings.approval_policy,
+                AskForApproval::OnRequest
+            );
+            assert_eq!(
+                notification.thread_settings.approvals_reviewer,
+                codex_app_server_protocol::ApprovalsReviewer::User
+            );
+            assert_eq!(
+                notification
+                    .thread_settings
+                    .active_permission_profile
+                    .map(|profile| profile.id),
+                Some(":workspace".to_string())
+            );
+        }
+        assert!(
+            op_rx.try_recv().is_err(),
+            "policy operation uses normal app-server submission"
+        );
+        let final_config_bytes = std::fs::read(&config_path)?;
+        if failed_scan {
+            assert_eq!(
+                final_config_bytes, config_bytes,
+                "failed scan and cancel must not persist config"
+            );
+        } else {
+            let saved: toml::Value = toml::from_str(std::str::from_utf8(&final_config_bytes)?)?;
+            assert_eq!(
+                saved
+                    .get("approvals_reviewer")
+                    .and_then(toml::Value::as_str),
+                Some("user")
+            );
+        }
+        app_server.shutdown().await?;
+        assert_eq!(std::fs::read(&config_path)?, final_config_bytes);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn clipboard_app_keys_preserve_failed_draft_and_submit_real_pngs_in_order() -> Result<()> {
+    use crate::clipboard_paste::PasteImageError;
+    let directory = tempdir()?;
+    let (mut app, mut events, mut op_rx) = Box::pin(make_test_app_with_channels()).await;
+    let mut app_server = start_config_write_test_app_server(&app).await?;
+    let thread_id = ThreadId::new();
+    let mut session = test_thread_session(thread_id, app.config.cwd.to_path_buf());
+    session.model = app
+        .config
+        .model
+        .clone()
+        .expect("configured image-capable model");
+    app.active_thread_id = Some(thread_id);
+    app.primary_thread_id = Some(thread_id);
+    app.chat_widget.handle_thread_session(session);
+    app.chat_widget
+        .handle_paste("draft to preserve".to_string());
+    let before = app.chat_widget.capture_thread_input_state();
+    while events.try_recv().is_ok() {}
+    while op_rx.try_recv().is_ok() {}
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    app.chat_widget.set_clipboard_image_reader_for_test(
+        Box::new(|| {
+            Err(PasteImageError::NoImage(
+                "test clipboard is empty".to_string(),
+            ))
+        }),
+        directory.path().to_path_buf(),
+    );
+    Box::pin(app.handle_key_event(
+        &mut tui,
+        &mut app_server,
+        KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL),
+    ))
+    .await;
+    assert_eq!(app.chat_widget.capture_thread_input_state(), before);
+    assert_eq!(std::fs::read_dir(directory.path())?.count(), 0);
+    assert!(
+        op_rx.try_recv().is_err(),
+        "failed capture must not submit a message"
+    );
+    let failure = events.try_recv().expect("capture failure is visible");
+    let AppEvent::InsertHistoryCell(cell) = failure else {
+        panic!("expected capture error history")
+    };
+    assert_eq!(
+        cell.display_lines(160)
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        vec!["■ Failed to paste image: no image on clipboard: test clipboard is empty".to_string()]
+    );
+    assert!(
+        events.try_recv().is_err(),
+        "capture failure emits only its error"
+    );
+    app.chat_widget.apply_external_edit(String::new());
+    app.chat_widget.set_clipboard_image_reader_for_test(
+        Box::new(|| {
+            Ok(image::DynamicImage::ImageRgba8(
+                image::RgbaImage::from_raw(2, 1, vec![255, 0, 0, 255, 0, 255, 0, 255]).unwrap(),
+            ))
+        }),
+        directory.path().to_path_buf(),
+    );
+    Box::pin(app.handle_key_event(
+        &mut tui,
+        &mut app_server,
+        KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL),
+    ))
+    .await;
+    let files = std::fs::read_dir(directory.path())?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    assert_eq!(files.len(), 1, "retry must create one actual attachment");
+    let first = files[0].clone();
+    let png = std::fs::read(&first)?;
+    assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
+    let decoded = image::load_from_memory_with_format(&png, image::ImageFormat::Png)?.into_rgba8();
+    assert_eq!(decoded.dimensions(), (2, 1));
+    assert_eq!(decoded.into_raw(), vec![255, 0, 0, 255, 0, 255, 0, 255]);
+    assert_eq!(app.chat_widget.composer_text_with_pending(), "[Image #1]");
+    app.chat_widget.set_clipboard_image_reader_for_test(
+        Box::new(|| {
+            Ok(image::DynamicImage::ImageRgba8(
+                image::RgbaImage::from_pixel(1, 1, image::Rgba([0, 0, 255, 255])),
+            ))
+        }),
+        directory.path().to_path_buf(),
+    );
+    Box::pin(app.handle_key_event(
+        &mut tui,
+        &mut app_server,
+        KeyEvent::new(KeyCode::Char('v'), KeyModifiers::ALT),
+    ))
+    .await;
+    let files = std::fs::read_dir(directory.path())?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    assert_eq!(files.len(), 2);
+    let second = files
+        .into_iter()
+        .find(|path| path != &first)
+        .expect("second image has independent file");
+    let png = std::fs::read(&second)?;
+    assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
+    let decoded = image::load_from_memory_with_format(&png, image::ImageFormat::Png)?.into_rgba8();
+    assert_eq!(decoded.dimensions(), (1, 1));
+    assert_eq!(decoded.into_raw(), vec![0, 0, 255, 255]);
+    assert_eq!(
+        app.chat_widget.composer_text_with_pending(),
+        "[Image #1][Image #2]"
+    );
+    assert!(
+        events.try_recv().is_err(),
+        "successful attachment does not announce a failure"
+    );
+    app.chat_widget
+        .handle_paste(" describe these colors".to_string());
+    assert_eq!(
+        app.chat_widget.composer_text_with_pending(),
+        "[Image #1][Image #2] describe these colors"
+    );
+    Box::pin(app.handle_key_event(&mut tui, &mut app_server, KeyEvent::from(KeyCode::Enter))).await;
+    let Op::UserTurn { items, .. } = next_user_turn_op(&mut op_rx) else {
+        unreachable!()
+    };
+    assert_eq!(
+        items,
+        vec![
+            UserInput::LocalImage {
+                path: first.clone(),
+                detail: None
+            },
+            UserInput::LocalImage {
+                path: second.clone(),
+                detail: None
+            },
+            UserInput::Text {
+                text: "[Image #1][Image #2] describe these colors".to_string(),
+                text_elements: vec![
+                    TextElement::new((0..10).into(), Some("[Image #1]".to_string())).into(),
+                    TextElement::new((10..20).into(), Some("[Image #2]".to_string())).into(),
+                ],
+            },
+        ]
+    );
+    assert!(app.chat_widget.composer_text_with_pending().is_empty());
+    assert!(
+        first.exists() && second.exists(),
+        "accepted files remain available to the submitted turn"
+    );
+    app_server.shutdown().await?;
+    Ok(())
+}
+
+#[test]
+fn clipboard_app_key_cancellation_cleans_worker_file_without_blocking_ui() -> Result<()> {
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+    // Keep this directory alive until after Runtime::drop has joined every blocking worker.
+    let directory = tempdir()?;
+    let returned_image = Arc::new(AtomicBool::new(false));
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async {
+        let (mut app, mut events, mut op_rx) = Box::pin(make_test_app_with_channels()).await;
+        let mut app_server = start_config_write_test_app_server(&app).await?;
+        let thread_id = ThreadId::new();
+        let mut session = test_thread_session(thread_id, app.config.cwd.to_path_buf());
+        session.model = app
+            .config
+            .model
+            .clone()
+            .expect("configured image-capable model");
+        app.active_thread_id = Some(thread_id);
+        app.primary_thread_id = Some(thread_id);
+        app.chat_widget.handle_thread_session(session);
+        app.chat_widget
+            .handle_paste("keep draft while cancelling paste".to_string());
+        let before = app.chat_widget.capture_thread_input_state();
+        while events.try_recv().is_ok() {}
+        while op_rx.try_recv().is_ok() {}
+        let ui_thread = std::thread::current().id();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker_returned_image = Arc::clone(&returned_image);
+        app.chat_widget.set_clipboard_image_reader_for_test(
+            Box::new(move || {
+                assert_ne!(std::thread::current().id(), ui_thread);
+                started_tx.send(()).expect("signal actual external reader");
+                release_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("UI heartbeat must release clipboard reader");
+                worker_returned_image.store(true, Ordering::SeqCst);
+                Ok(image::DynamicImage::ImageRgba8(
+                    image::RgbaImage::from_pixel(1, 1, image::Rgba([0, 0, 255, 255])),
+                ))
+            }),
+            directory.path().to_path_buf(),
+        );
+        let mut tui = crate::tui::test_support::make_test_tui()?;
+        {
+            let mut pending = Box::pin(app.handle_key_event(
+                &mut tui,
+                &mut app_server,
+                KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL),
+            ));
+            tokio::select! {
+                _ = &mut pending => panic!("paste completed before clipboard reader released"),
+                started = started_rx => started.expect("reader started"),
+                _ = tokio::time::sleep(Duration::from_secs(2)) => panic!("reader did not start"),
+            }
+            tokio::select! {
+                _ = &mut pending => panic!("paste completed during held external read"),
+                _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+            }
+            assert!(events.try_recv().is_err());
+            assert!(op_rx.try_recv().is_err());
+            assert_eq!(std::fs::read_dir(directory.path())?.count(), 0);
+            drop(pending); // Normal key handler is cancelled while its real blocking worker continues.
+        }
+        assert_eq!(app.chat_widget.capture_thread_input_state(), before);
+        assert!(
+            events.try_recv().is_err(),
+            "cancellation must not emit attachment or error history"
+        );
+        assert!(op_rx.try_recv().is_err());
+        release_tx
+            .send(())
+            .expect("release cancelled worker for real PNG encoding and file write");
+        app_server.shutdown().await?;
+        Ok::<(), color_eyre::eyre::Report>(())
+    })?;
+    drop(runtime);
+    assert!(
+        returned_image.load(Ordering::SeqCst),
+        "cancelled worker actually resumed with image bytes"
+    );
+    assert_eq!(
+        std::fs::read_dir(directory.path())?.count(),
+        0,
+        "joined cancelled worker must leave no orphan PNG"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn overridden_remote_features_preserve_known_values_and_reject_malformed_updates()
+-> Result<()> {
+    use codex_app_server_client::AppServerClient;
+    use codex_app_server_client::RemoteAppServerClient;
+    use codex_app_server_client::RemoteAppServerConnectArgs;
+    use codex_app_server_client::RemoteAppServerEndpoint;
+    use futures::SinkExt;
+    use futures::StreamExt;
+    use tokio_tungstenite::tungstenite::Message;
+
+    for (features, expected_code_mode, expected_refresh_error) in [
+        (
+            serde_json::json!({
+                "code_mode": {"enabled": true},
+                "guardian_approval": false,
+                "unknown_future_flag": {"nested": "not a boolean"}
+            }),
+            true,
+            None,
+        ),
+        (
+            serde_json::json!({
+                "code_mode": {"enabled": true},
+                "guardian_approval": "invalid"
+            }),
+            false,
+            Some("invalid effective feature `guardian_approval`"),
+        ),
+        (
+            serde_json::json!("invalid features section"),
+            false,
+            Some("effective config `features` must be an object"),
+        ),
+    ] {
+        let (mut app, mut events, mut op_rx) = Box::pin(make_test_app_with_channels()).await;
+        let home = tempdir()?;
+        app.config.codex_home = home.path().to_path_buf().abs();
+        let config_path = home.path().join("config.toml");
+        let config_bytes = b"# local client must not persist remote feature settings\n";
+        std::fs::write(&config_path, config_bytes)?;
+        for feature in [Feature::CodeMode, Feature::GuardianApproval] {
+            app.config.features.set_enabled(feature, false)?;
+            app.chat_widget.set_feature_enabled(feature, false);
+        }
+        app.config
+            .permissions
+            .set_permission_profile(PermissionProfile::read_only())?;
+        app.chat_widget.set_permission_profile_with_active_profile(
+            PermissionProfile::read_only(),
+            Some(ActivePermissionProfile::new(":read-only")),
+        )?;
+        app.config.approvals_reviewer = ApprovalsReviewer::User;
+        app.chat_widget
+            .set_approvals_reviewer(ApprovalsReviewer::User);
+        let initial_policy = app.config.permissions.approval_policy.value();
+        let initial_widget_policy = app
+            .chat_widget
+            .config_ref()
+            .permissions
+            .approval_policy
+            .value();
+        while events.try_recv().is_ok() {}
+        while op_rx.try_recv().is_ok() {}
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("ws://{}", listener.local_addr()?);
+        let expected_cwd = app.config.cwd.to_string_lossy().into_owned();
+        let wire_config_path = config_path.clone();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let peer = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept config client");
+            let mut socket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("handshake");
+            for expected_method in [
+                "initialize",
+                "initialized",
+                "config/batchWrite",
+                "config/read",
+            ] {
+                let frame = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
+                    .await
+                    .expect("config request deadline")
+                    .expect("open connection")
+                    .expect("frame");
+                let request: serde_json::Value =
+                    serde_json::from_str(frame.to_text().expect("text")).expect("request JSON");
+                assert_eq!(request["method"], expected_method);
+                let result = match expected_method {
+                    "initialize" => serde_json::json!({}),
+                    "initialized" => continue,
+                    "config/batchWrite" => {
+                        assert_eq!(
+                            request["params"],
+                            serde_json::json!({
+                                "edits": [
+                                    {"keyPath": "features.code_mode", "value": true, "mergeStrategy": "replace"},
+                                    {"keyPath": "approvals_reviewer", "value": "auto_review", "mergeStrategy": "replace"},
+                                    {"keyPath": "approval_policy", "value": "on-request", "mergeStrategy": "replace"},
+                                    {"keyPath": "sandbox_mode", "value": "workspace-write", "mergeStrategy": "replace"},
+                                    {"keyPath": "features.guardian_approval", "value": true, "mergeStrategy": "replace"}
+                                ],
+                                "filePath": null,
+                                "expectedVersion": null,
+                                "reloadUserConfig": true
+                            })
+                        );
+                        serde_json::json!({"status": "okOverridden", "version": "remote-v2", "filePath": wire_config_path, "overriddenMetadata": null})
+                    }
+                    "config/read" => {
+                        assert_eq!(request["params"], serde_json::json!({"cwd": expected_cwd}));
+                        serde_json::json!({"config": {
+                            "approval_policy": "on-request",
+                            "approvals_reviewer": "auto_review",
+                            "sandbox_mode": "workspace-write",
+                            "features": features
+                        }, "origins": {}})
+                    }
+                    _ => unreachable!(),
+                };
+                socket
+                    .send(Message::Text(
+                        serde_json::json!({"id": request["id"], "result": result})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
+                    .expect("config response");
+            }
+            done_rx.await.expect("normal App event completed");
+        });
+        let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+            endpoint: RemoteAppServerEndpoint::WebSocket {
+                websocket_url: endpoint,
+                auth_token: None,
+            },
+            client_name: "overridden-features-test".to_string(),
+            client_version: "0.0.0-test".to_string(),
+            experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
+            opt_out_notification_methods: Vec::new(),
+            channel_capacity: 8,
+        })
+        .await?;
+        let mut session = AppServerSession::new(
+            AppServerClient::Remote(client),
+            crate::app_server_session::ThreadParamsMode::Remote,
+        );
+        let mut tui = crate::tui::test_support::make_test_tui()?;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            Box::pin(app.handle_event(
+                &mut tui,
+                &mut session,
+                AppEvent::UpdateFeatureFlags {
+                    updates: vec![(Feature::CodeMode, true), (Feature::GuardianApproval, true)],
+                },
+            )),
+        )
+        .await
+        .expect("feature selection completes")?;
+
+        for config in [&app.config, app.chat_widget.config_ref()] {
+            assert!(
+                !config.features.enabled(Feature::GuardianApproval),
+                "remote false or malformed data must not enable Guardian"
+            );
+            assert_eq!(
+                config.features.enabled(Feature::CodeMode),
+                expected_code_mode
+            );
+            assert_eq!(config.approvals_reviewer, ApprovalsReviewer::User);
+            assert_eq!(
+                config.permissions.permission_profile(),
+                &PermissionProfile::read_only()
+            );
+        }
+        assert_eq!(
+            app.config.permissions.approval_policy.value(),
+            initial_policy
+        );
+        assert_eq!(
+            app.chat_widget
+                .config_ref()
+                .permissions
+                .approval_policy
+                .value(),
+            initial_widget_policy
+        );
+        assert!(app.runtime_permission_profile_override.is_none());
+        assert!(app.runtime_approval_policy_override.is_none());
+        assert!(
+            op_rx.try_recv().is_err(),
+            "rejected Guardian enable must not submit companion turn settings"
+        );
+        let mut history = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            match event {
+                AppEvent::InsertHistoryCell(cell) => history.push(
+                    cell.display_lines(240)
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                ),
+                other => panic!("unexpected companion event after overridden config: {other:?}"),
+            }
+        }
+        assert_eq!(
+            history.len(),
+            if expected_refresh_error.is_some() {
+                2
+            } else {
+                1
+            }
+        );
+        assert!(history[0].contains("Experimental feature changes were saved but not applied: the effective config is overridden by a higher-priority layer"), "{history:?}");
+        if let Some(error) = expected_refresh_error {
+            assert!(
+                history[1].contains(&format!(
+                    "Failed to refresh overridden experimental features: {error}"
+                )),
+                "{history:?}"
+            );
+        }
+        assert_eq!(std::fs::read(&config_path)?, config_bytes);
+        done_tx.send(()).expect("release config peer");
+        peer.await?;
+        session.shutdown().await?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn desktop_open_event_waits_without_blocking_and_reports_process_result() -> Result<()> {
+    for rejected in [false, true] {
+        let (mut app, mut events, mut op_rx) = Box::pin(make_test_app_with_channels()).await;
+        let mut app_server = start_config_write_test_app_server(&app).await?;
+        let mut tui = crate::tui::test_support::make_test_tui()?;
+        let files = tempdir()?;
+        let ready = files.path().join("ready");
+        let release = files.path().join("release");
+        let ready_literal = ready.to_string_lossy().replace('\'', "''");
+        let release_literal = release.to_string_lossy().replace('\'', "''");
+        let thread_id = ThreadId::new();
+        let expected_url = format!("codex://threads/{thread_id}");
+        app.desktop_thread_open_command_for_test = Some(Box::new(move |url| {
+            assert_eq!(
+                url, expected_url,
+                "normal event must preserve the selected thread"
+            );
+            let result = if rejected {
+                "[Console]::Error.Write('controlled opener rejection'); exit 17"
+            } else {
+                "exit 0"
+            };
+            // Only replace the external program. App dispatch, process waiting and visible
+            // success/error handling are production code; this script never launches Desktop.
+            let script = format!(
+                "[IO.File]::WriteAllText('{ready_literal}', 'ready'); \
+                 $deadline = [DateTime]::UtcNow.AddSeconds(5); \
+                 while (-not (Test-Path -LiteralPath '{release_literal}')) {{ \
+                   if ([DateTime]::UtcNow -gt $deadline) {{ exit 92 }}; \
+                   Start-Sleep -Milliseconds 10 \
+                 }}; {result}"
+            );
+            let mut command = tokio::process::Command::new("powershell.exe");
+            command.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
+            command
+        }));
+        while events.try_recv().is_ok() {}
+        while op_rx.try_recv().is_ok() {}
+        let mut opening = Box::pin(app.handle_event(
+            &mut tui,
+            &mut app_server,
+            AppEvent::OpenDesktopThread { thread_id },
+        ));
+        assert!(futures::poll!(opening.as_mut()).is_pending());
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if tokio::fs::read(&ready).await.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("controlled child must start while the App event remains pending");
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        assert!(futures::poll!(opening.as_mut()).is_pending());
+        assert!(
+            events.try_recv().is_err(),
+            "no completion message before the child exits"
+        );
+        assert!(
+            op_rx.try_recv().is_err(),
+            "opening Desktop must not modify the thread"
+        );
+        tokio::fs::write(&release, b"release").await?;
+        tokio::time::timeout(std::time::Duration::from_secs(5), opening)
+            .await
+            .expect("released child must finish")?;
+        let cell = match events.try_recv().expect("visible process result") {
+            AppEvent::InsertHistoryCell(cell) => cell,
+            other => panic!("unexpected event: {other:?}"),
+        };
+        let text = cell
+            .display_lines(240)
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        if rejected {
+            assert!(text.contains("Failed to open this session in Codex Desktop: controlled opener rejection. Install or launch Codex Desktop and try again."), "{text:?}");
+            assert!(!text.contains("Opened this session"), "{text:?}");
+        } else {
+            assert!(
+                text.contains("Opened this session in Codex Desktop."),
+                "{text:?}"
+            );
+            assert!(!text.contains("Failed to open"), "{text:?}");
+        }
+        assert!(events.try_recv().is_err(), "exactly one completion message");
+        assert!(
+            op_rx.try_recv().is_err(),
+            "no outbound thread mutation after completion"
+        );
+        app_server.shutdown().await?;
+    }
+    Ok(())
 }

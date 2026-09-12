@@ -845,7 +845,7 @@ impl AppServerSession {
     ) -> Result<TurnStartResponse> {
         let request_id = self.next_request_id();
         let (sandbox_policy, permission_profile, permissions) =
-            turn_permissions_overrides(permissions_override, cwd.as_path());
+            turn_permissions_overrides(permissions_override, cwd.as_path()).await?;
         self.client
             .request_typed(ClientRequest::TurnStart {
                 request_id,
@@ -1140,7 +1140,8 @@ impl AppServerSession {
         num_turns: u32,
     ) -> Result<ThreadRollbackResponse> {
         let request_id = self.next_request_id();
-        self.client
+        let response: ThreadRollbackResponse = self
+            .client
             .request_typed(ClientRequest::ThreadRollback {
                 request_id,
                 params: ThreadRollbackParams {
@@ -1149,7 +1150,11 @@ impl AppServerSession {
                 },
             })
             .await
-            .wrap_err("thread/rollback failed in TUI")
+            .wrap_err("thread/rollback failed in TUI")?;
+        if response.thread.id != thread_id.to_string() {
+            color_eyre::eyre::bail!("thread/rollback returned a different thread id");
+        }
+        Ok(response)
     }
 
     pub(crate) async fn bug_create(
@@ -1327,15 +1332,15 @@ fn permission_profile_id_from_active_profile(active: ActivePermissionProfile) ->
     active.id
 }
 
-fn turn_permissions_overrides(
+async fn turn_permissions_overrides(
     permissions_override: TurnPermissionsOverride,
     cwd: &std::path::Path,
-) -> (
+) -> Result<(
     Option<codex_app_server_protocol::SandboxPolicy>,
     Option<PermissionProfile>,
     Option<String>,
-) {
-    match permissions_override {
+)> {
+    Ok(match permissions_override {
         TurnPermissionsOverride::Preserve => (None, None, None),
         TurnPermissionsOverride::ActiveProfile(active_permission_profile) => (
             None,
@@ -1345,17 +1350,23 @@ fn turn_permissions_overrides(
             )),
         ),
         TurnPermissionsOverride::LegacySandbox(permission_profile) => {
-            let legacy_profile = legacy_compatible_permission_profile(&permission_profile, cwd);
-            let policy = legacy_profile
-                .to_legacy_sandbox_policy(cwd)
-                .unwrap_or_else(|err| {
-                    unreachable!(
-                        "legacy-compatible permissions must project to legacy policy: {err}"
-                    )
-                });
-            (Some(policy.into()), Some(permission_profile), None)
+            let cwd = cwd.to_path_buf();
+            tokio::task::spawn_blocking(move || {
+                let legacy_profile =
+                    legacy_compatible_permission_profile(&permission_profile, &cwd);
+                let policy = legacy_profile
+                    .to_legacy_sandbox_policy(&cwd)
+                    .unwrap_or_else(|err| {
+                        unreachable!(
+                            "legacy-compatible permissions must project to legacy policy: {err}"
+                        )
+                    });
+                (Some(policy.into()), Some(permission_profile), None)
+            })
+            .await
+            .wrap_err("failed to prepare legacy turn permissions")?
         }
-    }
+    })
 }
 
 fn permissions_selection_from_config(
@@ -1511,7 +1522,8 @@ async fn thread_session_state_from_thread_start_response(
         response.cwd.as_path(),
         config,
         thread_params_mode,
-    );
+    )
+    .await?;
     thread_session_state_from_thread_response(
         &response.thread.id,
         response.thread.forked_from_id.clone(),
@@ -1544,10 +1556,8 @@ async fn thread_session_state_from_thread_resume_response(
     } else if matches!(thread_params_mode, ThreadParamsMode::Embedded)
         && response.active_permission_profile.is_none()
     {
-        PermissionProfile::from_legacy_sandbox_policy_for_cwd(
-            &response.sandbox.to_core(),
-            response.cwd.as_path(),
-        )
+        legacy_permission_profile_from_thread_response(&response.sandbox, response.cwd.as_path())
+            .await?
     } else {
         display_permission_profile_from_thread_response(
             None,
@@ -1556,6 +1566,7 @@ async fn thread_session_state_from_thread_resume_response(
             config,
             thread_params_mode,
         )
+        .await?
     };
     thread_session_state_from_thread_response(
         &response.thread.id,
@@ -1589,7 +1600,8 @@ async fn thread_session_state_from_thread_fork_response(
         response.cwd.as_path(),
         config,
         thread_params_mode,
-    );
+    )
+    .await?;
     thread_session_state_from_thread_response(
         &response.thread.id,
         response.thread.forked_from_id.clone(),
@@ -1611,22 +1623,35 @@ async fn thread_session_state_from_thread_fork_response(
     .await
 }
 
-fn display_permission_profile_from_thread_response(
+async fn display_permission_profile_from_thread_response(
     permission_profile: Option<&PermissionProfile>,
     sandbox: &codex_app_server_protocol::SandboxPolicy,
     cwd: &std::path::Path,
     config: &Config,
     thread_params_mode: ThreadParamsMode,
-) -> PermissionProfile {
+) -> Result<PermissionProfile, String> {
     if let Some(permission_profile) = permission_profile {
-        return permission_profile.clone();
+        return Ok(permission_profile.clone());
     }
     match thread_params_mode {
-        ThreadParamsMode::Embedded => config.permissions.effective_permission_profile(),
+        ThreadParamsMode::Embedded => Ok(config.permissions.effective_permission_profile()),
         ThreadParamsMode::Remote => {
-            PermissionProfile::from_legacy_sandbox_policy_for_cwd(&sandbox.to_core(), cwd)
+            legacy_permission_profile_from_thread_response(sandbox, cwd).await
         }
     }
+}
+
+async fn legacy_permission_profile_from_thread_response(
+    sandbox: &codex_app_server_protocol::SandboxPolicy,
+    cwd: &std::path::Path,
+) -> Result<PermissionProfile, String> {
+    let sandbox = sandbox.to_core();
+    let cwd = cwd.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        PermissionProfile::from_legacy_sandbox_policy_for_cwd(&sandbox, &cwd)
+    })
+    .await
+    .map_err(|err| format!("failed to read legacy thread permissions: {err}"))
 }
 
 #[expect(
@@ -1732,6 +1757,132 @@ mod tests {
     use pretty_assertions::assert_eq;
     use std::collections::HashMap;
     use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn thread_rollback_rejects_other_thread_response_and_preserves_matching_response() {
+        use codex_app_server_client::RemoteAppServerClient;
+        use codex_app_server_client::RemoteAppServerConnectArgs;
+        use codex_app_server_client::RemoteAppServerEndpoint;
+        use futures::SinkExt;
+        use futures::StreamExt;
+        use tokio_tungstenite::tungstenite::Message;
+
+        let thread_id = ThreadId::new();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind rollback server");
+        let endpoint = format!("ws://{}", listener.local_addr().expect("server address"));
+        let response_thread = Thread {
+            id: thread_id.to_string(),
+            extra: None,
+            session_id: thread_id.to_string(),
+            forked_from_id: None,
+            parent_thread_id: None,
+            preview: "retained rollback history".to_string(),
+            ephemeral: false,
+            history_mode: Default::default(),
+            model_provider: "openai".to_string(),
+            created_at: 1,
+            updated_at: 2,
+            recency_at: Some(2),
+            status: ThreadStatus::Idle,
+            path: None,
+            cwd: test_path_buf("/tmp/project").abs(),
+            cli_version: "0.0.0".to_string(),
+            source: codex_app_server_protocol::SessionSource::Cli,
+            thread_source: None,
+            agent_nickname: None,
+            agent_role: None,
+            git_info: None,
+            name: None,
+            turns: Vec::new(),
+        };
+        let expected_thread = response_thread.clone();
+        let peer = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept client");
+            let mut socket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("upgrade websocket");
+            let initialize = socket.next().await.expect("initialize").expect("frame");
+            let initialize: serde_json::Value =
+                serde_json::from_str(initialize.to_text().expect("text")).expect("initialize JSON");
+            assert_eq!(initialize["method"], "initialize");
+            socket
+                .send(Message::Text(
+                    serde_json::json!({"id": initialize["id"], "result": {}})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .expect("initialize response");
+            let initialized = socket.next().await.expect("initialized").expect("frame");
+            let initialized: serde_json::Value =
+                serde_json::from_str(initialized.to_text().expect("text"))
+                    .expect("initialized JSON");
+            assert_eq!(initialized["method"], "initialized");
+            for mismatched in [true, false] {
+                let request = socket
+                    .next()
+                    .await
+                    .expect("rollback request")
+                    .expect("frame");
+                let request: serde_json::Value =
+                    serde_json::from_str(request.to_text().expect("text")).expect("request JSON");
+                assert_eq!(request["method"], "thread/rollback");
+                assert_eq!(request["params"]["threadId"], thread_id.to_string());
+                assert_eq!(request["params"]["numTurns"], 1);
+                let mut thread = response_thread.clone();
+                if mismatched {
+                    thread.id = ThreadId::new().to_string();
+                }
+                socket
+                    .send(Message::Text(
+                        serde_json::json!({"id": request["id"], "result": {"thread": thread}})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
+                    .expect("rollback response");
+            }
+        });
+        let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+            endpoint: RemoteAppServerEndpoint::WebSocket {
+                websocket_url: endpoint,
+                auth_token: None,
+            },
+            client_name: "codex-tui-test".to_string(),
+            client_version: "0.0.0-test".to_string(),
+            experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
+            opt_out_notification_methods: Vec::new(),
+            channel_capacity: 8,
+        })
+        .await
+        .expect("connect rollback client");
+        let mut session =
+            AppServerSession::new(AppServerClient::Remote(client), ThreadParamsMode::Remote);
+        let rejected = tokio::time::timeout(
+            Duration::from_secs(5),
+            session.thread_rollback(thread_id, 1),
+        )
+        .await
+        .expect("rollback must terminate")
+        .expect_err("another thread's history must not reach the caller");
+        assert_eq!(
+            rejected.to_string(),
+            "thread/rollback returned a different thread id"
+        );
+        let accepted = tokio::time::timeout(
+            Duration::from_secs(5),
+            session.thread_rollback(thread_id, 1),
+        )
+        .await
+        .expect("rollback must terminate")
+        .expect("matching response must remain usable");
+        assert_eq!(accepted.thread, expected_thread);
+        peer.await.expect("rollback peer");
+        session.shutdown().await.expect("shutdown session");
+    }
 
     async fn build_config(temp_dir: &TempDir) -> Config {
         ConfigBuilder::default()
@@ -1864,26 +2015,8 @@ mod tests {
         assert_eq!(params.session_start_source, Some(ThreadStartSource::Clear));
     }
 
-    #[test]
-    fn embedded_turn_permissions_use_active_profile_selection() {
-        let cwd = test_path_buf("/workspace/project").abs();
-        let active_permission_profile =
-            ActivePermissionProfile::new(BUILT_IN_PERMISSION_PROFILE_WORKSPACE);
-        let expected_permissions =
-            permission_profile_id_from_active_profile(active_permission_profile.clone());
-
-        let (sandbox_policy, permission_profile, permissions) = turn_permissions_overrides(
-            TurnPermissionsOverride::ActiveProfile(active_permission_profile),
-            cwd.as_path(),
-        );
-
-        assert_eq!(sandbox_policy, None);
-        assert_eq!(permission_profile, None);
-        assert_eq!(permissions, Some(expected_permissions));
-    }
-
-    #[test]
-    fn embedded_turn_permissions_select_profile_id_only() {
+    #[tokio::test]
+    async fn embedded_turn_permissions_use_active_profile_selection() {
         let cwd = test_path_buf("/workspace/project").abs();
         let active_permission_profile =
             ActivePermissionProfile::new(BUILT_IN_PERMISSION_PROFILE_WORKSPACE);
@@ -1891,7 +2024,9 @@ mod tests {
         let (sandbox_policy, permission_profile, permissions) = turn_permissions_overrides(
             TurnPermissionsOverride::ActiveProfile(active_permission_profile),
             cwd.as_path(),
-        );
+        )
+        .await
+        .expect("turn permissions");
 
         assert_eq!(sandbox_policy, None);
         assert_eq!(permission_profile, None);
@@ -1901,27 +2036,52 @@ mod tests {
         );
     }
 
-    #[test]
-    fn turn_permissions_preserve_thread_permissions_without_override() {
+    #[tokio::test]
+    async fn embedded_turn_permissions_select_profile_id_only() {
+        let cwd = test_path_buf("/workspace/project").abs();
+        let active_permission_profile =
+            ActivePermissionProfile::new(BUILT_IN_PERMISSION_PROFILE_WORKSPACE);
+
+        let (sandbox_policy, permission_profile, permissions) = turn_permissions_overrides(
+            TurnPermissionsOverride::ActiveProfile(active_permission_profile),
+            cwd.as_path(),
+        )
+        .await
+        .expect("turn permissions");
+
+        assert_eq!(sandbox_policy, None);
+        assert_eq!(permission_profile, None);
+        assert_eq!(
+            permissions,
+            Some(BUILT_IN_PERMISSION_PROFILE_WORKSPACE.to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_permissions_preserve_thread_permissions_without_override() {
         let cwd = test_path_buf("/workspace/project").abs();
 
         let (sandbox_policy, permission_profile, permissions) =
-            turn_permissions_overrides(TurnPermissionsOverride::Preserve, cwd.as_path());
+            turn_permissions_overrides(TurnPermissionsOverride::Preserve, cwd.as_path())
+                .await
+                .expect("turn permissions");
 
         assert_eq!(sandbox_policy, None);
         assert_eq!(permission_profile, None);
         assert_eq!(permissions, None);
     }
 
-    #[test]
-    fn legacy_turn_permissions_project_to_sandbox_when_explicitly_overridden() {
+    #[tokio::test]
+    async fn legacy_turn_permissions_project_to_sandbox_when_explicitly_overridden() {
         let cwd = test_path_buf("/workspace/project").abs();
 
         let requested_profile = PermissionProfile::read_only();
         let (sandbox_policy, permission_profile, permissions) = turn_permissions_overrides(
             TurnPermissionsOverride::LegacySandbox(requested_profile.clone()),
             cwd.as_path(),
-        );
+        )
+        .await
+        .expect("turn permissions");
 
         assert_eq!(
             sandbox_policy,
@@ -1933,21 +2093,21 @@ mod tests {
         assert_eq!(permissions, None);
     }
 
-    #[test]
-    fn remote_turn_permissions_preserve_active_profile_selection() {
+    #[tokio::test]
+    async fn remote_turn_permissions_preserve_active_profile_selection() {
         let cwd = test_path_buf("/workspace/project").abs();
         let active_permission_profile = ActivePermissionProfile::new("strict");
-        let expected_permissions =
-            permission_profile_id_from_active_profile(active_permission_profile.clone());
 
         let (sandbox_policy, permission_profile, permissions) = turn_permissions_overrides(
             TurnPermissionsOverride::ActiveProfile(active_permission_profile),
             cwd.as_path(),
-        );
+        )
+        .await
+        .expect("turn permissions");
 
         assert_eq!(sandbox_policy, None);
         assert_eq!(permission_profile, None);
-        assert_eq!(permissions, Some(expected_permissions));
+        assert_eq!(permissions, Some("strict".to_string()));
     }
 
     #[tokio::test]
@@ -2380,7 +2540,9 @@ mod tests {
                 cwd.as_path(),
                 &config,
                 ThreadParamsMode::Remote,
-            ),
+            )
+            .await
+            .expect("thread permissions"),
             PermissionProfile::read_only()
         );
     }
@@ -2402,7 +2564,9 @@ mod tests {
                 cwd.as_path(),
                 &config,
                 ThreadParamsMode::Remote,
-            ),
+            )
+            .await
+            .expect("thread permissions"),
             PermissionProfile::Disabled
         );
     }
@@ -2428,7 +2592,9 @@ mod tests {
                 cwd.as_path(),
                 &config,
                 ThreadParamsMode::Embedded,
-            ),
+            )
+            .await
+            .expect("thread permissions"),
             PermissionProfile::read_only()
         );
     }
@@ -2533,5 +2699,572 @@ mod tests {
                 plan: Some(ref plan),
             }) if plan == "Business"
         ));
+    }
+
+    #[test]
+    fn remote_thread_lifecycle_and_turn_preserve_worktree_permission_contracts() -> Result<()> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()?
+            .block_on(remote_thread_lifecycle_and_turn_contract_scenario())
+    }
+
+    async fn remote_thread_lifecycle_and_turn_contract_scenario() -> Result<()> {
+        use codex_app_server_client::RemoteAppServerClient;
+        use codex_app_server_client::RemoteAppServerConnectArgs;
+        use codex_app_server_client::RemoteAppServerEndpoint;
+        use codex_protocol::permissions::FileSystemAccessMode;
+        use codex_protocol::permissions::FileSystemPath;
+        use codex_protocol::permissions::FileSystemSandboxEntry;
+        use codex_protocol::permissions::NetworkSandboxPolicy;
+        use futures::SinkExt;
+        use futures::StreamExt;
+        use tokio_tungstenite::tungstenite::Message;
+
+        let fixture = tempfile::tempdir()?;
+        let cwd_path = fixture.path().join("worktree");
+        let extra_path = fixture.path().join("extra");
+        std::fs::create_dir(&cwd_path)?;
+        std::fs::create_dir(&extra_path)?;
+        for name in ["worktree-git", ".git", ".agents", ".codex"] {
+            std::fs::create_dir(extra_path.join(name))?;
+        }
+        let pointer_bytes = b"gitdir: ../extra/worktree-git\n";
+        std::fs::write(cwd_path.join(".git"), pointer_bytes)?;
+        std::fs::write(cwd_path.join("source.rs"), "worktree source")?;
+        std::fs::write(extra_path.join("source.rs"), "extra source")?;
+        let cwd = AbsolutePathBuf::from_absolute_path(dunce::canonicalize(&cwd_path)?)?;
+        let extra = AbsolutePathBuf::from_absolute_path(dunce::canonicalize(&extra_path)?)?;
+        let gitdir = extra.join("worktree-git");
+        let config_home = fixture.path().join("home");
+        std::fs::create_dir(&config_home)?;
+        let mut config = ConfigBuilder::default()
+            .codex_home(config_home)
+            .loader_overrides(codex_config::LoaderOverrides::without_managed_config_for_tests())
+            .strict_config(true)
+            .harness_overrides(ConfigOverrides {
+                cwd: Some(cwd.to_path_buf()),
+                default_permissions: Some(BUILT_IN_PERMISSION_PROFILE_READ_ONLY.to_string()),
+                ..Default::default()
+            })
+            .build()
+            .await?;
+        config.sqlite_home = fixture.path().join("sqlite");
+        assert_eq!(
+            config.permissions.effective_permission_profile(),
+            PermissionProfile::read_only()
+        );
+        let thread_id = ThreadId::new();
+        let fork_source_id = ThreadId::new();
+        let restored_turn = Turn {
+            id: "saved-turn".into(),
+            items_view: codex_app_server_protocol::TurnItemsView::Full,
+            items: vec![codex_app_server_protocol::ThreadItem::AgentMessage {
+                id: "saved-answer".into(),
+                text: "restored from remote history".into(),
+                phase: None,
+                memory_citation: None,
+            }],
+            status: TurnStatus::Completed,
+            error: None,
+            started_at: None,
+            completed_at: None,
+            duration_ms: None,
+            timing: None,
+            surfaced_result: None,
+            reasoning_policy_history: None,
+        };
+        let response = ThreadStartResponse {
+            thread: Thread {
+                id: thread_id.to_string(),
+                extra: None,
+                session_id: thread_id.to_string(),
+                forked_from_id: None,
+                parent_thread_id: None,
+                preview: "remote permission fixture".into(),
+                ephemeral: false,
+                history_mode: Default::default(),
+                model_provider: "openai".into(),
+                created_at: 1,
+                updated_at: 2,
+                recency_at: Some(2),
+                status: ThreadStatus::Idle,
+                path: Some(fixture.path().join("remote-rollout.jsonl")),
+                cwd: cwd.clone(),
+                cli_version: "0.0.0-test".into(),
+                source: codex_app_server_protocol::SessionSource::Cli,
+                thread_source: None,
+                agent_nickname: None,
+                agent_role: None,
+                git_info: None,
+                name: Some("remote permissions".into()),
+                turns: Vec::new(),
+            },
+            model: "remote-permission-model".into(),
+            model_provider: "openai".into(),
+            service_tier: None,
+            cwd: cwd.clone(),
+            selected_environment: None,
+            runtime_workspace_roots: vec![cwd.clone(), extra.clone()],
+            instruction_sources: Vec::new(),
+            approval_policy: AskForApproval::OnRequest,
+            approvals_reviewer: codex_app_server_protocol::ApprovalsReviewer::User,
+            sandbox: codex_app_server_protocol::SandboxPolicy::WorkspaceWrite {
+                writable_roots: vec![extra.clone()],
+                network_access: false,
+                exclude_tmpdir_env_var: true,
+                exclude_slash_tmp: true,
+            },
+            permission_profile: None,
+            active_permission_profile: None,
+            reasoning_effort: None,
+        };
+        // The legacy embedded resume mapper has a separate missing-profile branch.
+        // Exercise that production mapping boundary without inventing a hybrid client mode.
+        let embedded_response: ThreadResumeResponse =
+            serde_json::from_value(serde_json::to_value(&response)?)?;
+        let embedded = started_thread_from_resume_response(
+            embedded_response,
+            &config,
+            ThreadParamsMode::Embedded,
+        )
+        .await?;
+        let embedded_filesystem = embedded
+            .session
+            .permission_profile
+            .file_system_sandbox_policy();
+        assert!(
+            embedded_filesystem
+                .entries
+                .contains(&FileSystemSandboxEntry {
+                    path: FileSystemPath::Path {
+                        path: gitdir.clone()
+                    },
+                    access: FileSystemAccessMode::Read,
+                })
+        );
+        assert!(
+            embedded_filesystem
+                .can_write_path_with_cwd(cwd.join("source.rs").as_path(), cwd.as_path(),)
+        );
+        assert!(
+            embedded_filesystem
+                .can_write_path_with_cwd(extra.join("source.rs").as_path(), cwd.as_path(),)
+        );
+        assert_eq!(
+            config.permissions.effective_permission_profile(),
+            PermissionProfile::read_only()
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("ws://{}", listener.local_addr()?);
+        let peer_turn = restored_turn.clone();
+        let (legacy_reply_ready_tx, legacy_reply_ready_rx) = tokio::sync::oneshot::channel();
+        let peer = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept remote client");
+            let mut socket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("websocket");
+            let frame = socket.next().await.expect("initialize").expect("frame");
+            let initialize: serde_json::Value =
+                serde_json::from_str(frame.to_text().unwrap()).unwrap();
+            assert_eq!(initialize["method"], "initialize");
+            socket
+                .send(Message::Text(
+                    serde_json::json!({"id":initialize["id"],"result":{}})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            let frame = socket.next().await.expect("initialized").expect("frame");
+            let initialized: serde_json::Value =
+                serde_json::from_str(frame.to_text().unwrap()).unwrap();
+            assert_eq!(initialized["method"], "initialized");
+            let frame = socket
+                .next()
+                .await
+                .expect("legacy placement request")
+                .expect("frame");
+            let request: serde_json::Value =
+                serde_json::from_str(frame.to_text().unwrap()).unwrap();
+            assert_eq!(request["method"], "thread/start");
+            let mut invalid_response = serde_json::to_value(&response).unwrap();
+            invalid_response["thread"]["id"] = serde_json::json!("");
+            socket
+                .send(Message::Text(
+                    serde_json::json!({"id":request["id"], "result":invalid_response})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            // A Pong follows receipt of the preceding response on the same ordered stream.
+            let barrier_payload = b"legacy-response-delivered".to_vec();
+            socket
+                .send(Message::Ping(barrier_payload.clone().into()))
+                .await
+                .unwrap();
+            let pong = socket
+                .next()
+                .await
+                .expect("response receipt Pong")
+                .expect("Pong frame");
+            assert_eq!(pong, Message::Pong(barrier_payload.into()));
+            legacy_reply_ready_tx
+                .send(())
+                .expect("test awaiting response receipt");
+            for canonical in [false, true] {
+                for method in [
+                    "thread/start",
+                    "thread/start",
+                    "thread/resume",
+                    "thread/fork",
+                ] {
+                    let frame = socket
+                        .next()
+                        .await
+                        .expect("lifecycle request")
+                        .expect("frame");
+                    let request: serde_json::Value =
+                        serde_json::from_str(frame.to_text().unwrap()).unwrap();
+                    assert_eq!(request["method"], method);
+                    if method == "thread/resume" {
+                        assert_eq!(request["params"]["threadId"], thread_id.to_string());
+                    } else if method == "thread/fork" {
+                        assert_eq!(request["params"]["threadId"], fork_source_id.to_string());
+                    }
+                    let mut result = serde_json::to_value(&response).unwrap();
+                    if canonical {
+                        // Contradict the legacy WorkspaceWrite sandbox: the exact profile wins.
+                        result["permissionProfile"] =
+                            serde_json::to_value(PermissionProfile::read_only()).unwrap();
+                    } else {
+                        result.as_object_mut().unwrap().remove("permissionProfile");
+                    }
+                    result
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("activePermissionProfile");
+                    if method != "thread/start" {
+                        result["thread"]["turns"] = serde_json::json!([peer_turn]);
+                    }
+                    socket
+                        .send(Message::Text(
+                            serde_json::json!({"id":request["id"],"result":result})
+                                .to_string()
+                                .into(),
+                        ))
+                        .await
+                        .unwrap();
+                }
+            }
+            // The control request must pass the transport while legacy conversion is queued.
+            let frame = socket
+                .next()
+                .await
+                .expect("turn worker barrier")
+                .expect("frame");
+            let barrier: serde_json::Value =
+                serde_json::from_str(frame.to_text().unwrap()).unwrap();
+            assert_eq!(
+                barrier["method"], "config/read",
+                "legacy turn must not be enqueued before worker release"
+            );
+            assert_eq!(barrier["id"], "turn-permission-worker-barrier");
+            socket
+                .send(Message::Text(
+                    serde_json::json!({"id":barrier["id"],"result":{}})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            let mut turns = Vec::new();
+            for index in 0..3 {
+                let frame = socket.next().await.expect("turn request").expect("frame");
+                let request: serde_json::Value =
+                    serde_json::from_str(frame.to_text().unwrap()).unwrap();
+                assert_eq!(request["method"], "turn/start");
+                let mut turn = peer_turn.clone();
+                turn.id = format!("accepted-{index}");
+                turn.items.clear();
+                turn.status = TurnStatus::InProgress;
+                socket
+                    .send(Message::Text(
+                        serde_json::json!({"id":request["id"],"result":{"turn":turn}})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
+                turns.push(request["params"].clone());
+            }
+            turns
+        });
+        let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+            endpoint: RemoteAppServerEndpoint::WebSocket {
+                websocket_url: endpoint,
+                auth_token: None,
+            },
+            client_name: "codex-tui-test".into(),
+            client_version: "0.0.0-test".into(),
+            experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
+            opt_out_notification_methods: Vec::new(),
+            channel_capacity: 8,
+        })
+        .await?;
+        let mut session =
+            AppServerSession::new(AppServerClient::Remote(client), ThreadParamsMode::Remote);
+        // Occupy the sole blocking worker only after the real transport is connected.
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (occupied_tx, occupied_rx) = tokio::sync::oneshot::channel();
+        let blocker = tokio::task::spawn_blocking(move || {
+            occupied_tx.send(()).unwrap();
+            release_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("release blocking worker");
+        });
+        occupied_rx.await?;
+        let mut pending = Box::pin(session.start_thread_with_session_start_source(&config, None));
+        tokio::select! {
+            result = &mut pending => panic!("inline legacy mapping completed before worker release: {result:?}"),
+            delivered = legacy_reply_ready_rx => delivered.expect("ordered response receipt barrier"),
+            _ = tokio::time::sleep(Duration::from_secs(5)) => panic!("remote response was not consumed"),
+        }
+        // Explicit polling after the transport barrier removes scheduler timing from the oracle.
+        // Inline conversion would now return the invalid-ID error before history metadata awaits.
+        assert!(futures::poll!(tokio::task::unconstrained(pending.as_mut())).is_pending());
+        tokio::select! {
+            result = &mut pending => panic!("legacy mapping bypassed occupied blocking pool: {result:?}"),
+            _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+        }
+        release_tx
+            .send(())
+            .expect("release legacy conversion worker");
+        let rejected = tokio::time::timeout(Duration::from_secs(5), pending)
+            .await
+            .expect("legacy conversion completes after release")
+            .expect_err("invalid response must not produce a session");
+        assert_eq!(
+            rejected.to_string(),
+            "thread id `` is invalid: invalid length: found 0"
+        );
+        blocker.await?;
+
+        let mut legacy_profile = None;
+        for canonical in [false, true] {
+            for entry in 0..4 {
+                let started = tokio::time::timeout(Duration::from_secs(5), async {
+                    match entry {
+                        0 => {
+                            start_thread_with_request_handle(
+                                session.request_handle(),
+                                config.clone(),
+                                ThreadParamsMode::Remote,
+                                None,
+                            )
+                            .await
+                        }
+                        1 => {
+                            session
+                                .start_thread_with_session_start_source(&config, None)
+                                .await
+                        }
+                        2 => session.resume_thread(config.clone(), thread_id).await,
+                        _ => session.fork_thread(config.clone(), fork_source_id).await,
+                    }
+                })
+                .await
+                .expect("lifecycle mapping must finish")?;
+                assert_eq!(started.session.thread_id, thread_id);
+                assert_eq!(started.session.cwd, cwd);
+                assert_eq!(started.session.model, "remote-permission-model");
+                assert_eq!(
+                    started.session.runtime_workspace_roots,
+                    vec![cwd.clone(), extra.clone()]
+                );
+                assert_eq!(
+                    started.turns,
+                    if entry < 2 {
+                        Vec::new()
+                    } else {
+                        vec![restored_turn.clone()]
+                    }
+                );
+                let profile = started.session.permission_profile;
+                if canonical {
+                    assert_eq!(
+                        profile,
+                        PermissionProfile::read_only(),
+                        "canonical response must win at entry {entry}"
+                    );
+                } else {
+                    let filesystem = profile.file_system_sandbox_policy();
+                    for protected in [
+                        gitdir.clone(),
+                        extra.join(".git"),
+                        extra.join(".agents"),
+                        extra.join(".codex"),
+                    ] {
+                        assert!(
+                            filesystem.entries.contains(&FileSystemSandboxEntry {
+                                path: FileSystemPath::Path {
+                                    path: protected.clone()
+                                },
+                                access: FileSystemAccessMode::Read,
+                            }),
+                            "entry {entry} must materialize read-only {protected:?}"
+                        );
+                        assert!(
+                            filesystem.can_read_path_with_cwd(protected.as_path(), cwd.as_path())
+                        );
+                        assert!(
+                            !filesystem.can_write_path_with_cwd(protected.as_path(), cwd.as_path())
+                        );
+                    }
+                    assert!(
+                        filesystem.can_write_path_with_cwd(
+                            cwd.join("source.rs").as_path(),
+                            cwd.as_path()
+                        )
+                    );
+                    assert!(
+                        filesystem.can_write_path_with_cwd(
+                            extra.join("source.rs").as_path(),
+                            cwd.as_path()
+                        )
+                    );
+                    assert!(
+                        !filesystem
+                            .can_write_path_with_cwd(cwd.join(".git").as_path(), cwd.as_path())
+                    );
+                    assert_eq!(
+                        profile.network_sandbox_policy(),
+                        NetworkSandboxPolicy::Restricted
+                    );
+                    legacy_profile = Some(profile);
+                }
+            }
+        }
+        let legacy_profile = legacy_profile.expect("legacy response reached normal converter");
+        let expected_profile = serde_json::to_value(&legacy_profile)?;
+        for (index, override_) in [
+            TurnPermissionsOverride::LegacySandbox(legacy_profile),
+            TurnPermissionsOverride::Preserve,
+            TurnPermissionsOverride::ActiveProfile(ActivePermissionProfile::new(
+                "strict-test-profile",
+            )),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let worker_gate = if index == 0 {
+                let (release_tx, release_rx) = std::sync::mpsc::channel();
+                let (occupied_tx, occupied_rx) = tokio::sync::oneshot::channel();
+                let blocker = tokio::task::spawn_blocking(move || {
+                    occupied_tx.send(()).unwrap();
+                    release_rx
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("release turn worker");
+                });
+                occupied_rx.await?;
+                Some((release_tx, blocker))
+            } else {
+                None
+            };
+            let workspace_roots = [cwd.clone(), extra.clone()];
+            let control_handle = session.request_handle();
+            let mut pending_turn = Box::pin(session.turn_start(
+                thread_id,
+                vec![UserInput::Text {
+                    text: "check permission wire contract".into(),
+                    text_elements: Vec::new(),
+                }],
+                cwd.to_path_buf(),
+                AskForApproval::OnRequest,
+                codex_protocol::config_types::ApprovalsReviewer::User,
+                override_,
+                &workspace_roots,
+                "remote-permission-model".into(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ));
+            if let Some((release_tx, blocker)) = worker_gate {
+                assert!(
+                    futures::poll!(tokio::task::unconstrained(pending_turn.as_mut())).is_pending()
+                );
+                let control = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    control_handle.request(ClientRequest::ConfigRead {
+                        request_id: RequestId::String("turn-permission-worker-barrier".into()),
+                        params: codex_app_server_protocol::ConfigReadParams {
+                            include_layers: false,
+                            cwd: None,
+                        },
+                    }),
+                )
+                .await
+                .expect("ordered control request completes while worker held")?
+                .expect("control response succeeds");
+                assert_eq!(control, serde_json::json!({}));
+                assert!(
+                    futures::poll!(tokio::task::unconstrained(pending_turn.as_mut())).is_pending()
+                );
+                release_tx.send(()).expect("release turn permission worker");
+                let response = tokio::time::timeout(Duration::from_secs(5), pending_turn)
+                    .await
+                    .expect("turn mapping must finish")?;
+                assert_eq!(response.turn.id, format!("accepted-{index}"));
+                blocker.await?;
+            } else {
+                let response = tokio::time::timeout(Duration::from_secs(5), pending_turn)
+                    .await
+                    .expect("turn mapping must finish")?;
+                assert_eq!(response.turn.id, format!("accepted-{index}"));
+            }
+        }
+        let turn_params = peer.await?;
+        session.shutdown().await?;
+        assert_eq!(turn_params.len(), 3);
+        for params in &turn_params {
+            assert_eq!(params["threadId"], thread_id.to_string());
+            assert_eq!(params["cwd"], serde_json::to_value(&cwd)?);
+            assert_eq!(
+                params["input"],
+                serde_json::json!([{"type":"text","text":"check permission wire contract","text_elements":[]} ])
+            );
+            assert_eq!(params["approvalPolicy"], "on-request");
+            assert_eq!(params["approvalsReviewer"], "user");
+            assert_eq!(params["model"], "remote-permission-model");
+        }
+        assert_eq!(turn_params[0]["permissionProfile"], expected_profile);
+        assert_eq!(
+            turn_params[0]["sandboxPolicy"],
+            serde_json::json!({
+                "type":"workspaceWrite", "writableRoots":[extra], "networkAccess":false,
+                "excludeTmpdirEnvVar":true, "excludeSlashTmp":true,
+            })
+        );
+        assert!(turn_params[0]["permissions"].is_null());
+        assert!(turn_params[1]["permissionProfile"].is_null());
+        assert!(turn_params[1]["sandboxPolicy"].is_null());
+        assert!(turn_params[1]["permissions"].is_null());
+        assert!(turn_params[2]["permissionProfile"].is_null());
+        assert!(turn_params[2]["sandboxPolicy"].is_null());
+        assert_eq!(turn_params[2]["permissions"], "strict-test-profile");
+        assert_eq!(std::fs::read(cwd.join(".git"))?, pointer_bytes);
+        assert_eq!(std::fs::read(cwd.join("source.rs"))?, b"worktree source");
+        assert_eq!(
+            std::fs::read(extra_path.join("source.rs"))?,
+            b"extra source"
+        );
+        Ok(())
     }
 }

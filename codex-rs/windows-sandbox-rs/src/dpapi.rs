@@ -9,16 +9,20 @@ use windows_sys::Win32::Security::Cryptography::CRYPTPROTECT_UI_FORBIDDEN;
 use windows_sys::Win32::Security::Cryptography::CryptProtectData;
 use windows_sys::Win32::Security::Cryptography::CryptUnprotectData;
 
-fn make_blob(data: &[u8]) -> CRYPT_INTEGER_BLOB {
-    CRYPT_INTEGER_BLOB {
-        cbData: data.len() as u32,
+fn checked_blob_len(len: usize) -> Result<u32> {
+    u32::try_from(len).map_err(|_| anyhow!("DPAPI input exceeds the 32-bit blob length limit"))
+}
+
+fn make_blob(data: &[u8]) -> Result<CRYPT_INTEGER_BLOB> {
+    Ok(CRYPT_INTEGER_BLOB {
+        cbData: checked_blob_len(data.len())?,
         pbData: data.as_ptr() as *mut u8,
-    }
+    })
 }
 
 #[allow(clippy::unnecessary_mut_passed)]
 pub fn protect(data: &[u8]) -> Result<Vec<u8>> {
-    let mut in_blob = make_blob(data);
+    let mut in_blob = make_blob(data)?;
     let mut out_blob = CRYPT_INTEGER_BLOB {
         cbData: 0,
         pbData: std::ptr::null_mut(),
@@ -52,7 +56,7 @@ pub fn protect(data: &[u8]) -> Result<Vec<u8>> {
 
 #[allow(clippy::unnecessary_mut_passed)]
 pub fn unprotect(blob: &[u8]) -> Result<Vec<u8>> {
-    let mut in_blob = make_blob(blob);
+    let mut in_blob = make_blob(blob)?;
     let mut out_blob = CRYPT_INTEGER_BLOB {
         cbData: 0,
         pbData: std::ptr::null_mut(),
@@ -82,4 +86,37 @@ pub fn unprotect(blob: &[u8]) -> Result<Vec<u8>> {
         }
     }
     Ok(slice)
+}
+
+#[cfg(test)]
+mod tests {
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn public_dpapi_roundtrip_preserves_binary_input_and_rejects_invalid_ciphertext()
+    -> anyhow::Result<()> {
+        let plaintext = b"offline\0credential\xff\x80";
+        let ciphertext = crate::dpapi_protect(plaintext)?;
+        assert_ne!(ciphertext, plaintext);
+        assert_eq!(crate::dpapi_unprotect(&ciphertext)?, plaintext);
+        let error = crate::dpapi_unprotect(b"not a DPAPI ciphertext")
+            .expect_err("invalid ciphertext must fail");
+        assert!(error.to_string().contains("CryptUnprotectData failed"));
+        Ok(())
+    }
+
+    #[test]
+    fn blob_length_rejects_values_above_the_windows_abi_limit() -> anyhow::Result<()> {
+        assert_eq!(super::checked_blob_len(0)?, 0);
+        assert_eq!(super::checked_blob_len(u32::MAX as usize)?, u32::MAX);
+        if let Some(too_large) = (u32::MAX as usize).checked_add(1) {
+            let error = super::checked_blob_len(too_large)
+                .expect_err("oversized input must not wrap to zero");
+            assert_eq!(
+                error.to_string(),
+                "DPAPI input exceeds the 32-bit blob length limit"
+            );
+        }
+        Ok(())
+    }
 }

@@ -500,6 +500,84 @@ fn active_plugin_version_compares_semver_versions_semantically() {
 }
 
 #[test]
+fn active_plugin_version_rejects_incomplete_enumeration_before_choosing_any_version() {
+    for error_position in 0..=3 {
+        let mut entries = vec![
+            Ok(Some("9.0.0".to_string())),
+            Ok(Some("10.0.0".to_string())),
+            Ok(Some("local".to_string())),
+        ];
+        entries.insert(
+            error_position,
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "entry unavailable",
+            )),
+        );
+        assert_eq!(
+            select_active_plugin_version(entries),
+            None,
+            "an entry error at position {error_position} must reject all partial candidates"
+        );
+    }
+    assert_eq!(
+        select_active_plugin_version([
+            Ok(Some("9.0.0".to_string())),
+            Ok(None),
+            Ok(Some("10.0.0".to_string())),
+            Ok(Some("invalid/version".to_string())),
+        ]),
+        Some("10.0.0".to_string()),
+    );
+    assert_eq!(
+        select_active_plugin_version([
+            Ok(Some("local".to_string())),
+            Ok(Some("10.0.0".to_string())),
+        ]),
+        Some("local".to_string()),
+    );
+}
+
+#[test]
+fn active_plugin_version_filesystem_failure_exposes_no_root_and_recovers() {
+    let tmp = tempdir().unwrap();
+    let store = PluginStore::new(tmp.path().to_path_buf());
+    let plugin_id = PluginId::new("sample-plugin".to_string(), "debug".to_string()).unwrap();
+    let base = store.plugin_base_root(&plugin_id);
+    fs::create_dir_all(base.as_path().parent().unwrap()).unwrap();
+    fs::write(base.as_path(), "not a plugin directory").unwrap();
+
+    assert_eq!(store.active_plugin_version(&plugin_id), None);
+    assert_eq!(store.active_plugin_root(&plugin_id), None);
+    assert!(!store.is_installed(&plugin_id));
+    assert_eq!(
+        fs::read_to_string(base.as_path()).unwrap(),
+        "not a plugin directory"
+    );
+
+    fs::remove_file(base.as_path()).unwrap();
+    write_plugin(
+        &tmp.path().join("plugins/cache/debug"),
+        "sample-plugin/9.0.0",
+        "sample-plugin",
+    );
+    write_plugin(
+        &tmp.path().join("plugins/cache/debug"),
+        "sample-plugin/10.0.0",
+        "sample-plugin",
+    );
+    assert_eq!(
+        store.active_plugin_version(&plugin_id),
+        Some("10.0.0".to_string())
+    );
+    assert_eq!(
+        store.active_plugin_root(&plugin_id).unwrap().as_path(),
+        tmp.path().join("plugins/cache/debug/sample-plugin/10.0.0"),
+    );
+    assert!(store.is_installed(&plugin_id));
+}
+
+#[test]
 fn install_with_new_version_keeps_existing_plugin_root_and_prunes_old_versions() {
     let tmp = tempdir().unwrap();
     let store = PluginStore::new(tmp.path().to_path_buf());

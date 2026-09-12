@@ -757,6 +757,14 @@ pub(crate) enum AppEvent {
         profile_selection: Option<PermissionProfileSelection>,
     },
 
+    /// Check Windows filesystem protections before applying the selected permission mode.
+    CheckWorldWritablePermissionMode {
+        preset: ApprovalPreset,
+        label: String,
+        approvals_reviewer: ApprovalsReviewer,
+        profile_selection: Option<PermissionProfileSelection>,
+    },
+
     /// Open the Windows world-writable directories warning.
     /// If `preset` is `Some`, the confirmation will apply the provided
     /// approval/sandbox configuration on Continue; if `None`, it performs no

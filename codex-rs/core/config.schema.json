@@ -4262,6 +4262,9 @@
         "standalone_web_search": {
           "type": "boolean"
         },
+        "task_model_guidance": {
+          "type": "boolean"
+        },
         "terminal_visualization_instructions": {
           "type": "boolean"
         },

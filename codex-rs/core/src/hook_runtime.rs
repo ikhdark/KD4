@@ -926,16 +926,24 @@ mod tests {
     use codex_utils_absolute_path::test_support::test_path_buf;
     use pretty_assertions::assert_eq;
 
-    #[test]
-    fn context_injecting_hook_outcome_preserves_runtime_fields() {
-        let outcome = codex_hooks::ContextInjectingHookOutcome {
-            hook_events: Vec::new(),
-            should_stop: true,
-            stop_reason: Some("prompt blocked".to_string()),
-            additional_contexts: vec!["injected".to_string()],
-        };
+    #[tokio::test]
+    async fn context_injecting_hook_outcome_preserves_runtime_fields() {
+        let (session, turn) = make_session_and_context().await;
+        let outcome = super::run_context_injecting_hook(
+            &std::sync::Arc::new(session),
+            &std::sync::Arc::new(turn),
+            Vec::new(),
+            async {
+                codex_hooks::ContextInjectingHookOutcome {
+                    hook_events: Vec::new(),
+                    should_stop: true,
+                    stop_reason: Some("prompt blocked".to_string()),
+                    additional_contexts: vec!["injected".to_string()],
+                }
+            },
+        )
+        .await;
 
-        assert!(outcome.hook_events.is_empty());
         assert!(outcome.should_stop);
         assert_eq!(outcome.stop_reason.as_deref(), Some("prompt blocked"));
         assert_eq!(outcome.additional_contexts, vec!["injected"]);

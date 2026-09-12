@@ -343,6 +343,17 @@ mod tests {
         reducer.finish(&mut streamed, "test-provider");
 
         assert_eq!(streamed, batch);
+        assert_eq!(streamed.title, "streamed request");
+        assert_eq!(streamed.preview.as_deref(), Some("streamed request"));
+        assert_eq!(
+            streamed.first_user_message.as_deref(),
+            Some("streamed request")
+        );
+        assert_eq!(
+            streamed.recency_at,
+            DateTime::<Utc>::from_timestamp(1_735_905_845, 0).expect("valid timestamp")
+        );
+        assert_eq!(streamed.model_provider, "openai");
     }
 
     #[test]

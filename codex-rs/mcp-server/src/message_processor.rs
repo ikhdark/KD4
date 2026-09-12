@@ -17,9 +17,7 @@ use codex_home::CodexHomeUserInstructionsProvider;
 use codex_login::AuthManager;
 use codex_login::default_client::USER_AGENT_SUFFIX;
 use codex_login::default_client::get_codex_user_agent;
-use codex_protocol::ThreadId;
 use codex_protocol::protocol::SessionSource;
-use codex_protocol::protocol::Submission;
 use rmcp::model::CallToolRequestParams;
 use rmcp::model::CallToolResult;
 use rmcp::model::ClientNotification;
@@ -43,6 +41,7 @@ use crate::codex_tool_config::CodexToolCallParam;
 use crate::codex_tool_config::CodexToolCallReplyParam;
 use crate::codex_tool_config::create_tool_for_codex_tool_call_param;
 use crate::codex_tool_config::create_tool_for_codex_tool_call_reply_param;
+use crate::codex_tool_runner::RunningRequest;
 use crate::outgoing_message::OutgoingMessageSender;
 
 pub(crate) struct MessageProcessor {
@@ -50,7 +49,7 @@ pub(crate) struct MessageProcessor {
     initialized: bool,
     arg0_paths: Arg0DispatchPaths,
     thread_manager: Arc<ThreadManager>,
-    running_requests_id_to_codex_uuid: Arc<Mutex<HashMap<RequestId, ThreadId>>>,
+    running_requests_id_to_codex_uuid: Arc<Mutex<HashMap<RequestId, RunningRequest>>>,
     tool_tasks: ToolTasks,
 }
 
@@ -146,6 +145,7 @@ impl MessageProcessor {
 
     pub(crate) async fn shutdown(&self) {
         self.tool_tasks.shutdown().await;
+        self.outgoing.cancel_all_requests().await;
         let report = self
             .thread_manager
             .shutdown_all_threads_bounded(Duration::from_secs(10))
@@ -264,8 +264,11 @@ impl MessageProcessor {
         }
     }
 
-    pub(crate) fn process_error(&mut self, err: JsonRpcError) {
+    pub(crate) async fn process_error(&mut self, err: JsonRpcError) {
         tracing::error!("<- client error id={:?}", err.id);
+        if let Some(id) = err.id {
+            self.outgoing.cancel_request(&id).await;
+        }
     }
 
     async fn handle_initialize(
@@ -598,16 +601,19 @@ impl MessageProcessor {
         let request_id_string = request_id.to_string();
 
         // Obtain the thread id while holding the first lock, then release.
-        let thread_id = {
+        let request = {
             let map_guard = self.running_requests_id_to_codex_uuid.lock().await;
             match map_guard.get(&request_id) {
-                Some(id) => *id,
+                Some(request) => request.clone(),
                 None => {
                     tracing::warn!("Session not found for request_id: {request_id_string}");
                     return;
                 }
             }
         };
+        // Preserve cancellation while the normal turn-start admission is pending.
+        request.cancellation.cancel();
+        let thread_id = request.thread_id;
         tracing::info!("thread_id: {thread_id}");
 
         // Obtain the Codex thread from the server.
@@ -619,19 +625,9 @@ impl MessageProcessor {
             }
         };
 
-        // Submit interrupt to Codex.
-        if let Err(e) = codex_arc
-            .submit_with_id(Submission {
-                id: request_id_string,
-                op: codex_protocol::protocol::Op::Interrupt,
-                client_user_message_id: None,
-                trace: None,
-            })
-            .await
-        {
-            tracing::error!("Failed to submit interrupt to Codex: {e}");
-            return;
-        }
+        // Core checks this identity while claiming the active turn's terminal
+        // transition, so completion/new-turn races cannot redirect cancellation.
+        codex_arc.interrupt_turn_if_active(&request.turn_id).await;
         // unregister the id so we don't keep it in the map
         self.running_requests_id_to_codex_uuid
             .lock()
@@ -661,6 +657,147 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stale_mcp_cancellation_leaves_newer_turn_running() -> anyhow::Result<()> {
+        use codex_protocol::protocol::AgentStatus;
+        use core_test_support::responses::ev_assistant_message;
+        use core_test_support::responses::ev_completed;
+        use core_test_support::responses::ev_response_created;
+        use core_test_support::responses::sse;
+        use core_test_support::streaming_sse::StreamingSseChunk;
+        use core_test_support::streaming_sse::start_streaming_sse_server;
+        use core_test_support::test_codex::test_codex;
+
+        let (second_gate, second_rx) = tokio::sync::oneshot::channel();
+        let (server, _completions) = start_streaming_sse_server(vec![
+            vec![StreamingSseChunk {
+                gate: None,
+                body: sse(vec![
+                    ev_response_created("first-response"),
+                    ev_assistant_message("first-message", "first complete"),
+                    ev_completed("first-response"),
+                ]),
+            }],
+            vec![StreamingSseChunk {
+                gate: Some(second_rx),
+                body: sse(vec![
+                    ev_response_created("second-response"),
+                    ev_assistant_message("second-message", "second complete"),
+                    ev_completed("second-response"),
+                ]),
+            }],
+        ])
+        .await;
+        let test = test_codex().build_with_streaming_server(&server).await?;
+        let thread_id = test.session_configured.thread_id;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        // A slow transport blocks notification publication while the real core
+        // turn completes. No request-registry entries are fabricated by the test.
+        let output_permit = tx.clone().reserve_owned().await?;
+        let mut processor = MessageProcessor {
+            outgoing: Arc::new(OutgoingMessageSender::new(tx)),
+            initialized: true,
+            arg0_paths: Arg0DispatchPaths::default(),
+            thread_manager: Arc::clone(&test.thread_manager),
+            running_requests_id_to_codex_uuid: Arc::new(Mutex::new(HashMap::new())),
+            tool_tasks: ToolTasks::default(),
+        };
+        let reply = |id, prompt| {
+            serde_json::from_value(json!({
+                "jsonrpc": "2.0", "id": id, "method": "tools/call",
+                "params": { "name": "codex-reply", "arguments": {
+                    "threadId": thread_id.to_string(), "prompt": prompt,
+                }},
+            }))
+        };
+        processor.process_request(reply(101, "first prompt")?).await;
+        tokio::time::timeout(Duration::from_secs(60), async {
+            server.wait_for_request_count(1).await;
+            loop {
+                if matches!(test.codex.agent_status().await, AgentStatus::Completed(_)) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        assert!(
+            processor
+                .running_requests_id_to_codex_uuid
+                .lock()
+                .await
+                .contains_key(&RequestId::Number(101)),
+            "blocked completion publication keeps the first MCP request registered"
+        );
+        processor
+            .process_request(reply(102, "second prompt")?)
+            .await;
+        tokio::time::timeout(Duration::from_secs(60), server.wait_for_request_count(2)).await?;
+        assert_eq!(test.codex.agent_status().await, AgentStatus::Running);
+
+        processor
+            .process_notification(serde_json::from_value(json!({
+                "jsonrpc": "2.0", "method": "notifications/cancelled",
+                "params": { "requestId": 101 },
+            }))?)
+            .await;
+        assert_eq!(
+            test.codex.agent_status().await,
+            AgentStatus::Running,
+            "cancelling the completed first turn must leave the gated second turn active"
+        );
+        {
+            let requests = processor.running_requests_id_to_codex_uuid.lock().await;
+            assert!(!requests.contains_key(&RequestId::Number(101)));
+            assert!(requests.contains_key(&RequestId::Number(102)));
+        }
+        // An overlapping reply must not be admitted as steering for the turn
+        // owned by request 102, which would give 103 authority to cancel it.
+        processor
+            .process_request(reply(103, "overlapping prompt")?)
+            .await;
+        drop(output_permit);
+        let rejected = tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                if let Some(crate::outgoing_message::OutgoingMessage::Response(response)) =
+                    rx.recv().await
+                    && response.id == RequestId::Number(103)
+                {
+                    break response.result;
+                }
+            }
+        })
+        .await?;
+        assert_eq!(rejected["isError"], json!(true));
+        assert!(
+            rejected["content"][0]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("a turn is already active"))
+        );
+        assert_eq!(server.requests().await.len(), 2);
+        assert_eq!(test.codex.agent_status().await, AgentStatus::Running);
+        second_gate
+            .send(())
+            .expect("the newer model response must still be waiting");
+        let outcome = tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                let status = test.codex.agent_status().await;
+                if status != AgentStatus::Running {
+                    break status;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        processor.shutdown().await;
+        server.shutdown().await;
+        assert_eq!(
+            outcome?,
+            AgentStatus::Completed(Some("second complete".into()))
+        );
+        Ok(())
+    }
 
     #[test]
     fn mcp_host_uses_the_complete_shared_extension_profile() {

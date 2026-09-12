@@ -289,6 +289,7 @@ fn run_mutation_sequence(
             client,
             &expected.remote_plugin_id,
             ExpectedInstalledState::Installed,
+            Instant::now() + STATE_TIMEOUT,
         )?;
         wait_for_remote_plugin_event(
             capture_path,
@@ -302,6 +303,7 @@ fn run_mutation_sequence(
             client,
             &expected.remote_plugin_id,
             ExpectedInstalledState::Uninstalled,
+            Instant::now() + STATE_TIMEOUT,
         )
         .map_err(|state_err| {
             if let Some(err) = uninstall_error.as_ref() {
@@ -377,9 +379,23 @@ fn wait_for_installed_state(
     client: &mut CodexClient,
     remote_plugin_id: &str,
     expected_state: ExpectedInstalledState,
+    deadline: Instant,
 ) -> Result<RemotePluginExpectation> {
-    let deadline = Instant::now() + STATE_TIMEOUT;
+    client.with_stdio_deadline(deadline, |client| {
+        wait_for_installed_state_until(client, remote_plugin_id, expected_state, deadline)
+    })
+}
+
+fn wait_for_installed_state_until(
+    client: &mut CodexClient,
+    remote_plugin_id: &str,
+    expected_state: ExpectedInstalledState,
+    deadline: Instant,
+) -> Result<RemotePluginExpectation> {
     loop {
+        if Instant::now() >= deadline {
+            bail!("plugin state deadline expired before another plugin/read");
+        }
         match read_remote_plugin(client, remote_plugin_id) {
             Ok(plugin) if plugin.installed == expected_state.is_installed() => return Ok(plugin),
             Ok(_) => {}
@@ -391,7 +407,7 @@ fn wait_for_installed_state(
                 "timed out waiting for remote plugin `{remote_plugin_id}` to become {expected_state:?}"
             );
         }
-        thread::sleep(POLL_INTERVAL);
+        thread::sleep(POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now())));
     }
 }
 
@@ -419,6 +435,7 @@ fn restore_uninstalled_state(
         client,
         remote_plugin_id,
         ExpectedInstalledState::Uninstalled,
+        Instant::now() + STATE_TIMEOUT,
     ) {
         Ok(_) => match uninstall_result {
             Ok(()) => RestorationStatus::Clean,
@@ -484,4 +501,61 @@ fn print_recovery_command(codex_bin: &Path, config_overrides: &[String], remote_
     ));
     eprintln!("Recovery command:");
     eprintln!("  {command}");
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+
+    #[test]
+    fn smoke_deadline_bounds_plugin_read_and_stops_polling_after_expiry() {
+        for (body, budget) in [
+            ("Start-Sleep -Seconds 5", Duration::from_millis(200)),
+            (
+                "$response = @{jsonrpc='2.0'; id=$request.id; error=@{code=-32000; message='retryable test failure'}}; [Console]::WriteLine(($response | ConvertTo-Json -Depth 10 -Compress))",
+                Duration::from_millis(50),
+            ),
+        ] {
+            let temp = tempfile::tempdir().expect("peer log root");
+            let log = temp.path().join("requests.jsonl");
+            let mut client = crate::tests::smoke_deadline_client(&log, body);
+            let start = Instant::now();
+            let deadline = start + budget;
+            let error = wait_for_installed_state(
+                &mut client,
+                "fixture-remote",
+                ExpectedInstalledState::Installed,
+                deadline,
+            )
+            .expect_err("state polling is bounded through its actual plugin/read RPC");
+            assert!(error.to_string().contains("deadline"), "{error:#}");
+            assert!(start.elapsed() < Duration::from_secs(2));
+            let requests = std::fs::read_to_string(&log).expect("actual plugin/read request");
+            let requests = requests
+                .lines()
+                .map(|line| serde_json::from_str::<Value>(line).expect("RPC JSON"))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                requests.len(),
+                1,
+                "a retry sleep clipped to expiry cannot admit a second RPC"
+            );
+            assert_eq!(requests[0]["method"], "plugin/read");
+            assert_eq!(requests[0]["params"]["pluginName"], "fixture-remote");
+            wait_for_installed_state(
+                &mut client,
+                "fixture-remote",
+                ExpectedInstalledState::Installed,
+                deadline,
+            )
+            .expect_err("expired deadline rejects without another RPC");
+            assert_eq!(
+                std::fs::read_to_string(log)
+                    .expect("unchanged RPC log")
+                    .lines()
+                    .count(),
+                1
+            );
+        }
+    }
 }

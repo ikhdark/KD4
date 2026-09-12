@@ -6,6 +6,7 @@ use crate::tools::command_output_artifact::RawOutputArtifact;
 use crate::tools::command_output_artifact::ToolOutputArtifactId;
 use crate::tools::shell_output_summary::ShellOutputSummaryOptions;
 use crate::tools::shell_output_summary::summarize_shell_output_for_model;
+use crate::tools::tool_dispatch_trace::ToolDispatchTrace;
 use crate::turn_diff_tracker::TurnDiffTracker;
 use codex_protocol::mcp::CallToolResult;
 use codex_protocol::models::FunctionCallOutputBody;
@@ -74,6 +75,7 @@ pub type SharedTurnDiffTracker = Arc<Mutex<TurnDiffTracker>>;
 #[derive(Debug)]
 pub(crate) struct ToolDispatchState {
     state: AtomicU8,
+    trace: std::sync::OnceLock<ToolDispatchTrace>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -97,6 +99,23 @@ impl ToolDispatchState {
     pub(crate) fn new() -> Self {
         Self {
             state: AtomicU8::new(ToolDispatchPhase::WaitingForAdmission as u8),
+            trace: std::sync::OnceLock::new(),
+        }
+    }
+
+    pub(crate) fn attach_trace(&self, trace: ToolDispatchTrace) {
+        self.trace.set(trace).expect("one trace per dispatch");
+    }
+
+    pub(crate) async fn record_cancelled_trace(&self) {
+        if let Some(trace) = self.trace.get() {
+            trace.record_cancelled().await;
+        }
+    }
+
+    pub(crate) async fn record_failed_trace(&self, error: &crate::FunctionCallError) {
+        if let Some(trace) = self.trace.get() {
+            trace.record_failed(error).await;
         }
     }
 
@@ -747,6 +766,8 @@ impl ToolOutput for AbortedToolOutput {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExecCommandToolOutput {
+    /// Model-declared attribution only; it does not establish successful coverage.
+    pub validation: Option<codex_protocol::validation::ValidationCommandContext>,
     pub event_call_id: String,
     pub chunk_id: String,
     pub wall_time: Duration,
@@ -762,6 +783,8 @@ pub struct ExecCommandToolOutput {
     pub original_token_count: Option<usize>,
     pub hook_command: Option<String>,
     pub raw_output_artifact: Option<RawOutputArtifact>,
+    /// Availability observed by the async output-preparation boundary.
+    pub raw_output_reduction_notice: Option<String>,
     pub repair_notice: Option<String>,
 }
 
@@ -895,6 +918,8 @@ impl ToolOutput for ExecCommandToolOutput {
             #[serde(skip_serializing_if = "Option::is_none")]
             repair: Option<String>,
             output: String,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            validation: Option<JsonValue>,
         }
 
         let (raw_output_artifact_id, raw_output_artifact_bytes, raw_output_artifact_error) =
@@ -944,6 +969,7 @@ impl ToolOutput for ExecCommandToolOutput {
                 .as_ref()
                 .and_then(RawOutputArtifact::retention_limit_reason),
             repair: self.repair_notice.clone(),
+            validation: self.declared_validation_metadata(),
             output,
         };
 
@@ -1228,7 +1254,38 @@ fn strip_ansi_sequences(line: &str) -> String {
     stripped
 }
 
+pub(crate) fn declared_validation_metadata(
+    validation: &codex_protocol::validation::ValidationCommandContext,
+) -> JsonValue {
+    serde_json::json!({
+        "covered_paths": validation.covered_paths,
+        "coverage_status": "unverified",
+    })
+}
+
 impl ExecCommandToolOutput {
+    fn declared_validation_metadata(&self) -> Option<JsonValue> {
+        self.validation.as_ref().map(declared_validation_metadata)
+    }
+
+    /// Refresh before exposing an output whose raw artifact or projection inputs
+    /// have changed. Synchronous ToolOutput formatting consumes this observation
+    /// and never performs filesystem I/O.
+    pub(crate) async fn prepare_reduction_notice(&mut self) {
+        self.raw_output_reduction_notice = None;
+        let raw_output = String::from_utf8_lossy(&self.raw_output);
+        if self.projected_model_output(raw_output.as_ref()).reduced {
+            if let Some(artifact) = &self.raw_output_artifact {
+                self.raw_output_reduction_notice = artifact.reduction_notice().await;
+            }
+        }
+    }
+
+    pub(crate) async fn with_prepared_reduction_notice(mut self) -> Self {
+        self.prepare_reduction_notice().await;
+        self
+    }
+
     fn projection_metadata_from_raw(&self, raw_output: &str) -> ToolOutputProjectionMetadata {
         let (raw_output_artifact_id, raw_output_artifact_bytes, raw_output_artifact_error) = self
             .raw_output_artifact
@@ -1290,7 +1347,8 @@ impl ExecCommandToolOutput {
             // already preserved below as essential inline metadata, and the
             // existing artifact ID lets the boundary reuse the raw artifact.
             spillable_text: vec![raw_output.to_owned()],
-            essential_inline: serde_json::json!({
+            essential_inline: {
+                let mut metadata = serde_json::json!({
                 "chunk_id": &self.chunk_id,
                 "exit_code": self.exit_code,
                 "session_id": self.process_id,
@@ -1303,7 +1361,12 @@ impl ExecCommandToolOutput {
                 "raw_output_artifact_error": raw_output_artifact_error,
                 "raw_output_artifact_retention_limit_hit": raw_output_artifact_retention_limit_hit,
                 "raw_output_artifact_retention_limit_reason": raw_output_artifact_retention_limit_reason,
-            }),
+                });
+                if let Some(validation) = self.declared_validation_metadata() {
+                    metadata["validation"] = validation;
+                }
+                metadata
+            },
             requested_limit: self.max_output_tokens,
             predetermined_ranges: predetermined_validation_ranges(
                 raw_output,
@@ -1398,15 +1461,12 @@ impl ExecCommandToolOutput {
     fn output_with_reduction_notice(&self, projected: ProjectedModelOutput) -> String {
         let mut output = projected.text;
         if projected.reduced
-            && let Some(notice) = self
-                .raw_output_artifact
-                .as_ref()
-                .and_then(RawOutputArtifact::reduction_notice)
+            && let Some(notice) = self.raw_output_reduction_notice.as_deref()
         {
             if !output.is_empty() {
                 output.push('\n');
             }
-            output.push_str(&notice);
+            output.push_str(notice);
         }
         output
     }
@@ -1444,33 +1504,51 @@ impl ExecCommandToolOutput {
             }
         };
         sections.push(process_status);
+        if let Some(validation) = self.declared_validation_metadata() {
+            sections.push(format!(
+                "Declared validation attribution (coverage unverified): {validation}"
+            ));
+        }
 
         if let Some(repair_notice) = &self.repair_notice {
             sections.push(repair_notice.clone());
         }
 
+        let artifact_section_index = sections.len();
         if let Some(raw_output_artifact) = &self.raw_output_artifact {
             sections.push(raw_output_artifact.render_for_model());
         }
 
         sections.push("Output:".to_string());
         let projected = self.projected_model_output(raw_output);
-        let reduction_notice = projected.reduced.then(|| {
-            self.raw_output_artifact
-                .as_ref()
-                .and_then(RawOutputArtifact::reduction_notice)
-        });
+        let reduction_notice = projected
+            .reduced
+            .then_some(self.raw_output_reduction_notice.as_deref());
         sections.push(projected.text);
 
         let response = sections.join("\n");
         let Some(Some(notice)) = reduction_notice else {
             return truncate_text_to_token_ceiling(&response, max_tokens);
         };
-        let notice = truncate_text_to_token_ceiling(&notice, max_tokens);
+        // Keep the recovery identifier with its instruction. Truncating the
+        // surrounding response may otherwise remove the artifact that "above"
+        // refers to while retaining the recovery instruction.
+        let artifact_header = if self.raw_output_artifact.is_some() {
+            sections.remove(artifact_section_index)
+        } else {
+            String::new()
+        };
+        let notice = format!("{artifact_header}\n{notice}");
         let notice_tokens = codex_utils_string::approx_token_count(&notice);
-        if notice_tokens >= max_tokens {
+        if notice_tokens > max_tokens {
+            // An exceptionally small caller budget cannot fit the complete
+            // recovery pair. Keep its identifier without a dangling instruction.
+            return truncate_text_to_token_ceiling(&artifact_header, max_tokens);
+        }
+        if notice_tokens == max_tokens {
             return notice;
         }
+        let response = sections.join("\n");
         let mut response_budget = max_tokens.saturating_sub(notice_tokens + 1);
         loop {
             let response = truncate_text_to_token_ceiling(&response, response_budget);

@@ -49,7 +49,7 @@ an SDK, schema, package, installed binary, or Codex Desktop.
 Update it in the same change whenever the repository materially changes.
 
 <!-- BEGIN TRACKED PATH SNAPSHOT -->
-Tracked repository path snapshot: `count=6107 sha256=8742940e656e85a877a321ba594e9f0186f4cfb64bfa2df19b186f2612f06f8b`.
+Tracked repository path snapshot: `count=6102 sha256=f8734234e7ed5bb117cefdc35d4fa56b653a157c98860beddb86f0a68fec41fd`.
 <!-- END TRACKED PATH SNAPSHOT -->
 
 Every repository file or directory add, delete, move, or rename also requires
@@ -167,6 +167,7 @@ below.
 | `LICENSE`, `NOTICE`                                              | Legal notices                                                                                                                                                                                                                                                         |
 | `justfile`, `kd4_features.toml`, `source_owners.toml`            | Preferred command router, KD4 feature inventory, and machine-readable source ownership routing                                                                                                                                                                        |
 | `package.json`, `pnpm-lock.yaml`, `pnpm-workspace.yaml`          | Root maintenance commands, JavaScript dependency state, and workspace membership                                                                                                                                                                                      |
+| `current-diff.txt` | Saved local review diff for manual investigation; historical evidence only, with no runtime entrypoint or generated contract. Validate inventory membership with `just source-map-check` and use the current Git diff for implementation decisions. |
 
 ## Instruction scopes
 
@@ -383,12 +384,16 @@ owner must trace every reader and writer before completion.
 | TypeScript SDK                              | `sdk/typescript`                                                                                                                                                              | `just sdk-ts-check` and package-facing type/tests                                                                                                                             |
 | Python SDK                                  | `sdk/python`                                                                                                                                                                  | focused `uv run pytest` and `uv run ruff check .`                                                                                                                             |
 | Python runtime package                      | `sdk/python-runtime`                                                                                                                                                          | focused runtime-package tests and lint                                                                                                                                        |
-| Windows local publish                       | `scripts/publish-local-codex.ps1`, `just publish-local-codex-final`                                                                                                           | dry-run argument proof, one artifact-producing release build, doctor, backup/rollback guards, installed hash/version                                                          |
+| Windows local publish                       | `scripts/publish-local-codex.ps1`, `just publish-local-codex-final`                                                                                                           | concise build/install/restart; optional doctor; backup/rollback guards, installed hash/version                                                          |
 | Desktop-visible completion                  | local publish output plus app-server/CLI runtime                                                                                                                              | publish final, restart Desktop, prove process path and binary hash/version, inspect initialize/model metadata, capture visible evidence                                       |
 | Source-owner and architecture index refresh | `source_owners.toml`, `scripts/source_owners.py`, `scripts/test_source_owners.py`                                                                                             | regenerate `architecture_index.json` and the marked `SOURCEMAP.md` block through the owner workflow; run source-owner freshness and representative relationship-recall checks |
 | Generated schema freshness                  | `scripts/config_schema_check.py`, `scripts/app_server_schema_runtime_check.py`, `scripts/generated_output_lock.py`                                                            | use the owning check/regeneration command under the shared generated-output lock; never hand-edit generated schemas                                                           |
 | KD4 audits, evaluation, and measurement     | `scripts/kd4_sync_audit.py`, `scripts/kd4_model_attempt_analysis.py`, `scripts/kd4_perf_snapshot.py`, `scripts/investigation_evidence_smoke.py`, `scripts/investigation_eval` | matching fixture/unit test; keep audits non-mutating and distinguish measured subprocess wall time from startup-only timing, test duration, estimates, and stale binaries     |
 | Runtime binary selection proof              | `scripts/vscode_runtime_proof.py`                                                                                                                                             | read-only path, version, and environment evidence; binary replacement remains owned by the explicit publish/update flow                                                       |
+
+`just publish-local-codex-final` runs only the local publisher. Release-tooling tests
+remain available via `just test-release-tooling`; use `-RunDoctor -DoctorOnNoop`
+for doctor checks and `-Verbose` for full publisher diagnostics.
 
 Capability verifications in `kd4_features.toml` select exact named Rust gates.
 The existing runner groups compatible gates, verifies their required test IDs,

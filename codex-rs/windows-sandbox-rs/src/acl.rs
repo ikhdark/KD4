@@ -1,4 +1,5 @@
 use crate::winutil::to_wide;
+use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
 use std::ffi::c_void;
@@ -24,6 +25,7 @@ use windows_sys::Win32::Security::Authorization::TRUSTEE_IS_SID;
 use windows_sys::Win32::Security::Authorization::TRUSTEE_IS_UNKNOWN;
 use windows_sys::Win32::Security::Authorization::TRUSTEE_W;
 use windows_sys::Win32::Security::DACL_SECURITY_INFORMATION;
+use windows_sys::Win32::Security::DeleteAce;
 use windows_sys::Win32::Security::EqualSid;
 use windows_sys::Win32::Security::GENERIC_MAPPING;
 use windows_sys::Win32::Security::GetAce;
@@ -39,6 +41,7 @@ use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
 use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_EXECUTE;
 use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_READ;
 use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_WRITE;
+use windows_sys::Win32::Storage::FileSystem::FILE_READ_DATA;
 use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_DELETE;
 use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
 use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_WRITE;
@@ -291,8 +294,8 @@ pub unsafe fn dacl_has_write_deny_for_sid(p_dacl: *mut ACL, psid: *mut c_void) -
     if ok == 0 {
         return false;
     }
-    let deny_write_mask = FILE_GENERIC_WRITE
-        | FILE_WRITE_DATA
+    // Standard rights shared with read ACEs do not establish a write deny.
+    let deny_write_mask = FILE_WRITE_DATA
         | FILE_APPEND_DATA
         | FILE_WRITE_EA
         | FILE_WRITE_ATTRIBUTES
@@ -336,7 +339,8 @@ pub unsafe fn dacl_has_read_deny_for_sid(p_dacl: *mut ACL, psid: *mut c_void) ->
     if ok == 0 {
         return false;
     }
-    let deny_read_mask = FILE_GENERIC_READ | GENERIC_READ_MASK;
+    // READ_CONTROL and SYNCHRONIZE are also present in write-only denies.
+    let deny_read_mask = FILE_READ_DATA | GENERIC_READ_MASK;
     for i in 0..info.AceCount {
         let mut p_ace: *mut c_void = std::ptr::null_mut();
         if GetAce(p_dacl as *const ACL, i, &mut p_ace) == 0 {
@@ -604,6 +608,82 @@ impl DenyAceKind {
     }
 }
 
+unsafe fn set_deny_entries_in_acl(
+    path: &Path,
+    explicit: &EXPLICIT_ACCESS_W,
+    dacl: *mut ACL,
+    replacement: &mut *mut ACL,
+) -> u32 {
+    #[cfg(test)]
+    if let Some(code) = native_deny_write_test::error(path, native_deny_write_test::Stage::Entries)
+    {
+        return code;
+    }
+    #[cfg(not(test))]
+    let _ = path;
+    SetEntriesInAclW(1, explicit, dacl, replacement)
+}
+
+unsafe fn set_deny_named_security_info(path: &Path, dacl: *mut ACL) -> u32 {
+    #[cfg(test)]
+    if let Some(code) = native_deny_write_test::error(path, native_deny_write_test::Stage::Security)
+    {
+        return code;
+    }
+    SetNamedSecurityInfoW(
+        to_wide(path).as_ptr().cast_mut(),
+        1,
+        DACL_SECURITY_INFORMATION,
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+        dacl,
+        std::ptr::null_mut(),
+    )
+}
+
+// Fault only the external OS operation, on the calling thread and exact path.
+// Public ACL application, journaling, rollback, and admission checks stay real.
+#[cfg(test)]
+pub(crate) mod native_deny_write_test {
+    use std::cell::RefCell;
+    use std::path::Path;
+    use std::path::PathBuf;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum Stage {
+        Entries,
+        Security,
+    }
+
+    thread_local! {
+        static FAILURE: RefCell<Option<(PathBuf, Stage, u32)>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn error(path: &Path, stage: Stage) -> Option<u32> {
+        FAILURE.with(|failure| {
+            failure
+                .borrow()
+                .as_ref()
+                .and_then(|(target, operation, code)| {
+                    (target == path && *operation == stage).then_some(*code)
+                })
+        })
+    }
+
+    pub(crate) fn with_error<T>(path: &Path, stage: Stage, code: u32, f: impl FnOnce() -> T) -> T {
+        struct Restore(Option<(PathBuf, Stage, u32)>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                FAILURE.with(|failure| *failure.borrow_mut() = self.0.take());
+            }
+        }
+        let previous =
+            FAILURE.with(|failure| failure.replace(Some((path.to_path_buf(), stage, code))));
+        let _restore = Restore(previous);
+        f()
+    }
+}
+
 unsafe fn add_deny_ace(path: &Path, psid: *mut c_void, kind: DenyAceKind) -> Result<bool> {
     let mut p_sd: *mut c_void = std::ptr::null_mut();
     let mut p_dacl: *mut ACL = std::ptr::null_mut();
@@ -617,11 +697,14 @@ unsafe fn add_deny_ace(path: &Path, psid: *mut c_void, kind: DenyAceKind) -> Res
         std::ptr::null_mut(),
         &mut p_sd,
     );
-    if code != ERROR_SUCCESS {
-        return Err(anyhow!("GetNamedSecurityInfoW failed: {code}"));
-    }
-    let mut added = false;
-    if !kind.already_present(p_dacl, psid) {
+    let result = (|| -> Result<bool> {
+        if code != ERROR_SUCCESS {
+            return Err(std::io::Error::from_raw_os_error(code as i32))
+                .with_context(|| format!("GetNamedSecurityInfoW failed for {}", path.display()));
+        }
+        if kind.already_present(p_dacl, psid) {
+            return Ok(false);
+        }
         let trustee = TRUSTEE_W {
             pMultipleTrustee: std::ptr::null_mut(),
             MultipleTrusteeOperation: 0,
@@ -635,29 +718,28 @@ unsafe fn add_deny_ace(path: &Path, psid: *mut c_void, kind: DenyAceKind) -> Res
         explicit.grfInheritance = CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE;
         explicit.Trustee = trustee;
         let mut p_new_dacl: *mut ACL = std::ptr::null_mut();
-        let code2 = SetEntriesInAclW(1, &explicit, p_dacl, &mut p_new_dacl);
-        if code2 == ERROR_SUCCESS {
-            let code3 = SetNamedSecurityInfoW(
-                to_wide(path).as_ptr() as *mut u16,
-                1,
-                DACL_SECURITY_INFORMATION,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                p_new_dacl,
-                std::ptr::null_mut(),
-            );
-            if code3 == ERROR_SUCCESS {
-                added = true;
+        let code = set_deny_entries_in_acl(path, &explicit, p_dacl, &mut p_new_dacl);
+        let write_result = if code != ERROR_SUCCESS {
+            Err(std::io::Error::from_raw_os_error(code as i32))
+                .with_context(|| format!("SetEntriesInAclW failed for {}", path.display()))
+        } else {
+            let code = set_deny_named_security_info(path, p_new_dacl);
+            if code == ERROR_SUCCESS {
+                Ok(true)
+            } else {
+                Err(std::io::Error::from_raw_os_error(code as i32))
+                    .with_context(|| format!("SetNamedSecurityInfoW failed for {}", path.display()))
             }
-            if !p_new_dacl.is_null() {
-                LocalFree(p_new_dacl as HLOCAL);
-            }
+        };
+        if !p_new_dacl.is_null() {
+            LocalFree(p_new_dacl as HLOCAL);
         }
-    }
+        write_result
+    })();
     if !p_sd.is_null() {
         LocalFree(p_sd as HLOCAL);
     }
-    Ok(added)
+    result
 }
 
 /// Adds a deny ACE to prevent reads for the given SID on the target path.
@@ -673,73 +755,89 @@ pub unsafe fn add_deny_read_ace(path: &Path, psid: *mut c_void) -> Result<bool> 
     add_deny_ace(path, psid, DenyAceKind::Read)
 }
 
-pub unsafe fn revoke_ace(path: &Path, psid: *mut c_void) -> Result<bool> {
-    let mut p_sd: *mut c_void = std::ptr::null_mut();
-    let mut p_dacl: *mut ACL = std::ptr::null_mut();
-    let code = GetNamedSecurityInfoW(
-        to_wide(path).as_ptr(),
-        1,
-        DACL_SECURITY_INFORMATION,
-        std::ptr::null_mut(),
-        std::ptr::null_mut(),
-        &mut p_dacl,
-        std::ptr::null_mut(),
-        &mut p_sd,
-    );
-    if code != ERROR_SUCCESS {
-        if !p_sd.is_null() {
-            LocalFree(p_sd as HLOCAL);
+/// Removes the managed explicit deny-read permissions while preserving grants,
+/// inherited entries, other principals, and a combined managed deny-write mask.
+/// Unknown combined masks fail closed so persistent callers retain retry state.
+///
+/// # Safety
+/// Caller must pass a valid SID pointer and an existing path.
+pub unsafe fn revoke_deny_read_ace(path: &Path, psid: *mut c_void) -> Result<bool> {
+    let (p_dacl, p_sd) = fetch_dacl_handle(path)?;
+    let result = (|| -> Result<bool> {
+        if p_dacl.is_null() {
+            return Ok(false);
         }
-        return Err(anyhow!(
-            "GetNamedSecurityInfoW failed for {} with code {code}",
-            path.display()
-        ));
-    }
-    let trustee = TRUSTEE_W {
-        pMultipleTrustee: std::ptr::null_mut(),
-        MultipleTrusteeOperation: 0,
-        TrusteeForm: TRUSTEE_IS_SID,
-        TrusteeType: TRUSTEE_IS_UNKNOWN,
-        ptstrName: psid as *mut u16,
-    };
-    let mut explicit: EXPLICIT_ACCESS_W = std::mem::zeroed();
-    explicit.grfAccessPermissions = 0;
-    explicit.grfAccessMode = 4; // REVOKE_ACCESS
-    explicit.grfInheritance = CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE;
-    explicit.Trustee = trustee;
-    let mut p_new_dacl: *mut ACL = std::ptr::null_mut();
-    let code2 = SetEntriesInAclW(1, &explicit, p_dacl, &mut p_new_dacl);
-    if code2 != ERROR_SUCCESS {
-        if !p_sd.is_null() {
-            LocalFree(p_sd as HLOCAL);
+        // Use aligned owned storage: edits must not touch the descriptor returned
+        // by Windows, and no native DACL is changed until every entry is checked.
+        let size = usize::from((*p_dacl).AclSize);
+        let mut storage = vec![0_u32; size.div_ceil(std::mem::size_of::<u32>())];
+        std::ptr::copy_nonoverlapping(p_dacl.cast::<u8>(), storage.as_mut_ptr().cast(), size);
+        let replacement = storage.as_mut_ptr().cast::<ACL>();
+        let mut changed = false;
+        let mut mapping = GENERIC_MAPPING {
+            GenericRead: FILE_GENERIC_READ,
+            GenericWrite: FILE_GENERIC_WRITE,
+            GenericExecute: FILE_GENERIC_EXECUTE,
+            GenericAll: FILE_ALL_ACCESS,
+        };
+        let mut read_mask = DenyAceKind::Read.mask();
+        let mut write_mask = DenyAceKind::Write.mask();
+        MapGenericMask(&mut read_mask, &mut mapping);
+        MapGenericMask(&mut write_mask, &mut mapping);
+        for index in (0..u32::from((*replacement).AceCount)).rev() {
+            let mut entry = std::ptr::null_mut();
+            if GetAce(replacement, index, &mut entry) == 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            let header = &*entry.cast::<ACE_HEADER>();
+            if header.AceType != ACCESS_DENIED_ACE_TYPE || header.AceFlags & INHERITED_ACE != 0 {
+                continue;
+            }
+            let ace = &mut *entry.cast::<ACCESS_DENIED_ACE>();
+            if EqualSid(std::ptr::addr_of_mut!(ace.SidStart).cast(), psid) == 0 {
+                continue;
+            }
+            let mut mask = ace.Mask;
+            MapGenericMask(&mut mask, &mut mapping);
+            if mask == read_mask {
+                if DeleteAce(replacement, index) == 0 {
+                    return Err(std::io::Error::last_os_error().into());
+                }
+                changed = true;
+            } else if mask == (read_mask | write_mask) {
+                ace.Mask = write_mask;
+                changed = true;
+            } else if mask & (read_mask & !write_mask) != 0 {
+                return Err(anyhow!(
+                    "cannot safely revoke custom deny-read mask {mask:#x} for {}",
+                    path.display()
+                ));
+            }
         }
-        return Err(anyhow!(
-            "SetEntriesInAclW failed while revoking {} with code {code2}",
-            path.display()
-        ));
-    }
-    let code3 = SetNamedSecurityInfoW(
-        to_wide(path).as_ptr() as *mut u16,
-        1,
-        DACL_SECURITY_INFORMATION,
-        std::ptr::null_mut(),
-        std::ptr::null_mut(),
-        p_new_dacl,
-        std::ptr::null_mut(),
-    );
-    if !p_new_dacl.is_null() {
-        LocalFree(p_new_dacl as HLOCAL);
-    }
+        if !changed {
+            return Ok(false);
+        }
+        let code = SetNamedSecurityInfoW(
+            to_wide(path).as_ptr().cast_mut(),
+            1,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            replacement,
+            std::ptr::null_mut(),
+        );
+        if code != ERROR_SUCCESS {
+            return Err(anyhow!(
+                "SetNamedSecurityInfoW failed while revoking {} with code {code}",
+                path.display()
+            ));
+        }
+        Ok(true)
+    })();
     if !p_sd.is_null() {
         LocalFree(p_sd as HLOCAL);
     }
-    if code3 != ERROR_SUCCESS {
-        return Err(anyhow!(
-            "SetNamedSecurityInfoW failed while revoking {} with code {code3}",
-            path.display()
-        ));
-    }
-    Ok(true)
+    result
 }
 
 /// Grants RX to the null device for the given SID to support stdout/stderr redirection.

@@ -435,8 +435,9 @@ async fn verify_request_plugin_install_completed(
             let plugin_installed = verified_plugin_install_completed(
                 plugin.id.as_str(),
                 config.as_ref(),
-                session.services.plugins_manager.as_ref(),
-            );
+                Arc::clone(&session.services.plugins_manager),
+            )
+            .await;
             let mcp_servers_completed = if plugin_installed {
                 refresh_requested_mcp_servers_after_install(
                     session,
@@ -608,19 +609,24 @@ async fn refresh_missing_requested_connectors(
     }
 }
 
-fn verified_plugin_install_completed(
+async fn verified_plugin_install_completed(
     tool_id: &str,
     config: &crate::config::Config,
-    plugins_manager: &codex_core_plugins::PluginsManager,
+    plugins_manager: Arc<codex_core_plugins::PluginsManager>,
 ) -> bool {
     let plugins_input = config.plugins_config_input();
-    plugins_manager
-        .list_marketplaces_for_config(&plugins_input, &[], /*include_openai_curated*/ true)
-        .ok()
-        .into_iter()
-        .flat_map(|outcome| outcome.marketplaces)
-        .flat_map(|marketplace| marketplace.plugins.into_iter())
-        .any(|plugin| plugin.id == tool_id && plugin.installed)
+    let tool_id = tool_id.to_string();
+    tokio::task::spawn_blocking(move || {
+        plugins_manager
+            .list_marketplaces_for_config(&plugins_input, &[], /*include_openai_curated*/ true)
+            .ok()
+            .into_iter()
+            .flat_map(|outcome| outcome.marketplaces)
+            .flat_map(|marketplace| marketplace.plugins.into_iter())
+            .any(|plugin| plugin.id == tool_id && plugin.installed)
+    })
+    .await
+    .expect("plugin install verification worker should complete")
 }
 
 #[cfg(test)]

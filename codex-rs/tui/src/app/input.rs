@@ -111,9 +111,14 @@ impl App {
                 .adjacent_thread_id_with_backfill(app_server, AgentNavigationDirection::Previous)
                 .await
             {
-                let _ = self
+                if let Err(err) = self
                     .select_agent_thread_and_discard_side(tui, app_server, thread_id)
-                    .await;
+                    .await
+                {
+                    self.chat_widget.add_error_message(format!(
+                        "Failed to switch to agent thread {thread_id}: {err}"
+                    ));
+                }
             }
             return;
         }
@@ -128,9 +133,14 @@ impl App {
                 .adjacent_thread_id_with_backfill(app_server, AgentNavigationDirection::Next)
                 .await
             {
-                let _ = self
+                if let Err(err) = self
                     .select_agent_thread_and_discard_side(tui, app_server, thread_id)
-                    .await;
+                    .await
+                {
+                    self.chat_widget.add_error_message(format!(
+                        "Failed to switch to agent thread {thread_id}: {err}"
+                    ));
+                }
             }
             return;
         }
@@ -199,7 +209,9 @@ impl App {
             } else if self.should_reject_side_backtrack_esc(key_event) {
                 self.reject_side_backtrack_esc();
             } else {
-                self.chat_widget.handle_key_event(key_event);
+                self.chat_widget
+                    .handle_key_event_with_image_paste(key_event)
+                    .await;
             }
             return;
         }
@@ -244,10 +256,14 @@ impl App {
                 if key_event.code != KeyCode::Esc && self.backtrack.primed {
                     self.reset_backtrack_state();
                 }
-                self.chat_widget.handle_key_event(key_event);
+                self.chat_widget
+                    .handle_key_event_with_image_paste(key_event)
+                    .await;
             }
             _ => {
-                self.chat_widget.handle_key_event(key_event);
+                self.chat_widget
+                    .handle_key_event_with_image_paste(key_event)
+                    .await;
             }
         };
     }

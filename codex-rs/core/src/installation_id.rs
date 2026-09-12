@@ -10,6 +10,7 @@ use tokio::fs;
 use uuid::Uuid;
 
 pub(crate) const INSTALLATION_ID_FILENAME: &str = "installation_id";
+const MAX_INSTALLATION_ID_BYTES: u64 = 128;
 
 pub async fn resolve_installation_id(codex_home: &AbsolutePathBuf) -> Result<String> {
     let path = codex_home.join(INSTALLATION_ID_FILENAME);
@@ -21,13 +22,19 @@ pub async fn resolve_installation_id(codex_home: &AbsolutePathBuf) -> Result<Str
         let mut file = options.open(&path)?;
         file.lock()?;
 
-        let mut contents = String::new();
-        file.read_to_string(&mut contents)?;
-        let trimmed = contents.trim();
-        if !trimmed.is_empty()
-            && let Ok(existing) = Uuid::parse_str(trimmed)
-        {
-            return Ok(existing.to_string());
+        let mut contents = Vec::new();
+        (&mut file)
+            .take(MAX_INSTALLATION_ID_BYTES + 1)
+            .read_to_end(&mut contents)?;
+        if contents.len() <= MAX_INSTALLATION_ID_BYTES as usize {
+            let contents = String::from_utf8(contents)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+            let trimmed = contents.trim();
+            if !trimmed.is_empty()
+                && let Ok(existing) = Uuid::parse_str(trimmed)
+            {
+                return Ok(existing.to_string());
+            }
         }
 
         let installation_id = Uuid::new_v4().to_string();
@@ -89,6 +96,22 @@ mod tests {
                 .expect("parse existing installation id")
                 .to_string()
         );
+    }
+
+    #[tokio::test]
+    async fn resolve_installation_id_replaces_oversized_record() {
+        let codex_home = TempDir::new().expect("create temp dir");
+        let existing = Uuid::new_v4().to_string();
+        let path = codex_home.path().join(INSTALLATION_ID_FILENAME);
+        std::fs::write(&path, format!("{existing}{}", " ".repeat(512 * 1024)))
+            .expect("write oversized record");
+        let resolved = resolve_installation_id(&codex_home.path().abs())
+            .await
+            .expect("replace oversized record");
+        assert_ne!(resolved, existing);
+        assert!(Uuid::parse_str(&resolved).is_ok());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), resolved);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 36);
     }
 
     #[tokio::test]

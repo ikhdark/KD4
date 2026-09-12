@@ -11,6 +11,13 @@ pub(crate) enum UnifiedExecError {
     CreateProcess { message: String },
     #[error("Unified exec process failed: {message}")]
     ProcessFailed { message: String },
+    #[error("tool-history persistence failed after command completion: {message}")]
+    ToolHistoryPersistence {
+        message: String,
+        exit_code: i32,
+        duration: std::time::Duration,
+        event_call_id: Option<String>,
+    },
     // The model is trained on `session_id`, but internally we track a `process_id`.
     #[error("Unknown process id {process_id}")]
     UnknownProcessId { process_id: u32 },

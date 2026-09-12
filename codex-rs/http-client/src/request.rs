@@ -55,13 +55,15 @@ pub enum RequestBody {
     Json(Value),
     EncodedJson(EncodedJsonBody),
     Raw(Bytes),
+    /// A builder serialization failure retained until dispatch rejects the request.
+    InvalidJson(String),
 }
 
 impl RequestBody {
     pub fn json(&self) -> Option<&Value> {
         match self {
             Self::Json(value) => Some(value),
-            Self::EncodedJson(_) | Self::Raw(_) => None,
+            Self::EncodedJson(_) | Self::Raw(_) | Self::InvalidJson(_) => None,
         }
     }
 }
@@ -101,7 +103,10 @@ impl Request {
     }
 
     pub fn with_json<T: Serialize>(mut self, body: &T) -> Self {
-        self.body = serde_json::to_value(body).ok().map(RequestBody::Json);
+        self.body = Some(match serde_json::to_value(body) {
+            Ok(value) => RequestBody::Json(value),
+            Err(error) => RequestBody::InvalidJson(error.to_string()),
+        });
         self
     }
 
@@ -121,7 +126,10 @@ impl Request {
         let len = match self.body.as_ref()? {
             RequestBody::EncodedJson(body) if body.prepared => body.bytes.len(),
             RequestBody::Raw(body) if self.compression == RequestCompression::None => body.len(),
-            RequestBody::Json(_) | RequestBody::EncodedJson(_) | RequestBody::Raw(_) => {
+            RequestBody::Json(_)
+            | RequestBody::EncodedJson(_)
+            | RequestBody::Raw(_)
+            | RequestBody::InvalidJson(_) => {
                 return None;
             }
         };
@@ -146,7 +154,7 @@ impl Request {
                     serde_json::to_vec(body).map_err(|err| err.to_string())?,
                 )),
                 Some(RequestBody::EncodedJson(body)) => Some(body.bytes.clone()),
-                Some(RequestBody::Raw(_)) | None => None,
+                Some(RequestBody::Raw(_) | RequestBody::InvalidJson(_)) | None => None,
             }
         } else {
             None
@@ -188,6 +196,7 @@ impl Request {
                 self.prepare_encoded_json(headers, &body)
             }
             Some(RequestBody::EncodedJson(body)) => self.prepare_encoded_json(headers, body),
+            Some(RequestBody::InvalidJson(error)) => Err(error.clone()),
             None => Ok(PreparedRequestBody {
                 headers,
                 body: None,

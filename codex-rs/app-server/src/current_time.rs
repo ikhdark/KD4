@@ -97,41 +97,16 @@ impl PendingCurrentTimeRequest {
         self.request_id = None;
     }
 
-    async fn cancel(&mut self) {
+    fn cancel(&mut self) {
         if let Some(request_id) = self.request_id.take() {
-            let _canceled = self.outgoing.cancel_request(&request_id).await;
+            let _canceled = self.outgoing.cancel_request_sync(&request_id);
         }
     }
 }
 
 impl Drop for PendingCurrentTimeRequest {
     fn drop(&mut self) {
-        let Some(request_id) = self.request_id.take() else {
-            return;
-        };
-        let outgoing = self.outgoing.clone();
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(async move {
-                let _canceled = outgoing.cancel_request(&request_id).await;
-            });
-        } else {
-            // A request future can be stored and dropped after its originating
-            // runtime has shut down. Use a short-lived cleanup runtime rather
-            // than leaving the callback entry permanently registered.
-            let _cleanup = std::thread::Builder::new()
-                .name("codex-current-time-cleanup".to_string())
-                .spawn(move || {
-                    let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                    else {
-                        return;
-                    };
-                    runtime.block_on(async move {
-                        let _canceled = outgoing.cancel_request(&request_id).await;
-                    });
-                });
-        }
+        self.cancel();
     }
 }
 
@@ -152,20 +127,34 @@ async fn request_current_time(
             CURRENT_TIME_REQUEST_TIMEOUT.as_secs()
         )
     })?;
-    let connection_ids = thread_state_manager
-        .subscribed_connection_ids(thread_id)
-        .await;
-    let connection_id = require_single_current_time_connection(&connection_ids)?;
-    let connection_ids = [connection_id];
-    let (request_id, rx) = outgoing
-        .send_request_to_connections(
-            Some(&connection_ids),
-            ServerRequestPayload::CurrentTimeRead(CurrentTimeReadParams {
-                thread_id: thread_id.to_string(),
-            }),
-            Some(thread_id),
+    let (request_id, rx) = timeout_at(deadline, async {
+        let connection_ids = thread_state_manager
+            .subscribed_connection_ids(thread_id)
+            .await;
+        let connection_id = require_single_current_time_connection(&connection_ids)?;
+        // The subscription wait consumes the same budget as delivery and the
+        // response. Do not publish a request once that budget has expired.
+        if Instant::now() >= deadline {
+            bail!("current-time request deadline expired before delivery");
+        }
+        let connection_ids = [connection_id];
+        Ok(outgoing
+            .send_request_to_connections(
+                Some(&connection_ids),
+                ServerRequestPayload::CurrentTimeRead(CurrentTimeReadParams {
+                    thread_id: thread_id.to_string(),
+                }),
+                Some(thread_id),
+            )
+            .await)
+    })
+    .await
+    .map_err(|_| {
+        anyhow!(
+            "current-time request delivery timed out after {}s",
+            CURRENT_TIME_REQUEST_TIMEOUT.as_secs()
         )
-        .await;
+    })??;
     let mut pending_request = PendingCurrentTimeRequest {
         outgoing: outgoing.clone(),
         request_id: Some(request_id.clone()),
@@ -186,7 +175,7 @@ async fn request_current_time(
         }
         Ok(Err(err)) => bail!("current-time request was canceled: {err}"),
         Err(_) => {
-            pending_request.cancel().await;
+            pending_request.cancel();
             bail!(
                 "current-time request timed out after {}s",
                 CURRENT_TIME_REQUEST_TIMEOUT.as_secs()
@@ -249,6 +238,75 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn current_time_delivery_uses_remaining_subscription_budget() {
+        let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<OutgoingEnvelope>(1);
+        // Hold the transport's only slot so request delivery experiences real
+        // channel backpressure without a consumer draining it.
+        let capacity = outgoing_tx.clone().reserve_owned().await.unwrap();
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            outgoing_tx,
+            codex_analytics::AnalyticsEventsClient::disabled(),
+        ));
+        let thread_state_manager = ThreadStateManager::new();
+        let thread_id = ThreadId::new();
+        let connection_id = ConnectionId(1);
+        outgoing
+            .connection_opened(connection_id, Arc::new(AtomicBool::new(true)))
+            .await;
+        thread_state_manager
+            .connection_initialized(connection_id, ConnectionCapabilities::default())
+            .await;
+        let provider =
+            super::app_server_time_provider(outgoing.clone(), thread_state_manager.clone());
+        let time_read = tokio::spawn(async move { provider.current_time(thread_id).await });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(8)).await;
+        assert!(
+            thread_state_manager
+                .try_add_connection_to_thread(thread_id, connection_id)
+                .await
+        );
+        timeout(Duration::from_secs(1), async {
+            while outgoing
+                .pending_requests_for_thread(thread_id)
+                .await
+                .is_empty()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("delivery should register its callback before waiting for capacity");
+
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let error = timeout(Duration::from_secs(1), time_read)
+            .await
+            .expect("delivery must time out using the original ten-second budget")
+            .expect("current-time task should not panic")
+            .expect_err("a full transport queue must time out");
+        assert_eq!(
+            error.to_string(),
+            "current-time request delivery timed out after 10s"
+        );
+        timeout(Duration::from_secs(1), async {
+            while !outgoing
+                .pending_requests_for_thread(thread_id)
+                .await
+                .is_empty()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("canceled delivery must remove its callback");
+        drop(capacity);
+        assert!(matches!(
+            outgoing_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
     #[tokio::test]
     async fn thread_cleanup_cancels_pending_external_current_time_request() {
         let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<OutgoingEnvelope>(1);
@@ -303,5 +361,146 @@ mod tests {
                 .to_string()
                 .contains("current-time request was canceled")
         );
+    }
+
+    #[test]
+    fn delivered_current_time_cancellation_removes_callback_before_runtime_shutdown() {
+        use crate::outgoing_message::OutgoingMessage;
+        use std::task::Poll;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("originating runtime");
+        let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<OutgoingEnvelope>(1);
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            outgoing_tx,
+            codex_analytics::AnalyticsEventsClient::disabled(),
+        ));
+        let manager = ThreadStateManager::new();
+        let thread_id = ThreadId::new();
+        let connection = ConnectionId(71);
+        runtime.block_on(async {
+            outgoing
+                .connection_opened(connection, Arc::new(AtomicBool::new(true)))
+                .await;
+            manager
+                .connection_initialized(connection, ConnectionCapabilities::default())
+                .await;
+            assert!(
+                manager
+                    .try_add_connection_to_thread(thread_id, connection)
+                    .await
+            );
+        });
+        let provider = super::app_server_time_provider(Arc::clone(&outgoing), manager);
+        let mut original = provider.current_time(thread_id);
+        runtime.block_on(std::future::poll_fn(|cx| {
+            assert!(original.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        }));
+        let OutgoingEnvelope::ToConnection {
+            connection_id,
+            message: OutgoingMessage::Request(request),
+            ..
+        } = outgoing_rx
+            .try_recv()
+            .expect("normal current-time request actually delivered")
+        else {
+            panic!("expected current-time request");
+        };
+        assert_eq!(connection_id, connection);
+        assert!(matches!(
+            request,
+            codex_app_server_protocol::ServerRequest::CurrentTimeRead { .. }
+        ));
+        let original_id = request.id().clone();
+        assert_eq!(runtime.block_on(outgoing.pending_callback_count()), 1);
+        {
+            // Drop while a runtime is present but no executor is polling tasks.
+            // Immediately destroying it must not strand scheduled cleanup.
+            let _entered = runtime.enter();
+            drop(original);
+        }
+        runtime.shutdown_timeout(Duration::from_millis(100));
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("reconnect runtime");
+        runtime.block_on(async {
+            assert_eq!(
+                outgoing.pending_callback_count().await,
+                0,
+                "callback table must be physically empty before disconnect cleanup"
+            );
+            assert!(
+                outgoing
+                    .pending_requests_for_thread(thread_id)
+                    .await
+                    .is_empty()
+            );
+            let reconnected = ConnectionId(72);
+            outgoing
+                .connection_opened(reconnected, Arc::new(AtomicBool::new(true)))
+                .await;
+            outgoing
+                .replay_requests_to_connection_for_thread(reconnected, thread_id, true)
+                .await;
+            assert!(
+                matches!(
+                    outgoing_rx.try_recv(),
+                    Err(mpsc::error::TryRecvError::Empty)
+                ),
+                "cancelled current-time request replayed"
+            );
+
+            let mut fresh = provider.current_time(thread_id);
+            std::future::poll_fn(|cx| {
+                assert!(fresh.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            let OutgoingEnvelope::ToConnection {
+                message: OutgoingMessage::Request(request),
+                ..
+            } = outgoing_rx.try_recv().expect("fresh request delivered")
+            else {
+                panic!("expected fresh current-time request");
+            };
+            let fresh_id = request.id().clone();
+            assert_ne!(fresh_id, original_id);
+            outgoing
+                .notify_client_response(
+                    connection,
+                    original_id,
+                    serde_json::json!({"currentTimeAt": 1_600_000_000}),
+                )
+                .await;
+            std::future::poll_fn(|cx| {
+                assert!(
+                    fresh.as_mut().poll(cx).is_pending(),
+                    "late original response completed a fresh request"
+                );
+                Poll::Ready(())
+            })
+            .await;
+            assert_eq!(outgoing.pending_callback_count().await, 1);
+            outgoing
+                .notify_client_response(
+                    connection,
+                    fresh_id,
+                    serde_json::json!({"currentTimeAt": 1_700_000_000}),
+                )
+                .await;
+            assert_eq!(
+                fresh
+                    .await
+                    .expect("fresh current-time response")
+                    .timestamp(),
+                1_700_000_000
+            );
+            assert_eq!(outgoing.pending_callback_count().await, 0);
+        });
     }
 }

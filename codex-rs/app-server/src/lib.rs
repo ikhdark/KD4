@@ -1121,19 +1121,51 @@ pub async fn run_main(
 
     drop(transport_event_tx);
 
-    let _ = processor_handle.await;
-    let _ = outbound_handle.await;
-
-    transport_shutdown_token.cancel();
-    for handle in transport_accept_handles {
-        let _ = handle.await;
-    }
+    let task_result = finish_runtime_task_groups(
+        processor_handle,
+        outbound_handle,
+        transport_shutdown_token,
+        transport_accept_handles,
+    )
+    .await;
 
     if let Some(otel) = otel {
         otel.shutdown();
     }
 
-    Ok(())
+    task_result
+}
+
+async fn finish_runtime_task_groups(
+    processor: JoinHandle<()>,
+    outbound: JoinHandle<()>,
+    transport_shutdown: CancellationToken,
+    transport_handles: Vec<JoinHandle<()>>,
+) -> IoResult<()> {
+    let mut first_error = None;
+    for (task, result) in [
+        ("processor", processor.await),
+        ("outbound router", outbound.await),
+    ] {
+        if let Err(error) = result {
+            warn!(task, %error, "app-server runtime task failed");
+            first_error.get_or_insert_with(|| {
+                std::io::Error::other(format!("app-server {task} task failed: {error}"))
+            });
+        }
+    }
+    transport_shutdown.cancel();
+    for handle in transport_handles {
+        if let Err(error) = handle.await {
+            warn!(%error, "app-server transport task failed");
+            first_error.get_or_insert_with(|| {
+                std::io::Error::other(format!("app-server transport task failed: {error}"))
+            });
+        }
+    }
+    // Retire all task owners before exposing an infrastructure failure to the
+    // caller. run_main also shuts down telemetry before propagating this result.
+    first_error.map_or(Ok(()), Err)
 }
 
 struct SqliteRecoveryNotice {
@@ -1346,6 +1378,71 @@ mod tests {
                 event.metadata().target().to_string(),
                 *event.metadata().level(),
             ));
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_finalization_preserves_task_failure_after_all_owners_retire() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::atomic::Ordering;
+        use tokio_util::sync::CancellationToken;
+
+        // Exercise each real JoinHandle failure group and the all-success control.
+        for failing_group in 0..5 {
+            let processor = tokio::spawn(async move {
+                assert!(!matches!(failing_group, 0 | 4), "processor failure witness");
+            });
+            let outbound = tokio::spawn(async move {
+                assert!(!matches!(failing_group, 1 | 4), "outbound failure witness");
+            });
+            let failing_transport = tokio::spawn(async move {
+                assert!(!matches!(failing_group, 2 | 4), "transport failure witness");
+            });
+            let shutdown = CancellationToken::new();
+            let (retire_tx, retire_rx) = tokio::sync::oneshot::channel();
+            let retired = Arc::new(AtomicBool::new(false));
+            let healthy_transport = tokio::spawn({
+                let shutdown = shutdown.clone();
+                let retired = Arc::clone(&retired);
+                async move {
+                    shutdown.cancelled().await;
+                    retire_rx.await.unwrap();
+                    retired.store(true, Ordering::Release);
+                }
+            });
+            let finish = super::finish_runtime_task_groups(
+                processor,
+                outbound,
+                shutdown.clone(),
+                vec![failing_transport, healthy_transport],
+            );
+            tokio::pin!(finish);
+            tokio::select! {
+                biased;
+                result = &mut finish => panic!("returned before held healthy transport retired: {result:?}"),
+                _ = shutdown.cancelled() => {}
+            }
+            assert!(futures::poll!(&mut finish).is_pending());
+            assert!(!retired.load(Ordering::Acquire));
+            retire_tx.send(()).unwrap();
+            let result = tokio::time::timeout(std::time::Duration::from_secs(2), &mut finish)
+                .await
+                .unwrap();
+            assert!(retired.load(Ordering::Acquire));
+            if failing_group == 3 {
+                result.unwrap();
+            } else {
+                let error = result.unwrap_err();
+                assert_eq!(error.kind(), std::io::ErrorKind::Other);
+                let owner = [
+                    "processor",
+                    "outbound router",
+                    "transport",
+                    "unused",
+                    "processor",
+                ][failing_group];
+                assert!(error.to_string().contains(owner), "{error}");
+            }
         }
     }
 

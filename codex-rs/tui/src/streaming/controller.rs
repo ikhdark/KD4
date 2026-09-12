@@ -1183,6 +1183,7 @@ mod tests {
         assert_eq!(ctrl.queued_lines(), 0, "expected empty queue before table");
 
         ctrl.push("| A | B |\n");
+        ctrl.flush_render_for_frame();
         assert_eq!(
             ctrl.queued_lines(),
             0,
@@ -1234,6 +1235,7 @@ mod tests {
         assert!(idle, "intro line should fully drain");
 
         assert!(!ctrl.push("| Step | Owner |\n"));
+        ctrl.flush_render_for_frame();
         assert!(
             ctrl.has_live_tail(),
             "expected plan table header to be held"
@@ -1470,10 +1472,13 @@ mod tests {
         assert!(first_idle);
 
         ctrl.push("next line\n");
+        ctrl.flush_render_for_frame();
         let (second_commit, _second_idle) = ctrl.on_commit_tick();
-        assert!(
-            second_commit.is_some(),
-            "expected prose lines to be released once no table delimiter follows"
+        let released = second_commit
+            .expect("expected prose lines to be released once no table delimiter follows");
+        assert_eq!(
+            lines_to_plain_strings(&released.transcript_lines(u16::MAX)),
+            vec!["• status | owner | note".to_string()],
         );
     }
 
@@ -1486,6 +1491,7 @@ mod tests {
         assert!(first_idle);
 
         ctrl.push("gamma | delta\n\n");
+        ctrl.flush_render_for_frame();
         let (second_commit, _second_idle) = ctrl.on_commit_tick();
         let second_lines = second_commit
             .map(|cell| lines_to_plain_strings(&cell.transcript_lines(u16::MAX)))
@@ -1725,6 +1731,7 @@ mod tests {
 
         for delta in source.split_inclusive('\n') {
             ctrl.push(delta);
+            ctrl.flush_render_for_frame();
             loop {
                 let (cell, idle) = ctrl.on_commit_tick();
                 if let Some(cell) = cell {

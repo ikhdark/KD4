@@ -8,6 +8,7 @@ use crate::legacy_core::config::Config;
 use crate::legacy_core::config::ConfigBuilder;
 use crate::legacy_core::config::ConfigOverrides;
 use crate::legacy_core::config::ConfigTomlLoadResult;
+use crate::legacy_core::config::find_codex_home_async;
 use crate::legacy_core::config::load_config_toml_with_layer_stack;
 use crate::legacy_core::config::resolve_bootstrap_auth_keyring_backend_kind;
 use crate::legacy_core::config::resolve_bootstrap_auth_route_config;
@@ -305,10 +306,10 @@ async fn init_state_db_for_app_server_target(
 }
 
 // TODO(jif) delete after 22/11/2026.
-fn remove_legacy_tui_log_file(codex_home: &Path) {
+async fn remove_legacy_tui_log_file(codex_home: &Path) {
     // Shared append-only TUI logs could grow without bound. Existing processes
     // may still hold the file open, so startup cleanup is best effort.
-    let _ = std::fs::remove_file(codex_home.join("log").join(TUI_LOG_FILE_NAME));
+    let _ = tokio::fs::remove_file(codex_home.join("log").join(TUI_LOG_FILE_NAME)).await;
 }
 
 fn remote_addr_has_explicit_port(addr: &str, parsed: &Url) -> bool {
@@ -567,6 +568,7 @@ async fn lookup_session_target_by_name_with_app_server(
     name: &str,
 ) -> color_eyre::Result<Option<resume_picker::SessionTarget>> {
     let mut cursor = None;
+    let mut seen_cursors = std::collections::HashSet::new();
     loop {
         let response = app_server
             .thread_list(ThreadListParams {
@@ -591,10 +593,15 @@ async fn lookup_session_target_by_name_with_app_server(
         {
             return Ok(session_target_from_app_server_thread(thread));
         }
-        if response.next_cursor.is_none() {
+        let Some(next_cursor) = response.next_cursor else {
             return Ok(None);
+        };
+        if !seen_cursors.insert(next_cursor.clone()) {
+            return Err(color_eyre::eyre::eyre!(
+                "app server repeated a pagination cursor while resolving session '{name}'"
+            ));
         }
-        cursor = response.next_cursor;
+        cursor = Some(next_cursor);
     }
 }
 
@@ -859,7 +866,7 @@ pub async fn run_main(
 
     // we load config.toml here to determine project state.
     #[allow(clippy::print_stderr)]
-    let codex_home = match find_codex_home() {
+    let codex_home = match find_codex_home_async().await {
         Ok(codex_home) => codex_home.to_path_buf(),
         Err(err) => {
             eprintln!("Error finding codex home: {err}");
@@ -1070,7 +1077,7 @@ pub async fn run_main(
         }
     }
 
-    remove_legacy_tui_log_file(config.codex_home.as_path());
+    remove_legacy_tui_log_file(config.codex_home.as_path()).await;
 
     let otel_originator = originator().value;
     let otel = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1198,6 +1205,25 @@ pub async fn run_main(
     .map_err(|err| std::io::Error::other(err.to_string()))
 }
 
+async fn configure_final_theme(config: &mut Config) {
+    let name = config.tui_theme.clone();
+    let codex_home = find_codex_home_async()
+        .await
+        .ok()
+        .map(AbsolutePathBuf::into_path_buf);
+    // Custom theme validation opens and parses a local .tmTheme file, and resolving
+    // an already initialized theme may read it again. Keep that entire operation
+    // off the async executor, then preserve warning order before App startup.
+    let warning = tokio::task::spawn_blocking(move || {
+        crate::render::highlight::set_theme_override(name, codex_home)
+    })
+    .await
+    .unwrap_or_else(|err| Some(format!("Could not configure syntax highlighting: {err}")));
+    if let Some(warning) = warning {
+        config.startup_warnings.push(warning);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_ratatui_app(
     cli: Cli,
@@ -1262,195 +1288,254 @@ async fn run_ratatui_app(
     }
 
     // Initialize high-fidelity session event logging if enabled.
-    session_log::maybe_init(&initial_config);
+    session_log::maybe_init(&initial_config).await;
 
-    let app_server_session = match start_app_server(
-        &app_server_target,
-        arg0_paths.clone(),
-        initial_config.clone(),
-        cli_kv_overrides.clone(),
-        loader_overrides.clone(),
-        strict_config,
-        cloud_config_bundle.clone(),
-        feedback.clone(),
-        log_db.clone(),
-        state_db.clone(),
-        environment_manager.clone(),
-    )
-    .await
-    {
-        Ok(app_server) => AppServerSession::new(app_server, app_server_target.thread_params_mode()),
-        Err(err) => {
-            terminal_restore_guard.restore_silently();
-            session_log::log_session_end();
-            return Err(err);
-        }
-    }
-    .with_remote_cwd_override(remote_cwd_override.clone());
-    if let Some(provider) = manually_selected_oss_provider.as_deref()
-        && let Err(err) = config_update::write_config_batch(
-            app_server_session.request_handle(),
-            vec![config_update::build_oss_provider_edit(provider)],
+    // Keep all early returns and propagated errors inside the recording scope
+    // so accepted session records are drained before the TUI finishes.
+    let session_result = async {
+        let app_server_session = match start_app_server(
+            &app_server_target,
+            arg0_paths.clone(),
+            initial_config.clone(),
+            cli_kv_overrides.clone(),
+            loader_overrides.clone(),
+            strict_config,
+            cloud_config_bundle.clone(),
+            feedback.clone(),
+            log_db.clone(),
+            state_db.clone(),
+            environment_manager.clone(),
         )
         .await
-    {
-        warn!(
-            %err,
-            provider,
-            "Failed to persist selected OSS provider preference"
-        );
-    }
-    let mut app_server = Some(app_server_session);
+        {
+            Ok(app_server) => AppServerSession::new(app_server, app_server_target.thread_params_mode()),
+            Err(err) => {
+                terminal_restore_guard.restore_silently();
+                return Err(err);
+            }
+        }
+        .with_remote_cwd_override(remote_cwd_override.clone());
+        if let Some(provider) = manually_selected_oss_provider.as_deref()
+            && let Err(err) = config_update::write_config_batch(
+                app_server_session.request_handle(),
+                vec![config_update::build_oss_provider_edit(provider)],
+            )
+            .await
+        {
+            warn!(
+                %err,
+                provider,
+                "Failed to persist selected OSS provider preference"
+            );
+        }
+        let mut app_server = Some(app_server_session);
 
-    let should_show_trust_screen_flag =
-        !uses_remote_workspace && should_show_trust_screen(&initial_config);
+        let should_show_trust_screen_flag =
+            !uses_remote_workspace && should_show_trust_screen(&initial_config);
 
-    let mut trust_decision_was_made = false;
-    let login_status = if initial_config.model_provider.requires_openai_auth {
-        let Some(app_server) = app_server.as_mut() else {
-            unreachable!("app server should exist when auth is required");
+        let mut trust_decision_was_made = false;
+        let login_status = if initial_config.model_provider.requires_openai_auth {
+            let Some(app_server) = app_server.as_mut() else {
+                unreachable!("app server should exist when auth is required");
+            };
+            get_login_status(app_server, &initial_config).await?
+        } else {
+            LoginStatus::NotAuthenticated
         };
-        get_login_status(app_server, &initial_config).await?
-    } else {
-        LoginStatus::NotAuthenticated
-    };
-    let should_show_onboarding =
-        should_show_onboarding(login_status, &initial_config, should_show_trust_screen_flag);
+        let should_show_onboarding =
+            should_show_onboarding(login_status, &initial_config, should_show_trust_screen_flag);
 
-    let config = if should_show_onboarding {
-        let show_login_screen = should_show_login_screen(login_status, &initial_config);
-        let onboarding_result = run_onboarding_app(
-            OnboardingScreenArgs {
-                show_login_screen,
-                show_trust_screen: should_show_trust_screen_flag,
-                login_status,
-                app_server_request_handle: app_server
-                    .as_ref()
-                    .map(AppServerSession::request_handle),
-                config: initial_config.clone(),
-            },
-            if show_login_screen {
-                app_server.as_mut()
+        let config = if should_show_onboarding {
+            let show_login_screen = should_show_login_screen(login_status, &initial_config);
+            let onboarding_result = run_onboarding_app(
+                OnboardingScreenArgs {
+                    show_login_screen,
+                    show_trust_screen: should_show_trust_screen_flag,
+                    login_status,
+                    app_server_request_handle: app_server
+                        .as_ref()
+                        .map(AppServerSession::request_handle),
+                    config: initial_config.clone(),
+                },
+                if show_login_screen {
+                    app_server.as_mut()
+                } else {
+                    None
+                },
+                &mut tui,
+            )
+            .await?;
+            if onboarding_result.should_exit {
+                shutdown_app_server_if_present(app_server.take()).await;
+                terminal_restore_guard.restore_silently();
+                let _ = tui.terminal.clear();
+                return Ok(AppExitInfo {
+                    token_usage: crate::token_usage::TokenUsage::default(),
+                    thread_id: None,
+                    resume_hint: None,
+                    update_action: None,
+                    exit_reason: ExitReason::UserRequested,
+                });
+            }
+
+            {
+                trust_decision_was_made = onboarding_result.directory_trust_persisted;
+            }
+            // If this onboarding run included the login step, always refresh the cloud config bundle
+            // and rebuild config. This avoids missing newly available cloud-managed policy due to login
+            // status detection edge cases.
+            if show_login_screen && !uses_remote_workspace {
+                cloud_config_bundle = cloud_config_bundle_loader_for_storage(
+                    initial_config.codex_home.to_path_buf(),
+                    /*enable_codex_api_key_env*/ false,
+                    initial_config.cli_auth_credentials_store_mode,
+                    initial_config.auth_keyring_backend_kind(),
+                    initial_config.chatgpt_base_url.clone(),
+                    initial_config.auth_route_config(),
+                )
+                .await;
+            }
+
+            // If the user made an explicit trust decision, or we showed the login flow, reload config
+            // so current process state reflects persisted trust/auth changes.
+            if onboarding_result.directory_trust_persisted
+                || (show_login_screen && !uses_remote_workspace)
+            {
+                load_config_or_exit(
+                    cli_kv_overrides.clone(),
+                    overrides.clone(),
+                    loader_overrides.clone(),
+                    cloud_config_bundle.clone(),
+                    strict_config,
+                )
+                .await
             } else {
-                None
-            },
-            &mut tui,
-        )
-        .await?;
-        if onboarding_result.should_exit {
-            shutdown_app_server_if_present(app_server.take()).await;
+                initial_config
+            }
+        } else {
+            initial_config
+        };
+
+        let mut missing_session_exit = |id_str: &str, action: &str| {
+            error!("Error finding conversation path: {id_str}");
             terminal_restore_guard.restore_silently();
-            session_log::log_session_end();
             let _ = tui.terminal.clear();
-            return Ok(AppExitInfo {
+            Ok(AppExitInfo {
                 token_usage: crate::token_usage::TokenUsage::default(),
                 thread_id: None,
                 resume_hint: None,
                 update_action: None,
-                exit_reason: ExitReason::UserRequested,
-            });
-        }
+                exit_reason: ExitReason::Fatal(format!(
+                    "No saved session found with ID {id_str}. Run `codex {action}` without an ID to choose from existing sessions."
+                )),
+            })
+        };
 
-        {
-            trust_decision_was_made = onboarding_result.directory_trust_persisted;
-        }
-        // If this onboarding run included the login step, always refresh the cloud config bundle
-        // and rebuild config. This avoids missing newly available cloud-managed policy due to login
-        // status detection edge cases.
-        if show_login_screen && !uses_remote_workspace {
-            cloud_config_bundle = cloud_config_bundle_loader_for_storage(
-                initial_config.codex_home.to_path_buf(),
-                /*enable_codex_api_key_env*/ false,
-                initial_config.cli_auth_credentials_store_mode,
-                initial_config.auth_keyring_backend_kind(),
-                initial_config.chatgpt_base_url.clone(),
-                initial_config.auth_route_config(),
-            )
-            .await;
-        }
-
-        // If the user made an explicit trust decision, or we showed the login flow, reload config
-        // so current process state reflects persisted trust/auth changes.
-        if onboarding_result.directory_trust_persisted
-            || (show_login_screen && !uses_remote_workspace)
-        {
-            load_config_or_exit(
-                cli_kv_overrides.clone(),
-                overrides.clone(),
-                loader_overrides.clone(),
-                cloud_config_bundle.clone(),
-                strict_config,
-            )
-            .await
-        } else {
-            initial_config
-        }
-    } else {
-        initial_config
-    };
-
-    let mut missing_session_exit = |id_str: &str, action: &str| {
-        error!("Error finding conversation path: {id_str}");
-        terminal_restore_guard.restore_silently();
-        session_log::log_session_end();
-        let _ = tui.terminal.clear();
-        Ok(AppExitInfo {
-            token_usage: crate::token_usage::TokenUsage::default(),
-            thread_id: None,
-            resume_hint: None,
-            update_action: None,
-            exit_reason: ExitReason::Fatal(format!(
-                "No saved session found with ID {id_str}. Run `codex {action}` without an ID to choose from existing sessions."
-            )),
-        })
-    };
-
-    let use_fork = cli.fork_picker || cli.fork_last || cli.fork_session_id.is_some();
-    let session_selection = if use_fork {
-        if let Some(id_str) = cli.fork_session_id.as_deref() {
+        let use_fork = cli.fork_picker || cli.fork_last || cli.fork_session_id.is_some();
+        let session_selection = if use_fork {
+            if let Some(id_str) = cli.fork_session_id.as_deref() {
+                let Some(startup_app_server) = app_server.as_mut() else {
+                    unreachable!("app server should be initialized for --fork <id>");
+                };
+                match lookup_session_target_with_app_server(startup_app_server, id_str).await? {
+                    Some(target_session) => resume_picker::SessionSelection::Fork(target_session),
+                    None => {
+                        shutdown_app_server_if_present(app_server.take()).await;
+                        return missing_session_exit(id_str, "fork");
+                    }
+                }
+            } else if cli.fork_last {
+                let filter_cwd = latest_session_cwd_filter(
+                    uses_remote_workspace,
+                    remote_cwd_override.as_deref(),
+                    &config,
+                    cli.fork_show_all,
+                );
+                let Some(app_server) = app_server.as_mut() else {
+                    unreachable!("app server should be initialized for --fork --last");
+                };
+                match lookup_latest_session_target_with_app_server(
+                    app_server, &config, filter_cwd, /*include_non_interactive*/ false,
+                )
+                .await?
+                {
+                    Some(target_session) => resume_picker::SessionSelection::Fork(target_session),
+                    None => resume_picker::SessionSelection::StartFresh,
+                }
+            } else if cli.fork_picker {
+                let Some(app_server) = app_server.take() else {
+                    unreachable!("app server should be initialized for --fork picker");
+                };
+                match resume_picker::run_fork_picker_with_app_server(
+                    &mut tui,
+                    &config,
+                    cli.fork_show_all,
+                    app_server,
+                )
+                .await?
+                {
+                    resume_picker::SessionSelection::Exit => {
+                        terminal_restore_guard.restore_silently();
+                        return Ok(AppExitInfo {
+                            token_usage: crate::token_usage::TokenUsage::default(),
+                            thread_id: None,
+                            resume_hint: None,
+                            update_action: None,
+                            exit_reason: ExitReason::UserRequested,
+                        });
+                    }
+                    other => other,
+                }
+            } else {
+                resume_picker::SessionSelection::StartFresh
+            }
+        } else if let Some(id_str) = cli.resume_session_id.as_deref() {
             let Some(startup_app_server) = app_server.as_mut() else {
-                unreachable!("app server should be initialized for --fork <id>");
+                unreachable!("app server should be initialized for --resume <id>");
             };
             match lookup_session_target_with_app_server(startup_app_server, id_str).await? {
-                Some(target_session) => resume_picker::SessionSelection::Fork(target_session),
+                Some(target_session) => resume_picker::SessionSelection::Resume(target_session),
                 None => {
                     shutdown_app_server_if_present(app_server.take()).await;
-                    return missing_session_exit(id_str, "fork");
+                    return missing_session_exit(id_str, "resume");
                 }
             }
-        } else if cli.fork_last {
+        } else if cli.resume_last {
             let filter_cwd = latest_session_cwd_filter(
                 uses_remote_workspace,
                 remote_cwd_override.as_deref(),
                 &config,
-                cli.fork_show_all,
+                cli.resume_show_all,
             );
             let Some(app_server) = app_server.as_mut() else {
-                unreachable!("app server should be initialized for --fork --last");
+                unreachable!("app server should be initialized for --resume --last");
             };
             match lookup_latest_session_target_with_app_server(
-                app_server, &config, filter_cwd, /*include_non_interactive*/ false,
+                app_server,
+                &config,
+                filter_cwd,
+                cli.resume_include_non_interactive,
             )
             .await?
             {
-                Some(target_session) => resume_picker::SessionSelection::Fork(target_session),
+                Some(target_session) => resume_picker::SessionSelection::Resume(target_session),
                 None => resume_picker::SessionSelection::StartFresh,
             }
-        } else if cli.fork_picker {
+        } else if cli.resume_picker {
             let Some(app_server) = app_server.take() else {
-                unreachable!("app server should be initialized for --fork picker");
+                unreachable!("app server should be initialized for --resume picker");
             };
-            match resume_picker::run_fork_picker_with_app_server(
+            match resume_picker::run_resume_picker_with_app_server(
                 &mut tui,
                 &config,
-                cli.fork_show_all,
+                cli.resume_show_all,
+                cli.resume_include_non_interactive,
                 app_server,
             )
             .await?
             {
                 resume_picker::SessionSelection::Exit => {
                     terminal_restore_guard.restore_silently();
-                    session_log::log_session_end();
                     return Ok(AppExitInfo {
                         token_usage: crate::token_usage::TokenUsage::default(),
                         thread_id: None,
@@ -1463,285 +1548,219 @@ async fn run_ratatui_app(
             }
         } else {
             resume_picker::SessionSelection::StartFresh
-        }
-    } else if let Some(id_str) = cli.resume_session_id.as_deref() {
-        let Some(startup_app_server) = app_server.as_mut() else {
-            unreachable!("app server should be initialized for --resume <id>");
         };
-        match lookup_session_target_with_app_server(startup_app_server, id_str).await? {
-            Some(target_session) => resume_picker::SessionSelection::Resume(target_session),
-            None => {
-                shutdown_app_server_if_present(app_server.take()).await;
-                return missing_session_exit(id_str, "resume");
-            }
-        }
-    } else if cli.resume_last {
-        let filter_cwd = latest_session_cwd_filter(
-            uses_remote_workspace,
-            remote_cwd_override.as_deref(),
-            &config,
-            cli.resume_show_all,
-        );
-        let Some(app_server) = app_server.as_mut() else {
-            unreachable!("app server should be initialized for --resume --last");
-        };
-        match lookup_latest_session_target_with_app_server(
-            app_server,
-            &config,
-            filter_cwd,
-            cli.resume_include_non_interactive,
-        )
-        .await?
-        {
-            Some(target_session) => resume_picker::SessionSelection::Resume(target_session),
-            None => resume_picker::SessionSelection::StartFresh,
-        }
-    } else if cli.resume_picker {
-        let Some(app_server) = app_server.take() else {
-            unreachable!("app server should be initialized for --resume picker");
-        };
-        match resume_picker::run_resume_picker_with_app_server(
-            &mut tui,
-            &config,
-            cli.resume_show_all,
-            cli.resume_include_non_interactive,
-            app_server,
-        )
-        .await?
-        {
-            resume_picker::SessionSelection::Exit => {
-                terminal_restore_guard.restore_silently();
-                session_log::log_session_end();
-                return Ok(AppExitInfo {
-                    token_usage: crate::token_usage::TokenUsage::default(),
-                    thread_id: None,
-                    resume_hint: None,
-                    update_action: None,
-                    exit_reason: ExitReason::UserRequested,
-                });
-            }
-            other => other,
-        }
-    } else {
-        resume_picker::SessionSelection::StartFresh
-    };
 
-    let current_cwd = config.cwd.clone();
-    let allow_prompt = !uses_remote_workspace && cli.cwd.is_none();
-    let action_and_target_session_if_resume_or_fork = match &session_selection {
-        resume_picker::SessionSelection::Resume(target_session) => {
-            Some((CwdPromptAction::Resume, target_session))
-        }
-        resume_picker::SessionSelection::Fork(target_session) => {
-            Some((CwdPromptAction::Fork, target_session))
-        }
-        _ => None,
-    };
-    let fallback_cwd = match action_and_target_session_if_resume_or_fork {
-        Some((action, target_session)) => {
-            if uses_remote_workspace {
-                Some(current_cwd.to_path_buf())
-            } else {
-                match resolve_cwd_for_resume_or_fork(
-                    &mut tui,
-                    state_db.as_deref(),
-                    &current_cwd,
-                    target_session.thread_id,
-                    target_session.path.as_deref(),
-                    action,
-                    allow_prompt,
-                )
-                .await?
-                {
-                    ResolveCwdOutcome::Continue(cwd) => cwd,
-                    ResolveCwdOutcome::Exit => {
-                        terminal_restore_guard.restore_silently();
-                        session_log::log_session_end();
-                        return Ok(AppExitInfo {
-                            token_usage: crate::token_usage::TokenUsage::default(),
-                            thread_id: None,
-                            resume_hint: None,
-                            update_action: None,
-                            exit_reason: ExitReason::UserRequested,
-                        });
+        let current_cwd = config.cwd.clone();
+        let allow_prompt = !uses_remote_workspace && cli.cwd.is_none();
+        let action_and_target_session_if_resume_or_fork = match &session_selection {
+            resume_picker::SessionSelection::Resume(target_session) => {
+                Some((CwdPromptAction::Resume, target_session))
+            }
+            resume_picker::SessionSelection::Fork(target_session) => {
+                Some((CwdPromptAction::Fork, target_session))
+            }
+            _ => None,
+        };
+        let fallback_cwd = match action_and_target_session_if_resume_or_fork {
+            Some((action, target_session)) => {
+                if uses_remote_workspace {
+                    Some(current_cwd.to_path_buf())
+                } else {
+                    match resolve_cwd_for_resume_or_fork(
+                        &mut tui,
+                        state_db.as_deref(),
+                        &current_cwd,
+                        target_session.thread_id,
+                        target_session.path.as_deref(),
+                        action,
+                        allow_prompt,
+                    )
+                    .await?
+                    {
+                        ResolveCwdOutcome::Continue(cwd) => cwd,
+                        ResolveCwdOutcome::Exit => {
+                            terminal_restore_guard.restore_silently();
+                            return Ok(AppExitInfo {
+                                token_usage: crate::token_usage::TokenUsage::default(),
+                                thread_id: None,
+                                resume_hint: None,
+                                update_action: None,
+                                exit_reason: ExitReason::UserRequested,
+                            });
+                        }
                     }
                 }
             }
-        }
-        None => None,
-    };
+            None => None,
+        };
 
-    let picker_cancelled_without_selection = matches!(
-        session_selection,
-        resume_picker::SessionSelection::StartFresh
-    ) && (cli.resume_picker || cli.fork_picker);
+        let picker_cancelled_without_selection = matches!(
+            session_selection,
+            resume_picker::SessionSelection::StartFresh
+        ) && (cli.resume_picker || cli.fork_picker);
 
-    let mut config = match &session_selection {
-        resume_picker::SessionSelection::Resume(_) | resume_picker::SessionSelection::Fork(_) => {
-            load_config_or_exit_with_fallback_cwd(
+        let mut config = match &session_selection {
+            resume_picker::SessionSelection::Resume(_) | resume_picker::SessionSelection::Fork(_) => {
+                load_config_or_exit_with_fallback_cwd(
+                    cli_kv_overrides.clone(),
+                    overrides.clone(),
+                    loader_overrides.clone(),
+                    cloud_config_bundle.clone(),
+                    strict_config,
+                    fallback_cwd,
+                )
+                .await
+            }
+            resume_picker::SessionSelection::StartFresh if picker_cancelled_without_selection => {
+                load_config_or_exit(
+                    cli_kv_overrides.clone(),
+                    overrides.clone(),
+                    loader_overrides.clone(),
+                    cloud_config_bundle.clone(),
+                    strict_config,
+                )
+                .await
+            }
+            _ => config,
+        };
+
+        // Configure syntax highlighting theme from the final config — onboarding
+        // and resume/fork can both reload config with a different tui_theme, so
+        // this must happen after the last possible reload.
+        configure_final_theme(&mut config).await;
+
+        set_default_client_residency_requirement(config.enforce_residency.value());
+        let should_show_trust_screen = should_show_trust_screen(&config);
+
+        let windows_sandbox_level = crate::windows_sandbox::level_from_config(&config);
+
+        let should_check_windows_sandbox_readiness = (trust_decision_was_made
+            && windows_sandbox_level == WindowsSandboxLevel::Disabled)
+            || (windows_sandbox_level == WindowsSandboxLevel::Elevated
+                && config
+                    .config_layer_stack
+                    .requirements()
+                    .windows_sandbox_mode
+                    .source
+                    .is_some());
+
+        let Cli {
+            prompt,
+            shared,
+            no_alt_screen,
+            ..
+        } = cli;
+        let images = shared.into_inner().images;
+
+        let use_alt_screen = determine_alt_screen_mode(no_alt_screen, config.tui_alternate_screen);
+        tui.set_alt_screen_enabled(use_alt_screen);
+        let mut app_server = match app_server {
+            Some(app_server) => app_server,
+            None => match start_app_server(
+                &app_server_target,
+                arg0_paths,
+                config.clone(),
                 cli_kv_overrides.clone(),
-                overrides.clone(),
                 loader_overrides.clone(),
-                cloud_config_bundle.clone(),
                 strict_config,
-                fallback_cwd,
+                cloud_config_bundle.clone(),
+                feedback.clone(),
+                log_db.clone(),
+                state_db.clone(),
+                environment_manager.clone(),
             )
             .await
-        }
-        resume_picker::SessionSelection::StartFresh if picker_cancelled_without_selection => {
-            load_config_or_exit(
-                cli_kv_overrides.clone(),
-                overrides.clone(),
-                loader_overrides.clone(),
-                cloud_config_bundle.clone(),
-                strict_config,
-            )
-            .await
-        }
-        _ => config,
-    };
+            {
+                Ok(app_server) => {
+                    AppServerSession::new(app_server, app_server_target.thread_params_mode())
+                        .with_remote_cwd_override(remote_cwd_override.clone())
+                }
+                Err(err) => {
+                    terminal_restore_guard.restore_silently();
+                    return Err(err);
+                }
+            },
+        };
 
-    // Configure syntax highlighting theme from the final config — onboarding
-    // and resume/fork can both reload config with a different tui_theme, so
-    // this must happen after the last possible reload.
-    if let Some(w) = crate::render::highlight::set_theme_override(
-        config.tui_theme.clone(),
-        find_codex_home().ok().map(AbsolutePathBuf::into_path_buf),
-    ) {
-        config.startup_warnings.push(w);
-    }
-
-    set_default_client_residency_requirement(config.enforce_residency.value());
-    let should_show_trust_screen = should_show_trust_screen(&config);
-
-    let windows_sandbox_level = crate::windows_sandbox::level_from_config(&config);
-
-    let should_check_windows_sandbox_readiness = (trust_decision_was_made
-        && windows_sandbox_level == WindowsSandboxLevel::Disabled)
-        || (windows_sandbox_level == WindowsSandboxLevel::Elevated
-            && config
-                .config_layer_stack
-                .requirements()
-                .windows_sandbox_mode
-                .source
-                .is_some());
-
-    let Cli {
-        prompt,
-        shared,
-        no_alt_screen,
-        ..
-    } = cli;
-    let images = shared.into_inner().images;
-
-    let use_alt_screen = determine_alt_screen_mode(no_alt_screen, config.tui_alternate_screen);
-    tui.set_alt_screen_enabled(use_alt_screen);
-    let mut app_server = match app_server {
-        Some(app_server) => app_server,
-        None => match start_app_server(
-            &app_server_target,
-            arg0_paths,
-            config.clone(),
-            cli_kv_overrides.clone(),
-            loader_overrides.clone(),
-            strict_config,
-            cloud_config_bundle.clone(),
-            feedback.clone(),
-            log_db.clone(),
-            state_db.clone(),
-            environment_manager.clone(),
-        )
-        .await
-        {
-            Ok(app_server) => {
-                AppServerSession::new(app_server, app_server_target.thread_params_mode())
-                    .with_remote_cwd_override(remote_cwd_override.clone())
+        let should_prompt_windows_sandbox_nux_at_startup = if should_check_windows_sandbox_readiness {
+            match app_server.windows_sandbox_readiness().await {
+                Ok(response) => matches!(
+                    response.status,
+                    codex_app_server_protocol::WindowsSandboxReadiness::NotConfigured
+                        | codex_app_server_protocol::WindowsSandboxReadiness::UpdateRequired
+                ),
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        "failed to query app-server Windows sandbox readiness during startup"
+                    );
+                    false
+                }
             }
-            Err(err) => {
-                terminal_restore_guard.restore_silently();
-                session_log::log_session_end();
-                return Err(err);
-            }
-        },
-    };
+        } else {
+            false
+        };
 
-    let should_prompt_windows_sandbox_nux_at_startup = if should_check_windows_sandbox_readiness {
-        match app_server.windows_sandbox_readiness().await {
-            Ok(response) => matches!(
-                response.status,
-                codex_app_server_protocol::WindowsSandboxReadiness::NotConfigured
-                    | codex_app_server_protocol::WindowsSandboxReadiness::UpdateRequired
-            ),
-            Err(err) => {
-                tracing::warn!(
-                    error = %err,
-                    "failed to query app-server Windows sandbox readiness during startup"
-                );
-                false
-            }
-        }
-    } else {
-        false
-    };
-
-    // Persistent app-server resumes may attach to an already-running thread,
-    // where resume config overrides are ignored.
-    let is_persistent_resume = !matches!(&app_server_target, AppServerTarget::Embedded)
-        && matches!(
-            &session_selection,
-            resume_picker::SessionSelection::Resume(_)
+        // Persistent app-server resumes may attach to an already-running thread,
+        // where resume config overrides are ignored.
+        let is_persistent_resume = !matches!(&app_server_target, AppServerTarget::Embedded)
+            && matches!(
+                &session_selection,
+                resume_picker::SessionSelection::Resume(_)
+            );
+        let bypass_hook_trust_for_startup_review = config.bypass_hook_trust && !is_persistent_resume;
+        let hooks_request_handle = app_server.request_handle();
+        let hooks_cwd = config.cwd.to_path_buf();
+        let startup_prefetch_started_at = Instant::now();
+        let (startup_bootstrap, startup_hooks_entry) = tokio::join!(
+            app_server.bootstrap(&config),
+            load_startup_hooks_review_entry(hooks_request_handle, hooks_cwd),
         );
-    let bypass_hook_trust_for_startup_review = config.bypass_hook_trust && !is_persistent_resume;
-    let hooks_request_handle = app_server.request_handle();
-    let hooks_cwd = config.cwd.to_path_buf();
-    let startup_prefetch_started_at = Instant::now();
-    let (startup_bootstrap, startup_hooks_entry) = tokio::join!(
-        app_server.bootstrap(&config),
-        load_startup_hooks_review_entry(hooks_request_handle, hooks_cwd),
-    );
-    let startup_bootstrap = Some(startup_bootstrap?);
-    let startup_elapsed_before_app = startup_prefetch_started_at.elapsed();
-    let startup_hooks_browser = match maybe_run_startup_hooks_review(
-        &mut app_server,
-        &mut tui,
-        &config,
-        bypass_hook_trust_for_startup_review,
-        startup_hooks_entry,
-    )
-    .await?
-    {
-        StartupHooksReviewOutcome::Continue => None,
-        StartupHooksReviewOutcome::OpenHooksBrowser(data) => Some(data),
-    };
+        let startup_bootstrap = Some(startup_bootstrap?);
+        let startup_elapsed_before_app = startup_prefetch_started_at.elapsed();
+        let startup_hooks_browser = match maybe_run_startup_hooks_review(
+            &mut app_server,
+            &mut tui,
+            &config,
+            bypass_hook_trust_for_startup_review,
+            startup_hooks_entry,
+        )
+        .await?
+        {
+            StartupHooksReviewOutcome::Continue => None,
+            StartupHooksReviewOutcome::OpenHooksBrowser(data) => Some(data),
+        };
 
-    let app_result = App::run(
-        &mut tui,
-        app_server,
-        config,
-        cli_kv_overrides.clone(),
-        overrides.clone(),
-        loader_overrides.clone(),
-        cloud_config_bundle,
-        prompt,
-        images,
-        session_selection,
-        feedback,
-        should_show_trust_screen, // Proxy to: is it a first run in this directory?
-        should_prompt_windows_sandbox_nux_at_startup,
-        app_server_target,
-        state_db,
-        environment_manager,
-        startup_elapsed_before_app,
-        startup_bootstrap,
-        startup_hooks_browser,
-    )
+        let app_result = App::run(
+            &mut tui,
+            app_server,
+            config,
+            cli_kv_overrides.clone(),
+            overrides.clone(),
+            loader_overrides.clone(),
+            cloud_config_bundle,
+            prompt,
+            images,
+            session_selection,
+            feedback,
+            should_show_trust_screen, // Proxy to: is it a first run in this directory?
+            should_prompt_windows_sandbox_nux_at_startup,
+            app_server_target,
+            state_db,
+            environment_manager,
+            startup_elapsed_before_app,
+            startup_bootstrap,
+            startup_hooks_browser,
+        )
+        .await;
+
+        terminal_restore_guard.restore_silently();
+        // ignore error when collecting usage – report underlying error instead
+        app_result
+    }
     .await;
-
-    terminal_restore_guard.restore_silently();
-    // Mark the end of the recorded session.
-    session_log::log_session_end();
-    // ignore error when collecting usage – report underlying error instead
-    app_result
+    session_log::log_session_end().await;
+    session_result
 }
 
 #[expect(
@@ -1956,6 +1975,103 @@ mod tests {
     use serial_test::serial;
     use tempfile::TempDir;
 
+    #[tokio::test]
+    async fn session_name_lookup_rejects_cursor_cycles_and_preserves_finite_paging() {
+        use futures::SinkExt;
+        use futures::StreamExt;
+        use tokio_tungstenite::tungstenite::Message;
+
+        for (next_cursors, cyclic) in [
+            (vec![Some("a"), Some("a")], true),
+            (vec![Some("a"), Some("b"), Some("a")], true),
+            (vec![Some("a"), Some("b"), None], false),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+            let peer = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                let initialize = socket.next().await.unwrap().unwrap();
+                let initialize: serde_json::Value =
+                    serde_json::from_str(initialize.to_text().unwrap()).unwrap();
+                assert_eq!(initialize["method"], "initialize");
+                socket
+                    .send(Message::Text(
+                        serde_json::json!({"id":initialize["id"],"result":{}})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
+                let initialized = socket.next().await.unwrap().unwrap();
+                let initialized: serde_json::Value =
+                    serde_json::from_str(initialized.to_text().unwrap()).unwrap();
+                assert_eq!(initialized["method"], "initialized");
+                let mut cursor = None;
+                for next_cursor in next_cursors {
+                    let request = socket.next().await.unwrap().unwrap();
+                    let request: serde_json::Value =
+                        serde_json::from_str(request.to_text().unwrap()).unwrap();
+                    assert_eq!(
+                        request["method"], "thread/list",
+                        "lookup must not resume or fork a thread"
+                    );
+                    assert_eq!(request["params"]["cursor"], serde_json::json!(cursor));
+                    assert_eq!(request["params"]["searchTerm"], "missing-session");
+                    assert_eq!(request["params"]["archived"], false);
+                    assert_eq!(request["params"]["limit"], 100);
+                    socket.send(Message::Text(serde_json::json!({"id":request["id"],"result":{"data":[],"nextCursor":next_cursor}}).to_string().into())).await.unwrap();
+                    cursor = next_cursor;
+                }
+                let closed = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
+                    .await
+                    .expect("lookup must stop issuing requests")
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    matches!(closed, Message::Close(_)),
+                    "unexpected post-lookup operation: {closed:?}"
+                );
+            });
+            let client = codex_app_server_client::RemoteAppServerClient::connect(
+                codex_app_server_client::RemoteAppServerConnectArgs {
+                    endpoint: RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: endpoint,
+                        auth_token: None,
+                    },
+                    client_name: "name-lookup-test".to_string(),
+                    client_version: "test".to_string(),
+                    experimental_api: true,
+                    mcp_server_openai_form_elicitation: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 8,
+                },
+            )
+            .await
+            .expect("remote client");
+            let mut session =
+                AppServerSession::new(AppServerClient::Remote(client), ThreadParamsMode::Remote);
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                lookup_session_target_with_app_server(&mut session, "missing-session"),
+            )
+            .await
+            .expect("finite or cyclic lookup must complete");
+            if cyclic {
+                let error = result.expect_err("cycle must be rejected").to_string();
+                assert!(error.contains("repeated a pagination cursor"), "{error}");
+                assert!(error.contains("missing-session"), "{error}");
+            } else {
+                assert!(result.expect("finite paging succeeds").is_none());
+            }
+            drop(session);
+            tokio::time::timeout(std::time::Duration::from_secs(5), peer)
+                .await
+                .expect("bounded server peer")
+                .unwrap();
+        }
+    }
+
     async fn build_config(temp_dir: &TempDir) -> std::io::Result<Config> {
         let mut config = ConfigBuilder::default()
             .codex_home(temp_dir.path().to_path_buf())
@@ -2047,17 +2163,28 @@ mod tests {
         Ok(thread_id)
     }
 
-    #[test]
-    fn startup_removes_legacy_tui_log_file() -> std::io::Result<()> {
+    #[tokio::test]
+    async fn startup_removes_legacy_tui_log_file() -> std::io::Result<()> {
         let temp_dir = TempDir::new()?;
         let legacy_log_dir = temp_dir.path().join("log");
         std::fs::create_dir_all(&legacy_log_dir)?;
         let legacy_log = legacy_log_dir.join(TUI_LOG_FILE_NAME);
         std::fs::write(&legacy_log, "legacy log")?;
 
-        remove_legacy_tui_log_file(temp_dir.path());
+        remove_legacy_tui_log_file(temp_dir.path()).await;
 
         assert!(!legacy_log.exists());
+        remove_legacy_tui_log_file(temp_dir.path()).await;
+        assert!(!legacy_log.exists());
+
+        std::fs::create_dir(&legacy_log)?;
+        let retained_file = legacy_log.join("retained.txt");
+        std::fs::write(&retained_file, "preserve unrelated directory contents")?;
+        remove_legacy_tui_log_file(temp_dir.path()).await;
+        assert_eq!(
+            std::fs::read_to_string(retained_file)?,
+            "preserve unrelated directory contents"
+        );
         Ok(())
     }
 
@@ -2984,47 +3111,216 @@ trust_level = "untrusted"
         Ok(())
     }
 
-    /// Regression: theme must be configured from the *final* config.
-    ///
-    /// `run_ratatui_app` can reload config during onboarding and again
-    /// during session resume/fork.  The syntax theme override (stored in
-    /// a `OnceLock`) must use the final config's `tui_theme`, not the
-    /// initial one — otherwise users resuming a thread in a project with
-    /// a different theme get the wrong highlighting.
-    ///
-    /// We verify the invariant indirectly: `validate_theme_name` (the
-    /// pure validation core of `set_theme_override`) must be called with
-    /// the *final* config's theme, and its warning must land in the
-    /// final config's `startup_warnings`.
-    #[tokio::test]
-    async fn theme_warning_uses_final_config() -> std::io::Result<()> {
-        use crate::render::highlight::validate_theme_name;
+    /// Exercise the production final-theme step with reloaded config, in a fresh process
+    /// so syntax-highlighting OnceLocks and CODEX_HOME cannot affect other tests.
+    #[test]
+    fn theme_warning_uses_final_config() -> std::io::Result<()> {
+        const CHILD: &str = "CODEX_TEST_FINAL_THEME_CHILD";
+        const PASSED: &str = "FINAL_THEME_CHILD_ASSERTIONS_PASSED";
+        if std::env::var_os(CHILD).is_some() {
+            let home = PathBuf::from(std::env::var_os("CODEX_HOME").expect("child HOME"));
+            let canonical_home = dunce::canonicalize(&home)?;
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            runtime.block_on(Box::pin(async {
+                let load_config = || {
+                    ConfigBuilder::default()
+                        .codex_home(home.clone())
+                        .loader_overrides(LoaderOverrides::without_managed_config_for_tests())
+                        .strict_config(true)
+                        .harness_overrides(ConfigOverrides {
+                            cwd: Some(home.clone()),
+                            ..Default::default()
+                        })
+                        .build()
+                };
+                std::fs::write(home.join("config.toml"), "[tui]\ntheme = \"ansi\"\n")?;
+                let initial_config = load_config().await?;
+                assert_eq!(initial_config.tui_theme.as_deref(), Some("ansi"));
+                let initial_warnings = initial_config.startup_warnings.clone();
 
-        let temp_dir = TempDir::new()?;
+                let final_config_bytes = "[tui]\ntheme = \"bogus-theme\"\n";
+                std::fs::write(home.join("config.toml"), final_config_bytes)?;
+                let mut final_config = load_config().await?;
+                assert_eq!(final_config.tui_theme.as_deref(), Some("bogus-theme"));
+                final_config
+                    .startup_warnings
+                    .push("unrelated startup warning".into());
+                let mut expected_warnings = final_config.startup_warnings.clone();
+                expected_warnings.push(format!(
+                    "Theme \"bogus-theme\" not found. Using the default theme. \
+                     To use a custom theme, place a .tmTheme file at {}.",
+                    canonical_home
+                        .join("themes")
+                        .join("bogus-theme.tmTheme")
+                        .display()
+                ));
 
-        // initial_config has a valid theme — no warning.
-        let initial_config = build_config(&temp_dir).await?;
-        assert!(initial_config.tui_theme.is_none());
+                crate::configure_final_theme(&mut final_config).await;
 
-        // Simulate resume/fork reload: the final config has an invalid theme.
-        let mut config = build_config(&temp_dir).await?;
-        config.tui_theme = Some("bogus-theme".into());
-
-        // Theme override must use the final config (not initial_config).
-        // This mirrors the real call site in run_ratatui_app.
-        if let Some(w) = validate_theme_name(config.tui_theme.as_deref(), Some(temp_dir.path())) {
-            config.startup_warnings.push(w);
+                assert_eq!(final_config.startup_warnings, expected_warnings);
+                assert_eq!(initial_config.tui_theme.as_deref(), Some("ansi"));
+                assert_eq!(initial_config.startup_warnings, initial_warnings);
+                assert_eq!(
+                    std::fs::read(home.join("config.toml"))?,
+                    final_config_bytes.as_bytes()
+                );
+                assert!(
+                    !home.join("themes").exists(),
+                    "theme lookup must not create a directory"
+                );
+                Ok::<(), std::io::Error>(())
+            }))?;
+            println!("{PASSED}");
+            return Ok(());
         }
 
-        assert_eq!(
-            config.startup_warnings.len(),
-            1,
-            "warning from final config's invalid theme should be present"
-        );
+        let home = TempDir::new()?;
+        let output = std::process::Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "tests::theme_warning_uses_final_config",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .env("CODEX_HOME", home.path().join("."))
+            .env("CODEX_SQLITE_HOME", home.path().join("sqlite"))
+            .current_dir(home.path())
+            .output()?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stdout}\n{stderr}");
         assert!(
-            config.startup_warnings[0].contains("bogus-theme"),
-            "warning should reference the final config's theme name"
+            stdout.contains(PASSED),
+            "child test must actually run: {stdout}"
         );
+        Ok(())
+    }
+    #[test]
+    fn run_main_configured_log_directory_creates_appends_and_reports_failure() -> std::io::Result<()>
+    {
+        const CHILD: &str = "CODEX_TEST_CONFIGURED_LOG_STARTUP";
+        const PASSED: &str = "CONFIGURED_LOG_STARTUP_VERIFIED";
+        if let Some(case) = std::env::var_os(CHILD) {
+            use clap::Parser;
+            let home = PathBuf::from(std::env::var_os("CODEX_HOME").expect("isolated home"));
+            let log_dir = home.join("configured-logs");
+            let log_file = log_dir.join(TUI_LOG_FILE_NAME);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            let cli = Cli::parse_from([
+                "codex",
+                "--strict-config",
+                "--cd",
+                home.to_str().expect("UTF-8 temporary home"),
+            ]);
+            let result = runtime.block_on(async {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(30),
+                    run_main(
+                        cli,
+                        Arg0DispatchPaths { codex_self_exe: Some(std::env::current_exe().expect("isolated test executable")) },
+                        LoaderOverrides::without_managed_config_for_tests(),
+                        None,
+                    ),
+                )
+                .await
+                .expect("isolated normal startup must finish")
+            });
+            let error = result
+                .expect_err("null stdin deliberately stops before interactive terminal setup");
+            if case == "occupied" {
+                assert_eq!(std::fs::read(&log_dir)?, b"occupied log path");
+                assert_eq!(
+                    error.kind(),
+                    std::io::ErrorKind::AlreadyExists,
+                    "must propagate the actual log-directory collision"
+                );
+                assert!(
+                    !error.to_string().contains("stdin is not a terminal"),
+                    "directory failure must stop startup before terminal setup"
+                );
+            } else {
+                assert!(
+                    error.to_string().contains("stdin is not a terminal"),
+                    "unexpected earlier startup failure: {error}"
+                );
+                assert!(log_dir.is_dir());
+                let contents = std::fs::read(&log_file)?;
+                if case == "append" {
+                    assert!(contents.starts_with(b"keep prior log\n"));
+                }
+                #[cfg(windows)]
+                {
+                    use std::os::windows::fs::OpenOptionsExt;
+                    let exclusive = std::fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .share_mode(0)
+                        .open(&log_file)?;
+                    drop(exclusive);
+                }
+                std::fs::remove_file(&log_file)?;
+                assert!(
+                    !log_file.exists(),
+                    "startup error must release the log writer"
+                );
+            }
+            println!("{PASSED}");
+            return Ok(());
+        }
+        for case in ["create", "append", "occupied"] {
+            let home = TempDir::new()?;
+            let log_dir = home.path().join("configured-logs");
+            if case == "occupied" {
+                std::fs::write(&log_dir, "occupied log path")?;
+            }
+            if case == "append" {
+                std::fs::create_dir(&log_dir)?;
+                std::fs::write(log_dir.join(TUI_LOG_FILE_NAME), "keep prior log\n")?;
+            }
+            let config = format!(
+                "log_dir = {}\ncli_auth_credentials_store = \"file\"\n",
+                serde_json::to_string(&log_dir.to_string_lossy())
+                    .expect("TOML-compatible quoted path")
+            );
+            std::fs::write(home.path().join("config.toml"), &config)?;
+            let output = std::process::Command::new(std::env::current_exe()?)
+                .args([
+                    "--exact",
+                    "tests::run_main_configured_log_directory_creates_appends_and_reports_failure",
+                    "--nocapture",
+                ])
+                .env(CHILD, case)
+                .env("CODEX_HOME", home.path())
+                .env("CODEX_SQLITE_HOME", home.path())
+                .env_remove("OPENAI_API_KEY")
+                .env_remove("CODEX_API_KEY")
+                .env_remove("CODEX_EXEC_SERVER_URL")
+                .env_remove("CODEX_EXEC_SERVER_NOISE_REGISTRY_URL")
+                .env_remove("CODEX_EXEC_SERVER_NOISE_ENVIRONMENT_ID")
+                .env_remove("CODEX_EXEC_SERVER_NOISE_AUTH_TOKEN")
+                .env_remove("CODEX_EXEC_SERVER_NOISE_CHATGPT_ACCOUNT_ID")
+                .stdin(std::process::Stdio::null())
+                .output()?;
+            assert!(
+                output.status.success(),
+                "{case}: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains(PASSED),
+                "child must execute all startup assertions"
+            );
+            assert_eq!(
+                std::fs::read(home.path().join("config.toml"))?,
+                config.as_bytes()
+            );
+        }
         Ok(())
     }
 }

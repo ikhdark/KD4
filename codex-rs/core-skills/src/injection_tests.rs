@@ -119,33 +119,55 @@ fn collect_mentions(
 fn text_mentions_skill_requires_exact_boundary() {
     assert_eq!(
         true,
-        text_mentions_skill("use $notion-research-doc please", "notion-research-doc")
+        extract_tool_mentions("use $notion-research-doc please")
+            .names
+            .contains("notion-research-doc")
     );
     assert_eq!(
         true,
-        text_mentions_skill("($notion-research-doc)", "notion-research-doc")
+        extract_tool_mentions("($notion-research-doc)")
+            .names
+            .contains("notion-research-doc")
     );
     assert_eq!(
         true,
-        text_mentions_skill("$notion-research-doc.", "notion-research-doc")
+        extract_tool_mentions("$notion-research-doc.")
+            .names
+            .contains("notion-research-doc")
     );
     assert_eq!(
         false,
-        text_mentions_skill("$notion-research-docs", "notion-research-doc")
+        extract_tool_mentions("$notion-research-docs")
+            .names
+            .contains("notion-research-doc")
     );
     assert_eq!(
         false,
-        text_mentions_skill("$notion-research-doc_extra", "notion-research-doc")
+        extract_tool_mentions("$notion-research-doc_extra")
+            .names
+            .contains("notion-research-doc")
     );
 }
 
 #[test]
 fn text_mentions_skill_handles_end_boundary_and_near_misses() {
-    assert_eq!(true, text_mentions_skill("$alpha-skill", "alpha-skill"));
-    assert_eq!(false, text_mentions_skill("$alpha-skillx", "alpha-skill"));
     assert_eq!(
         true,
-        text_mentions_skill("$alpha-skillx and later $alpha-skill ", "alpha-skill")
+        extract_tool_mentions("$alpha-skill")
+            .names
+            .contains("alpha-skill")
+    );
+    assert_eq!(
+        false,
+        extract_tool_mentions("$alpha-skillx")
+            .names
+            .contains("alpha-skill")
+    );
+    assert_eq!(
+        true,
+        extract_tool_mentions("$alpha-skillx and later $alpha-skill ")
+            .names
+            .contains("alpha-skill")
     );
 }
 
@@ -153,7 +175,10 @@ fn text_mentions_skill_handles_end_boundary_and_near_misses() {
 fn text_mentions_skill_handles_many_dollars_without_looping() {
     let prefix = "$".repeat(256);
     let text = format!("{prefix} not-a-mention");
-    assert_eq!(false, text_mentions_skill(&text, "alpha-skill"));
+    assert_eq!(
+        false,
+        extract_tool_mentions(&text).names.contains("alpha-skill")
+    );
 }
 
 #[test]

@@ -7,18 +7,27 @@ use codex_mcp::McpRuntimeContext;
 
 pub(crate) struct McpManagerLifecycle {
     manager: Arc<McpConnectionManager>,
+    shutdown_runtime: Option<tokio::runtime::Handle>,
 }
 
 impl McpManagerLifecycle {
     fn new(manager: Arc<McpConnectionManager>) -> Self {
-        Self { manager }
+        Self {
+            manager,
+            // A final snapshot lease may be released outside an entered runtime.
+            shutdown_runtime: tokio::runtime::Handle::try_current().ok(),
+        }
     }
 }
 
 impl Drop for McpManagerLifecycle {
     fn drop(&mut self) {
         let manager = Arc::clone(&self.manager);
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        let Some(runtime) = self
+            .shutdown_runtime
+            .clone()
+            .or_else(|| tokio::runtime::Handle::try_current().ok())
+        else {
             return;
         };
         runtime.spawn(async move {
@@ -170,34 +179,286 @@ impl fmt::Debug for McpRuntimeSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codex_config::Constrained;
-    use codex_protocol::models::PermissionProfile;
-    use codex_protocol::protocol::AskForApproval;
+    use crate::session::tests::make_session_and_context_with_rx;
+    use codex_config::types::McpServerConfig;
+    use serde_json::json;
+    use std::collections::HashMap;
     use std::time::Duration;
+    use wiremock::Mock;
+    use wiremock::MockServer;
+    use wiremock::Request;
+    use wiremock::ResponseTemplate;
+    use wiremock::matchers::method;
+    use wiremock::matchers::path;
+
+    enum Finalization {
+        Lease { outside_runtime: bool },
+        Session { retain_step: bool },
+    }
 
     #[tokio::test]
-    async fn final_runtime_lifecycle_owner_starts_manager_shutdown() {
-        let approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
-        let manager = Arc::new(
-            McpConnectionManager::new_uninitialized_with_permission_profile(
-                &approval_policy,
-                &PermissionProfile::default(),
-                /*prefix_mcp_tool_names*/ true,
-            ),
-        );
-        let first = Arc::new(McpManagerLifecycle::new(Arc::clone(&manager)));
-        let second = Arc::clone(&first);
-
-        drop(first);
-        assert!(!manager.shutdown_started());
-        drop(second);
-
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while !manager.shutdown_started() {
-                tokio::task::yield_now().await;
-            }
+    async fn final_runtime_lifecycle_owner_closes_registered_transport() -> anyhow::Result<()> {
+        assert_final_runtime_lifecycle_owner_closes_registered_transport(Finalization::Lease {
+            outside_runtime: false,
         })
         .await
-        .expect("final runtime lifecycle owner should start manager shutdown");
+    }
+
+    #[tokio::test]
+    async fn final_runtime_lifecycle_owner_closes_registered_transport_outside_entered_runtime()
+    -> anyhow::Result<()> {
+        assert_final_runtime_lifecycle_owner_closes_registered_transport(Finalization::Lease {
+            outside_runtime: true,
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn session_shutdown_closes_retired_manager_with_live_step_lease() -> anyhow::Result<()> {
+        assert_final_runtime_lifecycle_owner_closes_registered_transport(Finalization::Session {
+            retain_step: true,
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn session_shutdown_waits_for_already_running_retired_manager_cleanup()
+    -> anyhow::Result<()> {
+        assert_final_runtime_lifecycle_owner_closes_registered_transport(Finalization::Session {
+            retain_step: false,
+        })
+        .await
+    }
+
+    async fn assert_final_runtime_lifecycle_owner_closes_registered_transport(
+        finalization: Finalization,
+    ) -> anyhow::Result<()> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
+            .respond_with(|request: &Request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                let result = match body["method"].as_str().unwrap() {
+                    "initialize" => json!({
+                        "protocolVersion": body["params"]["protocolVersion"],
+                        "capabilities": {"tools": {}},
+                        "serverInfo": {"name": "lifecycle-server", "version": "1"},
+                    }),
+                    "notifications/initialized" => return ResponseTemplate::new(202),
+                    "tools/list" => json!({"tools": [{
+                        "name": "echo",
+                        "inputSchema": {"type": "object", "properties": {}},
+                    }]}),
+                    "tools/call" => json!({
+                        "content": [{"type": "text", "text": body["params"]["arguments"]["message"]}],
+                        "isError": false,
+                    }),
+                    _ => return ResponseTemplate::new(400),
+                };
+                ResponseTemplate::new(200)
+                    .insert_header("mcp-session-id", "retired-runtime-session")
+                    .set_body_json(json!({"jsonrpc": "2.0", "id": body["id"], "result": result}))
+            })
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/mcp"))
+            .respond_with(ResponseTemplate::new(405))
+            .mount(&server)
+            .await;
+        let deleted = Arc::new(tokio::sync::Notify::new());
+        let delete_delay = if matches!(finalization, Finalization::Session { .. }) {
+            Duration::from_millis(500)
+        } else {
+            Duration::ZERO
+        };
+        Mock::given(method("DELETE"))
+            .and(path("/mcp"))
+            .respond_with({
+                let deleted = Arc::clone(&deleted);
+                move |_request: &Request| {
+                    deleted.notify_one();
+                    ResponseTemplate::new(204).set_delay(delete_delay)
+                }
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (session, turn_context, rx_event) = make_session_and_context_with_rx().await;
+        let mut configured = turn_context.config.as_ref().clone();
+        configured
+            .mcp_servers
+            .set(serde_json::from_value::<HashMap<String, McpServerConfig>>(
+                json!({"lifecycle": {"url": format!("{}/mcp", server.uri())}}),
+            )?)?;
+        session
+            .refresh_mcp_servers_now(&turn_context, &configured, None)
+            .await;
+        let old_runtime = session.services.latest_mcp_runtime();
+        // A raw manager observer does not own a runtime lease. Keeping it alive
+        // ensures McpConnectionManager::drop cannot mask a missing lifecycle close.
+        let old_manager = old_runtime.manager_arc();
+        let tools =
+            tokio::time::timeout(Duration::from_secs(5), old_manager.list_all_tools()).await?;
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].tool.name.as_ref(), "echo");
+        let step = session
+            .capture_step_context(Arc::clone(&turn_context))
+            .await;
+        assert!(Arc::ptr_eq(&step.mcp, &old_runtime));
+
+        let mut removed = configured.clone();
+        removed.mcp_servers.set(HashMap::new())?;
+        session
+            .refresh_mcp_servers_now(&turn_context, &removed, None)
+            .await;
+        let replacement = session.services.latest_mcp_runtime();
+        assert!(!Arc::ptr_eq(&old_runtime, &replacement));
+        assert!(replacement.manager().list_all_tools().await.is_empty());
+        let mut old_runtime = Some(old_runtime);
+        for message in [
+            "snapshot and step retain the connection",
+            "only the step retains the connection",
+        ] {
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                step.mcp.manager().call_tool(
+                    "lifecycle",
+                    "echo",
+                    Some(json!({"message": message})),
+                    None,
+                ),
+            )
+            .await??;
+            assert_eq!(result.is_error, Some(false));
+            assert_eq!(
+                result.content,
+                vec![json!({"type": "text", "text": message})]
+            );
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), deleted.notified())
+                    .await
+                    .is_err(),
+                "refresh and non-final lease release must not close a connection still used by a step"
+            );
+            drop(old_runtime.take());
+        }
+        match finalization {
+            Finalization::Lease { outside_runtime } => {
+                if outside_runtime {
+                    std::thread::spawn(move || {
+                        assert!(tokio::runtime::Handle::try_current().is_err());
+                        drop(step);
+                    })
+                    .join()
+                    .expect("final lifecycle lease drops outside an entered runtime");
+                } else {
+                    drop(step);
+                }
+                tokio::time::timeout(Duration::from_secs(5), deleted.notified()).await?;
+            }
+            Finalization::Session { retain_step } => {
+                let mut step = Some(step);
+                if !retain_step {
+                    let first_shutdown = tokio::spawn({
+                        let manager = Arc::clone(&old_manager);
+                        async move { manager.shutdown().await }
+                    });
+                    tokio::time::timeout(Duration::from_secs(5), deleted.notified()).await?;
+                    first_shutdown.abort();
+                    assert!(first_shutdown.await.unwrap_err().is_cancelled());
+                    drop(step.take());
+                }
+                let shutdown = tokio::spawn({
+                    let session = Arc::clone(&session);
+                    async move {
+                        crate::session::handlers::shutdown(&session, "mcp-shutdown".to_string())
+                            .await
+                    }
+                });
+                if retain_step {
+                    tokio::time::timeout(Duration::from_secs(5), deleted.notified()).await?;
+                }
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(100), async {
+                        loop {
+                            if matches!(
+                                rx_event.recv().await.unwrap().msg,
+                                codex_protocol::protocol::EventMsg::ShutdownComplete
+                            ) {
+                                break;
+                            }
+                        }
+                    })
+                    .await
+                    .is_err(),
+                    "ShutdownComplete must wait for the retired transport DELETE response"
+                );
+                assert!(tokio::time::timeout(Duration::from_secs(5), shutdown).await??);
+                assert!(old_manager.shutdown_finished());
+                assert!(replacement.manager().shutdown_finished());
+                assert!(matches!(
+                    rx_event.recv().await?.msg,
+                    codex_protocol::protocol::EventMsg::ShutdownComplete
+                ));
+                // A live caller lease cannot delay session shutdown indefinitely.
+                drop(step);
+            }
+        }
+        let requests = server
+            .received_requests()
+            .await
+            .expect("recorded server requests");
+        let deletions = requests
+            .iter()
+            .filter(|request| request.method.as_str() == "DELETE")
+            .collect::<Vec<_>>();
+        assert_eq!(deletions.len(), 1);
+        assert_eq!(
+            deletions[0]
+                .headers
+                .get("mcp-session-id")
+                .unwrap()
+                .to_str()?,
+            "retired-runtime-session"
+        );
+        let calls_before = requests
+            .iter()
+            .filter(|request| {
+                serde_json::from_slice::<serde_json::Value>(&request.body)
+                    .is_ok_and(|body| body["method"] == "tools/call")
+            })
+            .count();
+        assert_eq!(calls_before, 2);
+        assert!(
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                old_manager.call_tool(
+                    "lifecycle",
+                    "echo",
+                    Some(json!({"message": "must never reach the server"})),
+                    None,
+                )
+            )
+            .await?
+            .is_err(),
+            "a shut down client must reject further calls"
+        );
+        let calls_after = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| {
+                serde_json::from_slice::<serde_json::Value>(&request.body)
+                    .is_ok_and(|body| body["method"] == "tools/call")
+            })
+            .count();
+        assert_eq!(
+            calls_after, calls_before,
+            "closed transport must not send another tool request"
+        );
+        Ok(())
     }
 }

@@ -322,6 +322,8 @@ pub(crate) async fn spawn_streamable_http_server() -> anyhow::Result<(Child, Str
     let mut child = Command::new(streamable_http_server_bin()?)
         .kill_on_drop(true)
         .env("MCP_STREAMABLE_HTTP_BIND_ADDR", &bind_addr)
+        .env("MCP_TEST_ECHO_SELECTED", "selected-environment-value")
+        .env_remove("MCP_TEST_ECHO_MISSING_07a5ec54")
         .spawn()?;
 
     wait_for_streamable_http_server(&mut child, &bind_addr, Duration::from_secs(5)).await?;

@@ -271,6 +271,54 @@ fn relay_delivery_requires_enqueue_and_is_recorded_exactly_once() {
     );
 }
 
+#[test]
+fn concurrent_relay_delivery_preserves_other_queued_tools() {
+    for _ in 0..32 {
+        let turn_timing = Arc::new(TurnTimingState::default());
+        turn_timing.mark_turn_started();
+        let delivered = ToolDispatchTiming::new_with_turn_clock(
+            Arc::clone(&turn_timing),
+            tokio::time::Instant::now(),
+            false,
+        );
+        let pending = ToolDispatchTiming::new_with_turn_clock(
+            Arc::clone(&turn_timing),
+            tokio::time::Instant::now(),
+            false,
+        );
+        assert!(delivered.mark_relay_enqueue());
+        assert!(pending.mark_relay_enqueue());
+        let ready = std::sync::Barrier::new(8);
+        let accepted = std::thread::scope(|scope| {
+            let attempts = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        ready.wait();
+                        delivered.mark_relay_delivery(delivered.execution_id())
+                    })
+                })
+                .collect::<Vec<_>>();
+            attempts
+                .into_iter()
+                .map(|attempt| usize::from(attempt.join().expect("delivery thread")))
+                .sum::<usize>()
+        });
+        assert_eq!(accepted, 1);
+        assert_eq!(turn_timing.lifecycle_context().relay_queue_depth, 1);
+        let snapshot = delivered.snapshot(tokio::time::Instant::now());
+        assert_eq!(
+            snapshot
+                .lifecycle_events
+                .iter()
+                .filter(|event| event.boundary == ToolLifecycleBoundary::RelayDelivery)
+                .count(),
+            1
+        );
+        assert!(pending.mark_relay_delivery(pending.execution_id()));
+        assert_eq!(turn_timing.lifecycle_context().relay_queue_depth, 0);
+    }
+}
+
 struct TestHandler {
     tool_name: codex_tools::ToolName,
 }

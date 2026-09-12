@@ -116,6 +116,7 @@ pub(super) async fn cancel_login_attempt(
 pub(crate) struct ApiKeyInputState {
     value: String,
     prepopulated_from_env: bool,
+    pending_request_id: Option<Uuid>,
 }
 
 #[derive(Clone)]
@@ -703,6 +704,7 @@ impl AuthModeWidget {
                 } else {
                     match key_event.code {
                         KeyCode::Backspace => {
+                            state.pending_request_id = None;
                             if state.prepopulated_from_env {
                                 state.value.clear();
                                 state.prepopulated_from_env = false;
@@ -722,6 +724,7 @@ impl AuthModeWidget {
                                 state.value.clear();
                                 state.prepopulated_from_env = false;
                             }
+                            state.pending_request_id = None;
                             state.value.push(c);
                             self.set_error(/*message*/ None);
                             should_request_frame = true;
@@ -751,6 +754,7 @@ impl AuthModeWidget {
 
         let mut guard = self.sign_in_state.write().unwrap();
         if let SignInState::ApiKeyEntry(state) = &mut *guard {
+            state.pending_request_id = None;
             if state.prepopulated_from_env {
                 state.value = trimmed.to_string();
                 state.prepopulated_from_env = false;
@@ -790,6 +794,7 @@ impl AuthModeWidget {
                 *guard = SignInState::ApiKeyEntry(ApiKeyInputState {
                     value: prefill_from_env.clone().unwrap_or_default(),
                     prepopulated_from_env: prefill_from_env.is_some(),
+                    pending_request_id: None,
                 });
             }
         }
@@ -802,40 +807,54 @@ impl AuthModeWidget {
             self.disallow_api_login();
             return;
         }
+        let request_id = Uuid::new_v4();
+        {
+            let mut state = self.sign_in_state.write().unwrap();
+            let SignInState::ApiKeyEntry(input) = &mut *state else {
+                return;
+            };
+            input.pending_request_id = Some(request_id);
+        }
         self.set_error(/*message*/ None);
         let request_handle = self.app_server_request_handle.clone();
         let sign_in_state = self.sign_in_state.clone();
         let error = self.error.clone();
         let request_frame = self.request_frame.clone();
         tokio::spawn(async move {
-            match request_handle
+            let result = request_handle
                 .request_typed::<LoginAccountResponse>(ClientRequest::LoginAccount {
                     request_id: onboarding_request_id(),
                     params: LoginAccountParams::ApiKey {
                         api_key: api_key.clone(),
                     },
                 })
-                .await
+                .await;
             {
-                Ok(LoginAccountResponse::ApiKey {}) => {
-                    *error.write().unwrap() = None;
-                    *sign_in_state.write().unwrap() = SignInState::ApiKeyConfigured;
-                }
-                Ok(other) => {
-                    *error.write().unwrap() = Some(format!(
-                        "Unexpected account/login/start response: {other:?}"
-                    ));
-                    *sign_in_state.write().unwrap() = SignInState::ApiKeyEntry(ApiKeyInputState {
-                        value: api_key,
-                        prepopulated_from_env: false,
-                    });
-                }
-                Err(err) => {
-                    *error.write().unwrap() = Some(format!("Failed to save API key: {err}"));
-                    *sign_in_state.write().unwrap() = SignInState::ApiKeyEntry(ApiKeyInputState {
-                        value: api_key,
-                        prepopulated_from_env: false,
-                    });
+                let mut state = sign_in_state.write().unwrap();
+                // Escape, editing, and later submissions invalidate an older completion.
+                // An admitted backend write may still finish, but it cannot replace the UI.
+                if matches!(&*state, SignInState::ApiKeyEntry(input)
+                    if input.pending_request_id == Some(request_id))
+                {
+                    match result {
+                        Ok(LoginAccountResponse::ApiKey {}) => {
+                            *error.write().unwrap() = None;
+                            *state = SignInState::ApiKeyConfigured;
+                        }
+                        result => {
+                            *error.write().unwrap() = Some(match result {
+                                Ok(other) => {
+                                    format!("Unexpected account/login/start response: {other:?}")
+                                }
+                                Err(err) => format!("Failed to save API key: {err}"),
+                            });
+                            *state = SignInState::ApiKeyEntry(ApiKeyInputState {
+                                value: api_key,
+                                prepopulated_from_env: false,
+                                pending_request_id: None,
+                            });
+                        }
+                    }
                 }
             }
             request_frame.schedule_frame();
@@ -1031,6 +1050,164 @@ mod tests {
     use pretty_assertions::assert_eq;
     use std::sync::Arc;
     use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn api_key_completion_respects_current_keyboard_attempt() {
+        use codex_app_server_client::RemoteAppServerClient;
+        use codex_app_server_client::RemoteAppServerConnectArgs;
+        use codex_app_server_client::RemoteAppServerEndpoint;
+        use futures::SinkExt;
+        use futures::StreamExt;
+        use std::time::Duration;
+        use tokio::sync::broadcast;
+        use tokio::sync::mpsc;
+        use tokio_tungstenite::tungstenite::Message;
+
+        for stale_error in [false, true] {
+            for replacement in ["cancel", "edit", "resubmit"] {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+                let (arrived_tx, mut arrived_rx) = mpsc::channel(2);
+                let (release_tx, mut release_rx) = mpsc::channel(2);
+                let peer = tokio::spawn(async move {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                    let init = socket.next().await.unwrap().unwrap();
+                    let init: serde_json::Value =
+                        serde_json::from_str(init.to_text().unwrap()).unwrap();
+                    assert_eq!(init["method"], "initialize");
+                    socket
+                        .send(Message::Text(
+                            serde_json::json!({"id":init["id"],"result":{}})
+                                .to_string()
+                                .into(),
+                        ))
+                        .await
+                        .unwrap();
+                    let initialized = socket.next().await.unwrap().unwrap();
+                    let initialized: serde_json::Value =
+                        serde_json::from_str(initialized.to_text().unwrap()).unwrap();
+                    assert_eq!(initialized["method"], "initialized");
+                    for index in 0..2 {
+                        let request = socket.next().await.unwrap().unwrap();
+                        let request: serde_json::Value =
+                            serde_json::from_str(request.to_text().unwrap()).unwrap();
+                        assert_eq!(request["method"], "account/login/start");
+                        assert_eq!(request["params"]["type"], "apiKey");
+                        arrived_tx
+                            .send(request["params"]["apiKey"].as_str().unwrap().to_string())
+                            .await
+                            .unwrap();
+                        release_rx.recv().await.unwrap();
+                        let response = if index == 0 && stale_error {
+                            serde_json::json!({"id":request["id"],"error":{"code":-32000,"message":"old request rejected"}})
+                        } else {
+                            serde_json::json!({"id":request["id"],"result":{"type":"apiKey"}})
+                        };
+                        socket
+                            .send(Message::Text(response.to_string().into()))
+                            .await
+                            .unwrap();
+                    }
+                    // Keep the transport alive until the UI has consumed the last reply.
+                    let _ = release_rx.recv().await;
+                });
+                let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+                    endpoint: RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: endpoint,
+                        auth_token: None,
+                    },
+                    client_name: "codex-tui-test".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: true,
+                    mcp_server_openai_form_elicitation: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 8,
+                })
+                .await
+                .unwrap();
+                let (draw_tx, mut draw_rx) = broadcast::channel(16);
+                let mut widget = AuthModeWidget {
+                    request_frame: FrameRequester::new(draw_tx),
+                    highlighted_mode: SignInOption::ApiKey,
+                    error: Arc::new(RwLock::new(None)),
+                    sign_in_state: Arc::new(RwLock::new(SignInState::PickMode)),
+                    login_status: LoginStatus::NotAuthenticated,
+                    app_server_request_handle: AppServerRequestHandle::Remote(
+                        client.request_handle(),
+                    ),
+                    forced_login_method: None,
+                    animations_enabled: false,
+                    animations_suppressed: Cell::new(false),
+                };
+                let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+                widget.handle_key_event(key(KeyCode::Enter));
+                widget.handle_paste("sk-old-test".to_string());
+                widget.handle_key_event(key(KeyCode::Enter));
+                assert_eq!(arrived_rx.recv().await.as_deref(), Some("sk-old-test"));
+                tokio::time::timeout(Duration::from_secs(2), draw_rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                match replacement {
+                    "cancel" => {
+                        widget.handle_key_event(key(KeyCode::Esc));
+                        widget.handle_key_event(key(KeyCode::Enter));
+                        widget.handle_paste("sk-new-test".to_string());
+                    }
+                    "edit" => widget.handle_paste("-edited".to_string()),
+                    "resubmit" => widget.handle_key_event(key(KeyCode::Enter)),
+                    _ => unreachable!(),
+                }
+                let expected_key = match replacement {
+                    "cancel" => "sk-new-test",
+                    "edit" => "sk-old-test-edited",
+                    _ => "sk-old-test",
+                };
+                // Drain the redraw caused by input before releasing the old response.
+                tokio::time::timeout(Duration::from_secs(2), draw_rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                release_tx.send(()).await.unwrap();
+                tokio::time::timeout(Duration::from_secs(2), draw_rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    matches!(&*widget.sign_in_state.read().unwrap(), SignInState::ApiKeyEntry(input) if input.value == expected_key)
+                );
+                assert_eq!(
+                    widget.error_message(),
+                    None,
+                    "stale error must not reach the current entry"
+                );
+                assert_eq!(widget.get_step_state(), StepState::InProgress);
+
+                if replacement != "resubmit" {
+                    widget.handle_key_event(key(KeyCode::Enter));
+                    tokio::time::timeout(Duration::from_secs(2), draw_rx.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                }
+                assert_eq!(arrived_rx.recv().await.as_deref(), Some(expected_key));
+                release_tx.send(()).await.unwrap();
+                tokio::time::timeout(Duration::from_secs(2), draw_rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(matches!(
+                    &*widget.sign_in_state.read().unwrap(),
+                    SignInState::ApiKeyConfigured
+                ));
+                assert_eq!(widget.get_step_state(), StepState::Complete);
+                assert_eq!(widget.error_message(), None);
+                drop(release_tx);
+                peer.await.unwrap();
+            }
+        }
+    }
 
     async fn widget_forced_chatgpt() -> (AuthModeWidget, TempDir) {
         let codex_home = TempDir::new().unwrap();

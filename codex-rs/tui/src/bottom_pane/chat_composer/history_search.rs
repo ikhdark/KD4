@@ -469,7 +469,8 @@ impl ChatComposer {
         }
 
         let prompt_width = Line::from("reverse-i-search: ").width() as u16;
-        let query_width = Line::from(search.query.clone()).width() as u16;
+        let query_width =
+            u16::try_from(Line::from(search.query.clone()).width()).unwrap_or(u16::MAX);
         let desired_x = hint_rect
             .x
             .saturating_add(FOOTER_INDENT_COLS as u16)
@@ -500,6 +501,43 @@ mod tests {
     use crate::app_event::AppEvent;
     use crate::app_event_sender::AppEventSender;
     use crate::render::renderable::Renderable;
+
+    #[test]
+    fn history_search_cursor_clamps_long_query_without_wrapping() {
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let mut composer = ChatComposer::new(
+            true,
+            AppEventSender::new(tx),
+            false,
+            "Ask Codex to do anything".to_string(),
+            true,
+        );
+        let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        let area = Rect::new(0, 0, 40, 6);
+        let mut buf = Buffer::empty(area);
+        composer.render(area, &mut buf);
+        assert_eq!(
+            (0..21).map(|x| buf[(x, 5)].symbol()).collect::<String>(),
+            "  reverse-i-search: a"
+        );
+        // The rendered query ends in column 20: two gutter columns, the
+        // 18-column prompt, then one query character. Its caret follows it.
+        assert_eq!(composer.cursor_pos(area), Some((21, 5)));
+        assert_eq!(buf[(21, 5)].symbol(), " ");
+
+        // Enter through the same query transition as search keystrokes, without
+        // repeating a quadratic history search for every character in this fixture.
+        composer.update_history_search_query("x".repeat(65_536));
+        let mut buf = Buffer::empty(area);
+        composer.render(area, &mut buf);
+        assert_eq!(
+            (0..40).map(|x| buf[(x, 5)].symbol()).collect::<String>(),
+            "  reverse-i-search: xxxxxxxxxxxxxxxxxxxx"
+        );
+        assert_eq!(composer.cursor_pos(area), Some((39, 5)));
+        assert!(composer.draft.textarea.is_empty());
+    }
 
     #[test]
     fn history_search_opens_without_previewing_latest_entry() {

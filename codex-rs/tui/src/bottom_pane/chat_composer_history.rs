@@ -117,7 +117,7 @@ pub(crate) struct ChatComposerHistory {
 
     /// Current cursor within the combined (persistent + local) history. `None`
     /// indicates the user is *not* currently browsing history.
-    history_cursor: Option<isize>,
+    history_cursor: Option<usize>,
     pending_navigation_direction: Option<HistorySearchDirection>,
 
     /// The text that was last inserted into the composer as a result of
@@ -341,23 +341,19 @@ impl ChatComposerHistory {
     /// Ctrl+R search is active intentionally exits search traversal.
     pub fn navigate_up(&mut self, app_event_tx: &AppEventSender) -> Option<HistoryEntry> {
         self.search = None;
-        let total_entries = self.persistent_entry_count + self.local_history.len();
+        let total_entries = self.total_entries();
         if total_entries == 0 {
             return None;
         }
 
         let next_idx = match self.history_cursor {
-            None => (total_entries as isize) - 1,
+            None => total_entries - 1,
             Some(0) => return None, // already at oldest
             Some(idx) => idx - 1,
         };
 
         self.history_cursor = Some(next_idx);
-        self.populate_history_at_index(
-            next_idx as usize,
-            HistorySearchDirection::Older,
-            app_event_tx,
-        )
+        self.populate_history_at_index(next_idx, HistorySearchDirection::Older, app_event_tx)
     }
 
     /// Handles Down by moving toward newer entries or clearing the composer past the newest entry.
@@ -367,25 +363,20 @@ impl ChatComposerHistory {
     /// search state and resumes normal shell-style browsing.
     pub fn navigate_down(&mut self, app_event_tx: &AppEventSender) -> Option<HistoryEntry> {
         self.search = None;
-        let total_entries = self.persistent_entry_count + self.local_history.len();
+        let total_entries = self.total_entries();
         if total_entries == 0 {
             return None;
         }
 
         let next_idx_opt = match self.history_cursor {
             None => return None, // not browsing
-            Some(idx) if (idx as usize) + 1 >= total_entries => None,
-            Some(idx) => Some(idx + 1),
+            Some(idx) => self.next_history_offset(idx, HistorySearchDirection::Newer),
         };
 
         match next_idx_opt {
             Some(idx) => {
                 self.history_cursor = Some(idx);
-                self.populate_history_at_index(
-                    idx as usize,
-                    HistorySearchDirection::Newer,
-                    app_event_tx,
-                )
+                self.populate_history_at_index(idx, HistorySearchDirection::Newer, app_event_tx)
             }
             None => {
                 // Past newest – clear and exit browsing mode.
@@ -449,7 +440,7 @@ impl ChatComposerHistory {
             ));
         }
 
-        if self.history_cursor == Some(offset as isize) {
+        if self.history_cursor == Some(offset) {
             let direction = self.pending_navigation_direction.take();
             let Some(entry) = entry else {
                 return HistoryEntryResponse::Ignored;
@@ -460,7 +451,7 @@ impl ChatComposerHistory {
                 let Some(offset) = self.next_history_offset(offset, direction) else {
                     return HistoryEntryResponse::Ignored;
                 };
-                self.history_cursor = Some(offset as isize);
+                self.history_cursor = Some(offset);
                 return self
                     .populate_history_at_index(offset, direction, app_event_tx)
                     .map(HistoryEntryResponse::Found)
@@ -556,7 +547,8 @@ impl ChatComposerHistory {
     // ---------------------------------------------------------------------
 
     fn total_entries(&self) -> usize {
-        self.persistent_entry_count + self.local_history.len()
+        self.persistent_entry_count
+            .saturating_add(self.local_history.len())
     }
 
     fn search_start_offset(
@@ -684,7 +676,7 @@ impl ChatComposerHistory {
     }
 
     fn search_match(&mut self, offset: usize, entry: HistoryEntry) -> HistorySearchResult {
-        self.history_cursor = Some(offset as isize);
+        self.history_cursor = Some(offset);
         self.last_history_text = Some(entry.text.clone());
         if let Some(search) = self.search.as_mut() {
             search.selected_offset = Some(offset);
@@ -713,7 +705,7 @@ impl ChatComposerHistory {
         };
 
         let history_match = self.search.as_ref()?.unique_matches[next_index].clone();
-        self.history_cursor = Some(history_match.offset as isize);
+        self.history_cursor = Some(history_match.offset);
         self.last_history_text = Some(history_match.entry.text.clone());
         if let Some(search) = self.search.as_mut() {
             search.select_match(next_index);
@@ -756,7 +748,7 @@ impl ChatComposerHistory {
                         self.pending_navigation_direction = None;
                         return None;
                     };
-                    self.history_cursor = Some(next_idx as isize);
+                    self.history_cursor = Some(next_idx);
                     global_idx = next_idx;
                     continue;
                 }
@@ -942,6 +934,45 @@ mod tests {
                 pending_pastes: Vec::new(),
             })
         );
+    }
+
+    #[test]
+    fn navigation_preserves_offsets_above_signed_index_range() {
+        for entry_count in [(isize::MAX as usize) + 1, usize::MAX] {
+            let (tx, mut rx) = unbounded_channel::<AppEvent>();
+            let tx = AppEventSender::new(tx);
+            let mut history = ChatComposerHistory::new();
+            let thread_id = test_thread_id();
+            history.set_metadata(thread_id, 42, entry_count);
+
+            for (offset, text) in [(entry_count - 1, "newest"), (entry_count - 2, "older")] {
+                assert!(history.navigate_up(&tx).is_none());
+                let AppEvent::LookupMessageHistoryEntry {
+                    thread_id: requested_thread,
+                    log_id,
+                    offset: requested_offset,
+                } = rx.try_recv().expect("history lookup")
+                else {
+                    panic!("expected history lookup");
+                };
+                assert_eq!(requested_thread, thread_id);
+                assert_eq!(log_id, 42);
+                assert_eq!(requested_offset, offset);
+                assert_eq!(
+                    history.on_entry_response(42, offset, Some(text.to_string()), &tx),
+                    HistoryEntryResponse::Found(HistoryEntry::new(text.to_string())),
+                );
+            }
+            assert_eq!(
+                history.navigate_down(&tx),
+                Some(HistoryEntry::new("newest".to_string())),
+            );
+            assert_eq!(
+                history.navigate_down(&tx),
+                Some(HistoryEntry::new(String::new()))
+            );
+            assert!(rx.try_recv().is_err());
+        }
     }
 
     #[test]

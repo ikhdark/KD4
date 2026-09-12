@@ -13,6 +13,7 @@ pub(crate) struct ThreadGoalRequestProcessor {
     thread_state_manager: ThreadStateManager,
     state_db: Option<StateDbHandle>,
     goal_service: Arc<GoalService>,
+    pub(super) background_tasks: TaskTracker,
 }
 
 impl ThreadGoalRequestProcessor {
@@ -31,6 +32,7 @@ impl ThreadGoalRequestProcessor {
             thread_state_manager,
             state_db,
             goal_service,
+            background_tasks: TaskTracker::new(),
         }
     }
 
@@ -111,54 +113,74 @@ impl ThreadGoalRequestProcessor {
         let listener_command_tx = {
             let thread_state = self.thread_state_manager.thread_state(thread_id).await;
             let thread_state = thread_state.lock().await;
-            thread_state.listener_command_tx()
+            thread_state.listener_command_route()
         };
-        let status = params.status.map(ThreadGoalStatus::to_core);
-        let objective = params.objective.as_deref();
+        // Own the admitted mutation and its finalizer together: GoalService can
+        // await preview persistence after committing the goal itself. Gate shutdown
+        // drains RPC owners before it closes this shared background tracker.
+        let processor = self.clone();
+        self.background_tasks
+            .spawn(async move {
+                let status = params.status.map(ThreadGoalStatus::to_core);
+                let objective = params.objective.as_deref();
 
-        let outcome = self
-            .goal_service
-            .set_thread_goal(
-                &state_db,
-                GoalSetRequest {
-                    thread_id,
-                    objective: objective
-                        .map(GoalObjectiveUpdate::Set)
-                        .unwrap_or(GoalObjectiveUpdate::Keep),
-                    status,
-                    token_budget: match params.token_budget {
-                        Some(token_budget) => GoalTokenBudgetUpdate::Set(token_budget),
-                        None => GoalTokenBudgetUpdate::Keep,
-                    },
-                },
-            )
-            .await
-            .map_err(goal_service_error)?;
-        let goal = ThreadGoal::from(outcome.goal.clone());
-
-        let persist_result = match self.thread_manager.get_thread(thread_id).await {
-            Ok(thread) => {
-                // Live goal-first threads can be listed before any user turn is written.
-                // Use the live path so JSONL and SQLite preview metadata stay in sync.
-                thread
-                    .append_rollout_items(&[outcome.thread_goal_updated_item()])
+                let outcome = processor
+                    .goal_service
+                    .set_thread_goal(
+                        &state_db,
+                        GoalSetRequest {
+                            thread_id,
+                            objective: objective
+                                .map(GoalObjectiveUpdate::Set)
+                                .unwrap_or(GoalObjectiveUpdate::Keep),
+                            status,
+                            token_budget: match params.token_budget {
+                                Some(token_budget) => GoalTokenBudgetUpdate::Set(token_budget),
+                                None => GoalTokenBudgetUpdate::Keep,
+                            },
+                        },
+                    )
                     .await
-            }
-            Err(_) => Ok(()),
-        };
-        if let Err(err) = persist_result {
-            warn!("failed to persist goal update for live thread {thread_id}: {err}");
-        }
+                    .map_err(goal_service_error)?;
+                let goal = ThreadGoal::from(outcome.goal.clone());
 
-        self.outgoing
-            .send_response(
-                request_id.clone(),
-                ThreadGoalSetResponse { goal: goal.clone() },
-            )
-            .await;
-        self.emit_thread_goal_updated_ordered(thread_id, goal, listener_command_tx)
-            .await;
-        outcome.apply_runtime_effects(&self.goal_service).await;
+                let persist_result = match processor.thread_manager.get_thread(thread_id).await {
+                    Ok(thread) => {
+                        // Live goal-first threads can be listed before any user turn is written.
+                        // Use the live path so JSONL and SQLite preview metadata stay in sync.
+                        thread
+                            .append_rollout_items(&[outcome.thread_goal_updated_item()])
+                            .await
+                    }
+                    Err(_) => Ok(()),
+                };
+                if let Err(err) = persist_result {
+                    warn!("failed to persist goal update for live thread {thread_id}: {err}");
+                }
+
+                let delivery = async {
+                    processor
+                        .outgoing
+                        .send_response(
+                            request_id.clone(),
+                            ThreadGoalSetResponse { goal: goal.clone() },
+                        )
+                        .await;
+                    processor
+                        .emit_thread_goal_updated_ordered(thread_id, goal, listener_command_tx)
+                        .await;
+                };
+                if tokio::time::timeout(crate::outgoing_message::RESOURCE_DELIVERY_TIMEOUT, delivery)
+                    .await
+                    .is_err()
+                {
+                    warn!("timed out delivering committed goal update for {thread_id}; applying runtime effects");
+                }
+                outcome.apply_runtime_effects(&processor.goal_service).await;
+                Ok::<(), JSONRPCErrorError>(())
+            })
+            .await
+            .map_err(|error| internal_error(format!("goal update task failed: {error}")))??;
         Ok(())
     }
 
@@ -198,21 +220,37 @@ impl ThreadGoalRequestProcessor {
         let listener_command_tx = {
             let thread_state = self.thread_state_manager.thread_state(thread_id).await;
             let thread_state = thread_state.lock().await;
-            thread_state.listener_command_tx()
+            thread_state.listener_command_route()
         };
-        let cleared = self
-            .goal_service
-            .clear_thread_goal(&state_db, thread_id)
-            .await
-            .map_err(goal_service_error)?;
+        let processor = self.clone();
+        self.background_tasks
+            .spawn(async move {
+                let cleared = processor
+                    .goal_service
+                    .clear_thread_goal(&state_db, thread_id)
+                    .await
+                    .map_err(goal_service_error)?;
 
-        self.outgoing
-            .send_response(request_id, ThreadGoalClearResponse { cleared })
-            .await;
-        if cleared {
-            self.emit_thread_goal_cleared_ordered(thread_id, listener_command_tx)
-                .await;
-        }
+                if tokio::time::timeout(crate::outgoing_message::RESOURCE_DELIVERY_TIMEOUT, async {
+                    processor
+                        .outgoing
+                        .send_response(request_id, ThreadGoalClearResponse { cleared })
+                        .await;
+                    if cleared {
+                        processor
+                            .emit_thread_goal_cleared_ordered(thread_id, listener_command_tx)
+                            .await;
+                    }
+                })
+                .await
+                .is_err()
+                {
+                    warn!("timed out delivering committed goal clear for {thread_id}");
+                }
+                Ok::<(), JSONRPCErrorError>(())
+            })
+            .await
+            .map_err(|error| internal_error(format!("goal clear task failed: {error}")))??;
         Ok(())
     }
 
@@ -307,18 +345,23 @@ impl ThreadGoalRequestProcessor {
         let listener_command_tx = {
             let thread_state = self.thread_state_manager.thread_state(thread_id).await;
             let thread_state = thread_state.lock().await;
-            thread_state.listener_command_tx()
+            thread_state.listener_command_route()
         };
-        if let Some(listener_command_tx) = listener_command_tx {
+        if let Some((listener_command_tx, cancellation)) = listener_command_tx {
             let command = crate::thread_state::ThreadListenerCommand::EmitThreadGoalSnapshot {
                 state_db: state_db.clone(),
             };
-            if listener_command_tx.send(command).await.is_ok() {
+            if tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => return,
+                result = listener_command_tx.send(command) => result.is_ok(),
+            } {
                 return;
             }
             warn!(
                 "failed to enqueue thread goal snapshot for {thread_id}: listener command channel is closed"
             );
+            return;
         }
         send_thread_goal_snapshot_notification(&self.outgoing, thread_id, &state_db).await;
     }
@@ -327,19 +370,24 @@ impl ThreadGoalRequestProcessor {
         &self,
         thread_id: ThreadId,
         goal: ThreadGoal,
-        listener_command_tx: Option<tokio::sync::mpsc::Sender<ThreadListenerCommand>>,
+        listener_command_tx: Option<crate::thread_state::ThreadListenerCommandRoute>,
     ) {
-        if let Some(listener_command_tx) = listener_command_tx {
+        if let Some((listener_command_tx, cancellation)) = listener_command_tx {
             let command = crate::thread_state::ThreadListenerCommand::EmitThreadGoalUpdated {
                 turn_id: None,
                 goal: goal.clone(),
             };
-            if listener_command_tx.send(command).await.is_ok() {
+            if tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => return,
+                result = listener_command_tx.send(command) => result.is_ok(),
+            } {
                 return;
             }
             warn!(
                 "failed to enqueue thread goal update for {thread_id}: listener command channel is closed"
             );
+            return;
         }
         self.outgoing
             .send_server_notification(ServerNotification::ThreadGoalUpdated(
@@ -355,16 +403,21 @@ impl ThreadGoalRequestProcessor {
     async fn emit_thread_goal_cleared_ordered(
         &self,
         thread_id: ThreadId,
-        listener_command_tx: Option<tokio::sync::mpsc::Sender<ThreadListenerCommand>>,
+        listener_command_tx: Option<crate::thread_state::ThreadListenerCommandRoute>,
     ) {
-        if let Some(listener_command_tx) = listener_command_tx {
+        if let Some((listener_command_tx, cancellation)) = listener_command_tx {
             let command = crate::thread_state::ThreadListenerCommand::EmitThreadGoalCleared;
-            if listener_command_tx.send(command).await.is_ok() {
+            if tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => return,
+                result = listener_command_tx.send(command) => result.is_ok(),
+            } {
                 return;
             }
             warn!(
                 "failed to enqueue thread goal clear for {thread_id}: listener command channel is closed"
             );
+            return;
         }
         self.outgoing
             .send_server_notification(ServerNotification::ThreadGoalCleared(

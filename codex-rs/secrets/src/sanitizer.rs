@@ -24,7 +24,7 @@ pub fn redact_secrets(input: String) -> String {
 fn compile_regex(pattern: &str) -> Regex {
     match Regex::new(pattern) {
         Ok(regex) => regex,
-        // Panic is ok thanks to `load_regex` test.
+        // The redaction behavior test also compiles every pattern.
         Err(err) => panic!("invalid regex pattern `{pattern}`: {err}"),
     }
 }
@@ -34,8 +34,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn load_regex() {
-        // The goal of this test is just to compile all the regex to prevent the panic
-        let _ = redact_secrets("secret".to_string());
+    fn redacts_known_secrets_and_preserves_surrounding_text() {
+        let input = concat!(
+            "ordinary text 🦀\n",
+            "sk-abcdefghijklmnopqrst\n",
+            "AKIA1234567890ABCDEF\n",
+            "Authorization: bEaReR abcdefghijklmnop\n",
+            "api_key = \"abcdefgh\" token: '12345678' password=abcdefgh\n",
+            "secret=short; end"
+        );
+        assert_eq!(
+            redact_secrets(input.to_string()),
+            concat!(
+                "ordinary text 🦀\n",
+                "[REDACTED_SECRET]\n",
+                "[REDACTED_SECRET]\n",
+                "Authorization: Bearer [REDACTED_SECRET]\n",
+                "api_key = \"[REDACTED_SECRET]\" token: '[REDACTED_SECRET]' password=[REDACTED_SECRET]\n",
+                "secret=short; end"
+            )
+        );
     }
 }

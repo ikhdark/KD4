@@ -154,6 +154,8 @@ where
     buffers: [Buffer; 2],
     /// Index of the current buffer in the previous array
     current: usize,
+    /// Raw terminal operations require repainting even logically unchanged cells.
+    force_redraw: bool,
     /// Whether the cursor is currently hidden
     pub hidden_cursor: bool,
     /// Area of the viewport
@@ -232,6 +234,7 @@ where
             backend,
             buffers: [Buffer::empty(Rect::ZERO), Buffer::empty(Rect::ZERO)],
             current: 0,
+            force_redraw: false,
             hidden_cursor: false,
             viewport_area: Rect::new(
                 /*x*/ 0,
@@ -297,12 +300,18 @@ where
     /// Obtains a difference between the previous and the current buffer and passes it to the
     /// current backend for drawing.
     pub fn flush(&mut self) -> io::Result<()> {
-        let updates = diff_buffers(self.previous_buffer(), self.current_buffer());
+        let updates = diff_buffers(
+            self.previous_buffer(),
+            self.current_buffer(),
+            self.force_redraw,
+        );
         let last_put_command = updates.iter().rfind(|command| command.is_put());
         if let Some(&DrawCommand::Put { x, y, .. }) = last_put_command {
             self.last_known_cursor_pos = Position { x, y };
         }
-        draw(&mut self.backend, updates.into_iter())
+        draw(&mut self.backend, updates.into_iter())?;
+        self.force_redraw = false;
+        Ok(())
     }
 
     /// Updates the Terminal so that internal buffers match the requested area.
@@ -494,11 +503,11 @@ where
         Ok(())
     }
 
-    /// Force the next draw pass to repaint the entire viewport by resetting the
-    /// diff buffer. Call this after raw terminal operations that move screen
-    /// content outside ratatui's knowledge.
+    /// Force the next draw pass to repaint the entire viewport, including blank cells.
+    /// Call this after raw terminal operations that move screen content outside
+    /// ratatui's knowledge.
     pub fn invalidate_viewport(&mut self) {
-        self.previous_buffer_mut().reset();
+        self.force_redraw = true;
     }
 
     /// Clear terminal scrollback (if supported) and force a full redraw.
@@ -582,7 +591,7 @@ enum DrawCommand {
     ClearToEnd { x: u16, y: u16, bg: Color },
 }
 
-fn diff_buffers(a: &Buffer, b: &Buffer) -> Vec<DrawCommand> {
+fn diff_buffers(a: &Buffer, b: &Buffer, force_redraw: bool) -> Vec<DrawCommand> {
     let previous_buffer = &a.content;
     let next_buffer = &b.content;
 
@@ -624,7 +633,8 @@ fn diff_buffers(a: &Buffer, b: &Buffer) -> Vec<DrawCommand> {
     // their place (the skipped cells should be blank anyway), or due to per-cell-skipping:
     let mut to_skip: usize = 0;
     for (i, (current, previous)) in next_buffer.iter().zip(previous_buffer.iter()).enumerate() {
-        if !current.skip && (current != previous || invalidated > 0) && to_skip == 0 {
+        if !current.skip && (force_redraw || current != previous || invalidated > 0) && to_skip == 0
+        {
             let (x, y) = a.pos_of(i);
             let row = i / a.area.width as usize;
             if x <= last_nonblank_columns[row] {
@@ -891,7 +901,7 @@ mod tests {
             .expect("cell should exist")
             .set_symbol("X");
 
-        let commands = diff_buffers(&previous, &next);
+        let commands = diff_buffers(&previous, &next, false);
 
         let clear_count = commands
             .iter()
@@ -918,13 +928,54 @@ mod tests {
         previous.set_string(0, 0, "中文", Style::default());
         next.set_string(0, 0, "中", Style::default());
 
-        let commands = diff_buffers(&previous, &next);
+        let commands = diff_buffers(&previous, &next, false);
         assert!(
             commands
                 .iter()
                 .any(|command| matches!(command, DrawCommand::ClearToEnd { x: 2, y: 0, .. })),
             "expected clear-to-end to start after the remaining wide char; commands: {commands:?}"
         );
+    }
+
+    #[test]
+    fn invalidated_viewport_repaints_blank_first_column_without_erasing_history() {
+        use crate::test_backend::VT100Backend;
+
+        let mut terminal = Terminal::with_options(VT100Backend::new(4, 3)).expect("terminal");
+        terminal.set_viewport_area(Rect::new(0, 1, 4, 1));
+        terminal.draw(|_| {}).expect("initial blank draw");
+        // Simulate raw history/viewport movement outside the logical frame buffer.
+        terminal
+            .backend_mut()
+            .write_all(b"\x1b[1;1HKEEP\x1b[2;1HXYZ")
+            .unwrap();
+        assert_eq!(
+            terminal
+                .backend()
+                .vt100()
+                .screen()
+                .cell(1, 0)
+                .unwrap()
+                .contents(),
+            "X"
+        );
+
+        terminal.invalidate_viewport();
+        terminal.draw(|_| {}).expect("repaint blank viewport");
+        let screen = terminal.backend().vt100().screen();
+        for column in 0..4 {
+            assert!(
+                screen.cell(1, column).unwrap().contents().trim().is_empty(),
+                "blank viewport column {column} must replace stale physical content"
+            );
+        }
+        for (column, character) in "KEEP".chars().enumerate() {
+            assert_eq!(
+                screen.cell(0, column as u16).unwrap().contents(),
+                character.to_string(),
+                "viewport invalidation must preserve history above the viewport"
+            );
+        }
     }
 
     #[test]

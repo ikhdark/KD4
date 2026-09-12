@@ -72,10 +72,11 @@ fn request_user_input_rejects_duplicate_question_ids() {
 #[test]
 fn request_user_input_counts_header_characters_not_bytes() {
     let twelve = "🦀".repeat(12);
-    serde_json::from_value::<RequestUserInputArgs>(json!({
+    let args = serde_json::from_value::<RequestUserInputArgs>(json!({
         "questions": [question_json("q1", &twelve, 2)]
     }))
     .expect("twelve Unicode characters should deserialize");
+    assert_eq!(args.questions[0].header, twelve);
 
     let thirteen = "🦀".repeat(13);
     let err = serde_json::from_value::<RequestUserInputArgs>(json!({
@@ -88,10 +89,21 @@ fn request_user_input_counts_header_characters_not_bytes() {
 #[test]
 fn request_user_input_accepts_two_to_four_options() {
     for count in [2, 3, 4] {
-        serde_json::from_value::<RequestUserInputArgs>(json!({
+        let args = serde_json::from_value::<RequestUserInputArgs>(json!({
             "questions": [question_json("q1", "Mode", count)]
         }))
         .expect("two to four options should deserialize");
+        assert_eq!(args.questions.len(), 1);
+        let question = &args.questions[0];
+        assert_eq!(question.id, "q1");
+        assert_eq!(question.header, "Mode");
+        assert_eq!(question.question, "Pick one");
+        let options = question.options.as_ref().expect("options are preserved");
+        assert_eq!(options.len(), count);
+        for (index, option) in options.iter().enumerate() {
+            assert_eq!(option.label, format!("Option {index}"));
+            assert_eq!(option.description, format!("Description {index}"));
+        }
     }
 }
 

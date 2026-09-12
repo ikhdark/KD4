@@ -2,6 +2,8 @@ use codex_extension_api::ExtensionData;
 use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TurnAbortReason;
+use futures::FutureExt;
+use std::panic::AssertUnwindSafe;
 
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
@@ -12,29 +14,55 @@ impl Session {
         turn_context: &TurnContext,
         token_usage_at_turn_start: &TokenUsage,
     ) {
+        let mut first_panic = None;
         for contributor in self.services.extensions.turn_lifecycle_contributors() {
-            contributor
-                .on_turn_start(codex_extension_api::TurnStartInput {
-                    turn_id: turn_context.sub_id.as_str(),
-                    collaboration_mode: &turn_context.collaboration_mode,
-                    token_usage_at_turn_start,
-                    session_store: &self.services.session_extension_data,
-                    thread_store: &self.services.thread_extension_data,
-                    turn_store: turn_context.extension_data.as_ref(),
-                })
-                .await;
+            let result = AssertUnwindSafe(async {
+                contributor
+                    .on_turn_start(codex_extension_api::TurnStartInput {
+                        turn_id: turn_context.sub_id.as_str(),
+                        collaboration_mode: &turn_context.collaboration_mode,
+                        token_usage_at_turn_start,
+                        session_store: &self.services.session_extension_data,
+                        thread_store: &self.services.thread_extension_data,
+                        turn_store: turn_context.extension_data.as_ref(),
+                    })
+                    .await;
+            })
+            .catch_unwind()
+            .await;
+            if let Err(payload) = result
+                && first_panic.is_none()
+            {
+                first_panic = Some(payload);
+            }
+        }
+        if let Some(payload) = first_panic {
+            std::panic::resume_unwind(payload);
         }
     }
 
     pub(super) async fn emit_turn_stop_lifecycle(&self, turn_store: &ExtensionData) {
+        let mut first_panic = None;
         for contributor in self.services.extensions.turn_lifecycle_contributors() {
-            contributor
-                .on_turn_stop(codex_extension_api::TurnStopInput {
-                    session_store: &self.services.session_extension_data,
-                    thread_store: &self.services.thread_extension_data,
-                    turn_store,
-                })
-                .await;
+            let result = AssertUnwindSafe(async {
+                contributor
+                    .on_turn_stop(codex_extension_api::TurnStopInput {
+                        session_store: &self.services.session_extension_data,
+                        thread_store: &self.services.thread_extension_data,
+                        turn_store,
+                    })
+                    .await;
+            })
+            .catch_unwind()
+            .await;
+            if let Err(payload) = result
+                && first_panic.is_none()
+            {
+                first_panic = Some(payload);
+            }
+        }
+        if let Some(payload) = first_panic {
+            std::panic::resume_unwind(payload);
         }
     }
 
@@ -60,15 +88,28 @@ impl Session {
         reason: TurnAbortReason,
         turn_store: &ExtensionData,
     ) {
+        let mut first_panic = None;
         for contributor in self.services.extensions.turn_lifecycle_contributors() {
-            contributor
-                .on_turn_abort(codex_extension_api::TurnAbortInput {
-                    reason: reason.clone(),
-                    session_store: &self.services.session_extension_data,
-                    thread_store: &self.services.thread_extension_data,
-                    turn_store,
-                })
-                .await;
+            let result = AssertUnwindSafe(async {
+                contributor
+                    .on_turn_abort(codex_extension_api::TurnAbortInput {
+                        reason: reason.clone(),
+                        session_store: &self.services.session_extension_data,
+                        thread_store: &self.services.thread_extension_data,
+                        turn_store,
+                    })
+                    .await;
+            })
+            .catch_unwind()
+            .await;
+            if let Err(payload) = result
+                && first_panic.is_none()
+            {
+                first_panic = Some(payload);
+            }
+        }
+        if let Some(payload) = first_panic {
+            std::panic::resume_unwind(payload);
         }
     }
 
@@ -77,16 +118,29 @@ impl Session {
         turn_context: &TurnContext,
         error: CodexErrorInfo,
     ) {
+        let mut first_panic = None;
         for contributor in self.services.extensions.turn_lifecycle_contributors() {
-            contributor
-                .on_turn_error(codex_extension_api::TurnErrorInput {
-                    turn_id: turn_context.sub_id.as_str(),
-                    error: error.clone(),
-                    session_store: &self.services.session_extension_data,
-                    thread_store: &self.services.thread_extension_data,
-                    turn_store: turn_context.extension_data.as_ref(),
-                })
-                .await;
+            let result = AssertUnwindSafe(async {
+                contributor
+                    .on_turn_error(codex_extension_api::TurnErrorInput {
+                        turn_id: turn_context.sub_id.as_str(),
+                        error: error.clone(),
+                        session_store: &self.services.session_extension_data,
+                        thread_store: &self.services.thread_extension_data,
+                        turn_store: turn_context.extension_data.as_ref(),
+                    })
+                    .await;
+            })
+            .catch_unwind()
+            .await;
+            if let Err(payload) = result
+                && first_panic.is_none()
+            {
+                first_panic = Some(payload);
+            }
+        }
+        if let Some(payload) = first_panic {
+            std::panic::resume_unwind(payload);
         }
     }
 }

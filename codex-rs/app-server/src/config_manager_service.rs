@@ -357,6 +357,10 @@ impl ConfigManager {
             ));
         }
 
+        // Successful writes must be visible to the next per-cwd read, even
+        // when no live thread exists to receive a runtime config refresh.
+        self.invalidate_load_cache();
+
         let overridden = first_overridden_edit(&updated_layers, &effective, &parsed_segments);
         let status = overridden
             .as_ref()

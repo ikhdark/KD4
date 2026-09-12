@@ -383,8 +383,8 @@ fn exec_server_env_keeps_command_native_and_carries_sandbox_context() {
     assert_eq!(request.exec_server_managed_network, Some(managed_network));
 }
 
-#[test]
-fn local_env_carries_restricted_token_filesystem_overrides() {
+#[tokio::test]
+async fn local_env_carries_restricted_token_filesystem_overrides() {
     let temp_dir = tempfile::TempDir::new().expect("tempdir");
     let cwd = AbsolutePathBuf::from_absolute_path(
         dunce::canonicalize(temp_dir.path()).expect("canonical cwd"),
@@ -445,6 +445,7 @@ fn local_env_carries_restricted_token_filesystem_overrides() {
             /*network*/ None,
             /*environment_id*/ None,
         )
+        .await
         .expect("prepare local exec request");
 
     assert_eq!(
@@ -461,6 +462,12 @@ fn local_env_carries_restricted_token_filesystem_overrides() {
 
 #[test]
 fn local_env_carries_elevated_filesystem_overrides() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .expect("single-worker sandbox runtime");
+    runtime.block_on(async {
     let temp_dir = tempfile::TempDir::new().expect("tempdir");
     let cwd = AbsolutePathBuf::from_absolute_path(
         dunce::canonicalize(temp_dir.path()).expect("canonical cwd"),
@@ -468,11 +475,20 @@ fn local_env_carries_elevated_filesystem_overrides() {
     .expect("absolute cwd");
     let docs = cwd.join("docs");
     std::fs::create_dir_all(docs.as_path()).expect("create docs");
+    let secret = docs.join("private.env");
+    std::fs::write(secret.as_path(), "private").unwrap();
+    std::fs::write(docs.join("public.txt").as_path(), "public").unwrap();
     let permissions = codex_protocol::models::PermissionProfile::from_runtime_permissions(
-        &FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry {
-            path: FileSystemPath::Path { path: docs.clone() },
-            access: FileSystemAccessMode::Read,
-        }]),
+        &FileSystemSandboxPolicy::restricted(vec![
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Path { path: docs.clone() },
+                access: FileSystemAccessMode::Read,
+            },
+            FileSystemSandboxEntry {
+                path: FileSystemPath::GlobPattern { pattern: "**/*.env".to_string() },
+                access: FileSystemAccessMode::Deny,
+            },
+        ]),
         NetworkSandboxPolicy::Restricted,
     );
     let cwd_uri = PathUri::from_abs_path(&cwd);
@@ -490,7 +506,14 @@ fn local_env_carries_elevated_filesystem_overrides() {
         network_denial_cancellation_token: None,
         network_proxy: None,
     };
-    let request = attempt
+    let (occupied_tx, occupied_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let blocker = tokio::task::spawn_blocking(move || {
+        occupied_tx.send(()).unwrap();
+        release_rx.recv_timeout(std::time::Duration::from_secs(10)).is_ok()
+    });
+    occupied_rx.await.unwrap();
+    let prepare = attempt
         .env_for(
             SandboxCommand {
                 program: "cmd.exe".into(),
@@ -506,17 +529,30 @@ fn local_env_carries_elevated_filesystem_overrides() {
             },
             /*network*/ None,
             /*environment_id*/ None,
-        )
+        );
+    tokio::pin!(prepare);
+    tokio::select! {
+        result = &mut prepare => panic!("filesystem policy must await the occupied worker: {result:?}"),
+        _ = tokio::time::sleep(std::time::Duration::from_millis(25)) => {}
+    }
+    assert!(!blocker.is_finished(), "runtime progresses while policy discovery is queued");
+    release_tx.send(()).unwrap();
+    assert!(blocker.await.unwrap());
+    let request = tokio::time::timeout(std::time::Duration::from_secs(5), prepare)
+        .await.expect("filesystem policy resolves after worker release")
         .expect("prepare local exec request");
 
     assert_eq!(
         request.windows_sandbox_filesystem_overrides,
         Some(WindowsSandboxFilesystemOverrides {
-            read_roots_override: Some(vec![docs.into_path_buf()]),
+            read_roots_override: Some(vec![docs.to_path_buf()]),
             read_roots_include_platform_defaults: false,
             write_roots_override: None,
-            additional_deny_read_paths: vec![],
+            additional_deny_read_paths: vec![secret.clone()],
             additional_deny_write_paths: vec![],
         })
     );
+    assert_eq!(std::fs::read_to_string(secret.as_path()).unwrap(), "private");
+    assert_eq!(std::fs::read_to_string(docs.join("public.txt").as_path()).unwrap(), "public");
+    });
 }

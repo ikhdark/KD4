@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicI64;
 use std::sync::atomic::Ordering;
@@ -54,7 +55,7 @@ const TURN_DELIVERY_RECEIPT_TIMEOUT: Duration = Duration::from_secs(30);
 const TURN_DELIVERY_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 #[cfg(test)]
 const WRITER_ACKNOWLEDGEMENT_TIMEOUT: Duration = Duration::from_secs(30);
-const RESOURCE_DELIVERY_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const RESOURCE_DELIVERY_TIMEOUT: Duration = Duration::from_secs(5);
 const NO_ACTIVE_AUTHORIZED_CONNECTIONS_ERROR: &str =
     "client request canceled because no active authorized connections are available";
 const NO_INITIALIZED_CONNECTIONS_ERROR: &str =
@@ -125,7 +126,7 @@ pub(crate) struct OutgoingMessageSender {
     next_server_request_id: AtomicI64,
     sender: mpsc::Sender<OutgoingEnvelope>,
     active_connections: Arc<Mutex<HashMap<ConnectionId, Arc<AtomicBool>>>>,
-    request_id_to_callback: Arc<Mutex<HashMap<RequestId, PendingCallbackEntry>>>,
+    request_id_to_callback: Arc<StdMutex<HashMap<RequestId, PendingCallbackEntry>>>,
     /// Incoming requests that are still waiting on a final response or error.
     /// We keep them here because this is where responses, errors, and
     /// disconnect cleanup all get handled.
@@ -202,10 +203,12 @@ struct PendingCallbackEntry {
     request: ServerRequest,
     /// Connections that received this request and may resolve its callback.
     connection_ids: HashSet<ConnectionId>,
+    /// Successful initial or replay publication, shared across fanout owners.
+    delivered_connection_ids: HashSet<ConnectionId>,
 }
 
 struct PendingCallbackRegistration {
-    callbacks: Arc<Mutex<HashMap<RequestId, PendingCallbackEntry>>>,
+    callbacks: Arc<StdMutex<HashMap<RequestId, PendingCallbackEntry>>>,
     request_id: Option<RequestId>,
 }
 
@@ -220,12 +223,15 @@ impl Drop for PendingCallbackRegistration {
         let Some(request_id) = self.request_id.take() else {
             return;
         };
-        let callbacks = Arc::clone(&self.callbacks);
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(async move {
-                callbacks.lock().await.remove(&request_id);
-            });
-        }
+        let removed = {
+            self.callbacks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&request_id)
+        };
+        // Drop the sender after releasing the registry mutex; cancellation must
+        // not depend on another async task or the originating runtime surviving.
+        drop(removed);
     }
 }
 
@@ -445,7 +451,7 @@ impl OutgoingMessageSender {
             next_server_request_id: AtomicI64::new(0),
             sender,
             active_connections: Arc::new(Mutex::new(HashMap::new())),
-            request_id_to_callback: Arc::new(Mutex::new(HashMap::new())),
+            request_id_to_callback: Arc::new(StdMutex::new(HashMap::new())),
             request_contexts: Mutex::new(HashMap::new()),
             component_notification_cache: Mutex::new(ComponentNotificationCache::default()),
             analytics_events_client,
@@ -487,10 +493,14 @@ impl OutgoingMessageSender {
             // later registration from authorizing only this closed connection.
             let mut active_connections = Arc::clone(&self.active_connections).lock_owned().await;
             active_connections.remove(&connection_id);
-            let mut request_id_to_callback = self.request_id_to_callback.lock().await;
+            let mut request_id_to_callback = self
+                .request_id_to_callback
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let orphaned_request_ids = request_id_to_callback
                 .iter_mut()
                 .filter_map(|(request_id, entry)| {
+                    entry.delivered_connection_ids.remove(&connection_id);
                     let was_authorized = entry.connection_ids.remove(&connection_id);
                     (was_authorized && entry.connection_ids.is_empty())
                         .then_some(request_id.clone())
@@ -575,13 +585,23 @@ impl OutgoingMessageSender {
     }
 
     #[cfg(test)]
+    pub(crate) async fn lock_request_contexts_for_test(
+        &self,
+    ) -> tokio::sync::MutexGuard<'_, HashMap<ConnectionRequestId, RequestContext>> {
+        self.request_contexts.lock().await
+    }
+
+    #[cfg(test)]
     async fn request_context_count(&self) -> usize {
         self.request_contexts.lock().await.len()
     }
 
     #[cfg(test)]
-    async fn pending_callback_count(&self) -> usize {
-        self.request_id_to_callback.lock().await.len()
+    pub(crate) async fn pending_callback_count(&self) -> usize {
+        self.request_id_to_callback
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
     }
 
     pub(crate) async fn send_request(
@@ -651,7 +671,10 @@ impl OutgoingMessageSender {
             return (outgoing_message_id, rx_approve);
         }
         {
-            let mut request_id_to_callback = self.request_id_to_callback.lock().await;
+            let mut request_id_to_callback = self
+                .request_id_to_callback
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             request_id_to_callback.insert(
                 id,
                 PendingCallbackEntry {
@@ -659,6 +682,7 @@ impl OutgoingMessageSender {
                     thread_id,
                     request: request.clone(),
                     connection_ids: authorized_connection_ids,
+                    delivered_connection_ids: HashSet::new(),
                 },
             );
         }
@@ -671,26 +695,50 @@ impl OutgoingMessageSender {
         };
         drop(active_connections);
 
-        let outgoing_message = OutgoingMessage::Request(request.clone());
         let mut send_error = None;
-        let mut sent_connection_ids = HashSet::new();
         let mut analytics_connection_id = None;
+        let delivery_deadline = tokio::time::Instant::now() + RESOURCE_DELIVERY_TIMEOUT;
         for connection_id in target_connection_ids {
-            if let Err(err) = self
-                .sender
-                .send(OutgoingEnvelope::ToConnection {
-                    connection_id,
-                    message: outgoing_message.clone(),
-                    write_complete_tx: None,
-                })
-                .await
-            {
-                send_error = Some(err);
+            let permit = tokio::select! {
+                biased;
+                _ = self.delivery_shutdown.cancelled() => {
+                    send_error = Some("request delivery was cancelled by shutdown");
+                    break;
+                }
+                result = tokio::time::timeout_at(delivery_deadline, self.sender.reserve()) => {
+                    match result {
+                        Ok(Ok(permit)) => permit,
+                        Ok(Err(_)) => {
+                            send_error = Some("request output channel is closed");
+                            break;
+                        }
+                        Err(_) => {
+                            send_error = Some("request delivery exceeded the resource delivery budget");
+                            break;
+                        }
+                    }
+                }
+            };
+            // Cancellation and recipient disconnect can remove this authority
+            // while capacity is unavailable. Publish only while it remains live,
+            // using the same synchronous callback fence as replay.
+            let mut callbacks = self
+                .request_id_to_callback
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(entry) = callbacks.get_mut(&outgoing_message_id) else {
                 break;
-            } else {
-                sent_connection_ids.insert(connection_id);
-                analytics_connection_id.get_or_insert(connection_id);
+            };
+            if !entry.connection_ids.contains(&connection_id) {
+                continue;
             }
+            entry.delivered_connection_ids.insert(connection_id);
+            permit.send(OutgoingEnvelope::ToConnection {
+                connection_id,
+                message: OutgoingMessage::Request(request.clone()),
+                write_complete_tx: None,
+            });
+            analytics_connection_id.get_or_insert(connection_id);
         }
         if let Some(connection_id) = analytics_connection_id {
             self.analytics_events_client
@@ -703,14 +751,20 @@ impl OutgoingMessageSender {
 
         if let Err(err) = send_result {
             warn!("failed to send request {outgoing_message_id:?} to client: {err:?}");
-            let mut request_id_to_callback = self.request_id_to_callback.lock().await;
-            if let Some(entry) = request_id_to_callback.get_mut(&outgoing_message_id) {
-                entry
-                    .connection_ids
-                    .retain(|connection_id| sent_connection_ids.contains(connection_id));
-            }
-            let undelivered_entry = sent_connection_ids
-                .is_empty()
+            let mut request_id_to_callback = self
+                .request_id_to_callback
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let no_remaining_recipient = request_id_to_callback
+                .get_mut(&outgoing_message_id)
+                .is_some_and(|entry| {
+                    let delivered_connection_ids = &entry.delivered_connection_ids;
+                    entry
+                        .connection_ids
+                        .retain(|connection_id| delivered_connection_ids.contains(connection_id));
+                    entry.connection_ids.is_empty()
+                });
+            let undelivered_entry = no_remaining_recipient
                 .then(|| request_id_to_callback.remove(&outgoing_message_id))
                 .flatten();
             drop(request_id_to_callback);
@@ -738,7 +792,10 @@ impl OutgoingMessageSender {
             if !is_active {
                 return;
             }
-            let request_id_to_callback = self.request_id_to_callback.lock().await;
+            let request_id_to_callback = self
+                .request_id_to_callback
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             request_id_to_callback
                 .iter()
                 .filter_map(|(request_id, entry)| {
@@ -762,11 +819,24 @@ impl OutgoingMessageSender {
                     return;
                 }
             };
-            let mut request_id_to_callback = self.request_id_to_callback.lock().await;
+            // Capacity admission can outlive a disconnect. Keep the active
+            // connection and callback authority fenced through publication.
+            let active_connections = Arc::clone(&self.active_connections).lock_owned().await;
+            if !active_connections
+                .get(&connection_id)
+                .is_some_and(|initialized| initialized.load(Ordering::Acquire))
+            {
+                return;
+            }
+            let mut request_id_to_callback = self
+                .request_id_to_callback
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let Some(entry) = request_id_to_callback.get_mut(&request_id) else {
                 continue;
             };
             entry.connection_ids.insert(connection_id);
+            entry.delivered_connection_ids.insert(connection_id);
             permit.send(OutgoingEnvelope::ToConnection {
                 connection_id,
                 message: OutgoingMessage::Request(entry.request.clone()),
@@ -842,7 +912,11 @@ impl OutgoingMessageSender {
     }
 
     pub(crate) async fn cancel_request(&self, id: &RequestId) -> bool {
-        let entry = self.remove_request_callback(id).await;
+        self.cancel_request_sync(id)
+    }
+
+    pub(crate) fn cancel_request_sync(&self, id: &RequestId) -> bool {
+        let entry = self.remove_request_callback_sync(id);
         if let Some((request_id, _entry)) = entry {
             self.analytics_events_client
                 .track_server_request_aborted(now_unix_timestamp_ms(), request_id);
@@ -854,7 +928,10 @@ impl OutgoingMessageSender {
 
     pub(crate) async fn cancel_all_requests(&self, error: Option<JSONRPCErrorError>) {
         let entries = {
-            let mut request_id_to_callback = self.request_id_to_callback.lock().await;
+            let mut request_id_to_callback = self
+                .request_id_to_callback
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             request_id_to_callback
                 .drain()
                 .map(|(_, entry)| entry)
@@ -878,7 +955,10 @@ impl OutgoingMessageSender {
         connection_id: ConnectionId,
         id: &RequestId,
     ) -> TakeCallbackResult {
-        let mut request_id_to_callback = self.request_id_to_callback.lock().await;
+        let mut request_id_to_callback = self
+            .request_id_to_callback
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(entry) = request_id_to_callback.get(id) else {
             return TakeCallbackResult::Missing;
         };
@@ -891,11 +971,14 @@ impl OutgoingMessageSender {
         }
     }
 
-    async fn remove_request_callback(
+    fn remove_request_callback_sync(
         &self,
         id: &RequestId,
     ) -> Option<(RequestId, PendingCallbackEntry)> {
-        self.request_id_to_callback.lock().await.remove_entry(id)
+        self.request_id_to_callback
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove_entry(id)
     }
 
     #[cfg(test)]
@@ -903,7 +986,10 @@ impl OutgoingMessageSender {
         &self,
         thread_id: ThreadId,
     ) -> Vec<ServerRequest> {
-        let request_id_to_callback = self.request_id_to_callback.lock().await;
+        let request_id_to_callback = self
+            .request_id_to_callback
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut requests = request_id_to_callback
             .values()
             .filter_map(|entry| {
@@ -920,7 +1006,10 @@ impl OutgoingMessageSender {
         error: Option<JSONRPCErrorError>,
     ) {
         let entries = {
-            let mut request_id_to_callback = self.request_id_to_callback.lock().await;
+            let mut request_id_to_callback = self
+                .request_id_to_callback
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let request_ids = request_id_to_callback
                 .iter()
                 .filter_map(|(request_id, entry)| {
@@ -976,6 +1065,92 @@ impl OutgoingMessageSender {
     ) {
         self.send_response_as_inner(request_id, response, /*thread_originator*/ None)
             .await;
+    }
+
+    /// Prepare a resume response before acquiring its listener-generation fence.
+    /// The commit guard is retained through synchronous enqueue, so neither
+    /// metadata contention nor transport backpressure pins the thread state.
+    pub(crate) async fn send_resume_response_with_commit<G>(
+        &self,
+        request_id: ConnectionRequestId,
+        response: codex_app_server_protocol::ThreadResumeResponse,
+        thread_originator: String,
+        commit: impl std::future::Future<Output = std::result::Result<Option<G>, JSONRPCErrorError>>,
+    ) -> bool {
+        let serialized = ClientResponsePayload::from(response)
+            .into_jsonrpc_parts_and_payload(request_id.request_id.clone());
+        let (id, result, analytics_response) = match serialized {
+            Ok(parts) => parts,
+            Err(error) => {
+                self.send_error(
+                    request_id,
+                    internal_error(format!("failed to serialize response: {error}")),
+                )
+                .await;
+                return false;
+            }
+        };
+        let request_context = self.take_request_context(&request_id).await;
+        let reserve = async {
+            tokio::select! {
+                biased;
+                _ = self.delivery_shutdown.cancelled() => None,
+                result = tokio::time::timeout(RESOURCE_DELIVERY_TIMEOUT, self.sender.reserve()) => {
+                    match result {
+                        Ok(Ok(permit)) => Some(permit),
+                        Ok(Err(error)) => {
+                            warn!("failed to reserve resume response capacity: {error:?}");
+                            None
+                        }
+                        Err(_) => {
+                            warn!(connection_id = ?request_id.connection_id,
+                                "timed out enqueueing resume response");
+                            None
+                        }
+                    }
+                }
+            }
+        };
+        let permit = if let Some(context) = request_context {
+            reserve.instrument(context.span()).await
+        } else {
+            reserve.await
+        };
+        let Some(permit) = permit else {
+            return false;
+        };
+        let commit_result = tokio::select! {
+            biased;
+            _ = self.delivery_shutdown.cancelled() => return false,
+            result = commit => result,
+        };
+        let (message, guard) = match commit_result {
+            Ok(Some(guard)) => {
+                if let Some(response) = analytics_response {
+                    self.analytics_events_client
+                        .track_response_with_thread_originator(
+                            request_id.connection_id.0,
+                            request_id.request_id,
+                            response,
+                            thread_originator,
+                        );
+                }
+                (
+                    OutgoingMessage::Response(OutgoingResponse { id, result }),
+                    Some(guard),
+                )
+            }
+            Ok(None) => return false,
+            Err(error) => (OutgoingMessage::Error(OutgoingError { id, error }), None),
+        };
+        let committed = guard.is_some();
+        permit.send(OutgoingEnvelope::ToConnection {
+            connection_id: request_id.connection_id,
+            message,
+            write_complete_tx: None,
+        });
+        drop(guard);
+        committed
     }
 
     async fn send_response_as_inner(
@@ -2480,10 +2655,10 @@ mod tests {
         );
     }
 
-    // This test deliberately holds the callback-map lock across scheduler yields
-    // to force the registration/disconnect interleaving it verifies.
-    #[allow(clippy::await_holding_invalid_type)]
-    #[tokio::test]
+    // The test thread holds the callback map while a separate runtime worker
+    // enters registration. A second worker remains available for disconnect.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn explicit_request_registration_is_atomic_with_disconnect_cleanup() {
         let (tx, _rx) = mpsc::channel::<OutgoingEnvelope>(4);
         let outgoing = Arc::new(OutgoingMessageSender::new(
@@ -2503,7 +2678,10 @@ mod tests {
                 thread_id,
             );
 
-        let callback_guard = outgoing.request_id_to_callback.lock().await;
+        let callback_guard = outgoing
+            .request_id_to_callback
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let send_task = tokio::spawn(async move {
             thread_outgoing
                 .send_request(ServerRequestPayload::DynamicToolCall(
@@ -2518,7 +2696,13 @@ mod tests {
                 ))
                 .await
         });
-        tokio::task::yield_now().await;
+        timeout(Duration::from_secs(1), async {
+            while outgoing.active_connections.try_lock().is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("registration enters active-to-callback critical section");
         assert!(
             outgoing.active_connections.try_lock().is_err(),
             "request registration must retain the active-connection snapshot lock",
@@ -2808,6 +2992,296 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn initial_request_delivery_never_publishes_a_canceled_callback_after_backpressure() {
+        verify_initial_request_delivery_failure(/*cancel_before_capacity*/ true).await;
+    }
+
+    #[tokio::test]
+    async fn initial_request_delivery_budget_releases_callback_without_draining_transport() {
+        verify_initial_request_delivery_failure(/*cancel_before_capacity*/ false).await;
+    }
+
+    async fn verify_initial_request_delivery_failure(cancel_before_capacity: bool) {
+        let (tx, mut rx) = mpsc::channel::<OutgoingEnvelope>(1);
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            tx,
+            codex_analytics::AnalyticsEventsClient::disabled(),
+        ));
+        let connection_id = ConnectionId(64);
+        outgoing
+            .connection_opened(connection_id, Arc::new(AtomicBool::new(true)))
+            .await;
+        let thread_id = ThreadId::new();
+        outgoing
+            .send_server_notification(ServerNotification::ThreadClosed(
+                codex_app_server_protocol::ThreadClosedNotification {
+                    thread_id: "transport-capacity-sentinel".to_string(),
+                },
+            ))
+            .await;
+        let request = ServerRequestPayload::DynamicToolCall(DynamicToolCallParams {
+            thread_id: thread_id.to_string(),
+            turn_id: "turn-initial-delivery".to_string(),
+            call_id: "call-initial-delivery".to_string(),
+            namespace: None,
+            tool: "test_tool".to_string(),
+            arguments: json!({"must_not_be_delivered": true}),
+        });
+        let send_outgoing = Arc::clone(&outgoing);
+        let send_task = tokio::spawn(async move {
+            send_outgoing
+                .send_request_to_connections(Some(&[connection_id]), request, Some(thread_id))
+                .await
+        });
+        timeout(Duration::from_secs(1), async {
+            while outgoing.pending_callback_count().await != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("normal request registration must precede capacity admission");
+        assert!(
+            !send_task.is_finished(),
+            "actual output queue must block delivery"
+        );
+        let expected_error = if cancel_before_capacity {
+            let error = internal_error("thread request was canceled before delivery");
+            outgoing
+                .cancel_requests_for_thread(thread_id, Some(error.clone()))
+                .await;
+            assert_eq!(outgoing.pending_callback_count().await, 0);
+            rx.recv().await.expect("remove the capacity sentinel");
+            error
+        } else {
+            internal_error(ALL_AUTHORIZED_CONNECTION_SENDS_FAILED_ERROR)
+        };
+        let (_, result) = timeout(Duration::from_secs(7), send_task)
+            .await
+            .expect("delivery must terminate even while transport remains full")
+            .expect("request delivery task must not panic");
+        assert_eq!(
+            result.await.expect("callback reports the failure"),
+            Err(expected_error)
+        );
+        assert_eq!(outgoing.pending_callback_count().await, 0);
+        if !cancel_before_capacity {
+            assert_eq!(
+                rx.len(),
+                1,
+                "capacity sentinel remains queued throughout the budget"
+            );
+            rx.recv()
+                .await
+                .expect("remove the original capacity sentinel");
+        }
+        assert!(
+            matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+            "neither cancellation nor delivery timeout may emit a stale request"
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_request_delivery_timeout_releases_callback_after_delivered_peer_disconnects() {
+        let (tx, mut rx) = mpsc::channel::<OutgoingEnvelope>(1);
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            tx,
+            codex_analytics::AnalyticsEventsClient::disabled(),
+        ));
+        let first = ConnectionId(65);
+        let second = ConnectionId(66);
+        for connection_id in [first, second] {
+            outgoing
+                .connection_opened(connection_id, Arc::new(AtomicBool::new(true)))
+                .await;
+        }
+        let thread_id = ThreadId::new();
+        let request = ServerRequestPayload::DynamicToolCall(DynamicToolCallParams {
+            thread_id: thread_id.to_string(),
+            turn_id: "turn-partial-disconnect".to_string(),
+            call_id: "call-partial-disconnect".to_string(),
+            namespace: None,
+            tool: "test_tool".to_string(),
+            arguments: json!({}),
+        });
+        let send_outgoing = Arc::clone(&outgoing);
+        let send_task = tokio::spawn(async move {
+            send_outgoing
+                .send_request_to_connections(Some(&[first, second]), request, Some(thread_id))
+                .await
+        });
+        timeout(Duration::from_secs(1), async {
+            while rx.len() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first recipient delivery must fill the actual output queue");
+        outgoing.connection_closed(first).await;
+        assert_eq!(outgoing.pending_callback_count().await, 1);
+        let (_, result) = timeout(Duration::from_secs(7), send_task)
+            .await
+            .expect("second recipient delivery must exhaust its budget")
+            .expect("delivery owner must not panic");
+        assert_eq!(
+            result
+                .await
+                .expect("removed final authority must resolve callback"),
+            Err(internal_error(ALL_AUTHORIZED_CONNECTION_SENDS_FAILED_ERROR))
+        );
+        assert_eq!(outgoing.pending_callback_count().await, 0);
+        assert!(matches!(
+            rx.recv().await,
+            Some(OutgoingEnvelope::ToConnection { connection_id, .. }) if connection_id == first
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn initial_delivery_timeout_preserves_a_concurrently_replayed_recipient() {
+        verify_initial_delivery_replay_authority(false).await;
+        verify_initial_delivery_replay_authority(true).await;
+    }
+
+    async fn verify_initial_delivery_replay_authority(replay_original_target: bool) {
+        let (tx, mut rx) = mpsc::channel::<OutgoingEnvelope>(1);
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            tx,
+            codex_analytics::AnalyticsEventsClient::disabled(),
+        ));
+        let first = ConnectionId(67);
+        let second = ConnectionId(68);
+        let last = ConnectionId(70);
+        let replayed = if replay_original_target {
+            last
+        } else {
+            ConnectionId(69)
+        };
+        for connection_id in [first, second, replayed, last] {
+            outgoing
+                .connection_opened(connection_id, Arc::new(AtomicBool::new(true)))
+                .await;
+        }
+        let thread_id = ThreadId::new();
+        let request = ServerRequestPayload::DynamicToolCall(DynamicToolCallParams {
+            thread_id: thread_id.to_string(),
+            turn_id: "turn-concurrent-replay".to_string(),
+            call_id: "call-concurrent-replay".to_string(),
+            namespace: None,
+            tool: "test_tool".to_string(),
+            arguments: json!({}),
+        });
+        let targets = [first, second, last];
+        let mut initial = Box::pin(outgoing.send_request_to_connections(
+            Some(&targets),
+            request,
+            Some(thread_id),
+        ));
+        assert!(futures::poll!(initial.as_mut()).is_pending());
+        let mut replay =
+            Box::pin(outgoing.replay_requests_to_connection_for_thread(replayed, thread_id, true));
+        assert!(futures::poll!(replay.as_mut()).is_pending());
+        assert!(matches!(
+            rx.recv().await,
+            Some(OutgoingEnvelope::ToConnection { connection_id, .. }) if connection_id == first
+        ));
+        assert!(futures::poll!(initial.as_mut()).is_pending());
+        assert!(matches!(
+            rx.recv().await,
+            Some(OutgoingEnvelope::ToConnection { connection_id, .. }) if connection_id == second
+        ));
+        timeout(Duration::from_secs(1), replay)
+            .await
+            .expect("normal replay must publish before the final initial target");
+        outgoing.connection_closed(first).await;
+        outgoing.connection_closed(second).await;
+        let (request_id, result) = timeout(Duration::from_secs(7), initial)
+            .await
+            .expect("last initial target remains blocked until delivery timeout");
+        assert_eq!(outgoing.pending_callback_count().await, 1);
+        assert!(matches!(
+            rx.recv().await,
+            Some(OutgoingEnvelope::ToConnection { connection_id, .. }) if connection_id == replayed
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        let expected = json!({"contentItems": [], "success": true});
+        outgoing
+            .notify_client_response(replayed, request_id, expected.clone())
+            .await;
+        assert_eq!(
+            result
+                .await
+                .expect("replayed recipient retains callback authority"),
+            Ok(expected)
+        );
+        assert_eq!(outgoing.pending_callback_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn replay_does_not_resurrect_recipient_disconnected_during_capacity_wait() {
+        let (tx, mut rx) = mpsc::channel::<OutgoingEnvelope>(1);
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            tx,
+            codex_analytics::AnalyticsEventsClient::disabled(),
+        ));
+        let original = ConnectionId(71);
+        let replayed = ConnectionId(72);
+        for connection_id in [original, replayed] {
+            outgoing
+                .connection_opened(connection_id, Arc::new(AtomicBool::new(true)))
+                .await;
+        }
+        let thread_id = ThreadId::new();
+        let (request_id, result) = outgoing
+            .send_request_to_connections(
+                Some(&[original]),
+                ServerRequestPayload::DynamicToolCall(DynamicToolCallParams {
+                    thread_id: thread_id.to_string(),
+                    turn_id: "turn-replay-disconnect".to_string(),
+                    call_id: "call-replay-disconnect".to_string(),
+                    namespace: None,
+                    tool: "test_tool".to_string(),
+                    arguments: json!({}),
+                }),
+                Some(thread_id),
+            )
+            .await;
+        let mut replay =
+            Box::pin(outgoing.replay_requests_to_connection_for_thread(replayed, thread_id, true));
+        assert!(futures::poll!(replay.as_mut()).is_pending());
+        outgoing.connection_closed(replayed).await;
+        assert!(matches!(
+            rx.recv().await,
+            Some(OutgoingEnvelope::ToConnection { connection_id, .. }) if connection_id == original
+        ));
+        timeout(Duration::from_secs(1), replay)
+            .await
+            .expect("closed replay finishes");
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        outgoing
+            .notify_client_response(replayed, request_id.clone(), json!({"stale": true}))
+            .await;
+        assert_eq!(outgoing.pending_callback_count().await, 1);
+        let expected = json!({"contentItems": [], "success": true});
+        outgoing
+            .notify_client_response(original, request_id, expected.clone())
+            .await;
+        assert_eq!(
+            result.await.expect("original recipient remains live"),
+            Ok(expected)
+        );
+        assert_eq!(outgoing.pending_callback_count().await, 0);
+    }
+
+    #[tokio::test]
     async fn canceled_multi_connection_send_removes_registered_callback() {
         let (tx, _rx) = mpsc::channel::<OutgoingEnvelope>(1);
         let outgoing = Arc::new(OutgoingMessageSender::new(
@@ -2857,6 +3331,72 @@ mod tests {
         })
         .await
         .expect("canceled send should remove its request callback");
+    }
+
+    #[test]
+    fn canceled_send_after_runtime_shutdown_removes_callback_and_prevents_replay() {
+        use std::future::Future;
+        use std::task::Poll;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("create originating runtime");
+        let (tx, mut rx) = mpsc::channel::<OutgoingEnvelope>(1);
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            tx,
+            codex_analytics::AnalyticsEventsClient::disabled(),
+        ));
+        let connections = [ConnectionId(61), ConnectionId(62)];
+        let thread_id = ThreadId::new();
+        runtime.block_on(async {
+            for connection_id in connections {
+                outgoing
+                    .connection_opened(connection_id, Arc::new(AtomicBool::new(true)))
+                    .await;
+            }
+        });
+        let mut send = Box::pin(outgoing.send_request_to_connections(
+            Some(&connections),
+            ServerRequestPayload::AttestationGenerate(AttestationGenerateParams {}),
+            Some(thread_id),
+        ));
+        runtime.block_on(std::future::poll_fn(|cx| {
+            assert!(
+                send.as_mut().poll(cx).is_pending(),
+                "the second recipient must wait behind the full delivery queue"
+            );
+            Poll::Ready(())
+        }));
+        assert_eq!(runtime.block_on(outgoing.pending_callback_count()), 1);
+        let delivered = rx
+            .try_recv()
+            .expect("first recipient should receive request");
+        assert!(matches!(
+            delivered,
+            OutgoingEnvelope::ToConnection {
+                message: OutgoingMessage::Request(_),
+                ..
+            }
+        ));
+
+        drop(runtime);
+        drop(send);
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("create reconnect runtime");
+        runtime.block_on(async {
+            assert_eq!(outgoing.pending_callback_count().await, 0);
+            outgoing
+                .replay_requests_to_connection_for_thread(connections[0], thread_id, true)
+                .await;
+        });
+        assert!(
+            matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+            "a canceled request must not be replayed after reconnect"
+        );
     }
 
     #[tokio::test]

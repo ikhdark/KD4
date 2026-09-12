@@ -110,7 +110,17 @@ impl ChildTerminator for RawPidTerminator {
     }
 }
 
+#[cfg(all(test, windows))]
+thread_local! {
+    static TEST_PTY_SYSTEM: std::cell::RefCell<Option<Box<dyn portable_pty::PtySystem + Send>>> =
+        std::cell::RefCell::new(None);
+}
+
 fn platform_native_pty_system() -> Box<dyn portable_pty::PtySystem + Send> {
+    #[cfg(all(test, windows))]
+    if let Some(system) = TEST_PTY_SYSTEM.with(|system| system.borrow_mut().take()) {
+        return system;
+    }
     #[cfg(windows)]
     {
         Box::new(crate::win::ConPtySystem::default())
@@ -119,6 +129,33 @@ fn platform_native_pty_system() -> Box<dyn portable_pty::PtySystem + Send> {
     {
         native_pty_system()
     }
+}
+
+// Keep the receiver asynchronous so aborting the owning ProcessHandle drops the
+// queue even when external sender clones remain. At most one native write is in
+// flight; terminating/releasing the process closes its PTY and releases that write.
+fn spawn_pty_writer<W>(mut writer: W, mut receiver: mpsc::Receiver<Vec<u8>>) -> JoinHandle<()>
+where
+    W: std::io::Write + Send + 'static,
+{
+    tokio::spawn(async move {
+        #[cfg(windows)]
+        let mut windows_input = crate::WindowsTtyInputNormalizer::default();
+        while let Some(bytes) = receiver.recv().await {
+            #[cfg(windows)]
+            let bytes = windows_input.normalize(&bytes);
+            let result = tokio::task::spawn_blocking(move || {
+                let result = writer.write_all(&bytes).and_then(|()| writer.flush());
+                (writer, result)
+            })
+            .await;
+            match result {
+                Ok((returned_writer, Ok(()))) => writer = returned_writer,
+                // A closed or broken input must close the queue, not retain more input.
+                Ok((_, Err(_))) | Err(_) => break,
+            }
+        }
+    })
 }
 
 /// Spawn a process attached to a PTY, returning handles for stdin, split output, and exit.
@@ -171,6 +208,9 @@ async fn spawn_process_portable(
     let pty_system = platform_native_pty_system();
     let pair = pty_system.openpty(size.into())?;
     let portable_pty::PtyPair { master, slave } = pair;
+    // Complete fallible descriptor setup before starting a child or reader task.
+    let mut reader = master.try_clone_reader()?;
+    let writer = master.take_writer()?;
 
     let mut command_builder = CommandBuilder::new(arg0.as_ref().unwrap_or(&program.to_string()));
     command_builder.cwd(cwd);
@@ -199,10 +239,9 @@ async fn spawn_process_portable(
 
     let killer = child.clone_killer();
 
-    let (writer_tx, mut writer_rx) = mpsc::channel::<Vec<u8>>(128);
+    let (writer_tx, writer_rx) = mpsc::channel::<Vec<u8>>(128);
     let (stdout_tx, stdout_rx) = mpsc::channel::<Vec<u8>>(128);
     let (_stderr_tx, stderr_rx) = mpsc::channel::<Vec<u8>>(1);
-    let mut reader = master.try_clone_reader()?;
     let reader_handle: JoinHandle<()> = tokio::task::spawn_blocking(move || {
         let mut buf = [0u8; 8_192];
         loop {
@@ -221,23 +260,7 @@ async fn spawn_process_portable(
         }
     });
 
-    let writer = master.take_writer()?;
-    let writer = Arc::new(tokio::sync::Mutex::new(writer));
-    let writer_handle: JoinHandle<()> = tokio::spawn({
-        let writer = Arc::clone(&writer);
-        async move {
-            #[cfg(windows)]
-            let mut windows_input = crate::WindowsTtyInputNormalizer::default();
-            while let Some(bytes) = writer_rx.recv().await {
-                #[cfg(windows)]
-                let bytes = windows_input.normalize(&bytes);
-                let mut guard = writer.lock().await;
-                use std::io::Write;
-                let _ = guard.write_all(&bytes);
-                let _ = guard.flush();
-            }
-        }
-    });
+    let writer_handle = spawn_pty_writer(writer, writer_rx);
 
     let (exit_tx, exit_rx) = oneshot::channel::<i32>();
     let exit_status = Arc::new(AtomicBool::new(false));
@@ -344,13 +367,13 @@ async fn spawn_process_preserving_fds(
     // Finish all fallible parent-side PTY setup before spawning so an error
     // cannot leave a live child without a ProcessHandle.
     let mut reader = master.try_clone()?;
-    let writer = Arc::new(tokio::sync::Mutex::new(master.try_clone()?));
+    let writer = master.try_clone()?;
 
     let mut child = command.spawn()?;
     drop(slave);
     let process_group_id = child.id();
 
-    let (writer_tx, mut writer_rx) = mpsc::channel::<Vec<u8>>(128);
+    let (writer_tx, writer_rx) = mpsc::channel::<Vec<u8>>(128);
     let (stdout_tx, stdout_rx) = mpsc::channel::<Vec<u8>>(128);
     let (_stderr_tx, stderr_rx) = mpsc::channel::<Vec<u8>>(1);
     let reader_handle: JoinHandle<()> = tokio::task::spawn_blocking(move || {
@@ -371,17 +394,7 @@ async fn spawn_process_preserving_fds(
         }
     });
 
-    let writer_handle: JoinHandle<()> = tokio::spawn({
-        let writer = Arc::clone(&writer);
-        async move {
-            while let Some(bytes) = writer_rx.recv().await {
-                let mut guard = writer.lock().await;
-                use std::io::Write;
-                let _ = guard.write_all(&bytes);
-                let _ = guard.flush();
-            }
-        }
-    });
+    let writer_handle = spawn_pty_writer(writer, writer_rx);
 
     let (exit_tx, exit_rx) = oneshot::channel::<i32>();
     let exit_status = Arc::new(AtomicBool::new(false));
@@ -488,6 +501,68 @@ mod pty_fd_tests {
 
     use super::configure_owned_pty_files;
 
+    #[cfg(windows)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn public_pty_descriptor_failure_does_not_spawn_child() -> anyhow::Result<()> {
+        struct PreparedSystem(std::sync::Mutex<Option<portable_pty::PtyPair>>);
+        impl portable_pty::PtySystem for PreparedSystem {
+            fn openpty(&self, _: portable_pty::PtySize) -> anyhow::Result<portable_pty::PtyPair> {
+                Ok(self.0.lock().unwrap().take().expect("one native pair"))
+            }
+        }
+        struct ObservedSlave {
+            native: Box<dyn portable_pty::SlavePty + Send>,
+            spawn_count: Arc<AtomicUsize>,
+        }
+        impl portable_pty::SlavePty for ObservedSlave {
+            fn spawn_command(
+                &self,
+                command: portable_pty::CommandBuilder,
+            ) -> anyhow::Result<Box<dyn portable_pty::Child + Send + Sync>> {
+                self.spawn_count.fetch_add(1, Ordering::SeqCst);
+                self.native.spawn_command(command)
+            }
+        }
+
+        let size = super::TerminalSize::default();
+        let pair = super::platform_native_pty_system().openpty(size.into())?;
+        // Create a real native descriptor-acquisition failure, not an injected result.
+        drop(pair.master.take_writer()?);
+        let spawn_count = Arc::new(AtomicUsize::new(0));
+        let pair = portable_pty::PtyPair {
+            master: pair.master,
+            slave: Box::new(ObservedSlave {
+                native: pair.slave,
+                spawn_count: Arc::clone(&spawn_count),
+            }),
+        };
+        super::TEST_PTY_SYSTEM.with(|system| {
+            *system.borrow_mut() =
+                Some(Box::new(PreparedSystem(std::sync::Mutex::new(Some(pair)))));
+        });
+        let result = super::spawn_process(
+            "cmd.exe",
+            &["/D".to_string(), "/C".to_string(), "exit 0".to_string()],
+            &std::env::current_dir()?,
+            &std::env::vars().collect(),
+            &None,
+            size,
+        )
+        .await;
+        let error = match result {
+            Ok(_) => anyhow::bail!("consumed native writer unexpectedly allowed process setup"),
+            Err(error) => error,
+        };
+        assert_eq!(error.to_string(), "writer already taken");
+        assert_eq!(
+            spawn_count.load(Ordering::SeqCst),
+            0,
+            "descriptor failure must precede any native child creation"
+        );
+        assert!(super::TEST_PTY_SYSTEM.with(|system| system.borrow().is_none()));
+        Ok(())
+    }
+
     struct TrackedDescriptor {
         drop_count: Arc<AtomicUsize>,
     }
@@ -496,6 +571,102 @@ mod pty_fd_tests {
         fn drop(&mut self) {
             self.drop_count.fetch_add(1, Ordering::SeqCst);
         }
+    }
+
+    struct ControlledWriter {
+        entered: Option<tokio::sync::oneshot::Sender<()>>,
+        release: std::sync::mpsc::Receiver<()>,
+        output: Arc<std::sync::Mutex<Vec<u8>>>,
+        dropped: Option<tokio::sync::oneshot::Sender<()>>,
+    }
+
+    impl std::io::Write for ControlledWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if let Some(entered) = self.entered.take() {
+                let _ = entered.send(());
+                self.release
+                    .recv_timeout(std::time::Duration::from_secs(3))
+                    .map_err(std::io::Error::other)?;
+            }
+            self.output.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.output.lock().unwrap().push(b'|');
+            Ok(())
+        }
+    }
+
+    impl Drop for ControlledWriter {
+        fn drop(&mut self) {
+            if let Some(dropped) = self.dropped.take() {
+                let _ = dropped.send(());
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pty_writer_keeps_executor_responsive_and_preserves_order() {
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let output = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        let handle = super::spawn_pty_writer(
+            ControlledWriter {
+                entered: Some(entered_tx),
+                release: release_rx,
+                output: Arc::clone(&output),
+                dropped: Some(dropped_tx),
+            },
+            receiver,
+        );
+        let started = std::time::Instant::now();
+        sender.send(b"first".to_vec()).await.unwrap();
+        entered_rx.await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert!(output.lock().unwrap().is_empty());
+        release_tx.send(()).unwrap();
+        sender.send(b"second".to_vec()).await.unwrap();
+        drop(sender);
+        tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .unwrap()
+            .unwrap();
+        dropped_rx.await.unwrap();
+        assert_eq!(output.lock().unwrap().as_slice(), b"first|second|");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pty_writer_abort_closes_queue_and_releases_inflight_writer() {
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let output = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        let handle = super::spawn_pty_writer(
+            ControlledWriter {
+                entered: Some(entered_tx),
+                release: release_rx,
+                output: Arc::clone(&output),
+                dropped: Some(dropped_tx),
+            },
+            receiver,
+        );
+        sender.send(b"inflight".to_vec()).await.unwrap();
+        entered_rx.await.unwrap();
+        sender.send(b"must not write".to_vec()).await.unwrap();
+        handle.abort();
+        assert!(handle.await.unwrap_err().is_cancelled());
+        assert!(sender.send(b"late".to_vec()).await.is_err());
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), dropped_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(output.lock().unwrap().as_slice(), b"inflight|");
     }
 
     #[test]

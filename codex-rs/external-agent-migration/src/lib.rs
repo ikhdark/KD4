@@ -2184,13 +2184,44 @@ Review carefully."""
         fs::create_dir_all(&source_hooks).expect("create source hooks");
         fs::create_dir_all(&target_hooks).expect("create target hooks");
         fs::write(source_hooks.join("check.py"), "new script").expect("write source hook");
+        fs::write(source_hooks.join("added.py"), "added script").expect("write added hook");
         fs::write(target_hooks.join("check.py"), "existing script").expect("write target hook");
+        fs::write(
+            source_external_agent_dir.join("settings.json"),
+            r#"{"hooks":{"SessionStart":[{"matcher":"startup","hooks":[{"type":"command","command":"python3 .claude/hooks/check.py"}]}]}}"#,
+        )
+        .expect("write source settings");
 
-        copy_hook_scripts(&source_external_agent_dir, &target_config_dir).expect("copy hooks");
+        let target_config = target_config_dir.join("hooks.json");
+        assert!(import_hooks(&source_external_agent_dir, &target_config).expect("import hooks"));
 
         assert_eq!(
             fs::read_to_string(target_hooks.join("check.py")).expect("read target hook"),
             "existing script"
+        );
+        assert_eq!(
+            fs::read_to_string(target_hooks.join("added.py")).expect("read added hook"),
+            "added script"
+        );
+        let config_bytes = fs::read(&target_config).expect("read imported config");
+        let config: JsonValue =
+            serde_json::from_slice(&config_bytes).expect("parse imported config");
+        assert_eq!(
+            config,
+            serde_json::json!({
+                "hooks": {"SessionStart": [{
+                    "matcher": "startup",
+                    "hooks": [{
+                        "type": "command",
+                        "command": format!("python3 '{}'", target_hooks.join("check.py").display())
+                    }]
+                }]}
+            })
+        );
+        assert!(!import_hooks(&source_external_agent_dir, &target_config).expect("repeat import"));
+        assert_eq!(
+            fs::read(&target_config).expect("read unchanged config"),
+            config_bytes
         );
     }
 

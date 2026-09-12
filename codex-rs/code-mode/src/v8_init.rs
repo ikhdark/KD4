@@ -66,11 +66,21 @@ impl V8JitMode {
 
 #[cfg(test)]
 mod tests {
+    use super::V8JitMode;
+    use super::ensure_v8_initialized;
+    use super::initialize_v8;
     use pretty_assertions::assert_eq;
 
     #[test]
-    fn exposes_embedded_v8_version() {
-        assert!(!v8::V8::get_version().is_empty());
+    fn initialization_preserves_mode_after_conflicting_request() {
+        assert_eq!(initialize_v8(V8JitMode::Enabled), Ok(()));
+        assert_eq!(initialize_v8(V8JitMode::Enabled), Ok(()));
+        assert_eq!(
+            initialize_v8(V8JitMode::Disabled),
+            Err("V8 was already initialized with JIT enabled".to_string())
+        );
+        assert_eq!(ensure_v8_initialized(), Ok(()));
+        assert_eq!(initialize_v8(V8JitMode::Enabled), Ok(()));
     }
 
     #[test]

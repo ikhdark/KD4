@@ -22,7 +22,6 @@ use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ExecApprovalRequestEvent;
 use codex_protocol::protocol::Op;
-use codex_protocol::protocol::Submission;
 use codex_protocol::protocol::SurfacedToolResult;
 use codex_protocol::protocol::TurnCompleteEvent;
 use codex_protocol::user_input::UserInput;
@@ -33,6 +32,13 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
+
+#[derive(Clone)]
+pub struct RunningRequest {
+    pub(crate) thread_id: ThreadId,
+    pub(crate) turn_id: String,
+    pub(crate) cancellation: CancellationToken,
+}
 
 /// To adhere to MCP `tools/call` response format, include the Codex
 /// `threadId` in the `structured_content` field of the response.
@@ -139,7 +145,7 @@ pub async fn run_codex_tool_session(
     config: CodexConfig,
     outgoing: Arc<OutgoingMessageSender>,
     thread_manager: Arc<ThreadManager>,
-    running_requests_id_to_codex_uuid: Arc<Mutex<HashMap<RequestId, ThreadId>>>,
+    running_requests_id_to_codex_uuid: Arc<Mutex<HashMap<RequestId, RunningRequest>>>,
 ) {
     let NewThread {
         thread_id,
@@ -176,28 +182,31 @@ pub async fn run_codex_tool_session(
     // any events emitted for this tool-call can be correlated with the
     // originating `tools/call` request.
     let sub_id = id.to_string();
+    let request = RunningRequest {
+        thread_id,
+        turn_id: sub_id.clone(),
+        cancellation: CancellationToken::new(),
+    };
     running_requests_id_to_codex_uuid
         .lock()
         .await
-        .insert(id.clone(), thread_id);
-    let submission = Submission {
-        id: sub_id.clone(),
-        op: Op::UserInput {
-            items: vec![UserInput::Text {
-                text: initial_prompt.clone(),
-                // MCP tool prompts are plain text with no UI element ranges.
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        },
-        client_user_message_id: None,
-        trace: None,
+        .insert(id.clone(), request.clone());
+    let submission = Op::UserInput {
+        items: vec![UserInput::Text {
+            text: initial_prompt.clone(),
+            // MCP tool prompts are plain text with no UI element ranges.
+            text_elements: Vec::new(),
+        }],
+        final_output_json_schema: None,
+        responsesapi_client_metadata: None,
+        additional_context: Default::default(),
+        thread_settings: Default::default(),
     };
 
-    if let Err(e) = thread.submit_with_id(submission).await {
+    if let Err(e) = thread
+        .submit_user_input_with_reserved_turn_id(sub_id, submission, None, None)
+        .await
+    {
         tracing::error!("Failed to submit initial prompt: {e}");
         let result = create_call_tool_result_with_thread_id(
             thread_id,
@@ -208,6 +217,9 @@ pub async fn run_codex_tool_session(
         // unregister the id so we don't keep it in the map
         running_requests_id_to_codex_uuid.lock().await.remove(&id);
         return;
+    }
+    if request.cancellation.is_cancelled() {
+        thread.interrupt_turn_if_active(&request.turn_id).await;
     }
 
     run_codex_tool_session_inner(
@@ -226,24 +238,34 @@ pub async fn run_codex_tool_session_reply(
     outgoing: Arc<OutgoingMessageSender>,
     request_id: RequestId,
     prompt: String,
-    running_requests_id_to_codex_uuid: Arc<Mutex<HashMap<RequestId, ThreadId>>>,
+    running_requests_id_to_codex_uuid: Arc<Mutex<HashMap<RequestId, RunningRequest>>>,
 ) {
+    let request = RunningRequest {
+        thread_id,
+        turn_id: thread.reserve_turn_id(),
+        cancellation: CancellationToken::new(),
+    };
     running_requests_id_to_codex_uuid
         .lock()
         .await
-        .insert(request_id.clone(), thread_id);
+        .insert(request_id.clone(), request.clone());
     if let Err(e) = thread
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: prompt,
-                // MCP tool prompts are plain text with no UI element ranges.
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .submit_user_input_with_reserved_turn_id(
+            request.turn_id.clone(),
+            Op::UserInput {
+                items: vec![UserInput::Text {
+                    text: prompt,
+                    // MCP tool prompts are plain text with no UI element ranges.
+                    text_elements: Vec::new(),
+                }],
+                final_output_json_schema: None,
+                responsesapi_client_metadata: None,
+                additional_context: Default::default(),
+                thread_settings: Default::default(),
+            },
+            None,
+            None,
+        )
         .await
     {
         tracing::error!("Failed to submit user input: {e}");
@@ -259,6 +281,9 @@ pub async fn run_codex_tool_session_reply(
             .await
             .remove(&request_id);
         return;
+    }
+    if request.cancellation.is_cancelled() {
+        thread.interrupt_turn_if_active(&request.turn_id).await;
     }
 
     run_codex_tool_session_inner(
@@ -276,10 +301,11 @@ async fn run_codex_tool_session_inner(
     thread: Arc<CodexThread>,
     outgoing: Arc<OutgoingMessageSender>,
     request_id: RequestId,
-    running_requests_id_to_codex_uuid: Arc<Mutex<HashMap<RequestId, ThreadId>>>,
+    running_requests_id_to_codex_uuid: Arc<Mutex<HashMap<RequestId, RunningRequest>>>,
 ) {
     let request_id_str = request_id.to_string();
     let elicitation_cancellation = CancellationToken::new();
+    let _elicitation_drop_guard = elicitation_cancellation.clone().drop_guard();
 
     // Stream events until the task needs to pause for user interaction or
     // completes.
@@ -328,6 +354,7 @@ async fn run_codex_tool_session_inner(
                             approval_id,
                             parsed_cmd,
                             thread_id,
+                            elicitation_cancellation.clone(),
                         )
                         .await;
                         continue;
@@ -367,7 +394,13 @@ async fn run_codex_tool_session_inner(
                     }
                     EventMsg::TurnAborted(_) => {
                         elicitation_cancellation.cancel();
-                        continue;
+                        let result = create_call_tool_result_with_thread_id(
+                            thread_id,
+                            "Turn aborted.".to_string(),
+                            Some(true),
+                        );
+                        outgoing.send_response(request_id.clone(), result).await;
+                        break;
                     }
                     EventMsg::ApplyPatchApprovalRequest(ApplyPatchApprovalRequestEvent {
                         call_id,
@@ -388,6 +421,7 @@ async fn run_codex_tool_session_inner(
                             request_id_str.clone(),
                             event.id.clone(),
                             thread_id,
+                            elicitation_cancellation.clone(),
                         )
                         .await;
                         continue;
@@ -502,6 +536,10 @@ async fn run_codex_tool_session_inner(
         }
     }
     elicitation_cancellation.cancel();
+    running_requests_id_to_codex_uuid
+        .lock()
+        .await
+        .remove(&request_id);
 }
 
 #[cfg(test)]

@@ -107,6 +107,7 @@ fn request_body_for_trace(req: &Request) -> String {
             String::from_utf8_lossy(body.trace_bytes()).into_owned()
         }
         Some(RequestBody::Raw(body)) => format!("<raw body: {} bytes>", body.len()),
+        Some(RequestBody::InvalidJson(_)) => "<invalid JSON body>".to_string(),
         None => String::new(),
     }
 }

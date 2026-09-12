@@ -1038,13 +1038,15 @@ async fn review_uses_overridden_cwd_for_base_branch_merge_base() {
     let body = requests[0].body_json();
     let input = body["input"].as_array().expect("input array");
 
-    let saw_merge_base_sha = input
-        .iter()
-        .filter_map(|msg| msg["content"][0]["text"].as_str())
-        .any(|text| text.contains(&head_sha));
+    let expected_prompt = format!(
+        "Review the code changes against the base branch 'main'. The merge base commit for this comparison is {head_sha}. Run `git diff {head_sha}` to inspect the changes relative to main. Provide prioritized, actionable findings."
+    );
     assert!(
-        saw_merge_base_sha,
-        "expected review prompt to include merge-base sha {head_sha}"
+        input
+            .iter()
+            .filter_map(|msg| msg["content"][0]["text"].as_str())
+            .any(|text| text == expected_prompt),
+        "review must send the exact base-branch instructions resolved in the overridden repository"
     );
 
     let _codex_home_guard = codex_home;

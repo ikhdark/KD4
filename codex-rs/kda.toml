@@ -1,19 +1,26 @@
 version = 1
 policy-pack = ["kd4@1"]
+# Analyze both declared Windows feature worlds on ordinary matrix-capable runs.
+# An explicit --profile NAME remains available for a focused run.
+all-profiles = true
 
 # KD4's local Windows quality gate. Paths are relative to this Cargo workspace.
 # Preserve the registry's warn/deny defaults; overriding the global default
-# would also weaken existing deny rules. Enable the four opt-in lints below.
+# would also weaken existing deny rules. Enable all six opt-in lints below.
 # Do not exclude authored sources, tests, or workspace members.
 [lints]
 expect-in-library = "warn"
 await-holding-guard = "warn"
 capability-flow-unproven = "warn"
 generic-instantiation-uncertain = "warn"
+# Ranked findings require reviewed [[ranked-source]] operation contracts;
+# these severities do not create those contracts or claim coverage by themselves.
+ranked-contract-violation = "warn"
+ranked-contract-incomplete = "warn"
 
 # Normal runtime and the only optional workspace feature (code-mode/Cargo.toml).
 # Trusted loading provides build-script outputs and procedural macro expansion.
-# Use --all-profiles for both; --profile windows selects normal features.
+# Both run by default; --profile windows selects normal features.
 [[analysis-profile]]
 name = "windows"
 target = "x86_64-pc-windows-msvc"
@@ -39,23 +46,31 @@ analyze-public-enums = true
 [test-analysis]
 history = true
 base-ref = "HEAD"
-minimum-dependency-changes = 2
+# Review stale test dependencies after the first qualifying change.
+minimum-dependency-changes = 1
 ignored-max-commits = 100
 # Run bounded mutation trials for changed code in an isolated workspace copy.
 mutation = true
-mutation-limit = 8
+# Broader sampling for this large workspace, with a finite per-profile budget.
+mutation-limit = 32
 test-attributes = ["test", "tokio::test", "async_std::test", "rstest", "test_case"]
 oracle-macros = [
   "assert", "assert_eq", "assert_ne", "assert_matches",
   "debug_assert", "debug_assert_eq", "debug_assert_ne",
   "assert_snapshot", "assert_debug_snapshot", "assert_json_snapshot",
   "assert_yaml_snapshot", "assert_toml_snapshot",
+  # KD4's local assertion wrappers must participate in oracle history.
+  # Evidence: tui/src/{app,chatwidget}/tests.rs; tui/tests/suite/vt100_history.rs.
+  "assert_app_snapshot", "assert_chatwidget_snapshot", "assert_contains",
 ]
 
 [transition-analysis]
-minimum-materiality = 45
+# Report every discovered transition candidate; retain its score for review.
+minimum-materiality = 0
 enforce-lifecycle-metadata = true
-# No fixed analysis-date: a committed date would make expiry checks stale.
+# Expiry evaluation requires analysis-date = "YYYY-MM-DD" refreshed for each
+# audit. Without it, expiry is not checked; lifecycle metadata still is.
+# Do not pin a date here and mistake it for the current date on later runs.
 
 # Cargo direction and public signature boundaries are separate obligations.
 # Evidence: protocol/, app-server-protocol/, code-mode-protocol/,
@@ -64,34 +79,34 @@ enforce-lifecycle-metadata = true
 [[policy]]
 id = "kd4-protocol-independent-of-hosts"
 crates = "codex-protocol"
-forbid-deps = ["codex-core", "codex-app-server", "codex-cli", "codex-exec"]
+forbid-deps = ["codex-core", "codex-app-server", "codex-cli", "codex-exec", "codex-code-mode-host", "codex-exec-server", "codex-tui"]
 
 [[policy]]
 id = "kd4-specialized-protocols-independent-of-hosts"
 crates = "codex-*-protocol"
-forbid-deps = ["codex-core", "codex-app-server", "codex-cli", "codex-exec", "codex-code-mode-host"]
+forbid-deps = ["codex-core", "codex-app-server", "codex-cli", "codex-exec", "codex-code-mode-host", "codex-exec-server", "codex-tui"]
 
 [[policy]]
 id = "kd4-extension-api-independent-of-hosts"
 crates = "codex-extension-api"
-forbid-deps = ["codex-core", "codex-app-server", "codex-cli", "codex-exec"]
+forbid-deps = ["codex-core", "codex-app-server", "codex-cli", "codex-exec", "codex-code-mode-host", "codex-exec-server", "codex-tui"]
 
 [[public-boundary]]
 id = "kd4-protocol-public-types"
 crates = "codex-protocol"
-forbid-public-types-from = ["codex-core", "codex-app-server", "codex-cli", "codex-exec"]
+forbid-public-types-from = ["codex-core", "codex-app-server", "codex-cli", "codex-exec", "codex-code-mode-host", "codex-exec-server", "codex-tui"]
 severity = "deny"
 
 [[public-boundary]]
 id = "kd4-specialized-protocol-public-types"
 crates = "codex-*-protocol"
-forbid-public-types-from = ["codex-core", "codex-app-server", "codex-cli", "codex-exec", "codex-code-mode-host"]
+forbid-public-types-from = ["codex-core", "codex-app-server", "codex-cli", "codex-exec", "codex-code-mode-host", "codex-exec-server", "codex-tui"]
 severity = "deny"
 
 [[public-boundary]]
 id = "kd4-extension-api-public-types"
 crates = "codex-extension-api"
-forbid-public-types-from = ["codex-core", "codex-app-server", "codex-cli", "codex-exec"]
+forbid-public-types-from = ["codex-core", "codex-app-server", "codex-cli", "codex-exec", "codex-code-mode-host", "codex-exec-server", "codex-tui"]
 severity = "deny"
 
 # Extend those boundaries to resolved runtime calls and public signatures.
@@ -106,6 +121,8 @@ codex-app-server = "host"
 codex-cli = "host"
 codex-exec = "host"
 codex-code-mode-host = "host"
+codex-exec-server = "host"
+codex-tui = "host"
 
 [[workspace-scale-surfaces.dependencies.directions]]
 name = "kd4-protocol-cannot-own-host-runtime"
@@ -133,12 +150,13 @@ functions = "codex_core::tools::registry::ToolRegistry::dispatch_any_with_termin
 no-blocking = true
 severity = "deny"
 
-# The shared runtime must enter the router before reaching registry dispatch.
-# This catches future direct/nested dispatch paths that bypass the router.
-# Evidence: core/src/tools/parallel.rs -> router.rs -> registry.rs.
+# Every discovered production root must enter the router before registry
+# dispatch, including future entrypoints outside the shared tool runtime.
+# Evidence: router.rs owns the sole production call into registry dispatch;
+# other direct callers are tests. Empty entrypoints selects all production roots.
 [[required-mediation]]
 id = "kd4-tool-runtime-through-router"
-entrypoints = ["codex_core::tools::parallel::ToolCallRuntime::handle_tool_call_with_source_and_timing"]
+entrypoints = []
 effect = "codex_core::tools::registry::ToolRegistry::dispatch_any_with_terminal_outcome"
 mediators = ["codex_core::tools::router::ToolRouter::dispatch_tool_call_with_terminal_outcome"]
 severity = "deny"
@@ -170,7 +188,8 @@ remediation = "Await typed task authorization and propagate its result before re
 id = "kd4-router-authorization-envelope"
 wrappers = ["codex_core::tools::router::ToolRouter::dispatch_tool_call_with_terminal_outcome"]
 delegates = ["codex_core::tools::registry::ToolRegistry::dispatch_any_with_terminal_outcome"]
-max-depth = 32
+# Deeper wrapper-to-delegate traversal; this is a route-contract budget only.
+max-depth = 128
 report-uncertainty = true
 required-effects = [
   { id = "independent-review", patterns = ["codex_core::tools::router::authorize_independent_review_tool_call"] },
@@ -182,8 +201,9 @@ required-effects = [
 # No blanket sanitizer is trusted to erase credential provenance.
 [[semantic-effect-policy.sensitive-sinks]]
 id = "kd4-credentials-must-not-enter-logs"
-source-adts = ["codex_login::token_data::TokenData"]
+source-adts = ["codex_login::token_data::TokenData", "codex_login::token_data::IdTokenInfo"]
 source-fields = [
+  "codex_login::token_data::TokenData::id_token",
   "codex_login::token_data::TokenData::access_token",
   "codex_login::token_data::TokenData::refresh_token",
   "codex_login::token_data::IdTokenInfo::raw_jwt",

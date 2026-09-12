@@ -193,7 +193,24 @@ impl CodexAppsToolsCacheContext {
         }
     }
 
-    pub(crate) fn publish_if_newest_accepted(
+    pub(crate) async fn publish_if_newest_accepted(
+        &self,
+        ticket: CodexAppsToolsFetchTicket,
+        server_info: &McpServerInfo,
+        tools: Vec<ToolInfo>,
+    ) -> Vec<ToolInfo> {
+        let context = self.clone();
+        let server_info = server_info.clone();
+        // Keep acceptance, live publication, and disk ordering in one owned job.
+        // Dropping the request cannot detach persistence from its generation.
+        tokio::task::spawn_blocking(move || {
+            context.publish_if_newest_accepted_blocking(ticket, &server_info, tools)
+        })
+        .await
+        .expect("Codex Apps cache publication worker failed")
+    }
+
+    fn publish_if_newest_accepted_blocking(
         &self,
         ticket: CodexAppsToolsFetchTicket,
         server_info: &McpServerInfo,
@@ -245,29 +262,43 @@ impl CodexAppsToolsCache {
 
     /// Returns the latest shared Codex Apps tools without starting or refreshing
     /// an MCP connection. A new cache entry may be seeded from disk.
-    pub fn current_tools(
+    pub async fn current_tools(
         &self,
         codex_home: PathBuf,
         auth_key: CodexAppsToolsCacheKey,
     ) -> Option<Vec<ToolInfo>> {
-        self.context(codex_home, auth_key).current_tools()
+        self.context(codex_home, auth_key).await.current_tools()
     }
 
     /// Returns the current raw tools and their live-publication state without
     /// starting or refreshing an MCP connection.
-    pub fn current_snapshot(
+    pub async fn current_snapshot(
         &self,
         codex_home: PathBuf,
         auth_key: CodexAppsToolsCacheKey,
     ) -> Option<CodexAppsToolsSnapshot> {
         self.context(codex_home, auth_key)
+            .await
             .entry
             .current_snapshot
             .load_full()
             .map(|snapshot| snapshot.as_ref().clone())
     }
 
-    pub(crate) fn context(
+    pub(crate) async fn context(
+        &self,
+        codex_home: PathBuf,
+        auth_key: CodexAppsToolsCacheKey,
+    ) -> CodexAppsToolsCacheContext {
+        let cache = self.clone();
+        // Cold seeding holds the registry lock, so lock acquisition belongs on
+        // the worker as well; warm callers must never wait on it on the executor.
+        tokio::task::spawn_blocking(move || cache.context_blocking(codex_home, auth_key))
+            .await
+            .expect("Codex Apps cache initialization worker failed")
+    }
+
+    fn context_blocking(
         &self,
         codex_home: PathBuf,
         auth_key: CodexAppsToolsCacheKey,

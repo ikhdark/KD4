@@ -9,6 +9,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::fs;
+use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -65,7 +66,19 @@ fn persist_caps(path: &Path, caps: &CapSids) -> Result<()> {
         fs::create_dir_all(dir).with_context(|| format!("create cap sid dir {}", dir.display()))?;
     }
     let json = serde_json::to_string(caps)?;
-    fs::write(path, json).with_context(|| format!("write cap sid file {}", path.display()))?;
+    let parent = path.parent().context("cap sid file has no parent")?;
+    let mut staged = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("stage cap sid file {}", path.display()))?;
+    staged
+        .write_all(json.as_bytes())
+        .with_context(|| format!("write cap sid file {}", path.display()))?;
+    staged
+        .as_file()
+        .sync_all()
+        .with_context(|| format!("sync cap sid file {}", path.display()))?;
+    let staged = staged.into_temp_path();
+    fs::rename(&staged, path)
+        .with_context(|| format!("replace cap sid file {}", path.display()))?;
     Ok(())
 }
 
@@ -148,8 +161,10 @@ fn workspace_cap_sid_for_key(codex_home: &Path, key: String) -> Result<String> {
         return Ok(sid.clone());
     }
     let sid = make_random_cap_sid_string();
-    cached.caps.workspace_by_cwd.insert(key, sid.clone());
-    persist_caps(&path, &cached.caps)?;
+    let mut updated = cached.caps.clone();
+    updated.workspace_by_cwd.insert(key, sid.clone());
+    persist_caps(&path, &updated)?;
+    cached.caps = updated;
     Ok(sid)
 }
 
@@ -169,8 +184,10 @@ fn writable_root_cap_sid_for_key(codex_home: &Path, key: String) -> Result<Strin
         return Ok(sid.clone());
     }
     let sid = make_random_cap_sid_string();
-    cached.caps.writable_root_by_path.insert(key, sid.clone());
-    persist_caps(&path, &cached.caps)?;
+    let mut updated = cached.caps.clone();
+    updated.writable_root_by_path.insert(key, sid.clone());
+    persist_caps(&path, &updated)?;
+    cached.caps = updated;
     Ok(sid)
 }
 
@@ -232,6 +249,71 @@ mod tests {
     use pretty_assertions::assert_eq;
     use std::path::PathBuf;
     use tempfile::TempDir;
+
+    #[test]
+    fn failed_capability_persistence_does_not_publish_cache_entries() -> anyhow::Result<()> {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+
+        let home = TempDir::new()?;
+        let roots = TempDir::new()?;
+        let workspace = roots.path().join("workspace");
+        let extra_root = roots.path().join("extra");
+        std::fs::create_dir_all(&workspace)?;
+        std::fs::create_dir_all(&extra_root)?;
+        let original = load_or_create_cap_sids(home.path())?;
+        let path = super::cap_sid_file(home.path());
+        let original_bytes = std::fs::read(&path)?;
+        // Deny writes and replacement while still allowing the test to read the target.
+        let locked = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(&path)?;
+
+        for root in [&workspace, &extra_root] {
+            // A failed first attempt must not make the retry succeed from the cache.
+            for _ in 0..2 {
+                let error = workspace_write_cap_sid_for_root(home.path(), &workspace, root)
+                    .expect_err("locked capability file must reject persistence");
+                assert!(format!("{error:#}").contains("replace cap sid file"));
+            }
+        }
+        let cached = load_or_create_cap_sids(home.path())?;
+        assert_eq!(cached.workspace, original.workspace);
+        assert_eq!(cached.readonly, original.readonly);
+        assert!(cached.workspace_by_cwd.is_empty());
+        assert!(cached.writable_root_by_path.is_empty());
+        assert_eq!(std::fs::read(&path)?, original_bytes);
+        let entries = std::fs::read_dir(home.path())?.collect::<std::io::Result<Vec<_>>>()?;
+        assert_eq!(
+            entries.len(),
+            1,
+            "failed writes must remove temporary files"
+        );
+        assert_eq!(entries[0].path(), path);
+        drop(locked);
+
+        let workspace_sid = workspace_write_cap_sid_for_root(home.path(), &workspace, &workspace)?;
+        let extra_sid = workspace_write_cap_sid_for_root(home.path(), &workspace, &extra_root)?;
+        assert_ne!(workspace_sid, extra_sid);
+        // A distinct home forces the normal loader to consume persisted JSON, not this cache.
+        let reopened_home = TempDir::new()?;
+        std::fs::copy(&path, super::cap_sid_file(reopened_home.path()))?;
+        assert_eq!(
+            workspace_write_cap_sid_for_root(reopened_home.path(), &workspace, &workspace)?,
+            workspace_sid
+        );
+        assert_eq!(
+            workspace_write_cap_sid_for_root(reopened_home.path(), &workspace, &extra_root)?,
+            extra_sid
+        );
+        let reopened = load_or_create_cap_sids(reopened_home.path())?;
+        assert_eq!(reopened.workspace, original.workspace);
+        assert_eq!(reopened.readonly, original.readonly);
+        assert_eq!(reopened.workspace_by_cwd.len(), 1);
+        assert_eq!(reopened.writable_root_by_path.len(), 1);
+        Ok(())
+    }
 
     #[test]
     fn repeated_cap_sid_loads_reuse_the_process_cache() {

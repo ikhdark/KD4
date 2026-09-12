@@ -30,6 +30,7 @@ use codex_utils_pty::ProcessHandle;
 use codex_utils_pty::SpawnedProcess;
 use codex_utils_pty::TerminalSize;
 use tokio::sync::Mutex;
+use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::sync::watch;
@@ -49,6 +50,7 @@ use crate::outgoing_message::ConnectionRequestId;
 use crate::outgoing_message::OutgoingMessageSender;
 
 const EXEC_TIMEOUT_EXIT_CODE: i32 = 124;
+const MAX_PENDING_STDIN_WRITES: usize = 32;
 const OUTPUT_CHUNK_SIZE_HINT: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -200,10 +202,11 @@ impl ProcessExecRequestProcessor {
         &self,
         request_id: ConnectionRequestId,
         params: ProcessWriteStdinParams,
+        rpc_gate: &ConnectionRpcGate,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
-        self.write_stdin(request_id, params)
+        self.write_stdin(request_id, params, rpc_gate)
             .await
-            .map(|response| Some(response.into()))
+            .map(|()| None)
     }
 
     pub(crate) async fn process_resize_pty(
@@ -249,10 +252,10 @@ struct ConnectionProcessHandle {
 struct ProcessSession {
     control_tx: mpsc::Sender<ProcessControlRequest>,
     write_tx: mpsc::Sender<StdinWriteRequest>,
+    write_slots: Arc<Semaphore>,
 }
 
 enum ProcessControl {
-    Write { delta: Vec<u8>, close_stdin: bool },
     Resize { size: TerminalSize },
     Kill,
 }
@@ -348,7 +351,8 @@ impl ProcessExecRequestProcessor {
         let (control_tx, control_rx) = mpsc::channel(32);
         // Stdin writes preserve ordered backpressure on a dedicated worker so a
         // slow child cannot block kill, resize, expiration, or exit handling.
-        let (write_tx, write_rx) = mpsc::channel(32);
+        let (write_tx, write_rx) = mpsc::channel(MAX_PENDING_STDIN_WRITES);
+        let write_slots = Arc::new(Semaphore::new(MAX_PENDING_STDIN_WRITES));
         let process_key = ConnectionProcessHandle {
             connection_id: request_id.connection_id,
             process_handle: process_handle.clone(),
@@ -365,6 +369,7 @@ impl ProcessExecRequestProcessor {
                         entry.insert(ProcessSession {
                             control_tx,
                             write_tx,
+                            write_slots,
                         });
                         Ok(())
                     }
@@ -434,7 +439,8 @@ impl ProcessExecRequestProcessor {
         &self,
         request_id: ConnectionRequestId,
         params: ProcessWriteStdinParams,
-    ) -> Result<ProcessWriteStdinResponse, JSONRPCErrorError> {
+        rpc_gate: &ConnectionRpcGate,
+    ) -> Result<(), JSONRPCErrorError> {
         if params.delta_base64.is_none() && !params.close_stdin {
             return Err(invalid_params(
                 "process/writeStdin requires deltaBase64 or closeStdin",
@@ -448,17 +454,56 @@ impl ProcessExecRequestProcessor {
             None => Vec::new(),
         };
 
-        self.send_control(
-            request_id.connection_id,
-            params.process_handle,
-            ProcessControl::Write {
+        let process_key = ConnectionProcessHandle {
+            connection_id: request_id.connection_id,
+            process_handle: params.process_handle,
+        };
+        let session = self
+            .sessions
+            .lock()
+            .await
+            .get(&process_key)
+            .cloned()
+            .ok_or_else(|| no_active_process_error(&process_key.process_handle))?;
+        let outgoing = Arc::clone(&self.outgoing);
+        let cancellation = rpc_gate.cancellation_token();
+        // Keep FIFO admission in the process lane, then transfer the potentially
+        // backpressured acknowledgement to the existing connection task owner.
+        drop(rpc_gate.spawn_with_commit(|| {
+            let busy = || invalid_request("process stdin write queue is full; retry after a pending write completes");
+            let slot = session.write_slots.try_acquire_owned().map_err(|_| busy())?;
+            let (response_tx, response_rx) = oneshot::channel();
+            session.write_tx.try_send(StdinWriteRequest {
                 delta,
                 close_stdin: params.close_stdin,
-            },
-        )
-        .await?;
-
-        Ok(ProcessWriteStdinResponse {})
+                response_tx: Some(response_tx),
+            }).map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => busy(),
+                mpsc::error::TrySendError::Closed(_) => process_no_longer_running_error(&process_key.process_handle),
+            })?;
+            Ok::<_, JSONRPCErrorError>(async move {
+                // Waiting response deliveries count against the same finite limit.
+                let _slot = slot;
+                let result = tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => return,
+                    result = response_rx => result.unwrap_or_else(|_| {
+                        Err(process_no_longer_running_error(&process_key.process_handle))
+                    }),
+                };
+                tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => {},
+                    _ = async {
+                        match result {
+                            Ok(()) => outgoing.send_response(request_id, ProcessWriteStdinResponse {}).await,
+                            Err(error) => outgoing.send_error(request_id, error).await,
+                        }
+                    } => {},
+                }
+            })
+        })?.ok_or_else(|| invalid_request("connection is closed"))?);
+        Ok(())
     }
 
     async fn kill(
@@ -537,26 +582,14 @@ impl ProcessExecRequestProcessor {
             .cloned()
             .ok_or_else(|| no_active_process_error(&process_key.process_handle))?;
         let (response_tx, response_rx) = oneshot::channel();
-        let send_result = match control {
-            ProcessControl::Write { delta, close_stdin } => session
-                .write_tx
-                .send(StdinWriteRequest {
-                    delta,
-                    close_stdin,
-                    response_tx: Some(response_tx),
-                })
-                .await
-                .map_err(|_| ()),
-            control => session
-                .control_tx
-                .send(ProcessControlRequest {
-                    control,
-                    response_tx: Some(response_tx),
-                })
-                .await
-                .map_err(|_| ()),
-        };
-        send_result.map_err(|_| process_no_longer_running_error(&process_key.process_handle))?;
+        session
+            .control_tx
+            .send(ProcessControlRequest {
+                control,
+                response_tx: Some(response_tx),
+            })
+            .await
+            .map_err(|_| process_no_longer_running_error(&process_key.process_handle))?;
         response_rx
             .await
             .map_err(|_| process_no_longer_running_error(&process_key.process_handle))?
@@ -580,6 +613,7 @@ async fn run_process(params: RunProcessParams) {
     } = params;
     let mut control_rx = control_rx;
     let mut control_open = true;
+    let mut connection_cancelled = false;
     let expiration = expiration.wait_with_outcome();
     tokio::pin!(expiration);
     let SpawnedProcess {
@@ -624,13 +658,20 @@ async fn run_process(params: RunProcessParams) {
 
     let exit_code = loop {
         tokio::select! {
+            _ = connection_cancellation.cancelled(), if !connection_cancelled => {
+                connection_cancelled = true;
+                if let Err(error) = session.request_terminate() {
+                    tracing::warn!(
+                        process_handle = %process_handle,
+                        %error,
+                        "failed to terminate process after connection cancellation"
+                    );
+                }
+            }
             control = control_rx.recv(), if control_open => {
                 match control {
                     Some(ProcessControlRequest { control, response_tx }) => {
                         let result = match control {
-                            ProcessControl::Write { .. } => Err(internal_error(
-                                "stdin write was routed to the process control queue",
-                            )),
                             ProcessControl::Resize { size } => {
                                 handle_process_resize(&session, size)
                             }

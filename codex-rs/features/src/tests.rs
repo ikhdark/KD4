@@ -96,11 +96,13 @@ fn deleted_zombie_feature_keys_are_unknown() {
 
 #[test]
 fn under_development_features_are_disabled_by_default() {
+    let defaults = Features::with_defaults();
     for spec in crate::FEATURES {
         if matches!(spec.stage, Stage::UnderDevelopment) {
             assert_eq!(
-                spec.default_enabled, false,
-                "feature `{}` is under development and must be disabled by default",
+                defaults.enabled(spec.id),
+                false,
+                "feature `{}` is under development and must be disabled in resolved defaults",
                 spec.key
             );
         }
@@ -109,8 +111,9 @@ fn under_development_features_are_disabled_by_default() {
 
 #[test]
 fn default_enabled_features_are_stable() {
+    let defaults = Features::with_defaults();
     for spec in crate::FEATURES {
-        if spec.default_enabled {
+        if defaults.enabled(spec.id) {
             assert!(
                 matches!(spec.stage, Stage::Stable),
                 "feature `{}` is enabled by default but is not stable ({:?})",
@@ -302,64 +305,65 @@ fn browser_controls_are_stable_and_enabled_by_default() {
 }
 
 #[test]
-fn client_only_features_are_not_read_by_rust_runtime_sources() {
-    fn visit_rs_sources(path: &std::path::Path, files: &mut Vec<std::path::PathBuf>) {
-        for entry in std::fs::read_dir(path).expect("read Rust workspace directory") {
-            let entry = entry.expect("read Rust workspace entry");
-            let path = entry.path();
-            if path.is_dir() {
-                if path.file_name().is_some_and(|name| name == "target") {
-                    continue;
-                }
-                visit_rs_sources(&path, files);
-            } else if path.extension().is_some_and(|extension| extension == "rs") {
-                files.push(path);
-            }
+fn client_only_features_round_trip_without_changing_runtime_feature_states() {
+    let base: FeaturesToml = toml::from_str(
+        r#"
+code_mode = false
+code_mode_only = false
+multi_agent = false
+enable_fanout = false
+unified_exec = true
+"#,
+    )
+    .expect("base features should parse");
+    for enabled in [true, false] {
+        let profile: FeaturesToml = toml::from_str(&format!(
+            r#"
+in_app_browser = {enabled}
+browser_use = {enabled}
+browser_use_full_cdp_access = {enabled}
+browser_use_external = {enabled}
+computer_use = {enabled}
+"#
+        ))
+        .expect("client features should parse");
+        let resolved = Features::from_sources(
+            FeatureConfigSource {
+                features: Some(&base),
+            },
+            FeatureConfigSource {
+                features: Some(&profile),
+            },
+            FeatureOverrides::default(),
+        );
+        let mut materialized = FeaturesToml::default();
+        materialized.materialize_resolved_enabled(&resolved);
+        let serialized = toml::to_string(&materialized).expect("serialize resolved features");
+        let output: Table = toml::from_str(&serialized).expect("read serialized features");
+
+        for (feature, key) in [
+            (Feature::InAppBrowser, "in_app_browser"),
+            (Feature::BrowserUse, "browser_use"),
+            (
+                Feature::BrowserUseFullCdpAccess,
+                "browser_use_full_cdp_access",
+            ),
+            (Feature::BrowserUseExternal, "browser_use_external"),
+            (Feature::ComputerUse, "computer_use"),
+        ] {
+            assert_eq!(resolved.enabled(feature), enabled, "{key}");
+            assert_eq!(output.get(key), Some(&TomlValue::Boolean(enabled)), "{key}");
+            assert_eq!(feature.consumer(), FeatureConsumer::Client, "{key}");
         }
+        // These are independent runtime gates; client toggles must not normalize them.
+        assert!(!resolved.enabled(Feature::CodeMode));
+        assert!(!resolved.enabled(Feature::CodeModeOnly));
+        assert!(!resolved.enabled(Feature::Collab));
+        assert!(!resolved.enabled(Feature::SpawnCsv));
+        assert!(resolved.enabled(Feature::UnifiedExec));
+        assert_eq!(output.get("multi_agent"), Some(&TomlValue::Boolean(false)));
+        assert_eq!(output.get("unified_exec"), Some(&TomlValue::Boolean(true)));
     }
-
-    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("features crate is in the Rust workspace");
-    let mut files = Vec::new();
-    visit_rs_sources(workspace, &mut files);
-    let client_only_names = [
-        "Feature::InAppBrowser",
-        "Feature::BrowserUse",
-        "Feature::BrowserUseFullCdpAccess",
-        "Feature::BrowserUseExternal",
-        "Feature::ComputerUse",
-    ];
-    let mut violations = Vec::new();
-
-    for path in files {
-        let relative = path
-            .strip_prefix(workspace)
-            .expect("workspace-relative path");
-        if relative.starts_with("features")
-            || relative
-                .components()
-                .any(|component| component.as_os_str() == "tests")
-            || path.file_name().is_some_and(|name| name == "tests.rs")
-            || path
-                .file_stem()
-                .is_some_and(|name| name.to_string_lossy().ends_with("_tests"))
-        {
-            continue;
-        }
-        let source = std::fs::read_to_string(&path).expect("read Rust source");
-        for name in client_only_names {
-            if source.contains(name) {
-                violations.push(format!("{} reads {name}", relative.display()));
-            }
-        }
-    }
-
-    assert!(
-        violations.is_empty(),
-        "client-only feature flags must not select Rust runtime behavior:\n{}",
-        violations.join("\n")
-    );
 }
 
 #[test]
@@ -572,6 +576,11 @@ fn multi_agent_v2_schema_uses_authoritative_policy_bounds() {
         else {
             panic!("{field} should have an integer schema");
         };
+        assert_eq!(
+            schema.instance_type,
+            Some(schemars::schema::InstanceType::Integer.into()),
+            "{field} must reject fractional values"
+        );
         let number = schema
             .number
             .as_ref()
@@ -581,28 +590,16 @@ fn multi_agent_v2_schema_uses_authoritative_policy_bounds() {
 
     assert_eq!(
         number_bounds("max_concurrent_threads_per_session"),
-        (
-            Some(crate::MULTI_AGENT_V2_MIN_CONCURRENT_THREADS_PER_SESSION as f64),
-            None,
-        )
+        (Some(1.0), None)
     );
     for field in [
         "min_wait_timeout_ms",
         "max_wait_timeout_ms",
         "default_wait_timeout_ms",
     ] {
-        assert_eq!(
-            number_bounds(field),
-            (
-                Some(crate::MULTI_AGENT_MIN_WAIT_TIMEOUT_MS as f64),
-                Some(crate::MULTI_AGENT_MAX_WAIT_TIMEOUT_MS as f64),
-            )
-        );
+        assert_eq!(number_bounds(field), (Some(60_000.0), Some(3_600_000.0)));
     }
-    assert!(
-        (crate::MULTI_AGENT_MIN_WAIT_TIMEOUT_MS..=crate::MULTI_AGENT_MAX_WAIT_TIMEOUT_MS)
-            .contains(&crate::MULTI_AGENT_DEFAULT_WAIT_TIMEOUT_MS)
-    );
+    assert_eq!(crate::MULTI_AGENT_DEFAULT_WAIT_TIMEOUT_MS, 60_000);
 }
 
 #[test]

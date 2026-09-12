@@ -53,6 +53,7 @@ pub(crate) async fn handle_patch_approval_request(
     tool_call_id: String,
     event_id: String,
     thread_id: ThreadId,
+    cancellation: tokio_util::sync::CancellationToken,
 ) {
     let approval_id = call_id.clone();
     let mut message_lines = Vec::new();
@@ -87,17 +88,22 @@ pub(crate) async fn handle_patch_approval_request(
         }
     };
 
-    let on_response = outgoing
+    let pending = outgoing
         .send_request("elicitation/create", Some(params_json))
-        .await
-        .receiver;
+        .await;
 
     // Listen for the response on a separate task so we don't block the main agent loop.
     {
         let codex = codex.clone();
         let approval_id = approval_id.clone();
         tokio::spawn(async move {
-            on_patch_approval_response(approval_id, on_response, codex).await;
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => {
+                    outgoing.cancel_request(&pending.id).await;
+                }
+                _ = on_patch_approval_response(approval_id, pending.receiver, codex) => {}
+            }
         });
     }
 }

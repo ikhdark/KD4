@@ -1487,7 +1487,7 @@ mod thread_processor_behavior_tests {
         let manager = ThreadStateManager::new();
         let thread_id = ThreadId::from_string("ad7f0408-99b8-4f6e-a46f-bd0eec433370")?;
         let connection = ConnectionId(1);
-        let (cancel_tx, cancel_rx) = oneshot::channel();
+        let cancellation = CancellationToken::new();
 
         manager
             .connection_initialized(connection, ConnectionCapabilities::default())
@@ -1501,7 +1501,7 @@ mod thread_processor_behavior_tests {
         {
             let state = manager.thread_state(thread_id).await;
             let mut state = state.lock().await;
-            state.cancel_tx = Some(cancel_tx);
+            state.listener_cancellation = Some(cancellation.clone());
             state.track_current_turn_event(
                 "turn-1",
                 &EventMsg::TurnStarted(codex_protocol::protocol::TurnStartedEvent {
@@ -1515,13 +1515,13 @@ mod thread_processor_behavior_tests {
         }
 
         manager.remove_thread_state(thread_id).await;
-        assert_eq!(cancel_rx.await, Ok(()));
+        assert!(cancellation.is_cancelled());
 
         let state = manager.thread_state(thread_id).await;
         let subscribed_connection_ids = manager.subscribed_connection_ids(thread_id).await;
         assert!(subscribed_connection_ids.is_empty());
         let state = state.lock().await;
-        assert!(state.cancel_tx.is_none());
+        assert!(state.listener_cancellation.is_none());
         assert!(state.active_turn_snapshot().is_none());
         Ok(())
     }
@@ -1533,7 +1533,7 @@ mod thread_processor_behavior_tests {
         let thread_id = ThreadId::from_string("ad7f0408-99b8-4f6e-a46f-bd0eec433370")?;
         let connection_a = ConnectionId(1);
         let connection_b = ConnectionId(2);
-        let (cancel_tx, mut cancel_rx) = oneshot::channel();
+        let cancellation = CancellationToken::new();
 
         manager
             .connection_initialized(connection_a, ConnectionCapabilities::default())
@@ -1559,13 +1559,13 @@ mod thread_processor_behavior_tests {
             .expect("connection_b should be live");
         {
             let state = manager.thread_state(thread_id).await;
-            state.lock().await.cancel_tx = Some(cancel_tx);
+            state.lock().await.listener_cancellation = Some(cancellation.clone());
         }
 
         let threads_to_unload = manager.remove_connection(connection_a).await;
         assert_eq!(threads_to_unload, Vec::<ThreadId>::new());
         assert!(
-            tokio::time::timeout(Duration::from_millis(20), &mut cancel_rx)
+            tokio::time::timeout(Duration::from_millis(20), cancellation.cancelled())
                 .await
                 .is_err()
         );
@@ -1785,7 +1785,7 @@ mod elicitation_lease_tests {
             let config = load_default_config_for_test(&codex_home).await;
             let thread_manager =
                 codex_core::test_support::thread_manager_with_models_provider_and_home(
-                    CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+                    CodexAuth::from_api_key("test-api-key"),
                     config.model_provider.clone(),
                     config.codex_home.to_path_buf(),
                     Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),

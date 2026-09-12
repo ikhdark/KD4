@@ -1,69 +1,44 @@
-use crate::connectors::AppInfo;
-use crate::context::AppsInstructions;
-use crate::context::ContextualUserFragment;
-use codex_protocol::protocol::APPS_INSTRUCTIONS_CLOSE_TAG;
-use codex_protocol::protocol::APPS_INSTRUCTIONS_OPEN_TAG;
-
-pub(crate) fn render_apps_section(connectors: &[AppInfo]) -> Option<String> {
-    connectors
-        .iter()
-        .any(|connector| connector.is_accessible && connector.is_enabled)
-        .then(|| AppsInstructions.render())
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::context::world_state::AppsInstructionsState;
+    use crate::context::world_state::WorldState;
+    use codex_protocol::models::ContentItem;
+    use codex_protocol::models::ResponseItem;
+    use codex_protocol::protocol::APPS_INSTRUCTIONS_CLOSE_TAG;
+    use codex_protocol::protocol::APPS_INSTRUCTIONS_OPEN_TAG;
 
-    fn connector(id: &str, is_accessible: bool, is_enabled: bool) -> AppInfo {
-        AppInfo {
-            id: id.to_string(),
-            name: id.to_string(),
-            description: None,
-            logo_url: None,
-            logo_url_dark: None,
-            icon_assets: None,
-            icon_dark_assets: None,
-            distribution_channel: None,
-            branding: None,
-            app_metadata: None,
-            labels: None,
-            install_url: None,
-            is_accessible,
-            is_enabled,
-            plugin_display_names: Vec::new(),
-        }
+    #[test]
+    fn omits_apps_guidance_when_world_state_is_unavailable() {
+        let mut world_state = WorldState::default();
+        world_state.add_section(AppsInstructionsState::new(false));
+        let (fragments, _) = world_state.render_history_diff_with_snapshot(None, &[]);
+        assert!(fragments.is_empty());
     }
 
     #[test]
-    fn omits_apps_section_without_accessible_and_enabled_apps() {
-        assert_eq!(render_apps_section(&[]), None);
-        assert_eq!(
-            render_apps_section(&[connector(
-                "calendar", /*is_accessible*/ true, /*is_enabled*/ false
-            )]),
-            None
+    fn available_apps_world_state_emits_developer_guidance_once() {
+        let mut world_state = WorldState::default();
+        world_state.add_section(AppsInstructionsState::new(true));
+        let (mut fragments, snapshot) = world_state.render_history_diff_with_snapshot(None, &[]);
+        assert_eq!(fragments.len(), 1);
+        let item = fragments.remove(0).into_boxed_response_item();
+        let ResponseItem::Message { role, content, .. } = &item else {
+            panic!("apps guidance must be a message");
+        };
+        assert_eq!(role, "developer");
+        let [ContentItem::InputText { text }] = content.as_slice() else {
+            panic!("apps guidance must contain one text item");
+        };
+        assert!(text.starts_with(APPS_INSTRUCTIONS_OPEN_TAG));
+        assert!(text.contains("## Apps (Connectors)"));
+        assert!(text.contains("discoverable through `tool_search`"));
+        assert!(!text.contains("tools_search"));
+        assert!(text.contains("or clearly matched by the task"));
+        assert!(text.ends_with(APPS_INSTRUCTIONS_CLOSE_TAG));
+        let (repeated, _) = world_state.render_history_diff_with_snapshot(Some(&snapshot), &[item]);
+        assert!(
+            repeated.is_empty(),
+            "retained guidance must not be injected twice"
         );
-        assert_eq!(
-            render_apps_section(&[connector(
-                "calendar", /*is_accessible*/ false, /*is_enabled*/ true
-            )]),
-            None
-        );
-    }
-
-    #[test]
-    fn renders_apps_section_with_an_accessible_and_enabled_app() {
-        let rendered = render_apps_section(&[connector(
-            "calendar", /*is_accessible*/ true, /*is_enabled*/ true,
-        )])
-        .expect("expected apps section");
-
-        assert!(rendered.starts_with(APPS_INSTRUCTIONS_OPEN_TAG));
-        assert!(rendered.contains("## Apps (Connectors)"));
-        assert!(rendered.contains("discoverable through `tool_search`"));
-        assert!(!rendered.contains("tools_search"));
-        assert!(rendered.contains("or clearly matched by the task"));
-        assert!(rendered.ends_with(APPS_INSTRUCTIONS_CLOSE_TAG));
     }
 }

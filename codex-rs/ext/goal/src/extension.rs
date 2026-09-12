@@ -207,6 +207,9 @@ where
                 return;
             }
 
+            if let Err(err) = runtime.retry_pending_goal_progress(None).await {
+                tracing::warn!("failed to retry terminal goal accounting at turn start: {err}");
+            }
             let accounting = runtime.accounting_state();
             accounting.start_turn(
                 input.turn_id,
@@ -262,6 +265,7 @@ where
                 tracing::warn!(
                     "failed to account active goal progress at turn stop for {turn_id}: {err}"
                 );
+                runtime.accounting_state().defer_turn_finish(turn_id);
                 return;
             }
             runtime.accounting_state().finish_turn(turn_id);
@@ -290,6 +294,7 @@ where
                 tracing::warn!(
                     "failed to account active goal progress after turn abort for {turn_id}: {err}"
                 );
+                runtime.accounting_state().defer_turn_finish(turn_id);
                 return;
             }
             runtime.accounting_state().finish_turn(turn_id);

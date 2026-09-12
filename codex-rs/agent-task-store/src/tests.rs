@@ -5545,6 +5545,16 @@ async fn repository_wide_capture_detects_an_external_revert_missing_from_git_ove
             .collect::<Vec<_>>(),
         vec![REPOSITORY_WIDE_PATH, "src/lib.rs"]
     );
+    assert_eq!(
+        modified.files.iter().find(|entry| entry.path == "src/lib.rs"),
+        Some(&WorkspaceManifestEntry {
+            path: "src/lib.rs".to_string(),
+            content_hash: Some(
+                "4487e24377581c1a43c957c7700c8b49920de7b8500c05590cee74996ef73f42".to_string()
+            ),
+            existed: true,
+        })
+    );
 
     std::fs::write(fixture.repo.path().join("src/lib.rs"), "base\n").expect("external revert");
     let reverted = fixture
@@ -5561,6 +5571,16 @@ async fn repository_wide_capture_detects_an_external_revert_missing_from_git_ove
             .collect::<Vec<_>>(),
         vec![REPOSITORY_WIDE_PATH, "src/lib.rs"]
     );
+    assert_eq!(
+        reverted.files.iter().find(|entry| entry.path == "src/lib.rs"),
+        Some(&WorkspaceManifestEntry {
+            path: "src/lib.rs".to_string(),
+            content_hash: Some(
+                "f34848ca92665c342abd5816c9e3eda0e82180671195362bcd0080544a3bc2ac".to_string()
+            ),
+            existed: true,
+        })
+    );
     let events = fixture
         .store
         .read_workspace_events(fixture.repo.path(), modified.epoch)
@@ -5571,6 +5591,21 @@ async fn repository_wide_capture_detects_an_external_revert_missing_from_git_ove
             && event.attribution_confidence == AttributionConfidence::DetectionOnly
             && event.paths == vec!["src/lib.rs".to_string()]
     }));
+    let stable = fixture
+        .store
+        .capture_workspace_revision(fixture.repo.path(), vec![REPOSITORY_WIDE_PATH.to_string()])
+        .await
+        .expect("unchanged reverted file remains stable");
+    assert_eq!(stable.epoch, reverted.epoch);
+    assert_eq!(stable.manifest_hash, reverted.manifest_hash);
+    assert!(
+        fixture
+            .store
+            .read_workspace_events(fixture.repo.path(), reverted.epoch)
+            .await
+            .expect("events after stable capture read")
+            .is_empty()
+    );
 }
 
 #[tokio::test]

@@ -491,10 +491,8 @@ pub async fn get_threads_in_root_ascending(
             continue;
         };
         if anchor.is_some_and(|(anchor_ts, anchor_id)| match anchor_id {
-            Some(anchor_id) if sort_key == ThreadSortKey::RecencyAt => {
-                key <= (anchor_ts, anchor_id)
-            }
-            Some(_) | None => key.0 <= anchor_ts,
+            Some(anchor_id) => key <= (anchor_ts, anchor_id),
+            None => key.0 <= anchor_ts,
         }) {
             continue;
         }
@@ -1574,12 +1572,12 @@ async fn find_thread_path_by_id_str_in_subdir(
                 ..Default::default()
             };
 
-            let results = file_search::run(
-                id_str,
-                vec![root.clone()],
-                options,
-                /*cancel_flag*/ None,
-            )
+            let query = id_str.to_string();
+            let results = tokio::task::spawn_blocking(move || {
+                file_search::run(&query, vec![root], options, /*cancel_flag*/ None)
+            })
+            .await
+            .map_err(io::Error::other)?
             .map_err(|e| io::Error::other(format!("file search failed: {e}")))?;
 
             let found = results
@@ -1690,4 +1688,45 @@ pub fn rollout_date_parts(file_name: &OsStr) -> Option<(String, String, String)>
     let month = date.get(5..7)?.to_string();
     let day = date.get(8..10)?.to_string();
     Some((year, month, day))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+
+    #[tokio::test]
+    async fn uuid_lookup_finds_noncanonical_plain_and_compressed_rollouts() -> io::Result<()> {
+        let home = tempfile::tempdir()?;
+        let id = Uuid::from_u128(0x12345678123456781234567812345678).to_string();
+        for (subdir, suffix) in [
+            (SESSIONS_SUBDIR, ".jsonl"),
+            (ARCHIVED_SESSIONS_SUBDIR, ".jsonl.zst"),
+        ] {
+            let directory = home.path().join(subdir).join("legacy");
+            tokio::fs::create_dir_all(&directory).await?;
+            let path = directory.join(format!("rollout-custom-{id}{suffix}"));
+            tokio::fs::write(&path, b"stored rollout").await?;
+            assert!(
+                parse_timestamp_uuid_from_filename(&format!("rollout-custom-{id}.jsonl")).is_none()
+            );
+            let found = if subdir == SESSIONS_SUBDIR {
+                find_thread_path_by_id_str(home.path(), &id, None).await?
+            } else {
+                find_archived_thread_path_by_id_str(home.path(), &id, None).await?
+            };
+            assert_eq!(found, Some(path.clone()));
+            assert_eq!(tokio::fs::read(path).await?, b"stored rollout");
+        }
+        let missing_id = Uuid::from_u128(0xffffffffffffffffffffffffffffffff).to_string();
+        assert_eq!(
+            find_thread_path_by_id_str(home.path(), &missing_id, None).await?,
+            None
+        );
+        assert_eq!(
+            find_archived_thread_path_by_id_str(home.path(), "invalid", None).await?,
+            None
+        );
+        Ok(())
+    }
 }

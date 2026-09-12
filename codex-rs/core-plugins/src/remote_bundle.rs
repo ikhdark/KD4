@@ -436,11 +436,11 @@ fn install_remote_plugin_bundle(
 
     let store = PluginStore::try_new(codex_home)?;
     let remote_plugin_id = bundle.remote_plugin_id;
-    let result = store
-        .install_with_version(plugin_root, bundle.plugin_id, bundle.plugin_version)
+    let pending_install = store
+        .begin_install_with_version(plugin_root, bundle.plugin_id, bundle.plugin_version)
         .map_err(RemotePluginBundleInstallError::from)?;
-    store.write_remote_plugin_id(&result.plugin_id, &remote_plugin_id)?;
-    Ok(result)
+    store.write_remote_plugin_id(&pending_install.result().plugin_id, &remote_plugin_id)?;
+    Ok(pending_install.commit())
 }
 
 fn extract_remote_plugin_bundle_to_path(
@@ -829,6 +829,148 @@ mod tests {
                 "remote_plugin_id": REMOTE_PLUGIN_ID,
             })
         );
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    async fn download_install_metadata_failure_rolls_back_and_retries() {
+        // Set the HTTP test opt-in only in a child process, without mutating the
+        // environment shared by concurrently running tests.
+        if !allow_test_loopback_http_bundle_downloads() {
+            let status = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args([
+                    "--exact",
+                    "remote_bundle::tests::download_install_metadata_failure_rolls_back_and_retries",
+                    "--nocapture",
+                ])
+                .env(TEST_ALLOW_LOOPBACK_HTTP_REMOTE_PLUGIN_BUNDLES_ENV, "1")
+                .status()
+                .expect("run remote bundle HTTP scenario");
+            assert!(status.success(), "remote bundle scenario failed: {status}");
+            return;
+        }
+
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/linear.tar.gz"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_bytes(tar_gz_bytes(&[
+                    (
+                        ".codex-plugin/plugin.json",
+                        br#"{"name":"linear","version":"2.0.0"}"#,
+                        0o644,
+                    ),
+                    ("new.txt", b"new payload", 0o644),
+                ])),
+            )
+            .expect(4)
+            .mount(&server)
+            .await;
+        let http_clients = codex_login::default_client::create_client_pool_without_request_logging(
+            codex_http_client::HttpClientFactory::new(
+                codex_http_client::OutboundProxyPolicy::ReqwestDefault,
+            ),
+            codex_http_client::ClientRouteClass::Api,
+        );
+
+        for previously_installed in [false, true] {
+            let codex_home = tempdir().expect("codex home");
+            let store = PluginStore::new(codex_home.path().to_path_buf());
+            let plugin_id = valid_remote_plugin_bundle().plugin_id;
+            let base_root = store.plugin_base_root(&plugin_id);
+            let metadata_path = base_root.join(".codex-remote-plugin-install.json");
+            let previous_metadata = if previously_installed {
+                install_remote_plugin_bundle(
+                    codex_home.path().to_path_buf(),
+                    valid_remote_plugin_bundle(),
+                    tar_gz_bytes(&[
+                        (
+                            ".codex-plugin/plugin.json",
+                            br#"{"name":"linear","version":"1.2.3"}"#,
+                            0o644,
+                        ),
+                        ("old.txt", b"old payload", 0o644),
+                    ]),
+                )
+                .expect("install previous plugin");
+                Some(fs::read(metadata_path.as_path()).expect("previous metadata"))
+            } else {
+                None
+            };
+            // This accepted version creates a directory at the metadata-file
+            // destination, making the actual atomic metadata write fail.
+            let bundle = validate_remote_plugin_bundle(
+                "replacement-remote-id",
+                "openai-curated-remote",
+                "linear",
+                Some(".codex-remote-plugin-install.json"),
+                Some(&format!("{}/linear.tar.gz", server.uri())),
+                None,
+            )
+            .expect("valid bundle with metadata-path version");
+            let error = download_and_install_remote_plugin_bundle(
+                codex_home.path().to_path_buf(),
+                bundle.clone(),
+                &http_clients,
+            )
+            .await
+            .expect_err("metadata destination is a directory");
+            assert!(matches!(
+                error,
+                RemotePluginBundleInstallError::Store(PluginStoreError::Io {
+                    context: "failed to write remote plugin install metadata",
+                    ..
+                })
+            ));
+            if let Some(previous_metadata) = previous_metadata {
+                assert_eq!(
+                    fs::read(metadata_path.as_path()).unwrap(),
+                    previous_metadata
+                );
+                assert_eq!(
+                    fs::read(base_root.join("1.2.3/old.txt").as_path()).unwrap(),
+                    b"old payload"
+                );
+                assert_eq!(
+                    store.active_plugin_version(&plugin_id),
+                    Some("1.2.3".to_string())
+                );
+                assert!(!metadata_path.join("new.txt").as_path().exists());
+            } else {
+                assert!(
+                    !base_root.as_path().exists(),
+                    "failed install left cache files"
+                );
+                assert!(!store.is_installed(&plugin_id));
+            }
+
+            let result = download_and_install_remote_plugin_bundle(
+                codex_home.path().to_path_buf(),
+                validate_remote_plugin_bundle(
+                    "replacement-remote-id",
+                    "openai-curated-remote",
+                    "linear",
+                    Some("2.0.0"),
+                    Some(&format!("{}/linear.tar.gz", server.uri())),
+                    None,
+                )
+                .expect("valid retry bundle"),
+                &http_clients,
+            )
+            .await
+            .expect("retry installs plugin and metadata");
+            assert_eq!(result.plugin_version, "2.0.0");
+            assert_eq!(
+                fs::read(result.installed_path.join("new.txt").as_path()).unwrap(),
+                b"new payload"
+            );
+            assert_eq!(
+                store.remote_plugin_id(&plugin_id).unwrap(),
+                Some("replacement-remote-id".to_string())
+            );
+            assert!(!base_root.join("1.2.3").as_path().exists());
+        }
+        server.verify().await;
     }
 
     #[test]

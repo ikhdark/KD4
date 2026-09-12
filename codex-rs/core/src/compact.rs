@@ -566,10 +566,12 @@ async fn run_compact_task_inner_impl(
     }
     let reference_context_item = match &initial_context_injection {
         InitialContextInjection::DoNotInject => None,
-        InitialContextInjection::AtStart(_) => Some(turn_context.to_turn_context_item()),
+        InitialContextInjection::AtStart(_) => {
+            Some(turn_context.to_turn_context_item_async().await)
+        }
         #[cfg(test)]
         InitialContextInjection::BeforeLastUserMessage(_) => {
-            Some(turn_context.to_turn_context_item())
+            Some(turn_context.to_turn_context_item_async().await)
         }
     };
     let compacted_item = CompactedItem {
@@ -583,14 +585,14 @@ async fn run_compact_task_inner_impl(
         window_id: Some(window_ids.window_id.to_string()),
     };
     sess.replace_compacted_history(
-        turn_context.as_ref(),
+        &turn_context,
         new_history,
         reference_context_item,
         world_state_baseline,
         fragment_digests,
         compacted_item,
     )
-    .await;
+    .await?;
     sess.recompute_token_usage(&turn_context).await;
 
     sess.emit_turn_item_completed(&turn_context, compaction_item)

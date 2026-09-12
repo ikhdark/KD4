@@ -408,7 +408,7 @@ impl ResponsesWebsocketConnection {
             )]
             async move {
                 let mut guard = stream.lock().await;
-                let result = {
+                let result = 'response: {
                     let Some(ws_stream) = guard.as_mut() else {
                         let _ = tx_send_complete.send(());
                         let _ = tx_event
@@ -438,7 +438,9 @@ impl ResponsesWebsocketConnection {
                     } else {
                         for event in metadata.initial_events() {
                             if tx_event.send(Ok(event)).await.is_err() {
-                                return;
+                                break 'response Err(ApiError::Stream(
+                                    "response event consumer dropped".to_string(),
+                                ));
                             }
                         }
 
@@ -1070,6 +1072,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn caller_dropped_during_send_closes_socket_before_metadata_delivery() {
+        let (tx_command, mut rx_command) = mpsc::channel::<WsCommand>(1);
+        let (_tx_message, rx_message) = ws_ingress_channel(1, 1024);
+        let (tx_dispatched, rx_dispatched) = oneshot::channel();
+        let (tx_release_send, rx_release_send) = oneshot::channel();
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let observed_dispatches = Arc::clone(&dispatches);
+        let pump_task = tokio::spawn(async move {
+            let Some(WsCommand::Send { tx_result, .. }) = rx_command.recv().await else {
+                panic!("expected first dispatch");
+            };
+            observed_dispatches.fetch_add(1, Ordering::SeqCst);
+            tx_dispatched.send(()).expect("dispatch observer");
+            rx_release_send.await.expect("release external send");
+            tx_result.send(Ok(())).expect("send completion receiver");
+            while let Some(WsCommand::Send { tx_result, .. }) = rx_command.recv().await {
+                observed_dispatches.fetch_add(1, Ordering::SeqCst);
+                let _ = tx_result.send(Ok(()));
+            }
+        });
+        let mut headers = HeaderMap::new();
+        headers.insert("openai-model", HeaderValue::from_static("server-model"));
+        let connection = Arc::new(ResponsesWebsocketConnection::new(
+            WsStream {
+                tx_command,
+                rx_message,
+                rx_failure: None,
+                pending_failure: None,
+                pump_task,
+            },
+            Duration::from_secs(1),
+            ResponsesStreamMetadata::from_headers(&headers),
+            None,
+        ));
+        let request = Arc::new(ResponsesWsRequest::ResponseCreate(
+            ResponseCreateWsRequest {
+                model: "gpt-test".to_string(),
+                instructions: String::new(),
+                previous_response_id: None,
+                input: Vec::new().into(),
+                tools: None,
+                tool_choice: "auto".to_string(),
+                parallel_tool_calls: true,
+                reasoning: None,
+                store: false,
+                stream: true,
+                stream_options: None,
+                include: Vec::new(),
+                service_tier: None,
+                prompt_cache_key: None,
+                text: None,
+                generate: None,
+                client_metadata: None,
+            },
+        ));
+        let caller_connection = Arc::clone(&connection);
+        let caller_request = Arc::clone(&request);
+        let caller = tokio::spawn(async move {
+            caller_connection
+                .stream_request_with_dispatch_ready(
+                    &caller_request,
+                    false,
+                    None,
+                    || {},
+                    |_| {},
+                    || {},
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), rx_dispatched)
+            .await
+            .expect("request must dispatch")
+            .expect("dispatch signal");
+        caller.abort();
+        assert!(matches!(caller.await, Err(error) if error.is_cancelled()));
+        tx_release_send.send(()).expect("release blocked send");
+
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), connection.is_closed())
+                .await
+                .expect("metadata failure must release connection lock")
+        );
+        let mut second = connection
+            .stream_request_with_dispatch_ready(&request, true, None, || {}, |_| {}, || {})
+            .await
+            .expect("closed connection reports through response stream");
+        let error = second
+            .next()
+            .await
+            .expect("closed connection error")
+            .expect_err("must reject reuse");
+        assert!(
+            matches!(error, ApiError::Stream(message) if message == "websocket connection is closed")
+        );
+        assert!(second.next().await.is_none());
+        assert_eq!(dispatches.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn websocket_ingress_failure_preempts_staged_messages() {
         let (tx_command, _rx_command) = mpsc::channel::<WsCommand>(1);
         let (tx_message, rx_message) = ws_ingress_channel(1, 1024);
@@ -1244,13 +1345,43 @@ mod tests {
             )])),
         });
 
-        let previous_payload = serde_json::to_value(&request).expect("serialize previous payload");
         let request_text =
             serialize_websocket_request(&request).expect("serialize websocket request");
         let wire_payload =
             serde_json::from_str::<Value>(&request_text).expect("parse websocket request");
 
-        assert_eq!(wire_payload, previous_payload);
+        assert_eq!(
+            wire_payload,
+            json!({
+                "type": "response.create",
+                "model": "gpt-test",
+                "instructions": "Use the available tools.",
+                "previous_response_id": "resp-1",
+                "input": [{
+                    "type": "message",
+                    "id": "msg_1",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "hello"}],
+                }],
+                "tools": [{
+                    "type": "function",
+                    "name": "lookup",
+                    "parameters": {"type": "object"},
+                }],
+                "tool_choice": "auto",
+                "parallel_tool_calls": true,
+                "reasoning": null,
+                "store": false,
+                "stream": true,
+                "include": ["reasoning.encrypted_content"],
+                "service_tier": "priority",
+                "prompt_cache_key": "cache-key",
+                "generate": false,
+                "client_metadata": {
+                    "traceparent": "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01",
+                },
+            })
+        );
     }
 
     #[test]

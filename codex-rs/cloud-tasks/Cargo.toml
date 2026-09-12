@@ -29,6 +29,7 @@ codex-utils-cli = { workspace = true }
 crossterm = { workspace = true, features = ["event-stream"] }
 http = { workspace = true }
 owo-colors = { workspace = true, features = ["supports-colors"] }
+percent-encoding = "2"
 ratatui = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

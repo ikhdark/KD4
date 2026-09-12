@@ -1,12 +1,4 @@
 use std::borrow::Cow;
-#[cfg(test)]
-use std::collections::HashMap;
-#[cfg(test)]
-use std::collections::HashSet;
-#[cfg(test)]
-use std::path::Component;
-#[cfg(test)]
-use std::path::Path;
 
 use crate::model::SKILL_CATALOG_LOCATOR_PREFIX;
 use crate::model::SkillLoadOutcome;
@@ -27,7 +19,6 @@ const MAX_SKILL_METADATA_TOKEN_BUDGET: usize = 2_000;
 const MAX_DEFAULT_CONTEXT_SKILL_DESCRIPTION_CHARS: usize = 240;
 const TRUNCATED_SKILL_DESCRIPTION_SUFFIX: &str = "...";
 const SKILL_DESCRIPTION_TRUNCATION_WARNING_THRESHOLD_CHARS: usize = 100;
-const APPROX_BYTES_PER_TOKEN: usize = 4;
 pub const SKILL_DESCRIPTION_TRUNCATED_WARNING: &str = "Skill descriptions were shortened to fit the skills context budget. Codex can still see every skill, but some descriptions are shorter. Disable unused skills or plugins to leave more room for the rest.";
 pub const SKILL_DESCRIPTIONS_REMOVED_WARNING_PREFIX: &str =
     "Exceeded skills context budget. All skill descriptions were removed and";
@@ -74,17 +65,6 @@ impl SkillMetadataBudget {
             Self::Characters(_) => text.chars().count(),
         }
     }
-
-    fn cost_from_counts(self, chars: usize, bytes: usize) -> usize {
-        match self {
-            Self::Tokens(_) => approx_token_count_from_bytes(bytes),
-            Self::Characters(_) => chars,
-        }
-    }
-}
-
-fn approx_token_count_from_bytes(bytes: usize) -> usize {
-    bytes.saturating_add(APPROX_BYTES_PER_TOKEN.saturating_sub(1)) / APPROX_BYTES_PER_TOKEN
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,12 +125,7 @@ pub fn build_available_skills(
     }
 
     let skill_lines = ordered_catalog_skill_lines(&skills);
-    let selected = build_available_skills_from_lines(
-        skill_lines,
-        skills.len(),
-        budget,
-        SkillPathAliases::default(),
-    )?;
+    let selected = build_available_skills_from_lines(skill_lines, skills.len(), budget)?;
 
     record_available_skills_side_effects(&selected, budget, side_effects);
     Some(selected)
@@ -160,7 +135,6 @@ fn build_available_skills_from_lines(
     skill_lines: Vec<SkillLine<'_>>,
     total_count: usize,
     budget: SkillMetadataBudget,
-    path_aliases: SkillPathAliases,
 ) -> Option<AvailableSkills> {
     if total_count == 0 {
         return None;
@@ -193,7 +167,7 @@ fn build_available_skills_from_lines(
         None
     };
     let available = AvailableSkills {
-        skill_root_lines: path_aliases.skill_root_lines,
+        skill_root_lines: Vec::new(),
         skill_lines,
         report,
         warning_message,
@@ -421,14 +395,6 @@ fn sum_description_truncation(rendered: &[RenderedSkillLine]) -> (usize, usize) 
 }
 
 impl<'a> SkillLine<'a> {
-    #[cfg(test)]
-    fn new(skill: &'a SkillMetadata) -> Self {
-        Self::with_path(
-            skill,
-            skill.path_to_skills_md.to_string_lossy().replace('\\', "/"),
-        )
-    }
-
     fn catalog(skill: &'a SkillMetadata) -> Self {
         let summary = skill
             .short_description
@@ -444,16 +410,6 @@ impl<'a> SkillLine<'a> {
             name: skill.name.as_str(),
             description: truncate_default_context_skill_description(summary),
             path: format!("{SKILL_CATALOG_LOCATOR_PREFIX}{}", skill_catalog_id(skill)),
-        }
-    }
-
-    #[cfg(test)]
-    fn with_path(skill: &'a SkillMetadata, path: String) -> Self {
-        let description = truncate_default_context_skill_description(skill.description.as_str());
-        Self {
-            name: skill.name.as_str(),
-            description,
-            path,
         }
     }
 
@@ -491,16 +447,10 @@ impl<'a> SkillLine<'a> {
     }
 
     fn render_with_description(&self, description: &str) -> String {
-        if self.path.starts_with(SKILL_CATALOG_LOCATOR_PREFIX) {
-            if description.is_empty() {
-                format!("- {} — {}", self.name, self.path)
-            } else {
-                format!("- {} — {} — {}", self.name, description, self.path)
-            }
-        } else if description.is_empty() {
-            format!("- {}: (file: {})", self.name, self.path)
+        if description.is_empty() {
+            format!("- {} — {}", self.name, self.path)
         } else {
-            format!("- {}: {} (file: {})", self.name, description, self.path)
+            format!("- {} — {} — {}", self.name, description, self.path)
         }
     }
 }
@@ -536,23 +486,26 @@ impl<'a> DescriptionBudgetLine<'a> {
     fn new(line: &'a SkillLine<'a>, budget: SkillMetadataBudget) -> Self {
         let minimum_line = line.render_minimum();
         let minimum_chars = minimum_line.chars().count().saturating_add(1);
-        let minimum_bytes = minimum_line.len().saturating_add(1);
-        let minimum_cost = budget.cost_from_counts(minimum_chars, minimum_bytes);
+        let minimum_cost = line_cost(budget, &minimum_line);
 
         let description_char_count = line.description_char_count();
         let mut extra_costs = Vec::with_capacity(description_char_count.saturating_add(1));
         extra_costs.push(0);
 
-        let mut prefix_chars = 0usize;
-        let mut prefix_bytes = 0usize;
-        for ch in line.description.chars() {
-            prefix_chars = prefix_chars.saturating_add(1);
-            prefix_bytes = prefix_bytes.saturating_add(ch.len_utf8());
-            let rendered_chars = minimum_chars.saturating_add(prefix_chars).saturating_add(1);
-            let rendered_bytes = minimum_bytes.saturating_add(prefix_bytes).saturating_add(1);
-            let cost = budget
-                .cost_from_counts(rendered_chars, rendered_bytes)
-                .saturating_sub(minimum_cost);
+        for (index, (byte_offset, ch)) in line.description.char_indices().enumerate() {
+            let rendered_cost = match budget {
+                // A nonempty description adds another catalog separator (" — ").
+                SkillMetadataBudget::Characters(_) => {
+                    minimum_chars.saturating_add(index + 1).saturating_add(3)
+                }
+                // The shared estimator includes lexical costs, so byte counts alone
+                // cannot account for punctuation-heavy descriptions.
+                SkillMetadataBudget::Tokens(_) => line_cost(
+                    budget,
+                    &line.render_with_description(&line.description[..byte_offset + ch.len_utf8()]),
+                ),
+            };
+            let cost = rendered_cost.saturating_sub(minimum_cost);
             extra_costs.push(cost);
         }
 
@@ -623,247 +576,6 @@ fn render_lines_with_description_budget(
         .collect()
 }
 
-#[cfg(test)]
-fn build_aliased_available_skills(
-    outcome: &SkillLoadOutcome,
-    skills: &[SkillMetadata],
-    budget: SkillMetadataBudget,
-) -> Option<AvailableSkills> {
-    let plan = build_alias_plan(outcome, skills, budget)?;
-    if plan.table_cost >= budget.limit() {
-        return None;
-    }
-
-    let adjusted_limit = budget.limit().saturating_sub(plan.table_cost);
-    let adjusted_budget = match budget {
-        SkillMetadataBudget::Tokens(_) => SkillMetadataBudget::Tokens(adjusted_limit),
-        SkillMetadataBudget::Characters(_) => SkillMetadataBudget::Characters(adjusted_limit),
-    };
-    let ordered_skills = ordered_skills_for_budget(skills);
-    let skill_lines = ordered_skills
-        .into_iter()
-        .map(|skill| SkillLine::with_path(skill, render_skill_path_with_aliases(skill, &plan)))
-        .collect::<Vec<_>>();
-    build_available_skills_from_lines(skill_lines, skills.len(), adjusted_budget, plan.aliases)
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct SkillPathAliases {
-    skill_root_lines: Vec<String>,
-}
-
-#[cfg(test)]
-struct AliasPlan {
-    aliases: SkillPathAliases,
-    root_aliases: HashMap<AbsolutePathBuf, String>,
-    alias_root_by_path: HashMap<AbsolutePathBuf, AbsolutePathBuf>,
-    table_cost: usize,
-}
-
-#[cfg(test)]
-fn build_alias_plan(
-    outcome: &SkillLoadOutcome,
-    skills: &[SkillMetadata],
-    budget: SkillMetadataBudget,
-) -> Option<AliasPlan> {
-    let skill_paths = skills
-        .iter()
-        .map(|skill| skill.path_to_skills_md.clone())
-        .collect::<HashSet<_>>();
-    let skill_root_by_path = outcome
-        .skill_root_by_path
-        .iter()
-        .filter(|(path, _)| skill_paths.contains(*path))
-        .map(|(path, root)| (path.clone(), root.clone()))
-        .collect::<HashMap<_, _>>();
-    let used_roots = outcome
-        .skill_roots
-        .iter()
-        .filter(|root| {
-            skill_root_by_path
-                .values()
-                .any(|skill_root| skill_root == *root)
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    if used_roots.is_empty() {
-        return None;
-    }
-
-    let plugin_version_skill_counts =
-        plugin_version_skill_counts_for_skill_roots(skill_root_by_path.values());
-    let alias_root_by_skill_root = used_roots
-        .iter()
-        .map(|root| {
-            (
-                root.clone(),
-                alias_root_for_skill_root(root, &plugin_version_skill_counts),
-            )
-        })
-        .collect::<HashMap<_, _>>();
-    let alias_roots = ordered_alias_roots(&used_roots, &alias_root_by_skill_root)?;
-    let root_aliases = alias_roots
-        .iter()
-        .enumerate()
-        .map(|(index, alias_root)| (alias_root.clone(), format!("r{index}")))
-        .collect::<HashMap<_, _>>();
-    let alias_root_by_path = skill_root_by_path
-        .iter()
-        .filter_map(|(path, skill_root)| {
-            alias_root_by_skill_root
-                .get(skill_root)
-                .map(|alias_root| (path.clone(), alias_root.clone()))
-        })
-        .collect::<HashMap<_, _>>();
-    let skill_root_lines = build_skill_root_lines(&alias_roots);
-    let table_cost = aliased_metadata_overhead_cost(budget, &skill_root_lines);
-
-    Some(AliasPlan {
-        aliases: SkillPathAliases { skill_root_lines },
-        root_aliases,
-        alias_root_by_path,
-        table_cost,
-    })
-}
-
-#[cfg(test)]
-fn ordered_alias_roots(
-    used_roots: &[AbsolutePathBuf],
-    alias_root_by_skill_root: &HashMap<AbsolutePathBuf, AbsolutePathBuf>,
-) -> Option<Vec<AbsolutePathBuf>> {
-    let mut seen = HashSet::new();
-    let mut alias_roots = Vec::new();
-    for root in used_roots {
-        let alias_root = alias_root_by_skill_root.get(root)?.clone();
-        if seen.insert(alias_root.clone()) {
-            alias_roots.push(alias_root);
-        }
-    }
-    Some(alias_roots)
-}
-
-#[cfg(test)]
-fn alias_root_for_skill_root(
-    root: &AbsolutePathBuf,
-    plugin_version_skill_counts: &HashMap<AbsolutePathBuf, usize>,
-) -> AbsolutePathBuf {
-    let Some(plugin_version_base) = plugin_version_base(root.as_path()) else {
-        return root.clone();
-    };
-    let skill_count = plugin_version_skill_counts
-        .get(&plugin_version_base)
-        .copied()
-        .unwrap_or_default();
-    if skill_count > 1 {
-        root.clone()
-    } else {
-        plugin_marketplace_base(root.as_path()).unwrap_or_else(|| root.clone())
-    }
-}
-
-#[cfg(test)]
-fn plugin_version_skill_counts_for_skill_roots<'a>(
-    skill_roots: impl Iterator<Item = &'a AbsolutePathBuf>,
-) -> HashMap<AbsolutePathBuf, usize> {
-    let mut counts = HashMap::new();
-    for root in skill_roots {
-        if let Some(plugin_version_base) = plugin_version_base(root.as_path()) {
-            let count = counts.entry(plugin_version_base).or_insert(0usize);
-            *count = count.saturating_add(1);
-        }
-    }
-    counts
-}
-
-#[cfg(test)]
-fn aliased_metadata_overhead_cost(
-    budget: SkillMetadataBudget,
-    skill_root_lines: &[String],
-) -> usize {
-    let empty_skill_lines: &[String] = &[];
-    let absolute_body = render_available_skills_body(&[], empty_skill_lines);
-    let aliased_body = render_available_skills_body(skill_root_lines, empty_skill_lines);
-    budget
-        .cost(&aliased_body)
-        .saturating_sub(budget.cost(&absolute_body))
-}
-
-#[cfg(test)]
-fn build_skill_root_lines(roots: &[AbsolutePathBuf]) -> Vec<String> {
-    roots
-        .iter()
-        .enumerate()
-        .map(|(index, root)| {
-            let root_str = root.to_string_lossy().replace('\\', "/");
-            format!("- `r{index}` = `{root_str}`")
-        })
-        .collect()
-}
-
-#[cfg(test)]
-fn plugin_marketplace_base(path: &Path) -> Option<AbsolutePathBuf> {
-    let mut candidate = path;
-    while let Some(parent) = candidate.parent() {
-        if parent.file_name()?.to_str()? == "cache"
-            && parent.parent()?.file_name()?.to_str()? == "plugins"
-        {
-            return AbsolutePathBuf::from_absolute_path(candidate).ok();
-        }
-        candidate = parent;
-    }
-    None
-}
-
-#[cfg(test)]
-fn plugin_version_base(path: &Path) -> Option<AbsolutePathBuf> {
-    let marketplace_base = plugin_marketplace_base(path)?;
-    let mut relative_components = path
-        .strip_prefix(marketplace_base.as_path())
-        .ok()?
-        .components();
-    let plugin = match relative_components.next()? {
-        Component::Normal(plugin) => plugin,
-        _ => return None,
-    };
-    let version = match relative_components.next()? {
-        Component::Normal(version) => version,
-        _ => return None,
-    };
-    AbsolutePathBuf::from_absolute_path(marketplace_base.join(plugin).join(version)).ok()
-}
-
-#[cfg(test)]
-fn render_skill_path_with_aliases(skill: &SkillMetadata, plan: &AliasPlan) -> String {
-    outcome_relative_skill_path(skill, plan)
-        .unwrap_or_else(|| skill.path_to_skills_md.to_string_lossy().replace('\\', "/"))
-}
-
-#[cfg(test)]
-fn outcome_relative_skill_path(skill: &SkillMetadata, plan: &AliasPlan) -> Option<String> {
-    let alias_root = plan.alias_root_by_path.get(&skill.path_to_skills_md)?;
-    let alias = plan.root_aliases.get(alias_root)?;
-    let relative_path = skill
-        .path_to_skills_md
-        .as_path()
-        .strip_prefix(alias_root.as_path())
-        .ok()?;
-    let relative_path = relative_path.to_string_lossy().replace('\\', "/");
-    Some(format!("{alias}/{relative_path}"))
-}
-
-#[cfg(test)]
-fn ordered_absolute_skill_lines(skills: &[SkillMetadata]) -> Vec<SkillLine<'_>> {
-    ordered_skills_for_budget(skills)
-        .into_iter()
-        .map(|skill| {
-            SkillLine::with_path(
-                skill,
-                skill.path_to_skills_md.to_string_lossy().replace('\\', "/"),
-            )
-        })
-        .collect()
-}
-
 fn ordered_catalog_skill_lines(skills: &[SkillMetadata]) -> Vec<SkillLine<'_>> {
     ordered_skills_for_budget(skills)
         .into_iter()
@@ -926,8 +638,24 @@ mod tests {
     }
 
     fn expected_skill_line(skill: &SkillMetadata, description: &str) -> String {
-        SkillLine::with_path(skill, normalized_path(&skill.path_to_skills_md))
-            .render_with_description(description)
+        let locator = format!("skill:{}", skill_catalog_id(skill));
+        if description.is_empty() {
+            format!("- {} — {locator}", skill.name)
+        } else {
+            format!("- {} — {description} — {locator}", skill.name)
+        }
+    }
+
+    fn expected_catalog_cost(
+        skill: &SkillMetadata,
+        description: &str,
+        budget: SkillMetadataBudget,
+    ) -> usize {
+        let text = format!("{}\n", expected_skill_line(skill, description));
+        match budget {
+            SkillMetadataBudget::Characters(_) => text.chars().count(),
+            SkillMetadataBudget::Tokens(_) => approx_token_count(&text),
+        }
     }
 
     fn normalized_path(path: &AbsolutePathBuf) -> String {
@@ -964,25 +692,33 @@ mod tests {
         skills: &[SkillMetadata],
         budget: SkillMetadataBudget,
     ) -> Option<AvailableSkills> {
-        build_available_skills_from_lines(
-            ordered_absolute_skill_lines(skills),
-            skills.len(),
+        let rendered = build_available_skills(
+            &SkillLoadOutcome {
+                skills: skills.to_vec(),
+                ..Default::default()
+            },
             budget,
-            SkillPathAliases::default(),
-        )
-    }
-
-    #[test]
-    fn skill_usage_instructions_require_complete_main_agent_reads() {
-        assert!(SKILLS_HOW_TO_USE.contains("read each selected `SKILL.md` completely"));
-        assert!(SKILLS_HOW_TO_USE.contains("Do not delegate that reading or interpretation"));
-        assert!(SKILLS_HOW_TO_USE.contains("Read task-required linked instructions"));
-        assert!(SKILLS_HOW_TO_USE.contains("dedicated read-only route"));
-        assert!(SKILLS_HOW_TO_USE.contains("orchestrator"));
-        assert!(SKILLS_HOW_TO_USE.contains("state ordering when needed"));
-        assert!(SKILLS_HOW_TO_USE.contains("named skill or required read is unavailable"));
-        assert!(SKILLS_HOW_TO_USE.contains("relevant variants"));
-        assert!(SKILLS_HOW_TO_USE.len() <= 1_000);
+            SkillRenderSideEffects::None,
+        );
+        if let Some(rendered) = &rendered {
+            // Assert the actual visible lines, including the terminating newline per entry.
+            let cost: usize = rendered
+                .skill_lines
+                .iter()
+                .map(|line| {
+                    let text = format!("{line}\n");
+                    match budget {
+                        SkillMetadataBudget::Characters(_) => text.chars().count(),
+                        SkillMetadataBudget::Tokens(_) => approx_token_count(&text),
+                    }
+                })
+                .sum();
+            assert!(
+                cost <= budget.limit(),
+                "visible cost {cost} exceeds {budget:?}"
+            );
+        }
+        rendered
     }
 
     #[test]
@@ -1079,13 +815,18 @@ mod tests {
                 skill
             })
             .collect::<Vec<_>>();
-        let old = build_available_skills_from_lines(
-            ordered_absolute_skill_lines(&skills),
-            skills.len(),
-            SkillMetadataBudget::Characters(usize::MAX),
-            SkillPathAliases::default(),
-        )
-        .expect("historical catalog should render");
+        let old_text = skills
+            .iter()
+            .map(|skill| {
+                format!(
+                    "- {}: {} (file: {})",
+                    skill.name,
+                    skill.description,
+                    normalized_path(&skill.path_to_skills_md)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
         let new = build_available_skills(
             &SkillLoadOutcome {
                 skills: skills.clone(),
@@ -1095,18 +836,10 @@ mod tests {
             SkillRenderSideEffects::None,
         )
         .expect("opaque catalog should render");
-        let old_text = old.skill_lines.join("\n");
         let new_text = new.skill_lines.join("\n");
 
         assert!(new_text.len() * 100 <= old_text.len() * 65);
         for skill in &skills {
-            assert_eq!(
-                old.skill_lines
-                    .iter()
-                    .filter(|line| line.starts_with(&format!("- {}:", skill.name)))
-                    .count(),
-                1
-            );
             assert_eq!(
                 new.skill_lines
                     .iter()
@@ -1159,10 +892,10 @@ mod tests {
     fn budgeted_rendering_truncates_descriptions_equally_before_omitting_skills() {
         let alpha = make_skill_with_description("alpha-skill", SkillScope::Repo, "abcdef");
         let beta = make_skill_with_description("beta-skill", SkillScope::Repo, "uvwxyz");
-        let minimum_cost = SkillLine::new(&alpha)
-            .minimum_cost(SkillMetadataBudget::Characters(usize::MAX))
-            + SkillLine::new(&beta).minimum_cost(SkillMetadataBudget::Characters(usize::MAX));
-        let budget = SkillMetadataBudget::Characters(minimum_cost + 6);
+        let minimum_cost =
+            expected_catalog_cost(&alpha, "", SkillMetadataBudget::Characters(usize::MAX))
+                + expected_catalog_cost(&beta, "", SkillMetadataBudget::Characters(usize::MAX));
+        let budget = SkillMetadataBudget::Characters(minimum_cost + 10);
 
         let rendered = build_available_skills_from_metadata(&[beta.clone(), alpha.clone()], budget)
             .expect("skills should render");
@@ -1184,10 +917,10 @@ mod tests {
     fn budgeted_rendering_does_not_warn_when_average_description_truncation_is_within_threshold() {
         let alpha = make_skill_with_description("alpha-skill", SkillScope::Repo, "abcdefghij");
         let beta = make_skill_with_description("beta-skill", SkillScope::Repo, "uvwxyzabcd");
-        let minimum_cost = SkillLine::new(&alpha)
-            .minimum_cost(SkillMetadataBudget::Characters(usize::MAX))
-            + SkillLine::new(&beta).minimum_cost(SkillMetadataBudget::Characters(usize::MAX));
-        let budget = SkillMetadataBudget::Characters(minimum_cost + 6);
+        let minimum_cost =
+            expected_catalog_cost(&alpha, "", SkillMetadataBudget::Characters(usize::MAX))
+                + expected_catalog_cost(&beta, "", SkillMetadataBudget::Characters(usize::MAX));
+        let budget = SkillMetadataBudget::Characters(minimum_cost + 10);
 
         let rendered = build_available_skills_from_metadata(&[alpha, beta], budget)
             .expect("skills should render");
@@ -1205,11 +938,14 @@ mod tests {
         let long_skill =
             make_skill_with_description("long-skill", SkillScope::Repo, &long_description);
         let empty_skill = make_skill_with_description("empty-skill", SkillScope::Repo, "");
-        let minimum_cost = SkillLine::new(&long_skill)
-            .minimum_cost(SkillMetadataBudget::Characters(usize::MAX))
-            + SkillLine::new(&empty_skill)
-                .minimum_cost(SkillMetadataBudget::Characters(usize::MAX));
-        let budget = SkillMetadataBudget::Characters(minimum_cost + 39);
+        let minimum_cost =
+            expected_catalog_cost(&long_skill, "", SkillMetadataBudget::Characters(usize::MAX))
+                + expected_catalog_cost(
+                    &empty_skill,
+                    "",
+                    SkillMetadataBudget::Characters(usize::MAX),
+                );
+        let budget = SkillMetadataBudget::Characters(minimum_cost + 41);
 
         let rendered = build_available_skills_from_metadata(&[long_skill, empty_skill], budget)
             .expect("skills should render");
@@ -1230,16 +966,25 @@ mod tests {
 
     #[test]
     fn budgeted_rendering_token_budget_uses_generic_ceiling_warning() {
-        let long_description = "a".repeat(1000);
+        let long_description = "!".repeat(1000);
         let long_skill =
             make_skill_with_description("long-skill", SkillScope::Repo, &long_description);
-        let minimum_cost =
-            SkillLine::new(&long_skill).minimum_cost(SkillMetadataBudget::Tokens(usize::MAX));
-        let budget = SkillMetadataBudget::Tokens(minimum_cost + 1);
+        // The minimum catalog entry has 15 lexical tokens: three punctuation
+        // tokens, four name tokens, two for "skill", and six for the 24 hex ID
+        // characters. The extra separator and two exclamation marks add three.
+        let budget = SkillMetadataBudget::Tokens(18);
 
-        let rendered = build_available_skills_from_metadata(&[long_skill], budget)
+        let rendered = build_available_skills_from_metadata(&[long_skill.clone()], budget)
             .expect("skills should render");
 
+        assert_eq!(rendered.report.total_count, 1);
+        assert_eq!(rendered.report.included_count, 1);
+        assert_eq!(rendered.report.omitted_count, 0);
+        assert_eq!(rendered.report.truncated_description_chars, 238);
+        assert_eq!(
+            rendered.skill_lines,
+            vec![expected_skill_line(&long_skill, "!!")]
+        );
         assert_eq!(
             rendered.warning_message,
             Some(SKILL_DESCRIPTION_TRUNCATED_WARNING.to_string())
@@ -1250,10 +995,10 @@ mod tests {
     fn budgeted_rendering_redistributes_unused_description_budget() {
         let short = make_skill_with_description("short-skill", SkillScope::Repo, "x");
         let long = make_skill_with_description("long-skill", SkillScope::Repo, "abcdefghi");
-        let minimum_cost = SkillLine::new(&short)
-            .minimum_cost(SkillMetadataBudget::Characters(usize::MAX))
-            + SkillLine::new(&long).minimum_cost(SkillMetadataBudget::Characters(usize::MAX));
-        let budget = SkillMetadataBudget::Characters(minimum_cost + 11);
+        let minimum_cost =
+            expected_catalog_cost(&short, "", SkillMetadataBudget::Characters(usize::MAX))
+                + expected_catalog_cost(&long, "", SkillMetadataBudget::Characters(usize::MAX));
+        let budget = SkillMetadataBudget::Characters(minimum_cost + 15);
 
         let rendered = build_available_skills_from_metadata(&[short.clone(), long.clone()], budget)
             .expect("skills should render");
@@ -1277,9 +1022,9 @@ mod tests {
         let repo = make_skill("repo-skill", SkillScope::Repo);
         let admin = make_skill("admin-skill", SkillScope::Admin);
         let system_cost = SkillMetadataBudget::Characters(usize::MAX)
-            .cost(&format!("{}\n", SkillLine::new(&system).render_minimum()));
+            .cost(&format!("{}\n", expected_skill_line(&system, "")));
         let admin_cost = SkillMetadataBudget::Characters(usize::MAX)
-            .cost(&format!("{}\n", SkillLine::new(&admin).render_minimum()));
+            .cost(&format!("{}\n", expected_skill_line(&admin, "")));
         let budget = SkillMetadataBudget::Characters(system_cost + admin_cost);
 
         let rendered = build_available_skills_from_metadata(&[system, user, repo, admin], budget)
@@ -1295,11 +1040,11 @@ mod tests {
             )
         );
         let rendered_text = rendered.skill_lines.join("\n");
-        assert!(rendered_text.contains("- system-skill:"));
-        assert!(rendered_text.contains("- admin-skill:"));
+        assert!(rendered_text.contains("- system-skill —"));
+        assert!(rendered_text.contains("- admin-skill —"));
         assert!(!rendered_text.contains("desc"));
-        assert!(!rendered_text.contains("- repo-skill:"));
-        assert!(!rendered_text.contains("- user-skill:"));
+        assert!(!rendered_text.contains("- repo-skill —"));
+        assert!(!rendered_text.contains("- user-skill —"));
     }
 
     #[test]
@@ -1308,7 +1053,7 @@ mod tests {
         oversized.description = "desc ".repeat(100);
         let repo = make_skill("repo-skill", SkillScope::Repo);
         let repo_cost = SkillMetadataBudget::Characters(usize::MAX)
-            .cost(&format!("{}\n", SkillLine::new(&repo).render_full()));
+            .cost(&format!("{}\n", expected_skill_line(&repo, "desc")));
         let budget = SkillMetadataBudget::Characters(repo_cost);
 
         let rendered = build_available_skills_from_metadata(&[oversized, repo], budget)
@@ -1324,12 +1069,12 @@ mod tests {
             )
         );
         let rendered_text = rendered.skill_lines.join("\n");
-        assert!(!rendered_text.contains("- oversized-system-skill:"));
-        assert!(rendered_text.contains("- repo-skill:"));
+        assert!(!rendered_text.contains("- oversized-system-skill —"));
+        assert!(rendered_text.contains("- repo-skill —"));
     }
 
     #[test]
-    fn outcome_rendering_omits_aliases_when_absolute_plan_has_no_budget_pressure() {
+    fn outcome_rendering_uses_opaque_catalog_without_budget_pressure() {
         let root = test_path_buf("/tmp/skills").abs();
         let alpha_path = root.join("alpha/SKILL.md");
         let beta_path = root.join("beta/SKILL.md");
@@ -1353,298 +1098,124 @@ mod tests {
     }
 
     #[test]
-    fn outcome_rendering_uses_opaque_catalog_when_it_outperforms_aliases() {
-        let root = test_path_buf(
-            "/Users/xl/.codex/plugins/cache/openai-curated/example/hash1234567890/skills-with-a-very-long-shared-prefix",
-        )
-        .abs();
-        let skills = (0..12)
-            .map(|index| {
-                let name = format!("shared-root-skill-{index}");
-                skill_with_path(&name, &root.join(format!("skill-{index}/SKILL.md")))
-            })
-            .collect::<Vec<_>>();
-        let outcome = outcome_with_roots(skills.clone(), vec![root]);
-        let absolute_minimum = skills.iter().fold(0usize, |cost, skill| {
-            cost.saturating_add(
-                SkillLine::new(skill).minimum_cost(SkillMetadataBudget::Characters(usize::MAX)),
+    fn opaque_catalog_resolves_skills_across_plugin_root_layouts() {
+        for (scenario, paths) in [
+            ("single skill", vec!["github/v1/skills/alpha/SKILL.md"]),
+            (
+                "shared root",
+                vec![
+                    "github/v1/skills/alpha/SKILL.md",
+                    "github/v1/skills/beta/SKILL.md",
+                ],
+            ),
+            (
+                "multiple roots",
+                vec![
+                    "github/v1/skills/alpha/SKILL.md",
+                    "github/v1/extra-skills/beta/SKILL.md",
+                ],
+            ),
+            (
+                "multiple plugins",
+                vec![
+                    "github/v1/skills/alpha/SKILL.md",
+                    "slack/v1/skills/beta/SKILL.md",
+                ],
+            ),
+            (
+                "multiple versions",
+                vec![
+                    "github/v1/skills/alpha/SKILL.md",
+                    "github/v2/skills/beta/SKILL.md",
+                ],
+            ),
+        ] {
+            let marketplace =
+                test_path_buf("/Users/private/.codex/plugins/cache/marketplace").abs();
+            let skills = paths
+                .iter()
+                .enumerate()
+                .map(|(index, path)| {
+                    skill_with_path(&format!("plugin-skill-{index}"), &marketplace.join(path))
+                })
+                .collect::<Vec<_>>();
+            let roots = skills
+                .iter()
+                .map(|skill| {
+                    AbsolutePathBuf::from_absolute_path(
+                        skill
+                            .path_to_skills_md
+                            .as_path()
+                            .parent()
+                            .unwrap()
+                            .parent()
+                            .unwrap(),
+                    )
+                    .expect("absolute skill root")
+                })
+                .collect();
+            let outcome = Arc::new(outcome_with_roots(skills.clone(), roots));
+            let snapshot = crate::model::HostSkillsSnapshot::new(Arc::clone(&outcome));
+            let rendered = build_available_skills(
+                &outcome,
+                SkillMetadataBudget::Characters(2_000),
+                SkillRenderSideEffects::None,
             )
-        });
-        let plan = build_alias_plan(
-            &outcome,
-            &skills,
-            SkillMetadataBudget::Characters(usize::MAX),
-        )
-        .expect("alias plan should build");
-        let alias_minimum = skills.iter().fold(plan.table_cost, |cost, skill| {
-            cost.saturating_add(
-                SkillLine::with_path(skill, render_skill_path_with_aliases(skill, &plan))
-                    .minimum_cost(SkillMetadataBudget::Characters(usize::MAX)),
-            )
-        });
-        assert!(
-            alias_minimum < absolute_minimum,
-            "test fixture should make aliases cheaper"
-        );
-
-        let rendered = build_available_skills(
-            &outcome,
-            SkillMetadataBudget::Characters(alias_minimum),
-            SkillRenderSideEffects::None,
-        )
-        .expect("skills should render");
-
-        assert_eq!(rendered.report.included_count, skills.len());
-        assert_eq!(rendered.report.omitted_count, 0);
-        assert!(rendered.skill_root_lines.is_empty());
-        let rendered_text = rendered.skill_lines.join("\n");
-        assert!(!rendered_text.contains("/Users/xl/"));
-        assert!(!rendered_text.contains("r0/"));
-        for skill in &skills {
-            assert!(
-                rendered_text.contains(&format!("skill:{}", skill_catalog_id(skill))),
-                "{rendered_text}"
+            .expect("catalog");
+            assert_eq!(rendered.report.total_count, skills.len(), "{scenario}");
+            assert_eq!(rendered.report.included_count, skills.len(), "{scenario}");
+            assert_eq!(rendered.report.omitted_count, 0, "{scenario}");
+            assert!(rendered.skill_root_lines.is_empty(), "{scenario}");
+            assert_eq!(
+                rendered.skill_lines,
+                skills
+                    .iter()
+                    .map(|skill| expected_skill_line(skill, "desc"))
+                    .collect::<Vec<_>>(),
+                "{scenario}"
             );
+            let body =
+                render_available_skills_body(&rendered.skill_root_lines, &rendered.skill_lines);
+            assert!(!body.contains("/Users/private"), "{scenario}: {body}");
+            assert!(!body.contains("r0/"), "{scenario}: {body}");
+            for (line, skill) in rendered.skill_lines.iter().zip(&skills) {
+                let locator = line.rsplit(" — ").next().expect("catalog locator");
+                assert_eq!(
+                    snapshot
+                        .resolve_catalog_locator(locator)
+                        .map(|resolved| &resolved.path_to_skills_md),
+                    Some(&skill.path_to_skills_md),
+                    "{scenario}"
+                );
+            }
         }
     }
 
     #[test]
-    fn outcome_rendering_uses_marketplace_root_for_single_skill_plugin_versions() {
-        let github_root =
-            test_path_buf("/Users/xl/.codex/plugins/cache/openai-curated/github/hash123/skills")
+    fn opaque_catalog_counts_all_skills_before_budget_omission() {
+        let root =
+            test_path_buf("/Users/private/.codex/plugins/cache/example/plugin/version/skills")
                 .abs();
-        let marketplace_root = test_path_buf("/Users/xl/.codex/plugins/cache/openai-curated").abs();
-        let github = skill_with_path("github:gh-fix-ci", &github_root.join("gh-fix-ci/SKILL.md"));
-        let outcome = outcome_with_roots(vec![github.clone()], vec![github_root.clone()]);
-        let plan = build_alias_plan(
-            &outcome,
-            &[github],
-            SkillMetadataBudget::Characters(usize::MAX),
-        )
-        .expect("alias plan should build");
-
-        assert_eq!(
-            plan.aliases.skill_root_lines,
-            vec![format!("- `r0` = `{}`", normalized_path(&marketplace_root))]
-        );
-        assert_eq!(
-            render_skill_path_with_aliases(
-                &skill_with_path("github:gh-fix-ci", &github_root.join("gh-fix-ci/SKILL.md")),
-                &plan
-            ),
-            "r0/github/hash123/skills/gh-fix-ci/SKILL.md"
-        );
-    }
-
-    #[test]
-    fn outcome_rendering_uses_skill_root_for_multiple_skills_in_one_plugin_version() {
-        let github_root =
-            test_path_buf("/Users/xl/.codex/plugins/cache/openai-curated/github/hash123/skills")
-                .abs();
-        let fix_ci = skill_with_path("github:gh-fix-ci", &github_root.join("gh-fix-ci/SKILL.md"));
-        let yeet = skill_with_path("github:yeet", &github_root.join("yeet/SKILL.md"));
-        let outcome = outcome_with_roots(
-            vec![fix_ci.clone(), yeet.clone()],
-            vec![github_root.clone()],
-        );
-        let plan = build_alias_plan(
-            &outcome,
-            &[fix_ci, yeet],
-            SkillMetadataBudget::Characters(usize::MAX),
-        )
-        .expect("alias plan should build");
-
-        assert_eq!(
-            plan.aliases.skill_root_lines,
-            vec![format!("- `r0` = `{}`", normalized_path(&github_root))]
-        );
-        assert_eq!(
-            render_skill_path_with_aliases(
-                &skill_with_path("github:gh-fix-ci", &github_root.join("gh-fix-ci/SKILL.md")),
-                &plan
-            ),
-            "r0/gh-fix-ci/SKILL.md"
-        );
-        assert_eq!(
-            render_skill_path_with_aliases(
-                &skill_with_path("github:yeet", &github_root.join("yeet/SKILL.md")),
-                &plan
-            ),
-            "r0/yeet/SKILL.md"
-        );
-    }
-
-    #[test]
-    fn outcome_rendering_counts_plugin_version_skills_before_budget_omission() {
-        let root = test_path_buf(
-            "/Users/xl/.codex/plugins/cache/openai-curated/example/hash1234567890/skills-with-a-very-long-shared-prefix",
-        )
-        .abs();
         let alpha = skill_with_path("alpha-skill", &root.join("alpha/SKILL.md"));
         let beta = skill_with_path("beta-skill", &root.join("beta/SKILL.md"));
-        let outcome = outcome_with_roots(vec![alpha.clone(), beta.clone()], vec![root.clone()]);
-        let plan = build_alias_plan(
-            &outcome,
-            &[alpha.clone(), beta.clone()],
-            SkillMetadataBudget::Characters(usize::MAX),
+        let budget =
+            SkillMetadataBudget::Characters(expected_skill_line(&alpha, "").chars().count() + 1);
+        let rendered = build_available_skills(
+            &outcome_with_roots(vec![beta, alpha.clone()], vec![root]),
+            budget,
+            SkillRenderSideEffects::None,
         )
-        .expect("alias plan should build");
-        let alpha_cost = SkillMetadataBudget::Characters(usize::MAX).cost(&format!(
-            "{}\n",
-            SkillLine::with_path(&alpha, render_skill_path_with_aliases(&alpha, &plan))
-                .render_minimum()
-        ));
-        let rendered = build_aliased_available_skills(
-            &outcome,
-            &[alpha, beta],
-            SkillMetadataBudget::Characters(plan.table_cost + alpha_cost),
-        )
-        .expect("skills should render");
-
+        .expect("catalog");
+        assert_eq!(rendered.report.total_count, 2);
         assert_eq!(rendered.report.included_count, 1);
+        assert_eq!(rendered.report.omitted_count, 1);
+        assert!(rendered.skill_root_lines.is_empty());
+        assert_eq!(rendered.skill_lines, vec![expected_skill_line(&alpha, "")]);
         assert_eq!(
-            rendered.skill_root_lines,
-            vec![format!("- `r0` = `{}`", normalized_path(&root))]
-        );
-        assert_eq!(
-            rendered.skill_lines,
-            vec!["- alpha-skill: (file: r0/alpha/SKILL.md)"]
-        );
-    }
-
-    #[test]
-    fn outcome_rendering_uses_each_skill_root_for_multiple_roots_in_one_plugin_version() {
-        let skills_root =
-            test_path_buf("/Users/xl/.codex/plugins/cache/openai-curated/github/hash123/skills")
-                .abs();
-        let extra_root = test_path_buf(
-            "/Users/xl/.codex/plugins/cache/openai-curated/github/hash123/extra-skills",
-        )
-        .abs();
-        let fix_ci = skill_with_path("github:gh-fix-ci", &skills_root.join("gh-fix-ci/SKILL.md"));
-        let yeet = skill_with_path("github:yeet", &extra_root.join("yeet/SKILL.md"));
-        let outcome = outcome_with_roots(
-            vec![fix_ci.clone(), yeet.clone()],
-            vec![skills_root.clone(), extra_root.clone()],
-        );
-        let plan = build_alias_plan(
-            &outcome,
-            &[fix_ci, yeet],
-            SkillMetadataBudget::Characters(usize::MAX),
-        )
-        .expect("alias plan should build");
-
-        assert_eq!(
-            plan.aliases.skill_root_lines,
-            vec![
-                format!("- `r0` = `{}`", normalized_path(&skills_root)),
-                format!("- `r1` = `{}`", normalized_path(&extra_root)),
-            ]
-        );
-        assert_eq!(
-            render_skill_path_with_aliases(
-                &skill_with_path("github:gh-fix-ci", &skills_root.join("gh-fix-ci/SKILL.md")),
-                &plan
-            ),
-            "r0/gh-fix-ci/SKILL.md"
-        );
-        assert_eq!(
-            render_skill_path_with_aliases(
-                &skill_with_path("github:yeet", &extra_root.join("yeet/SKILL.md")),
-                &plan
-            ),
-            "r1/yeet/SKILL.md"
-        );
-    }
-
-    #[test]
-    fn outcome_rendering_extracts_plugin_marketplace_root_for_multiple_plugins() {
-        let github_root =
-            test_path_buf("/Users/xl/.codex/plugins/cache/openai-curated/github/hash123/skills")
-                .abs();
-        let slack_root =
-            test_path_buf("/Users/xl/.codex/plugins/cache/openai-curated/slack/hash456/skills")
-                .abs();
-        let marketplace_root = test_path_buf("/Users/xl/.codex/plugins/cache/openai-curated").abs();
-        let github = skill_with_path("github:gh-fix-ci", &github_root.join("gh-fix-ci/SKILL.md"));
-        let slack = skill_with_path(
-            "slack:daily-digest",
-            &slack_root.join("daily-digest/SKILL.md"),
-        );
-        let outcome = outcome_with_roots(
-            vec![github.clone(), slack.clone()],
-            vec![github_root.clone(), slack_root.clone()],
-        );
-        let plan = build_alias_plan(
-            &outcome,
-            &[github, slack],
-            SkillMetadataBudget::Characters(usize::MAX),
-        )
-        .expect("alias plan should build");
-
-        assert_eq!(
-            plan.aliases.skill_root_lines,
-            vec![format!("- `r0` = `{}`", normalized_path(&marketplace_root))]
-        );
-        assert_eq!(
-            render_skill_path_with_aliases(
-                &skill_with_path("github:gh-fix-ci", &github_root.join("gh-fix-ci/SKILL.md")),
-                &plan
-            ),
-            "r0/github/hash123/skills/gh-fix-ci/SKILL.md"
-        );
-        assert_eq!(
-            render_skill_path_with_aliases(
-                &skill_with_path(
-                    "slack:daily-digest",
-                    &slack_root.join("daily-digest/SKILL.md")
-                ),
-                &plan
-            ),
-            "r0/slack/hash456/skills/daily-digest/SKILL.md"
-        );
-    }
-
-    #[test]
-    fn outcome_rendering_uses_one_marketplace_root_for_multiple_plugin_versions() {
-        let skills_root =
-            test_path_buf("/Users/xl/.codex/plugins/cache/openai-curated/github/hash123/skills")
-                .abs();
-        let extra_root = test_path_buf(
-            "/Users/xl/.codex/plugins/cache/openai-curated/github/hash456/extra-skills",
-        )
-        .abs();
-        let marketplace_root = test_path_buf("/Users/xl/.codex/plugins/cache/openai-curated").abs();
-        let fix_ci = skill_with_path("github:gh-fix-ci", &skills_root.join("gh-fix-ci/SKILL.md"));
-        let yeet = skill_with_path("github:yeet", &extra_root.join("yeet/SKILL.md"));
-        let outcome = outcome_with_roots(
-            vec![fix_ci.clone(), yeet.clone()],
-            vec![skills_root.clone(), extra_root.clone()],
-        );
-        let plan = build_alias_plan(
-            &outcome,
-            &[fix_ci, yeet],
-            SkillMetadataBudget::Characters(usize::MAX),
-        )
-        .expect("alias plan should build");
-
-        assert_eq!(
-            plan.aliases.skill_root_lines,
-            vec![format!("- `r0` = `{}`", normalized_path(&marketplace_root))]
-        );
-        assert_eq!(
-            render_skill_path_with_aliases(
-                &skill_with_path("github:gh-fix-ci", &skills_root.join("gh-fix-ci/SKILL.md")),
-                &plan
-            ),
-            "r0/github/hash123/skills/gh-fix-ci/SKILL.md"
-        );
-        assert_eq!(
-            render_skill_path_with_aliases(
-                &skill_with_path("github:yeet", &extra_root.join("yeet/SKILL.md")),
-                &plan
-            ),
-            "r0/github/hash456/extra-skills/yeet/SKILL.md"
+            rendered.warning_message.as_deref(),
+            Some(
+                "Exceeded skills context budget. All skill descriptions were removed and 1 additional skill was not included in the model-visible skills list."
+            )
         );
     }
 

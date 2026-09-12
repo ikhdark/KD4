@@ -426,7 +426,13 @@ mod worker {
     }
 
     pub(super) async fn run(codex_home: PathBuf) -> io::Result<()> {
-        let marker = match CompressionRunMarker::try_claim(codex_home.as_path()) {
+        let marker_home = codex_home.clone();
+        let marker = match tokio::task::spawn_blocking(move || {
+            CompressionRunMarker::try_claim(marker_home.as_path())
+        })
+        .await
+        .map_err(io::Error::other)?
+        {
             Ok(Some(marker)) => marker,
             Ok(None) => {
                 metrics::run("skipped_already_running");
@@ -464,6 +470,9 @@ mod worker {
             Err(err) => {
                 metrics::run("failed");
                 metrics::run_duration("failed", started_at.elapsed());
+                tokio::task::spawn_blocking(move || drop(marker))
+                    .await
+                    .map_err(io::Error::other)?;
                 return Err(err);
             }
         };

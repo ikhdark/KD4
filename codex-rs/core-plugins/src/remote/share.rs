@@ -395,6 +395,7 @@ async fn fetch_created_workspace_plugins(
 ) -> Result<Vec<RemotePluginDirectoryItem>, RemotePluginCatalogError> {
     let mut plugins = Vec::new();
     let mut page_token = None;
+    let mut seen_page_tokens = HashSet::new();
     loop {
         let response =
             get_created_workspace_plugins_page(client, config, auth, page_token.as_deref()).await?;
@@ -402,6 +403,11 @@ async fn fetch_created_workspace_plugins(
         let Some(next_page_token) = response.pagination.next_page_token else {
             break;
         };
+        if !seen_page_tokens.insert(next_page_token.clone()) {
+            return Err(RemotePluginCatalogError::UnexpectedResponse(
+                "remote plugin catalog returned a repeated pagination token".to_string(),
+            ));
+        }
         page_token = Some(next_page_token);
     }
     Ok(plugins)

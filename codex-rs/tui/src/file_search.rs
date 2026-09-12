@@ -9,6 +9,7 @@ use codex_file_search as file_search;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::Weak;
 
 use crate::app_event::AppEvent;
 use crate::app_event_sender::AppEventSender;
@@ -76,7 +77,7 @@ impl FileSearchManager {
         st.session_token = st.session_token.wrapping_add(1);
         let session_token = st.session_token;
         let reporter = Arc::new(TuiSessionReporter {
-            state: self.state.clone(),
+            state: Arc::downgrade(&self.state),
             app_tx: self.app_tx.clone(),
             session_token,
         });
@@ -100,15 +101,18 @@ impl FileSearchManager {
 }
 
 struct TuiSessionReporter {
-    state: Arc<Mutex<SearchState>>,
+    state: Weak<Mutex<SearchState>>,
     app_tx: AppEventSender,
     session_token: usize,
 }
 
 impl TuiSessionReporter {
     fn send_snapshot(&self, snapshot: &file_search::FileSearchSnapshot) {
+        let Some(state) = self.state.upgrade() else {
+            return;
+        };
         #[expect(clippy::unwrap_used)]
-        let st = self.state.lock().unwrap();
+        let st = state.lock().unwrap();
         if st.session_token != self.session_token
             || st.latest_query.is_empty()
             || snapshot.query.is_empty()
@@ -130,4 +134,45 @@ impl file_search::SessionReporter for TuiSessionReporter {
     }
 
     fn on_complete(&self, _query: &str) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn file_search_manager_publishes_matches_and_releases_workers_on_drop() {
+        let directory = tempfile::tempdir().expect("search directory");
+        std::fs::write(directory.path().join("needle.rs"), "fn needle() {}")
+            .expect("write matching file");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let manager =
+            FileSearchManager::new(directory.path().to_path_buf(), AppEventSender::new(tx));
+        manager.on_user_query("needle".to_string());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match rx.recv().await.expect("search must publish before closing") {
+                    AppEvent::FileSearchResult { query, matches }
+                        if query == "needle"
+                            && matches
+                                .iter()
+                                .any(|entry| entry.path == PathBuf::from("needle.rs")) =>
+                    {
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("normal query must find the matching file");
+
+        drop(manager);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while rx.recv().await.is_some() {}
+        })
+        .await
+        .expect("dropping manager must release its session workers and event senders");
+    }
 }

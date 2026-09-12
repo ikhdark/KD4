@@ -73,7 +73,7 @@ pub(crate) struct GuardianNetworkAccessTrigger {
     pub(crate) call_id: String,
     pub(crate) tool_name: String,
     pub(crate) command: Vec<String>,
-    pub(crate) cwd: AbsolutePathBuf,
+    pub(crate) cwd: PathUri,
     pub(crate) sandbox_permissions: crate::sandboxing::SandboxPermissions,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) additional_permissions: Option<AdditionalPermissionProfile>,

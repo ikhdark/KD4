@@ -3,35 +3,45 @@
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequest;
 use codex_protocol::ThreadId;
+use std::collections::HashSet;
 
-pub(super) fn server_request_thread_id(request: &ServerRequest) -> Option<ThreadId> {
-    match request {
+pub(super) fn server_request_thread_id(
+    request: &ServerRequest,
+) -> Result<Option<ThreadId>, String> {
+    let thread_id = match request {
         ServerRequest::CommandExecutionRequestApproval { params, .. } => {
-            ThreadId::from_string(&params.thread_id).ok()
+            Some(params.thread_id.as_str())
         }
-        ServerRequest::FileChangeRequestApproval { params, .. } => {
-            ThreadId::from_string(&params.thread_id).ok()
-        }
+        ServerRequest::FileChangeRequestApproval { params, .. } => Some(params.thread_id.as_str()),
         ServerRequest::ToolRequestUserInput { params, .. } => {
-            ThreadId::from_string(&params.thread_id).ok()
+            let mut question_ids = HashSet::with_capacity(params.questions.len());
+            for question in &params.questions {
+                if !question_ids.insert(question.id.as_str()) {
+                    return Err(format!(
+                        "duplicate user-input question id `{}`",
+                        question.id
+                    ));
+                }
+            }
+            Some(params.thread_id.as_str())
         }
         ServerRequest::McpServerElicitationRequest { params, .. } => {
-            ThreadId::from_string(&params.thread_id).ok()
+            Some(params.thread_id.as_str())
         }
-        ServerRequest::PermissionsRequestApproval { params, .. } => {
-            ThreadId::from_string(&params.thread_id).ok()
-        }
-        ServerRequest::DynamicToolCall { params, .. } => {
-            ThreadId::from_string(&params.thread_id).ok()
-        }
-        ServerRequest::CurrentTimeRead { params, .. } => {
-            ThreadId::from_string(&params.thread_id).ok()
-        }
+        ServerRequest::PermissionsRequestApproval { params, .. } => Some(params.thread_id.as_str()),
+        ServerRequest::DynamicToolCall { params, .. } => Some(params.thread_id.as_str()),
+        ServerRequest::CurrentTimeRead { params, .. } => Some(params.thread_id.as_str()),
         ServerRequest::ChatgptAuthTokensRefresh { .. }
         | ServerRequest::AttestationGenerate { .. }
         | ServerRequest::ApplyPatchApproval { .. }
         | ServerRequest::ExecCommandApproval { .. } => None,
-    }
+    };
+    thread_id
+        .map(|thread_id| {
+            ThreadId::from_string(thread_id)
+                .map_err(|err| format!("invalid app-server request thread id `{thread_id}`: {err}"))
+        })
+        .transpose()
 }
 
 #[derive(Debug, PartialEq, Eq)]

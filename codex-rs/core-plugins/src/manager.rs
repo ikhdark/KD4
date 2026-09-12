@@ -57,8 +57,8 @@ use crate::tool_suggest_metadata::ToolSuggestMetadataCache;
 use codex_analytics::AnalyticsEventsClient;
 use codex_analytics::PluginInstallSource;
 use codex_config::ConfigLayerStack;
-use codex_config::clear_user_plugin;
-use codex_config::set_user_plugin_enabled;
+use codex_config::PluginConfigEdit;
+use codex_config::apply_user_plugin_config_edits_blocking;
 use codex_config::types::PluginConfig;
 use codex_config::types::ToolSuggestDisabledTool;
 use codex_config::types::ToolSuggestDiscoverableType;
@@ -427,7 +427,9 @@ struct ConfigLayerStackIdentity(Arc<ConfigLayerStack>);
 
 impl PartialEq for ConfigLayerStackIdentity {
     fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
+        // Independent config loads can describe the exact same layers.
+        // Keep origins, requirements, and discovery context in the comparison.
+        Arc::ptr_eq(&self.0, &other.0) || self.0.as_ref() == other.0.as_ref()
     }
 }
 
@@ -884,12 +886,58 @@ impl PluginsManager {
         }
     }
 
+    async fn installed_plugin_root(&self, plugin_id: &PluginId) -> Option<AbsolutePathBuf> {
+        let store = self.store.clone();
+        let plugin_id = plugin_id.clone();
+        match tokio::task::spawn_blocking(move || store.active_plugin_root(&plugin_id)).await {
+            Ok(root) => root,
+            Err(err) => {
+                warn!(error = %err, "failed to inspect installed plugin root");
+                None
+            }
+        }
+    }
+
     pub async fn telemetry_metadata_for_installed_plugin(
         &self,
         plugin_id: &PluginId,
     ) -> PluginTelemetryMetadata {
-        let mut metadata = self.telemetry_metadata_for_plugin_id(plugin_id);
-        metadata.capability_summary = match self.store.active_plugin_root(plugin_id) {
+        let cached_remote_plugin_id = {
+            let cache = self
+                .remote_installed_plugins_cache
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            cache.as_ref().and_then(|plugins| {
+                plugins.iter().find_map(|plugin| {
+                    (plugin.name == plugin_id.plugin_name()
+                        && plugin.marketplace_name == plugin_id.marketplace_name())
+                    .then(|| plugin.id.clone())
+                })
+            })
+        };
+        let remote_plugin_id = if cached_remote_plugin_id.is_some() {
+            cached_remote_plugin_id
+        } else {
+            let store = self.store.clone();
+            let plugin_id = plugin_id.clone();
+            match tokio::task::spawn_blocking(move || store.remote_plugin_id(&plugin_id)).await {
+                Ok(Ok(id)) => id,
+                Ok(Err(err)) => {
+                    warn!(error = %err, "failed to read persisted remote plugin identity");
+                    None
+                }
+                Err(err) => {
+                    warn!(error = %err, "failed to inspect persisted remote plugin identity");
+                    None
+                }
+            }
+        };
+        let mut metadata = PluginTelemetryMetadata {
+            plugin_id: Some(plugin_id.clone()),
+            remote_plugin_id,
+            capability_summary: None,
+        };
+        metadata.capability_summary = match self.installed_plugin_root(plugin_id).await {
             Some(plugin_root) => plugin_capability_summary_from_root(plugin_id, &plugin_root).await,
             None => None,
         };
@@ -901,9 +949,12 @@ impl PluginsManager {
         plugin_id: &PluginId,
         remote_plugin_id: &str,
     ) -> PluginTelemetryMetadata {
-        let mut metadata =
-            self.telemetry_metadata_for_plugin_id_with_remote_id(plugin_id, remote_plugin_id);
-        metadata.capability_summary = match self.store.active_plugin_root(plugin_id) {
+        let mut metadata = PluginTelemetryMetadata {
+            plugin_id: Some(plugin_id.clone()),
+            remote_plugin_id: Some(remote_plugin_id.to_string()),
+            capability_summary: None,
+        };
+        metadata.capability_summary = match self.installed_plugin_root(plugin_id).await {
             Some(plugin_root) => plugin_capability_summary_from_root(plugin_id, &plugin_root).await,
             None => None,
         };
@@ -1468,7 +1519,9 @@ impl PluginsManager {
         config_layer_stack: &ConfigLayerStack,
         request: PluginInstallRequest,
     ) -> Result<PluginInstallOutcome, PluginInstallError> {
-        let resolved = self.resolve_installable_plugin(config_layer_stack, &request)?;
+        let resolved = self
+            .resolve_installable_plugin(config_layer_stack, &request)
+            .await?;
         let plugin_id = resolved.plugin_id.clone();
         match self.install_resolved_plugin(resolved).await {
             Ok(outcome) => Ok(outcome),
@@ -1484,39 +1537,40 @@ impl PluginsManager {
         }
     }
 
-    fn resolve_installable_plugin(
+    async fn resolve_installable_plugin(
         &self,
         config_layer_stack: &ConfigLayerStack,
         request: &PluginInstallRequest,
     ) -> Result<ResolvedMarketplacePlugin, PluginInstallError> {
-        let resolved = match find_installable_marketplace_plugin(
-            &request.marketplace_path,
-            &request.plugin_name,
-            self.restriction_product,
-        ) {
-            Ok(resolved) => resolved,
-            Err(err) => {
-                self.track_plugin_install_resolution_failed(&err);
-                return Err(err.into());
-            }
-        };
-        if let Err(message) =
+        let config_layer_stack = config_layer_stack.clone();
+        let request = request.clone();
+        let codex_home = self.codex_home.clone();
+        let restriction_product = self.restriction_product;
+        let result = tokio::task::spawn_blocking(move || {
+            let resolved = find_installable_marketplace_plugin(
+                &request.marketplace_path,
+                &request.plugin_name,
+                restriction_product,
+            )?;
             MarketplacePolicy::from_requirements(config_layer_stack.requirements())
                 .validate_install(
-                    config_layer_stack,
-                    self.codex_home.as_path(),
+                    &config_layer_stack,
+                    &codex_home,
                     &request.marketplace_path,
                     resolved.plugin_id.marketplace_name(),
                 )
-        {
-            let err = MarketplaceError::InvalidMarketplaceFile {
-                path: request.marketplace_path.to_path_buf(),
-                message,
-            };
+                .map_err(|message| MarketplaceError::InvalidMarketplaceFile {
+                    path: request.marketplace_path.to_path_buf(),
+                    message,
+                })?;
+            Ok::<_, MarketplaceError>(resolved)
+        })
+        .await
+        .map_err(PluginInstallError::join)?;
+        result.map_err(|err| {
             self.track_plugin_install_resolution_failed(&err);
-            return Err(err.into());
-        }
-        Ok(resolved)
+            err.into()
+        })
     }
 
     fn track_plugin_install_resolution_failed(&self, err: &MarketplaceError) {
@@ -1583,30 +1637,32 @@ impl PluginsManager {
         resolved: ResolvedMarketplacePlugin,
     ) -> Result<PluginInstallOutcome, PluginInstallError> {
         let auth_policy = resolved.policy.authentication;
-        let plugin_version =
-            if is_openai_curated_marketplace_name(resolved.plugin_id.marketplace_name()) {
-                let curated_plugin_version = read_curated_plugins_sha(self.codex_home.as_path())
-                    .ok_or_else(|| {
-                        PluginStoreError::Invalid(
-                            "local curated marketplace sha is not available".to_string(),
-                        )
-                    })?;
-                Some(curated_plugin_cache_version(&curated_plugin_version))
-            } else {
-                None
-            };
         let store = self.store.clone();
         let codex_home = self.codex_home.clone();
         let manifest_fallback_contents = resolved
             .manifest_fallback
             .contents_if_has_metadata()
             .map(str::to_string);
-        let pending_install = tokio::task::spawn_blocking(move || {
+        // The worker owns staging, config persistence, and commit together so
+        // cancelling its caller cannot roll back files while config is written.
+        let result = tokio::task::spawn_blocking(move || -> Result<_, PluginInstallError> {
+            let plugin_version =
+                if is_openai_curated_marketplace_name(resolved.plugin_id.marketplace_name()) {
+                    let curated_plugin_version = read_curated_plugins_sha(codex_home.as_path())
+                        .ok_or_else(|| {
+                            PluginStoreError::Invalid(
+                                "local curated marketplace sha is not available".to_string(),
+                            )
+                        })?;
+                    Some(curated_plugin_cache_version(&curated_plugin_version))
+                } else {
+                    None
+                };
             let materialized =
                 materialize_marketplace_plugin_source(codex_home.as_path(), &resolved.source)
                     .map_err(PluginStoreError::Invalid)?;
             let source_path = materialized.path;
-            match (plugin_version, manifest_fallback_contents.as_deref()) {
+            let pending_install = match (plugin_version, manifest_fallback_contents.as_deref()) {
                 (Some(plugin_version), Some(manifest_contents)) => store
                     .begin_install_with_version_and_fallback_manifest(
                         source_path,
@@ -1625,23 +1681,19 @@ impl PluginsManager {
                     manifest_contents,
                 ),
                 (None, None) => store.begin_install(source_path, resolved.plugin_id),
-            }
+            }?;
+            apply_user_plugin_config_edits_blocking(
+                codex_home.as_path(),
+                vec![PluginConfigEdit::SetEnabled {
+                    plugin_key: pending_install.result().plugin_id.as_key(),
+                    enabled: true,
+                }],
+            )
+            .map_err(anyhow::Error::from)?;
+            Ok(pending_install.commit())
         })
         .await
         .map_err(PluginInstallError::join)??;
-        let result = pending_install.result().clone();
-
-        if let Err(err) = set_user_plugin_enabled(
-            &self.codex_home,
-            result.plugin_id.as_key(),
-            /*enabled*/ true,
-        )
-        .await
-        {
-            drop(pending_install);
-            return Err(anyhow::Error::from(err).into());
-        }
-        pending_install.commit();
 
         let analytics_events_client = match self.analytics_events_client.read() {
             Ok(client) => client.clone(),
@@ -1668,7 +1720,7 @@ impl PluginsManager {
     }
 
     async fn uninstall_plugin_id(&self, plugin_id: PluginId) -> Result<(), PluginUninstallError> {
-        let plugin_telemetry = if self.store.active_plugin_root(&plugin_id).is_some() {
+        let plugin_telemetry = if self.installed_plugin_root(&plugin_id).await.is_some() {
             Some(
                 self.telemetry_metadata_for_installed_plugin(&plugin_id)
                     .await,
@@ -1677,17 +1729,22 @@ impl PluginsManager {
             None
         };
         let store = self.store.clone();
-        let plugin_id_for_store = plugin_id.clone();
-        let pending_uninstall =
-            tokio::task::spawn_blocking(move || store.begin_uninstall(&plugin_id_for_store))
-                .await
-                .map_err(PluginUninstallError::join)??;
-
-        if let Err(err) = clear_user_plugin(&self.codex_home, plugin_id.as_key()).await {
-            drop(pending_uninstall);
-            return Err(anyhow::Error::from(err).into());
-        }
-        pending_uninstall.commit();
+        let codex_home = self.codex_home.clone();
+        // Keep rollback ownership with the config write even if the request ends.
+        tokio::task::spawn_blocking(move || -> Result<(), PluginUninstallError> {
+            let pending_uninstall = store.begin_uninstall(&plugin_id)?;
+            apply_user_plugin_config_edits_blocking(
+                codex_home.as_path(),
+                vec![PluginConfigEdit::Clear {
+                    plugin_key: plugin_id.as_key(),
+                }],
+            )
+            .map_err(anyhow::Error::from)?;
+            pending_uninstall.commit();
+            Ok(())
+        })
+        .await
+        .map_err(PluginUninstallError::join)??;
 
         let analytics_events_client = match self.analytics_events_client.read() {
             Ok(client) => client.clone(),
@@ -1834,44 +1891,56 @@ impl PluginsManager {
             return Err(MarketplaceError::PluginsDisabled);
         }
 
-        let plugin = find_marketplace_plugin(&request.marketplace_path, &request.plugin_name)?;
-        MarketplacePolicy::from_requirements(config.config_layer_stack.requirements())
-            .validate_install(
-                &config.config_layer_stack,
-                self.codex_home.as_path(),
-                &request.marketplace_path,
-                plugin.plugin_id.marketplace_name(),
-            )
-            .map_err(|message| MarketplaceError::InvalidMarketplaceFile {
-                path: request.marketplace_path.to_path_buf(),
-                message,
-            })?;
-        if !self.restriction_product_matches(plugin.policy.products.as_deref()) {
-            return Err(MarketplaceError::PluginNotFound {
-                plugin_name: plugin.plugin_id.plugin_name().to_string(),
-                marketplace_name: plugin.plugin_id.marketplace_name().to_string(),
-            });
-        }
-
-        let marketplace_name = plugin.plugin_id.marketplace_name().to_string();
-        let plugin_key = plugin.plugin_id.as_key();
-        let manifest_fallback = plugin
-            .manifest_fallback
-            .contents_if_has_metadata()
-            .map(|_| plugin.manifest_fallback.clone());
-        let (installed_plugins, enabled_plugins) = self.configured_plugin_states(config);
-        let installed = installed_plugins.contains(&plugin_key);
-        let installed_version = if installed {
-            self.store.active_plugin_version(&plugin.plugin_id)
-        } else {
-            None
-        };
-        let plugin = self
-            .read_plugin_detail_for_marketplace_plugin(
-                config,
-                &marketplace_name,
+        let config_for_read = config.clone();
+        let request_for_read = request.clone();
+        let store = self.store.clone();
+        let codex_home = self.codex_home.clone();
+        let restriction_product = self.restriction_product;
+        let (marketplace_name, configured_plugin) = tokio::task::spawn_blocking(move || {
+            let plugin = find_marketplace_plugin(
+                &request_for_read.marketplace_path,
+                &request_for_read.plugin_name,
+            )?;
+            MarketplacePolicy::from_requirements(config_for_read.config_layer_stack.requirements())
+                .validate_install(
+                    &config_for_read.config_layer_stack,
+                    &codex_home,
+                    &request_for_read.marketplace_path,
+                    plugin.plugin_id.marketplace_name(),
+                )
+                .map_err(|message| MarketplaceError::InvalidMarketplaceFile {
+                    path: request_for_read.marketplace_path.to_path_buf(),
+                    message,
+                })?;
+            let product_matches = match plugin.policy.products.as_deref() {
+                None => true,
+                Some([]) => false,
+                Some(products) => restriction_product
+                    .is_some_and(|product| product.matches_product_restriction(products)),
+            };
+            if !product_matches {
+                return Err(MarketplaceError::PluginNotFound {
+                    plugin_name: plugin.plugin_id.plugin_name().to_string(),
+                    marketplace_name: plugin.plugin_id.marketplace_name().to_string(),
+                });
+            }
+            let marketplace_name = plugin.plugin_id.marketplace_name().to_string();
+            let plugin_key = plugin.plugin_id.as_key();
+            let manifest_fallback = plugin
+                .manifest_fallback
+                .contents_if_has_metadata()
+                .map(|_| plugin.manifest_fallback.clone());
+            let configured_plugins =
+                configured_plugins_from_stack(&config_for_read.config_layer_stack, &codex_home);
+            let configured = configured_plugins.get(&plugin_key);
+            let installed_version =
+                configured.and_then(|_| store.active_plugin_version(&plugin.plugin_id));
+            let installed = installed_version.is_some();
+            let enabled = configured.is_some_and(|plugin| plugin.enabled);
+            Ok::<_, MarketplaceError>((
+                marketplace_name,
                 ConfiguredMarketplacePlugin {
-                    id: plugin_key.clone(),
+                    id: plugin_key,
                     name: plugin.plugin_id.plugin_name().to_string(),
                     local_version: plugin
                         .manifest
@@ -1888,9 +1957,16 @@ impl PluginsManager {
                         .unwrap_or_default(),
                     manifest_fallback,
                     installed,
-                    enabled: enabled_plugins.contains(&plugin_key),
+                    enabled,
                 },
-            )
+            ))
+        })
+        .await
+        .map_err(|err| {
+            MarketplaceError::InvalidPlugin(format!("failed to read plugin source: {err}"))
+        })??;
+        let plugin = self
+            .read_plugin_detail_for_marketplace_plugin(config, &marketplace_name, configured_plugin)
             .await?;
 
         Ok(PluginReadOutcome {
@@ -1946,44 +2022,49 @@ impl PluginsManager {
             });
         }
 
-        let source_path = if plugin.source.is_install_materialized() && plugin.installed {
-            self.store.active_plugin_root(&plugin_id).ok_or_else(|| {
-                MarketplaceError::InvalidPlugin(format!(
-                    "installed plugin cache entry is missing for {plugin_key}"
-                ))
-            })?
-        } else {
-            let codex_home = self.codex_home.clone();
-            let source = plugin.source.clone();
-            let materialized = tokio::task::spawn_blocking(move || {
-                materialize_marketplace_plugin_source(codex_home.as_path(), &source)
-            })
-            .await
-            .map_err(|err| {
-                MarketplaceError::InvalidPlugin(format!(
-                    "failed to materialize plugin source: {err}"
-                ))
-            })?
-            .map_err(MarketplaceError::InvalidPlugin)?;
-            materialized.path.clone()
-        };
-        if !source_path.as_path().is_dir() {
-            return Err(MarketplaceError::InvalidPlugin(
-                "path does not exist or is not a directory".to_string(),
-            ));
-        }
-        let manifest =
-            if codex_plugin::find_plugin_manifest_path(source_path.as_path()).is_some() {
-                load_plugin_manifest(source_path.as_path())
+        let store = self.store.clone();
+        let codex_home = self.codex_home.clone();
+        let source = plugin.source.clone();
+        let installed = plugin.installed;
+        let plugin_id_for_read = plugin_id.clone();
+        let plugin_key_for_read = plugin_key.clone();
+        let fallback = plugin.manifest_fallback.clone();
+        let (source_path, manifest) = tokio::task::spawn_blocking(move || {
+            let source_path = if source.is_install_materialized() && installed {
+                store
+                    .active_plugin_root(&plugin_id_for_read)
+                    .ok_or_else(|| {
+                        MarketplaceError::InvalidPlugin(format!(
+                            "installed plugin cache entry is missing for {plugin_key_for_read}"
+                        ))
+                    })?
             } else {
-                plugin
-                    .manifest_fallback
-                    .as_ref()
-                    .and_then(|fallback| fallback.parse_for_plugin_root(source_path.as_path()))
+                materialize_marketplace_plugin_source(&codex_home, &source)
+                    .map_err(MarketplaceError::InvalidPlugin)?
+                    .path
+            };
+            if !source_path.as_path().is_dir() {
+                return Err(MarketplaceError::InvalidPlugin(
+                    "path does not exist or is not a directory".to_string(),
+                ));
             }
-            .ok_or_else(|| {
-                MarketplaceError::InvalidPlugin("missing or invalid plugin.json".to_string())
-            })?;
+            let manifest =
+                if codex_plugin::find_plugin_manifest_path(source_path.as_path()).is_some() {
+                    load_plugin_manifest(source_path.as_path())
+                } else {
+                    fallback
+                        .as_ref()
+                        .and_then(|fallback| fallback.parse_for_plugin_root(source_path.as_path()))
+                }
+                .ok_or_else(|| {
+                    MarketplaceError::InvalidPlugin("missing or invalid plugin.json".to_string())
+                })?;
+            Ok::<_, MarketplaceError>((source_path, manifest))
+        })
+        .await
+        .map_err(|err| {
+            MarketplaceError::InvalidPlugin(format!("failed to materialize plugin source: {err}"))
+        })??;
         let description = manifest.description.clone();
         let marketplace_category = plugin
             .interface

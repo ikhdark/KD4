@@ -554,6 +554,44 @@ async fn code_mode_session_provider_is_shared_across_threads() {
 }
 
 #[tokio::test]
+async fn start_thread_discovers_a_usable_default_shell() {
+    let temp_dir = tempdir().expect("tempdir");
+    let mut config = test_config().await;
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = config.codex_home.abs();
+    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
+    let manager = ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+    );
+    let started = manager.start_thread(config).await.expect("start thread");
+    let shell = &started.thread.codex.session.services.user_shell;
+    let arguments = shell
+        .derive_exec_args("echo shell-discovery-ready", false)
+        .expect("default shell arguments");
+    let mut command = tokio::process::Command::new(&arguments[0]);
+    command.args(&arguments[1..]).kill_on_drop(true);
+    let output = tokio::time::timeout(Duration::from_secs(10), command.output())
+        .await
+        .expect("discovered shell should finish")
+        .expect("discovered shell should execute");
+    assert!(output.status.success(), "shell failed: {output:?}");
+    assert_eq!(
+        String::from_utf8(output.stdout)
+            .expect("shell UTF-8 output")
+            .trim(),
+        "shell-discovery-ready"
+    );
+    started
+        .thread
+        .shutdown_and_wait()
+        .await
+        .expect("shutdown thread");
+}
+
+#[tokio::test]
 async fn provider_override_builds_a_provider_specific_models_manager() {
     let temp_dir = tempdir().expect("tempdir");
     let mut config = test_config().await;
@@ -2439,4 +2477,99 @@ fn stored_thread_errors_are_classified_by_variant_not_message() {
     let missing =
         stored_thread_read_error(thread_id, ThreadStoreError::ThreadNotFound { thread_id });
     assert!(matches!(missing, CodexErr::ThreadNotFound(id) if id == thread_id));
+}
+
+#[test]
+fn reconstructed_legacy_permissions_use_worker_and_reach_resume_and_fork() {
+    std::thread::Builder::new()
+        .name("reconstructed-legacy-permissions".to_string())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .max_blocking_threads(1)
+                .build()
+                .expect("single projection worker runtime");
+            runtime.block_on(async {
+                use codex_protocol::permissions::FileSystemAccessMode;
+                use codex_protocol::protocol::SandboxPolicy;
+                let temp = tempdir().expect("legacy workspace");
+                let root = temp.path().join("checkout").abs();
+                let gitdir = root.join("private-git");
+                std::fs::create_dir_all(&gitdir).expect("git metadata directory");
+                std::fs::write(root.join(".git"), "gitdir: private-git\n").expect("real worktree pointer");
+                let mut config = test_config().await;
+                config.codex_home = temp.path().join("home").abs();
+                std::fs::create_dir_all(&config.codex_home).expect("local home");
+                config.cwd = root.clone();
+                config.workspace_roots = vec![root.clone()];
+                let settings = PersistedThreadSettings {
+                    sandbox_policy: Some(SandboxPolicy::WorkspaceWrite {
+                        writable_roots: vec![root.clone()],
+                        network_access: false,
+                        exclude_tmpdir_env_var: true,
+                        exclude_slash_tmp: true,
+                    }),
+                    ..Default::default()
+                };
+                let (release, blocked) = std::sync::mpsc::channel();
+                let (entered, waiting) = tokio::sync::oneshot::channel();
+                let blocker = tokio::task::spawn_blocking(move || {
+                    entered.send(()).expect("worker observer");
+                    let _ = blocked.recv_timeout(Duration::from_secs(5));
+                });
+                waiting.await.expect("worker occupied");
+                let mut projection = Box::pin(apply_reconstructed_settings_to_config_async(config.clone(), &settings));
+                assert!(tokio::time::timeout(Duration::from_millis(50), &mut projection).await.is_err(),
+                    "legacy reconstruction must wait for the filesystem worker while the timer progresses");
+                drop(projection);
+                release.send(()).expect("release worker");
+                blocker.await.expect("worker released");
+                let projected = apply_reconstructed_settings_to_config_async(config.clone(), &settings).await.expect("retry projection");
+                let policy = projected.permissions.permission_profile().file_system_sandbox_policy();
+                assert_eq!(policy.resolve_access_with_cwd(gitdir.as_path(), root.as_path()), FileSystemAccessMode::Read);
+                assert!(policy.can_write_path_with_cwd(root.join("work.txt").as_path(), root.as_path()));
+                assert_eq!(std::fs::read(root.join(".git")).expect("pointer preserved"), b"gitdir: private-git\n");
+
+                let auth = AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
+                let manager = ThreadManager::new(
+                    &config, auth.clone(), SessionSource::Exec,
+                    Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+                    empty_extension_registry(), Arc::new(crate::test_support::EmptyUserInstructionsProvider),
+                    None, thread_store_from_config(&config, None), None, TEST_INSTALLATION_ID.to_string(), None, None,
+                );
+                let history = InitialHistory::Forked(vec![RolloutItem::ResponseItem(user_msg("legacy seed"))]);
+                let reconstructed = || ThreadSettingsReconstruction { precomputed: Some(settings.clone()), ..Default::default() };
+                let resumed = manager.resume_thread_with_history_and_settings(
+                    config.clone(), history.clone(), auth.clone(), None, false, reconstructed(),
+                ).await.expect("normal resume reconstruction");
+                let forked = manager.fork_thread_from_history_with_settings(
+                    ForkSnapshot::Interrupted, config.clone(), history.clone(), None, None, false, reconstructed(),
+                ).await.expect("normal fork reconstruction");
+                assert_ne!(resumed.thread_id, forked.thread_id);
+                for thread in [&resumed.thread, &forked.thread] {
+                    let snapshot = thread.config_snapshot().await;
+                    let policy = snapshot.permission_profile.file_system_sandbox_policy();
+                    assert_eq!(policy.resolve_access_with_cwd(gitdir.as_path(), root.as_path()), FileSystemAccessMode::Read);
+                    assert_eq!(policy.resolve_access_with_cwd(root.join(".git").as_path(), root.as_path()), FileSystemAccessMode::Read);
+                    assert!(policy.can_write_path_with_cwd(root.join("work.txt").as_path(), root.as_path()));
+                    assert!(!policy.can_write_path_with_cwd(temp.path().join("outside.txt").as_path(), root.as_path()));
+                    thread.shutdown_and_wait().await.expect("normal shutdown");
+                }
+                let ids = manager.list_thread_ids().await;
+                let mut invalid = settings;
+                invalid.model_provider_id = Some("missing-legacy-provider".to_string());
+                let result = manager.resume_thread_with_history_and_settings(
+                    config, history, auth, None, false,
+                    ThreadSettingsReconstruction { precomputed: Some(invalid), ..Default::default() },
+                ).await;
+                assert!(matches!(result, Err(CodexErr::InvalidRequest(message)) if message.contains("missing-legacy-provider")));
+                assert_eq!(manager.list_thread_ids().await, ids, "rejected reconstruction must not register another thread");
+                assert_eq!(std::fs::read(root.join(".git")).expect("pointer preserved"), b"gitdir: private-git\n");
+            });
+            runtime.shutdown_timeout(Duration::from_secs(2));
+        })
+        .expect("projection test thread")
+        .join()
+        .expect("projection test succeeds");
 }

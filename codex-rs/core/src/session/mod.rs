@@ -181,7 +181,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-struct DurableHistoryCommitInFlight {
+pub(crate) struct DurableHistoryCommitInFlight {
     session: Arc<Session>,
 }
 
@@ -509,6 +509,7 @@ use crate::tools::network_approval::build_network_policy_decider;
 #[cfg(test)]
 use crate::tools::parallel::ToolCallRuntime;
 use crate::tools::sandboxing::ApprovalStore;
+use crate::tools::tool_dispatch_trace::run_trace_recording;
 use crate::turn_timing::InteractiveWaitKind;
 use crate::turn_timing::TurnLocalPhase;
 use crate::turn_timing::TurnTimingState;
@@ -1191,6 +1192,7 @@ async fn thread_title_from_thread_store(
 fn take_prompt_fragment(
     fragment: PromptFragment,
     budget: &mut ModelContextBudget,
+    turn_id: &str,
 ) -> Option<(PromptSlot, String)> {
     let categorized = crate::context::CategorizedPromptFragment::from_extension(fragment);
     let category = categorized.category();
@@ -1201,7 +1203,53 @@ fn take_prompt_fragment(
         }
         _ => fragment.text().to_string(),
     };
-    budget.take(&rendered).map(|text| (fragment.slot(), text))
+    let slot = fragment.slot();
+    if slot == PromptSlot::SeparateDeveloper && rendered.is_empty() {
+        return None;
+    }
+    // Charge each fragment as its own normal message, including its envelope and turn ID.
+    // Grouping fragments into fewer messages later can only reduce this conservative charge.
+    let message_bytes = |text: &str| {
+        let mut items = Session::build_context_contribution_items_from_rendered_fragments(vec![(
+            slot,
+            text.to_string(),
+        )]);
+        let tokens = items.iter_mut().fold(0usize, |total, item| {
+            item.set_turn_id_if_missing(turn_id);
+            total.saturating_add(
+                usize::try_from(crate::context_manager::estimate_item_token_count(item).max(1))
+                    .unwrap_or(usize::MAX),
+            )
+        });
+        codex_utils_string::approx_bytes_for_tokens(tokens)
+    };
+    let text = budget.clone().take(&rendered)?;
+    let charge = message_bytes(&text);
+    if budget.try_take_bytes(charge) {
+        return Some((slot, text));
+    }
+
+    // Preserve the existing bounded head/tail truncation when the envelope leaves less room.
+    let mut lower = 1;
+    let mut upper = budget.remaining_bytes().saturating_sub(1);
+    let mut admitted = None;
+    while lower <= upper {
+        let middle = lower + (upper - lower) / 2;
+        let text = budget.clone().take_up_to(&rendered, middle)?;
+        if slot == PromptSlot::SeparateDeveloper && text.is_empty() {
+            lower = middle + 1;
+            continue;
+        }
+        let charge = message_bytes(&text);
+        if charge <= budget.remaining_bytes() {
+            admitted = Some((text, charge));
+            lower = middle + 1;
+        } else {
+            upper = middle - 1;
+        }
+    }
+    let (text, charge) = admitted?;
+    budget.try_take_bytes(charge).then_some((slot, text))
 }
 
 fn push_rendered_prompt_fragment(
@@ -1392,13 +1440,10 @@ impl Session {
         Ok((network_proxy, session_network_proxy))
     }
 
-    async fn refresh_managed_network_proxy_for_current_permission_profile(
+    async fn prepare_managed_network_proxy(
         &self,
-    ) -> anyhow::Result<()> {
-        let session_configuration = {
-            let state = self.state.lock().await;
-            state.session_configuration.clone()
-        };
+        session_configuration: &SessionConfiguration,
+    ) -> anyhow::Result<Option<Arc<StartedNetworkProxy>>> {
         let Some(spec) = session_configuration
             .original_config_do_not_use
             .permissions
@@ -1406,9 +1451,17 @@ impl Session {
             .as_ref()
             .cloned()
         else {
-            self.services.network_proxy.store(None);
-            return Ok(());
+            return Ok(None);
         };
+
+        #[cfg(test)]
+        self.managed_network_proxy_start_entered.notify_one();
+        #[cfg(test)]
+        let _start_guard = self
+            .managed_network_proxy_start_gate
+            .acquire()
+            .await
+            .expect("proxy startup test gate remains open");
 
         let spec = match spec
             .recompute_for_permission_profile(&session_configuration.permission_profile())
@@ -1436,13 +1489,7 @@ impl Session {
             self.services.network_proxy_audit_metadata.clone(),
         )
         .await?;
-        // Publish only a fully started candidate. Existing turns retain their
-        // Arc to the previous proxy; new turns cannot enter while the caller
-        // holds the refresh semaphore.
-        self.services
-            .network_proxy
-            .store(Some(Arc::new(started_proxy)));
-        Ok(())
+        Ok(Some(Arc::new(started_proxy)))
     }
 
     pub(crate) async fn codex_home(&self) -> AbsolutePathBuf {
@@ -1482,6 +1529,48 @@ impl Session {
         } else {
             Ok(())
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn shutdown_runtime_for_test(self: &Arc<Self>) -> bool {
+        handlers::shutdown(self, "cleanup-shutdown-test".to_string()).await
+    }
+
+    /// Keep accepted tool commits ahead of turn terminalization even if their
+    /// caller disappears before cooperative cancellation finishes.
+    pub(crate) fn retain_tool_dispatch_commit(self: &Arc<Self>) -> DurableHistoryCommitInFlight {
+        self.durable_history_commits_in_flight
+            .fetch_add(1, Ordering::AcqRel);
+        DurableHistoryCommitInFlight {
+            session: Arc::clone(self),
+        }
+    }
+
+    /// Retain generation evidence until invalidation and publication finish,
+    /// including when the sampling worker is aborted during a capture.
+    pub(crate) async fn flush_workspace_evidence_generation(
+        self: &Arc<Self>,
+        turn_context: &Arc<TurnContext>,
+        batch: &Arc<crate::tools::parallel::WorkspaceEvidenceGenerationBatch>,
+        tracker: &crate::tools::context::SharedTurnDiffTracker,
+    ) -> CodexResult<crate::tools::parallel::WorkspaceEvidenceGenerationFlush> {
+        self.durable_history_commits_in_flight
+            .fetch_add(1, Ordering::AcqRel);
+        let in_flight = DurableHistoryCommitInFlight {
+            session: Arc::clone(self),
+        };
+        let session = Arc::clone(self);
+        let turn_context = Arc::clone(turn_context);
+        let batch = Arc::clone(batch);
+        let tracker = Arc::clone(tracker);
+        tokio::spawn(async move {
+            let _in_flight = in_flight;
+            batch.flush(&session, &turn_context, &tracker).await
+        })
+        .await
+        .map_err(|error| {
+            CodexErr::Fatal(format!("workspace evidence flush task failed: {error}"))
+        })?
     }
 
     /// Wait for every cancellation-shielded history append accepted before terminalization, then
@@ -1935,8 +2024,23 @@ impl Session {
         &self,
         updates: SessionSettingsUpdate,
     ) -> ConstraintResult<()> {
-        let _refresh_guard = if updates.permission_profile.is_some()
+        self.update_settings_and_get(&updates, /*serialize_turn*/ false)
+            .await
+            .map(|_| ())
+    }
+
+    async fn update_settings_and_get(
+        &self,
+        updates: &SessionSettingsUpdate,
+        serialize_turn: bool,
+    ) -> ConstraintResult<SessionConfiguration> {
+        // Workspace roots materialize the profile's project-root entries, so
+        // changing them can also replace the managed proxy.
+        let _refresh_guard = if serialize_turn
+            || updates.permission_profile.is_some()
             || updates.sandbox_policy.is_some()
+            || updates.environments.is_some()
+            || updates.workspace_roots.is_some()
         {
             let Ok(refresh_guard) = self.managed_network_proxy_refresh_lock.acquire().await else {
                 unreachable!("managed network proxy refresh semaphore is never closed");
@@ -1946,16 +2050,9 @@ impl Session {
             None
         };
         let notify_config_contributors = !self.services.extensions.config_contributors().is_empty();
-        let (
-            previous_config,
-            new_config,
-            permission_profile_changed,
-            previous_session_configuration,
-            updated_session_configuration,
-            environments_changed,
-        ) = {
+        let (previous_config, new_config, updated) = {
             let mut state = self.state.lock().await;
-            let updated = match state.session_configuration.apply(&updates) {
+            let mut updated = match state.session_configuration.apply_async(updates).await {
                 Ok(updated) => updated,
                 Err(err) => {
                     warn!("rejected session settings update: {err}");
@@ -1963,46 +2060,45 @@ impl Session {
                 }
             };
 
+            let permission_profile_changed =
+                state.session_configuration.permission_profile() != updated.permission_profile();
+            let prepared_proxy = if permission_profile_changed {
+                // Startup may fail or be cancelled. Keep the accepted configuration
+                // visible until its replacement proxy is ready.
+                drop(state);
+                let proxy =
+                    self.prepare_managed_network_proxy(&updated)
+                        .await
+                        .map_err(|error| codex_config::ConstraintError::UpdateRejected {
+                            reason: error.to_string(),
+                        })?;
+                state = self.state.lock().await;
+                // Ordinary settings updates can complete during proxy startup.
+                // Reapply only this request so their accepted changes survive.
+                updated = state.session_configuration.apply_async(updates).await?;
+                Some(proxy)
+            } else {
+                None
+            };
             let previous_config = notify_config_contributors
                 .then(|| Self::build_effective_session_config(&state.session_configuration));
             let new_config =
                 notify_config_contributors.then(|| Self::build_effective_session_config(&updated));
-            let previous_permission_profile = state.session_configuration.permission_profile();
-            let updated_permission_profile = updated.permission_profile();
-            let permission_profile_changed =
-                previous_permission_profile != updated_permission_profile;
-            let previous_session_configuration = state.session_configuration.clone();
-            let updated_session_configuration = updated.clone();
-            state.session_configuration = updated;
-            (
-                previous_config,
-                new_config,
-                permission_profile_changed,
-                previous_session_configuration,
-                updated_session_configuration,
-                updates.environments.is_some(),
-            )
+            state.session_configuration = updated.clone();
+            if let Some(proxy) = prepared_proxy {
+                self.services.network_proxy.store(proxy);
+            }
+            if updates.environments.is_some() {
+                self.services
+                    .turn_environments
+                    .update_selections(updated.environment_selections());
+                self.services.advance_planning_generation(&mut state);
+            }
+            (previous_config, new_config, updated)
         };
-        if permission_profile_changed
-            && let Err(error) = self
-                .refresh_managed_network_proxy_for_current_permission_profile()
-                .await
-        {
-            self.state.lock().await.session_configuration = previous_session_configuration;
-            return Err(codex_config::ConstraintError::UpdateRejected {
-                reason: error.to_string(),
-            });
-        }
-        if environments_changed {
-            let mut state_owner = self.state.lock().await;
-            self.services
-                .turn_environments
-                .update_selections(updated_session_configuration.environment_selections());
-            self.services.advance_planning_generation(&mut state_owner);
-        }
         self.emit_config_changed_contributors(previous_config.as_ref(), new_config.as_ref());
 
-        Ok(())
+        Ok(updated)
     }
 
     pub(crate) async fn preview_settings(
@@ -2012,7 +2108,8 @@ impl Session {
         let state = self.state.lock().await;
         state
             .session_configuration
-            .apply(updates)
+            .apply_async(updates)
+            .await
             .map(|configuration| configuration.thread_config_snapshot())
     }
 
@@ -2246,6 +2343,76 @@ impl Session {
 
     /// Persist the event to rollout and send it to clients.
     pub(crate) async fn send_event(&self, turn_context: &TurnContext, msg: EventMsg) {
+        let post_dispatch = self
+            .send_event_before_post_dispatch(turn_context, msg, true, None)
+            .await;
+        self.finish_prepared_event_dispatch(turn_context, post_dispatch)
+            .await;
+    }
+
+    /// Publish the original terminal outcome once, retaining its actual live-delivery receipt.
+    /// Parent notification is a separate finalizer phase so recovery can finish it independently.
+    pub(crate) async fn publish_terminal_event(
+        &self,
+        turn_context: &TurnContext,
+        msg: EventMsg,
+        published: &mut Option<EventMsg>,
+        recovering_publication: bool,
+    ) -> EventMsg {
+        if let Some(event) = published.as_ref() {
+            return event.clone();
+        }
+        debug_assert!(matches!(
+            &msg,
+            EventMsg::TurnComplete(_) | EventMsg::TurnAborted(_)
+        ));
+        // An append can have succeeded before a panic prevented live delivery. Reuse that
+        // accepted outcome and do not append a contradictory recovery terminal after it.
+        let (msg, persist) = if recovering_publication && let Some(live_thread) = self.live_thread()
+        {
+            match live_thread
+                .terminal_event(&turn_context.sub_id, false)
+                .await
+            {
+                Ok(Some(event)) => (event, false),
+                Ok(None) => (msg, true),
+                Err(error) => {
+                    warn!(
+                        "terminal persistence is ambiguous; suppressing another append: {error:#}"
+                    );
+                    (msg, false)
+                }
+            }
+        } else {
+            (msg, true)
+        };
+        let post_dispatch = self
+            .send_event_before_post_dispatch(turn_context, msg, persist, Some(published))
+            .await;
+        post_dispatch
+            .terminal_source
+            .expect("terminal publication retains its original outcome")
+    }
+
+    pub(crate) async fn finish_terminal_event_dispatch(
+        &self,
+        turn_context: &TurnContext,
+        event: &EventMsg,
+    ) -> bool {
+        self.finish_prepared_event_dispatch(
+            turn_context,
+            PreparedEventDispatch::new(event, self.show_raw_agent_reasoning()),
+        )
+        .await
+    }
+
+    async fn send_event_before_post_dispatch(
+        &self,
+        turn_context: &TurnContext,
+        msg: EventMsg,
+        persist: bool,
+        publication_receipt: Option<&mut Option<EventMsg>>,
+    ) -> PreparedEventDispatch {
         let post_dispatch = PreparedEventDispatch::new(&msg, self.show_raw_agent_reasoning());
         if let EventMsg::Error(error) = &msg
             && error.affects_turn_status()
@@ -2256,19 +2423,23 @@ impl Session {
                 .await
                 .replace(error.clone());
         }
-        self.services
-            .rollout_thread_trace
-            .record_codex_turn_event(&turn_context.sub_id, &msg);
-        self.services
-            .rollout_thread_trace
-            .record_tool_call_event(turn_context.sub_id.as_str(), &msg);
+        if self.services.rollout_thread_trace.is_enabled() {
+            let trace = self.services.rollout_thread_trace.clone();
+            let turn_id = turn_context.sub_id.clone();
+            let trace_msg = msg.clone();
+            let _ = run_trace_recording(&self.terminal_tasks, move || {
+                trace.record_codex_turn_event(&turn_id, &trace_msg);
+                trace.record_tool_call_event(&turn_id, &trace_msg);
+            })
+            .await;
+        }
         let event = Event {
             id: turn_context.sub_id.clone(),
             msg,
         };
-        self.send_event_raw(event).await;
-        self.finish_prepared_event_dispatch(turn_context, post_dispatch)
+        self.send_event_raw_with_receipt(event, persist, publication_receipt)
             .await;
+        post_dispatch
     }
 
     async fn finish_prepared_event_dispatch(
@@ -2284,9 +2455,15 @@ impl Session {
             None => true,
         };
         for legacy in post_dispatch.legacy_events {
-            self.services
-                .rollout_thread_trace
-                .record_tool_call_event(turn_context.sub_id.as_str(), &legacy);
+            if self.services.rollout_thread_trace.is_enabled() {
+                let trace = self.services.rollout_thread_trace.clone();
+                let turn_id = turn_context.sub_id.clone();
+                let trace_msg = legacy.clone();
+                let _ = run_trace_recording(&self.terminal_tasks, move || {
+                    trace.record_tool_call_event(&turn_id, &trace_msg);
+                })
+                .await;
+            }
             let legacy_event = Event {
                 id: turn_context.sub_id.clone(),
                 msg: legacy,
@@ -2436,10 +2613,12 @@ impl Session {
             return false;
         }
         if let Some(message) = trace_message {
-            self.services
-                .rollout_thread_trace
-                .record_agent_result_interaction(
-                    turn_context.sub_id.as_str(),
+            let trace = self.services.rollout_thread_trace.clone();
+            let turn_id = turn_context.sub_id.clone();
+            let child_agent_path = child_agent_path.clone();
+            let _ = run_trace_recording(&self.terminal_tasks, move || {
+                trace.record_agent_result_interaction(
+                    &turn_id,
                     parent_thread_id,
                     &AgentResultTracePayload {
                         child_agent_path: child_agent_path.as_str(),
@@ -2447,6 +2626,8 @@ impl Session {
                         status: &status,
                     },
                 );
+            })
+            .await;
         }
         true
     }
@@ -2470,6 +2651,15 @@ impl Session {
     }
 
     async fn send_event_raw_with_persistence(&self, event: Event, persist: bool) {
+        self.send_event_raw_with_receipt(event, persist, None).await;
+    }
+
+    async fn send_event_raw_with_receipt(
+        &self,
+        event: Event,
+        persist: bool,
+        publication_receipt: Option<&mut Option<EventMsg>>,
+    ) {
         // Reject transient events before entering the persistence stack. Live delivery remains
         // independent and follows below.
         if persist
@@ -2489,19 +2679,41 @@ impl Session {
                 self.persist_rollout_items(&rollout_items).await;
             }
         }
-        self.services
-            .rollout_thread_trace
-            .record_protocol_event(&event.msg);
-        self.deliver_event_raw(event).await;
+        if self.services.rollout_thread_trace.is_enabled() {
+            let trace = self.services.rollout_thread_trace.clone();
+            let trace_msg = event.msg.clone();
+            let _ = run_trace_recording(&self.terminal_tasks, move || {
+                trace.record_protocol_event(&trace_msg);
+            })
+            .await;
+        }
+        self.deliver_event_raw_with_receipt(event, publication_receipt)
+            .await;
     }
 
     async fn deliver_event_raw(&self, event: Event) {
+        self.deliver_event_raw_with_receipt(event, None).await;
+    }
+
+    async fn deliver_event_raw_with_receipt(
+        &self,
+        event: Event,
+        publication_receipt: Option<&mut Option<EventMsg>>,
+    ) {
         // Record the last known agent status.
         if let Some(status) = agent_status_from_event(&event.msg) {
             self.agent_status.send_replace(status);
         }
-        if let Err(e) = self.tx_event.send(event).await {
-            debug!("dropping event because channel is closed: {e}");
+        let published_msg = publication_receipt.as_ref().map(|_| event.msg.clone());
+        match self.tx_event.send(event).await {
+            Ok(()) => {
+                // No await separates channel acceptance from recording the receipt in the
+                // existing finalizer owner. A later post-dispatch panic must not publish again.
+                if let (Some(receipt), Some(msg)) = (publication_receipt, published_msg) {
+                    *receipt = Some(msg);
+                }
+            }
+            Err(e) => debug!("dropping event because channel is closed: {e}"),
         }
     }
 
@@ -2731,20 +2943,33 @@ impl Session {
         // `approval_id` is only present for subcommand callbacks (execve intercept)
         let effective_approval_id = approval_id.clone().unwrap_or_else(|| call_id.clone());
         // Add the tx_approve callback to the map before sending the request.
+        let cleanup = CancellationToken::new();
+        let _cleanup_on_drop = cleanup.clone().drop_guard();
         let (tx_approve, rx_approve) = oneshot::channel();
-        let prev_entry = {
+        let (originating_turn_state, prev_entry) = {
             let mut active = self.active_turn.lock().await;
             match active.as_mut() {
                 Some(at) => {
                     let mut ts = at.turn_state.lock().await;
-                    ts.insert_pending_approval(effective_approval_id.clone(), tx_approve)
+                    let previous =
+                        ts.insert_pending_approval(effective_approval_id.clone(), tx_approve);
+                    (Some(Arc::clone(&at.turn_state)), previous)
                 }
-                None => None,
+                None => (None, None),
             }
         };
+        if let Some(turn_state) = originating_turn_state {
+            let key = effective_approval_id.clone();
+            self.terminal_tasks.spawn(async move {
+                cleanup.cancelled().await;
+                // A stale requester must preserve a replacement with a live receiver.
+                turn_state.lock().await.remove_closed_pending_approval(&key);
+            });
+        }
         if prev_entry.is_some() {
             warn!("Overwriting existing pending approval for call_id: {effective_approval_id}");
         }
+        drop(prev_entry);
 
         let parsed_cmd = parse_command(&command);
         let proposed_network_policy_amendments = network_approval_context.as_ref().map(|context| {
@@ -2809,21 +3034,33 @@ impl Session {
     ) -> ReviewDecision {
         let _elicitation = self.services.elicitations.register();
         // Add the tx_approve callback to the map before sending the request.
-        let (tx_approve, rx_approve) = oneshot::channel();
         let approval_id = call_id.clone();
-        let prev_entry = {
+        let cleanup = CancellationToken::new();
+        let _cleanup_on_drop = cleanup.clone().drop_guard();
+        let (tx_approve, rx_approve) = oneshot::channel();
+        let (originating_turn_state, prev_entry) = {
             let mut active = self.active_turn.lock().await;
             match active.as_mut() {
                 Some(at) => {
                     let mut ts = at.turn_state.lock().await;
-                    ts.insert_pending_approval(approval_id.clone(), tx_approve)
+                    let previous = ts.insert_pending_approval(approval_id.clone(), tx_approve);
+                    (Some(Arc::clone(&at.turn_state)), previous)
                 }
-                None => None,
+                None => (None, None),
             }
         };
+        if let Some(turn_state) = originating_turn_state {
+            let key = approval_id.clone();
+            self.terminal_tasks.spawn(async move {
+                cleanup.cancelled().await;
+                // A stale requester must preserve a replacement with a live receiver.
+                turn_state.lock().await.remove_closed_pending_approval(&key);
+            });
+        }
         if prev_entry.is_some() {
             warn!("Overwriting existing pending approval for call_id: {approval_id}");
         }
+        drop(prev_entry);
 
         let event = EventMsg::ApplyPatchApprovalRequest(ApplyPatchApprovalRequestEvent {
             call_id,
@@ -2852,6 +3089,10 @@ impl Session {
         environment: TurnEnvironmentSelection,
         cancellation_token: CancellationToken,
     ) -> Option<RequestPermissionsResponse> {
+        // A dropped requester must make any late response inert, including while the
+        // notification is waiting to acquire the grant storage lock.
+        let cancellation_token = Arc::new(cancellation_token.child_token());
+        let _cancel_on_drop = cancellation_token.as_ref().clone().drop_guard();
         match turn_context.as_ref().approval_policy.value() {
             AskForApproval::Never => {
                 return Some(RequestPermissionsResponse {
@@ -2934,7 +3175,7 @@ impl Session {
                 request,
                 /*retry_reason*/ None,
                 codex_analytics::GuardianApprovalRequestSource::MainTurn,
-                cancellation_token.clone(),
+                cancellation_token.as_ref().clone(),
             );
             let decision = tokio::select! {
                 biased;
@@ -2981,37 +3222,60 @@ impl Session {
                 response,
                 &environment.cwd,
             );
-            self.record_granted_request_permissions_for_turn(
-                &response,
-                &approval_scope_id,
-                originating_turn_state.as_ref(),
-            )
-            .await;
+            if !self
+                .record_granted_request_permissions_for_turn(
+                    &response,
+                    &approval_scope_id,
+                    originating_turn_state.as_ref(),
+                    &cancellation_token,
+                )
+                .await
+            {
+                return None;
+            }
             return Some(response);
         }
 
         let _elicitation = self.services.elicitations.register();
         let (tx_response, rx_response) = oneshot::channel();
-        let prev_entry = {
+        let (originating_turn_state, prev_entry) = {
             let mut active = self.active_turn.lock().await;
             match active.as_mut() {
                 Some(at) => {
                     let mut ts = at.turn_state.lock().await;
-                    ts.insert_pending_request_permissions(
+                    let previous = ts.insert_pending_request_permissions(
                         call_id.clone(),
                         PendingRequestPermissions {
                             tx_response,
+                            cancellation_token: cancellation_token.clone(),
                             requested_permissions: requested_permissions.clone(),
                             environment: environment.clone(),
                             approval_scope_id: approval_scope_id.clone(),
                         },
-                    )
+                    );
+                    (Some(Arc::clone(&at.turn_state)), previous)
                 }
-                None => None,
+                None => (None, None),
             }
         };
         if prev_entry.is_some() {
             warn!("Overwriting existing pending request_permissions for call_id: {call_id}");
+        }
+        drop(prev_entry);
+        if let Some(turn_state) = originating_turn_state.as_ref() {
+            let turn_state = Arc::clone(turn_state);
+            let call_id = call_id.clone();
+            let cancellation_token = Arc::clone(&cancellation_token);
+            // The existing requester DropGuard cancels this token even while
+            // event delivery is blocked, before the local cancellation select.
+            // Retain only this registration's identity in an existing owner.
+            self.terminal_tasks.spawn(async move {
+                cancellation_token.cancelled().await;
+                turn_state
+                    .lock()
+                    .await
+                    .remove_pending_request_permissions_if_same(&call_id, &cancellation_token);
+            });
         }
 
         let event = EventMsg::RequestPermissions(RequestPermissionsEvent {
@@ -3031,10 +3295,11 @@ impl Session {
         tokio::select! {
             biased;
             _ = cancellation_token.cancelled() => {
-                let mut active = self.active_turn.lock().await;
-                if let Some(at) = active.as_mut() {
-                    let mut ts = at.turn_state.lock().await;
-                    let _ = ts.remove_pending_request_permissions(&call_id);
+                if let Some(turn_state) = originating_turn_state {
+                    turn_state.lock().await.remove_pending_request_permissions_if_same(
+                        &call_id,
+                        &cancellation_token,
+                    );
                 }
                 None
             }
@@ -3089,21 +3354,49 @@ impl Session {
     ) -> Option<RequestUserInputResponse> {
         let _elicitation = self.services.elicitations.register();
         let sub_id = turn_context.sub_id.clone();
+        let cleanup = CancellationToken::new();
+        let _cleanup_on_drop = cleanup.clone().drop_guard();
         let (tx_response, rx_response) = oneshot::channel();
         let event_id = sub_id.clone();
-        let prev_entry = {
+        let (originating_turn_state, prev_entry) = {
             let mut active = self.active_turn.lock().await;
-            match active.as_mut() {
-                Some(at) => {
-                    let mut ts = at.turn_state.lock().await;
-                    ts.insert_pending_user_input(sub_id, tx_response)
-                }
-                None => None,
+            let at = active.as_mut()?;
+            // A late tool/delegate must not register an old turn's response key
+            // in whichever turn happens to be active now.
+            let active_id = at
+                .terminal
+                .as_ref()
+                .map(|terminal| terminal.turn_id())
+                .or_else(|| {
+                    at.task
+                        .as_ref()
+                        .map(|task| task.turn_context.sub_id.as_str())
+                });
+            if active_id != Some(sub_id.as_str()) {
+                return None;
             }
+            let mut ts = at.turn_state.lock().await;
+            let previous = ts.insert_pending_user_input(sub_id, tx_response);
+            (Arc::clone(&at.turn_state), previous)
         };
+        self.terminal_tasks.spawn(async move {
+            cleanup.cancelled().await;
+            // The old request cannot remove a same-key replacement whose
+            // response receiver is still live, even across active-turn changes.
+            originating_turn_state
+                .lock()
+                .await
+                .remove_closed_pending_user_input(&event_id);
+        });
         if prev_entry.is_some() {
-            warn!("Overwriting existing pending user input for sub_id: {event_id}");
+            warn!(
+                "Overwriting existing pending user input for sub_id: {}",
+                turn_context.sub_id
+            );
         }
+        // Replacing the keyed request must release its old waiter immediately,
+        // rather than retaining its sender until the replacement also finishes.
+        drop(prev_entry);
 
         let event = EventMsg::RequestUserInput(RequestUserInputEvent {
             call_id,
@@ -3143,18 +3436,17 @@ impl Session {
         };
         match entry {
             Some((tx_response, terminal)) => {
-                // Only the accepted waiter may arm the terminal interruption fence.
-                // A duplicate or stray response has no waiter and must be inert.
+                // Delivery and fencing share admission locks so a canceled
+                // waiter is inert and an accepted consumer cannot finish first.
                 if response.interrupted
                     && let Some(terminal) = terminal
-                    && !terminal.mark_interrupt_pending().await
                 {
-                    debug!(
-                        turn_id = terminal.turn_id(),
-                        "request-user-input interruption arrived after terminal admission"
-                    );
+                    terminal
+                        .mark_interrupt_pending_if(|| tx_response.send(response).is_ok())
+                        .await;
+                } else {
+                    tx_response.send(response).ok();
                 }
-                tx_response.send(response).ok();
             }
             None => {
                 warn!("No pending user input found for sub_id: {sub_id}");
@@ -3185,17 +3477,25 @@ impl Session {
         };
         match entry {
             Some(entry) => {
+                if entry.cancellation_token.is_cancelled() {
+                    return;
+                }
                 let response = Self::normalize_request_permissions_response(
                     entry.requested_permissions,
                     response,
                     &entry.environment.cwd,
                 );
-                self.record_granted_request_permissions_for_turn(
-                    &response,
-                    &entry.approval_scope_id,
-                    originating_turn_state.as_ref(),
-                )
-                .await;
+                if !self
+                    .record_granted_request_permissions_for_turn(
+                        &response,
+                        &entry.approval_scope_id,
+                        originating_turn_state.as_ref(),
+                        &entry.cancellation_token,
+                    )
+                    .await
+                {
+                    return;
+                }
                 entry.tx_response.send(response).ok();
             }
             None => {
@@ -3238,14 +3538,21 @@ impl Session {
         response: &RequestPermissionsResponse,
         approval_scope_id: &str,
         originating_turn_state: Option<&Arc<Mutex<crate::state::TurnState>>>,
-    ) {
+        cancellation_token: &CancellationToken,
+    ) -> bool {
+        if cancellation_token.is_cancelled() {
+            return false;
+        }
         if response.permissions.is_empty() {
-            return;
+            return true;
         }
         match response.scope {
             PermissionGrantScope::Turn => {
                 if let Some(turn_state) = originating_turn_state {
                     let mut ts = turn_state.lock().await;
+                    if cancellation_token.is_cancelled() {
+                        return false;
+                    }
                     let permissions: UriAdditionalPermissionProfile =
                         response.permissions.clone().into();
                     ts.record_granted_permissions(approval_scope_id, permissions);
@@ -3256,12 +3563,16 @@ impl Session {
             }
             PermissionGrantScope::Session => {
                 let mut state = self.state.lock().await;
+                if cancellation_token.is_cancelled() {
+                    return false;
+                }
                 state.record_granted_permissions(
                     approval_scope_id,
                     response.permissions.clone().into(),
                 );
             }
         }
+        true
     }
 
     #[expect(
@@ -3491,7 +3802,7 @@ impl Session {
         turn_context: &Arc<TurnContext>,
         items: &[ResponseItem],
     ) -> std::io::Result<()> {
-        self.record_conversation_items_committed(turn_context, items, true)
+        self.record_conversation_items_committed(turn_context, items, true, None)
             .await
     }
 
@@ -3503,8 +3814,25 @@ impl Session {
         turn_context: &Arc<TurnContext>,
         items: &[ResponseItem],
     ) -> std::io::Result<()> {
-        self.record_conversation_items_committed(turn_context, items, false)
+        self.record_conversation_items_committed(turn_context, items, false, None)
             .await
+    }
+
+    /// Own a completed tool response and its pending hook context before any await.
+    /// Terminalization observes the same in-flight commit owner as ordered history.
+    pub(crate) async fn record_tool_completion_ordered(
+        self: &Arc<Self>,
+        turn_context: &Arc<TurnContext>,
+        call_id: &str,
+        items: &[ResponseItem],
+    ) -> std::io::Result<()> {
+        self.record_conversation_items_committed(
+            turn_context,
+            items,
+            false,
+            Some(call_id.to_owned()),
+        )
+        .await
     }
 
     async fn record_conversation_items_committed(
@@ -3512,33 +3840,9 @@ impl Session {
         turn_context: &Arc<TurnContext>,
         items: &[ResponseItem],
         wait_for_durability: bool,
+        post_tool_context_call_id: Option<String>,
     ) -> std::io::Result<()> {
-        // Build the retry key before assigning generated item IDs so the same logical commit
-        // remains stable across repeated calls. Keep ordinary tool results inline to avoid adding
-        // a scheduler handoff to the tool-continuation path, while moving large or structured
-        // batches to the blocking pool. Either path returns the one owned batch that persistence
-        // and live history will share.
-        let turn_id = turn_context.sub_id.clone();
-        let (commit_key, items) = if conversation_items_need_blocking_history_identity(items) {
-            let raw_items = items.to_vec();
-            tokio::task::spawn_blocking(move || {
-                let commit_key = durable_history_commit_key(&turn_id, &raw_items)?;
-                let items = Self::prepare_owned_conversation_items_for_history(&turn_id, raw_items);
-                Ok::<_, std::io::Error>((commit_key, items))
-            })
-            .await
-            .map_err(|err| {
-                std::io::Error::other(format!("history identity task failed: {err}"))
-            })??
-        } else {
-            let commit_key = durable_history_commit_key(&turn_id, items)?;
-            let items =
-                Self::prepare_owned_conversation_items_for_history(&turn_id, items.to_vec());
-            (commit_key, items)
-        };
-        let persistence_timing_guard = turn_context
-            .turn_timing_state
-            .begin_local_phase(TurnLocalPhase::Persistence);
+        let mut raw_items = items.to_vec();
         let session = Arc::clone(self);
         let turn_context = Arc::clone(turn_context);
         session
@@ -3549,6 +3853,36 @@ impl Session {
         };
         let commit = tokio::spawn(async move {
             let _in_flight = in_flight;
+            let is_tool_completion = post_tool_context_call_id.is_some();
+            if let Some(call_id) = post_tool_context_call_id {
+                raw_items.extend(turn_context.take_post_tool_contexts(&call_id).await);
+            }
+            // Build the retry key before assigning generated item IDs so the same logical commit
+            // remains stable across repeated calls. Large or structured batches use the blocking
+            // pool inside this owner, so cancellation cannot discard the accepted batch between
+            // identity preparation and the ordered rollout/live-history commit.
+            let turn_id = turn_context.sub_id.clone();
+            let (commit_key, items) =
+                if conversation_items_need_blocking_history_identity(&raw_items) {
+                    tokio::task::spawn_blocking(move || {
+                        let commit_key = durable_history_commit_key(&turn_id, &raw_items)?;
+                        let items =
+                            Self::prepare_owned_conversation_items_for_history(&turn_id, raw_items);
+                        Ok::<_, std::io::Error>((commit_key, items))
+                    })
+                    .await
+                    .map_err(|err| {
+                        std::io::Error::other(format!("history identity task failed: {err}"))
+                    })??
+                } else {
+                    let commit_key = durable_history_commit_key(&turn_id, &raw_items)?;
+                    let items =
+                        Self::prepare_owned_conversation_items_for_history(&turn_id, raw_items);
+                    (commit_key, items)
+                };
+            let persistence_timing_guard = turn_context
+                .turn_timing_state
+                .begin_local_phase(TurnLocalPhase::Persistence);
             // Once started, this task owns the commit. A terminal deadline may
             // stop waiting for it, but cannot split the ordered rollout append
             // from the corresponding live-history mutation.
@@ -3620,12 +3954,22 @@ impl Session {
                 }
             }
             session.send_raw_response_items(&turn_context, &items).await;
+            drop(persistence_timing_guard);
+            if is_tool_completion {
+                for item in &items {
+                    crate::stream_events_utils::mark_thread_memory_mode_polluted_if_external_context(
+                        session.as_ref(),
+                        turn_context.as_ref(),
+                        item,
+                    )
+                    .await;
+                }
+            }
             Ok(())
         });
         let result = commit.await.map_err(|err| {
             std::io::Error::other(format!("durable history commit failed: {err}"))
         })?;
-        drop(persistence_timing_guard);
         result
     }
 
@@ -3725,11 +4069,12 @@ impl Session {
                     .fragment_digests
                 }
             };
+            let turn_context_item = step_context.turn.to_turn_context_item_async().await;
             self.state
                 .lock()
                 .await
                 .stage_context_baseline(ContextBaselineCandidate {
-                    turn_context_item: turn_context.to_turn_context_item(),
+                    turn_context_item,
                     world_state_snapshot,
                     world_state_item,
                     fragment_digests,
@@ -3898,61 +4243,107 @@ impl Session {
     }
 
     pub(crate) async fn replace_compacted_history(
-        &self,
-        turn_context: &TurnContext,
+        self: &Arc<Self>,
+        turn_context: &Arc<TurnContext>,
         items: Vec<ResponseItem>,
         reference_context_item: Option<TurnContextItem>,
         world_state_baseline: Option<WorldStateSnapshot>,
         fragment_digests: Vec<ContextFragmentDigest>,
         compacted_item: CompactedItem,
-    ) {
-        let _tool_history_io_permit = if turn_context.config.completed_tool_history_projection {
-            let Some(permit) = self.acquire_tool_history_io_permit().await else {
-                return;
-            };
-            Some(permit)
-        } else {
-            None
+    ) -> CodexResult<()> {
+        let session = Arc::clone(self);
+        let turn_context = Arc::clone(turn_context);
+        session
+            .durable_history_commits_in_flight
+            .fetch_add(1, Ordering::AcqRel);
+        let in_flight = DurableHistoryCommitInFlight {
+            session: Arc::clone(&session),
         };
-        let items = Self::assign_missing_response_item_ids(Cow::Owned(items)).into_owned();
-        let compacted_item = CompactedItem {
-            replacement_history: Some(items.clone()),
-            ..compacted_item
-        };
-        // Compaction prepares a replacement baseline but cannot realize it until
-        // the exact next physical attempt is accepted and durably recorded.
-        {
-            let mut state = self.state.lock().await;
-            state.replace_history(items.clone(), None);
-            if let (Some(turn_context_item), Some(snapshot)) =
-                (reference_context_item, world_state_baseline)
-            {
-                state.stage_context_baseline(ContextBaselineCandidate {
-                    turn_context_item,
-                    world_state_snapshot: snapshot.clone(),
-                    world_state_item: Some(WorldStateItem::full(snapshot.into_value())),
-                    fragment_digests,
-                    bound_sampling_request_id: None,
-                    bound_physical_attempt_id: None,
-                });
+        // Like ordinary ordered history commits, compaction owns its append and
+        // publication even if the requesting future is dropped.
+        tokio::spawn(async move {
+            let _in_flight = in_flight;
+            let _commit_permit = session
+                .durable_history_commit_gate
+                .acquire()
+                .await
+                .map_err(|_| {
+                    CodexErr::Fatal("durable history commit gate is closed".to_string())
+                })?;
+            let _tool_history_io_permit = if turn_context.config.completed_tool_history_projection {
+                Some(session.acquire_tool_history_io_permit().await?)
             } else {
-                state.clear_pending_context_baseline();
+                None
+            };
+            let items = Self::assign_missing_response_item_ids(Cow::Owned(items)).into_owned();
+            let compacted_item = CompactedItem {
+                replacement_history: Some(items.clone()),
+                ..compacted_item
+            };
+            let snapshot = if turn_context.config.completed_tool_history_projection {
+                let mut snapshot = session.state.lock().await.tool_history_state();
+                snapshot.retain_for_history(&items);
+                Some(snapshot)
+            } else {
+                None
+            };
+            let mut persistence_writer = if snapshot.is_some() {
+                Some(session.tool_history_persistence.writer().await)
+            } else {
+                None
+            };
+            // The old durable ledger remains a safe superset until the rollout
+            // commits. Keep the worker behind this writer; rollback the reserved
+            // prune if append fails, including unwinding before publication.
+            let snapshot_reservation = match (persistence_writer.as_mut(), snapshot) {
+                (Some(writer), Some(snapshot)) => Some(
+                    writer
+                        .reserve_snapshot(snapshot, session.live_thread().cloned())
+                        .map_err(|error| {
+                            CodexErr::Fatal(format!(
+                                "failed to reserve compacted tool history: {error}"
+                            ))
+                        })?,
+                ),
+                _ => None,
+            };
+            session
+                .persist_rollout_items_ordered(&[RolloutItem::Compacted(compacted_item)])
+                .await
+                .map_err(|error| {
+                    CodexErr::Fatal(format!("failed to commit compacted history: {error}"))
+                })?;
+            {
+                let mut state = session.state.lock().await;
+                state.replace_history(items, None);
+                if let (Some(turn_context_item), Some(snapshot)) =
+                    (reference_context_item, world_state_baseline)
+                {
+                    state.stage_context_baseline(ContextBaselineCandidate {
+                        turn_context_item,
+                        world_state_snapshot: snapshot.clone(),
+                        world_state_item: Some(WorldStateItem::full(snapshot.into_value())),
+                        fragment_digests,
+                        bound_sampling_request_id: None,
+                        bound_physical_attempt_id: None,
+                    });
+                } else {
+                    state.clear_pending_context_baseline();
+                }
+                session.services.advance_planning_generation(&mut state);
+                state.queue_pending_session_start_source(codex_hooks::SessionStartSource::Compact);
             }
-            self.services.advance_planning_generation(&mut state);
-        }
-
-        self.persist_rollout_items(&[RolloutItem::Compacted(compacted_item)])
-            .await;
-        if turn_context.config.completed_tool_history_projection {
-            self.reconcile_and_persist_current_tool_history_state_locked(
-                turn_context.config.codex_home.as_path(),
-            )
-            .await;
-        }
-        {
-            let mut state = self.state.lock().await;
-            state.queue_pending_session_start_source(codex_hooks::SessionStartSource::Compact);
-        }
+            if let Some(reservation) = snapshot_reservation {
+                reservation.commit();
+            }
+            // A failed later prune remains a dirty queue obligation. The old
+            // persisted superset and protection markers still cover this commit.
+            Ok(())
+        })
+        .await
+        .map_err(|error| {
+            CodexErr::Fatal(format!("compacted history commit task failed: {error}"))
+        })?
     }
 
     async fn persist_rollout_response_items(&self, items: &[ResponseItem]) {
@@ -4152,7 +4543,13 @@ impl Session {
             .poll_turn_context_contributors(turn_context, estimate)
             .await
             .into_iter()
-            .filter_map(|fragment| take_prompt_fragment(fragment, &mut extension_context_budget))
+            .filter_map(|fragment| {
+                take_prompt_fragment(
+                    fragment,
+                    &mut extension_context_budget,
+                    &turn_context.sub_id,
+                )
+            })
             .collect();
         Self::build_context_contribution_items_from_rendered_fragments(rendered_fragments)
     }
@@ -4367,8 +4764,11 @@ impl Session {
         }
         let mut extension_context_budget = ModelContextBudget::default();
         for fragment in self.poll_thread_context_contributors(estimate).await {
-            let Some((slot, text)) = take_prompt_fragment(fragment, &mut extension_context_budget)
-            else {
+            let Some((slot, text)) = take_prompt_fragment(
+                fragment,
+                &mut extension_context_budget,
+                &turn_context.sub_id,
+            ) else {
                 continue;
             };
             push_rendered_prompt_fragment(
@@ -4391,8 +4791,11 @@ impl Session {
             .poll_turn_context_contributors(turn_context, estimate)
             .await
         {
-            let Some((slot, text)) = take_prompt_fragment(fragment, &mut extension_context_budget)
-            else {
+            let Some((slot, text)) = take_prompt_fragment(
+                fragment,
+                &mut extension_context_budget,
+                &turn_context.sub_id,
+            ) else {
                 continue;
             };
             rendered_turn_context_fragments.push((slot, text.clone()));
@@ -4532,8 +4935,9 @@ impl Session {
         }
     }
 
-    /// Append rollout items and wait for the durability barrier. Unlike the
-    /// best-effort event path, provenance records must fail closed.
+    /// Append rollout items and wait for the configured persistence barrier. Unlike the
+    /// best-effort event path, an enabled writer must fail closed. Ephemeral sessions
+    /// deliberately have no writer: accepting their in-memory history never creates a rollout.
     pub(crate) async fn persist_rollout_items_durable(
         &self,
         items: &[RolloutItem],
@@ -4640,6 +5044,13 @@ impl Session {
         state.clear_pending_context_baseline();
     }
 
+    #[cfg(test)]
+    pub(crate) async fn lock_history_state_for_test(
+        &self,
+    ) -> tokio::sync::MutexGuard<'_, SessionState> {
+        self.state.lock().await
+    }
+
     pub(crate) async fn clone_history(&self) -> ContextManager {
         let state = self.state.lock().await;
         state.clone_history()
@@ -4647,35 +5058,54 @@ impl Session {
 
     async fn acquire_tool_history_io_permit(
         &self,
-    ) -> Option<(
+    ) -> CodexResult<(
         tokio::sync::SemaphorePermit<'_>,
         tokio::sync::SemaphorePermit<'_>,
     )> {
-        let reconciliation_permit = match self.tool_history_reconciliation_gate.acquire().await {
-            Ok(permit) => permit,
-            Err(error) => {
-                tracing::warn!(%error, "completed-tool history reconciliation gate closed unexpectedly");
-                return None;
-            }
-        };
-        self.tool_history_persistence.drain().await;
-        match self.tool_history_io_gate.acquire().await {
-            Ok(io_permit) => Some((reconciliation_permit, io_permit)),
-            Err(error) => {
-                tracing::warn!(%error, "completed-tool history I/O gate closed unexpectedly");
-                None
-            }
-        }
+        let reconciliation_permit = self
+            .tool_history_reconciliation_gate
+            .acquire()
+            .await
+            .map_err(|error| {
+                CodexErr::Fatal(format!(
+                    "completed-tool history reconciliation gate closed: {error}"
+                ))
+            })?;
+        self.tool_history_persistence
+            .drain()
+            .await
+            .map_err(|error| {
+                CodexErr::Fatal(format!("completed-tool history is not durable: {error}"))
+            })?;
+        let io_permit = self.tool_history_io_gate.acquire().await.map_err(|error| {
+            CodexErr::Fatal(format!("completed-tool history I/O gate closed: {error}"))
+        })?;
+        Ok((reconciliation_permit, io_permit))
+    }
+
+    pub(crate) async fn drain_tool_history_persistence(&self) -> CodexResult<()> {
+        self.tool_history_persistence
+            .drain()
+            .await
+            .map_err(|error| {
+                CodexErr::Fatal(format!("completed-tool history is not durable: {error}"))
+            })
+    }
+
+    pub(crate) fn check_tool_history_persistence(&self) -> CodexResult<()> {
+        self.tool_history_persistence
+            .check_failure()
+            .map_err(|error| {
+                CodexErr::Fatal(format!("completed-tool history is not durable: {error}"))
+            })
     }
 
     pub(crate) async fn finalize_initial_tool_history_state(
         &self,
         codex_home: &std::path::Path,
         fork_source_thread_id: Option<ThreadId>,
-    ) {
-        let Some(_tool_history_io_permit) = self.acquire_tool_history_io_permit().await else {
-            return;
-        };
+    ) -> CodexResult<()> {
+        let _tool_history_io_permit = self.acquire_tool_history_io_permit().await?;
         let mut snapshot = self.state.lock().await.tool_history_state();
         if let Some(source_thread_id) = fork_source_thread_id {
             let (reminted, dropped_candidates) =
@@ -4696,65 +5126,44 @@ impl Session {
                 );
             }
         }
-        self.reconcile_and_persist_tool_history_state_locked(codex_home, snapshot)
-            .await;
-    }
-
-    async fn reconcile_and_persist_current_tool_history_state_locked(
-        &self,
-        codex_home: &std::path::Path,
-    ) {
-        let snapshot = self.state.lock().await.tool_history_state();
-        let reconciled = crate::tool_history::reconcile_tool_history_state(
+        // Add/validate the new protections before persistence, but never release
+        // prior protections until the replacement ledger has committed.
+        let reconciled = crate::tool_history::prepare_tool_history_state(
             codex_home,
             &self.thread_id.to_string(),
             snapshot,
         )
         .await;
-        {
-            let mut state = self.state.lock().await;
-            state.set_tool_history_state(reconciled.clone());
-        }
-        self.persist_reconciled_tool_history_state_locked(codex_home, reconciled)
-            .await;
-    }
-
-    async fn reconcile_and_persist_tool_history_state_locked(
-        &self,
-        codex_home: &std::path::Path,
-        snapshot: crate::tool_history::ToolHistoryState,
-    ) {
-        let reconciled = crate::tool_history::reconcile_tool_history_state(
-            codex_home,
-            &self.thread_id.to_string(),
-            snapshot,
-        )
-        .await;
-        {
-            let mut state = self.state.lock().await;
-            state.set_tool_history_state(reconciled.clone());
-        }
-        self.persist_reconciled_tool_history_state_locked(codex_home, reconciled)
-            .await;
-    }
-
-    async fn persist_reconciled_tool_history_state_locked(
-        &self,
-        codex_home: &std::path::Path,
-        reconciled: crate::tool_history::ToolHistoryState,
-    ) {
-        if let Err(err) = crate::tool_history::persist_tool_history_state(
+        crate::tool_history::persist_tool_history_state(
             codex_home,
             &self.thread_id.to_string(),
             &reconciled,
         )
         .await
-        {
-            tracing::warn!("failed to persist reconciled completed-tool history metadata: {err}");
-        }
+        .map_err(|error| {
+            CodexErr::Fatal(format!(
+                "failed to persist initial completed-tool history: {error}"
+            ))
+        })?;
+        self.state
+            .lock()
+            .await
+            .set_tool_history_state(reconciled.clone());
         self.tool_history_persistence
-            .replace_mirror(reconciled)
+            .replace_mirror(reconciled.clone())
             .await;
+        crate::tools::command_output_artifact::prune_active_tool_history_artifact_protection(
+            codex_home,
+            &self.thread_id.to_string(),
+            &reconciled.artifact_references(),
+        )
+        .await
+        .map_err(|error| {
+            CodexErr::Fatal(format!(
+                "failed to finalize initial tool-history artifact cleanup: {error}"
+            ))
+        })?;
+        Ok(())
     }
 
     pub(crate) async fn register_tool_history_candidate(
@@ -4831,8 +5240,13 @@ impl Session {
         }
     }
 
-    pub(crate) async fn flush_tool_history_persistence(&self) {
-        self.tool_history_persistence.checkpoint().await;
+    pub(crate) async fn flush_tool_history_persistence(&self) -> CodexResult<()> {
+        self.tool_history_persistence
+            .checkpoint()
+            .await
+            .map_err(|error| {
+                CodexErr::Fatal(format!("completed-tool history checkpoint failed: {error}"))
+            })
     }
 
     pub(crate) async fn invalidate_tool_history_source_dependencies(
@@ -4840,14 +5254,14 @@ impl Session {
         codex_home: &std::path::Path,
         affected_paths: Option<&std::collections::BTreeSet<std::path::PathBuf>>,
         current_workspace_identity: Option<&crate::git_workspace::WorkspaceEvidenceIdentity>,
-    ) {
+    ) -> CodexResult<()> {
         self.invalidate_tool_history_source_dependencies_excluding_call_ids(
             codex_home,
             affected_paths,
             current_workspace_identity,
             &std::collections::BTreeSet::new(),
         )
-        .await;
+        .await
     }
 
     pub(crate) async fn invalidate_tool_history_source_dependencies_excluding_call_ids(
@@ -4856,7 +5270,7 @@ impl Session {
         affected_paths: Option<&std::collections::BTreeSet<std::path::PathBuf>>,
         current_workspace_identity: Option<&crate::git_workspace::WorkspaceEvidenceIdentity>,
         excluded_call_ids: &std::collections::BTreeSet<String>,
-    ) {
+    ) -> CodexResult<()> {
         let Ok(reconciliation_permit) = self.tool_history_reconciliation_gate.acquire().await
         else {
             unreachable!("session-owned tool-history reconciliation semaphore is never closed");
@@ -4870,18 +5284,25 @@ impl Session {
             let mut persistence_writer = self.tool_history_persistence.writer().await;
             let mut state = self.state.lock().await;
             if !state.apply_tool_history_mutation(&mutation) {
-                return;
+                return self.check_tool_history_persistence();
             }
-            if let Err(err) = persistence_writer
+            persistence_writer
                 .enqueue_mutation(mutation, "source-dependency invalidation state")
-            {
-                tracing::warn!(
-                    "failed to enqueue source-dependency invalidation state; in-memory state is not durable: {err}"
-                );
-            }
+                .map_err(|error| {
+                    CodexErr::Fatal(format!(
+                        "source-dependency invalidation is not durable: {error}"
+                    ))
+                })?;
         }
         drop(reconciliation_permit);
-        self.tool_history_persistence.drain().await;
+        self.tool_history_persistence
+            .drain()
+            .await
+            .map_err(|error| {
+                CodexErr::Fatal(format!(
+                    "source-dependency invalidation is not durable: {error}"
+                ))
+            })
     }
 
     pub(crate) async fn mark_tool_history_consumed(
@@ -4962,7 +5383,7 @@ impl Session {
             .as_ref()
             .map(|candidate| &candidate.turn_context_item)
             .or(reference_context_item.as_ref());
-        let turn_context_item = turn_context.to_turn_context_item();
+        let turn_context_item = turn_context.to_turn_context_item_async().await;
         let turn_context_changed =
             !context_snapshot_matches(represented_context_item, &turn_context_item);
         let world_state = Arc::new(if estimate {
@@ -5449,23 +5870,32 @@ impl Session {
         if input.is_empty() {
             return Err(SteerInputError::EmptyInput);
         }
-        active_turn_context
-            .update_validation_authorization(&input)
-            .await;
-        active_turn_context.update_multi_agent_spawn_authorization(&input);
         let input_for_telemetry = input.clone();
-
-        let additional_context_input = {
-            let mut state = self.state.lock().await;
-            state.additional_context.merge(additional_context)
+        let task_identity = Arc::clone(&active_task.worker_done);
+        let turn_state_identity = Arc::clone(&active_turn.turn_state);
+        // Validation launch lifecycles retain authorization readers until spawn finishes. Do
+        // not block task interruption on active_turn while waiting for that reader.
+        drop(active);
+        let mut authorization = active_turn_context.validation_authorization.write().await;
+        let mut active = self.active_turn.lock().await;
+        let Some(active_turn) = active.as_mut() else {
+            return Err(SteerInputError::NoActiveTurn(input));
         };
-
-        if let Some(responsesapi_client_metadata) = responsesapi_client_metadata {
-            active_task
-                .turn_context
-                .turn_metadata_state
-                .set_responsesapi_client_metadata(responsesapi_client_metadata);
+        let Some(active_task) = active_turn.task.as_ref() else {
+            return Err(SteerInputError::NoActiveTurn(input));
+        };
+        // A replacement can reuse the textual turn ID or even its TurnContext.
+        // Retain and compare both registration and queue identities before effects.
+        if !Arc::ptr_eq(&task_identity, &active_task.worker_done)
+            || !Arc::ptr_eq(&turn_state_identity, &active_turn.turn_state)
+        {
+            return Err(SteerInputError::NoActiveTurn(input));
         }
+        // Acquire context guards without changing live state. Rejection or a
+        // dropped caller while waiting for queue admission must have no effects.
+        let mut state = self.state.lock().await;
+        let mut staged_additional_context = state.additional_context.clone();
+        let additional_context_input = staged_additional_context.merge(additional_context);
 
         let mut pending_input = additional_context_input
             .into_iter()
@@ -5480,12 +5910,29 @@ impl Session {
             .extend_pending_input_and_accept_mailbox_delivery_for_turn_state(
                 active_turn.turn_state.as_ref(),
                 &pending_input,
+                || {
+                    for item in &input_for_telemetry {
+                        if let UserInput::Text { text, .. } = item {
+                            authorization.update_from_user_input(text);
+                        }
+                    }
+                    active_turn_context
+                        .update_multi_agent_spawn_authorization(&input_for_telemetry);
+                    state.additional_context = staged_additional_context;
+                    if let Some(metadata) = responsesapi_client_metadata {
+                        active_turn_context
+                            .turn_metadata_state
+                            .set_responsesapi_client_metadata(metadata);
+                    }
+                },
             )
             .await
             .map_err(|err| SteerInputError::PendingInputLimitExceeded {
                 max_items: err.max_items,
                 max_bytes: err.max_bytes,
             })?;
+        drop(state);
+        drop(authorization);
         drop(active);
         active_turn_context
             .session_telemetry
@@ -5639,7 +6086,7 @@ async fn build_hooks_for_config(
     let plugin_outcome = plugins_manager.plugins_for_config(&plugins_input).await;
     let plugin_hook_sources = plugin_outcome.effective_plugin_hook_sources();
     let plugin_hook_load_warnings = plugin_outcome.effective_plugin_hook_warnings();
-    Hooks::new(HooksConfig {
+    let hooks_config = HooksConfig {
         legacy_notify_argv: config.notify.clone(),
         mutating_finalizer: matches!(
             config.after_agent_policy,
@@ -5652,7 +6099,10 @@ async fn build_hooks_for_config(
         plugin_hook_load_warnings,
         shell_program: hook_shell_program,
         shell_args: hook_shell_argv,
-    })
+    };
+    tokio::task::spawn_blocking(move || Hooks::new(hooks_config))
+        .await
+        .expect("hook discovery worker should complete")
 }
 
 #[cfg(test)]

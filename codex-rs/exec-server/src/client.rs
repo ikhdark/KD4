@@ -1028,15 +1028,25 @@ impl ExecServerClient {
             })??;
         let call_timeout = deadline.saturating_duration_since(Instant::now());
         if call_timeout.is_zero() {
+            if method == FS_CLOSE_METHOD {
+                rpc_client.request_transport_close();
+            }
             return Err(ExecServerError::Protocol(format!(
                 "timed out waiting for exec-server `{method}` response after {PROCESS_TERMINATION_TIMEOUT:?}"
             )));
         }
-        map_rpc_call_result(
-            rpc_client
-                .call_for_cleanup(method, params, call_timeout)
-                .await,
-        )
+        let result = rpc_client
+            .call_for_cleanup(method, params, call_timeout)
+            .await;
+        if method == FS_CLOSE_METHOD && matches!(&result, Err(RpcCallError::TimedOut { .. })) {
+            // File handles are connection-local. If their close could not settle,
+            // discard this transport so server shutdown releases every handle;
+            // keeping it live could strand a close that never entered the queue.
+            // Request closure synchronously: waiting for a child supervisor here
+            // would extend the already expired cleanup deadline.
+            rpc_client.request_transport_close();
+        }
+        map_rpc_call_result(result)
     }
 }
 
@@ -1389,7 +1399,7 @@ impl Session {
         }
     }
 
-    pub(crate) async fn unregister(&self) {
+    pub(crate) fn unregister(&self) {
         self.client
             .inner
             .remove_session_if(&self.process_id, &self.state);
@@ -2149,7 +2159,7 @@ mod tests {
             .expect("json-rpc websocket frame should write");
     }
 
-    async fn complete_websocket_initialize(
+    async fn complete_websocket_session_initialize(
         websocket: &mut WebSocketStream<TcpStream>,
         session_id: &str,
         expected_resume_session_id: Option<&str>,
@@ -2184,7 +2194,15 @@ mod tests {
                 if notification.method == INITIALIZED_METHOD => {}
             other => panic!("expected initialized notification, got {other:?}"),
         }
+    }
 
+    async fn complete_websocket_initialize(
+        websocket: &mut WebSocketStream<TcpStream>,
+        session_id: &str,
+        expected_resume_session_id: Option<&str>,
+    ) {
+        complete_websocket_session_initialize(websocket, session_id, expected_resume_session_id)
+            .await;
         let environment_info_request = read_jsonrpc_websocket(websocket).await;
         let request = match environment_info_request {
             JSONRPCMessage::Request(request) if request.method == ENVIRONMENT_INFO_METHOD => {
@@ -2459,6 +2477,484 @@ mod tests {
 
         drop(client);
         server.await.expect("server task should finish");
+    }
+
+    #[tokio::test]
+    async fn file_close_admission_timeout_disconnects_and_releases_server_file() {
+        for scenario in [
+            "queue_timeout",
+            "expired",
+            "stream_drop",
+            "cleanup_overflow",
+        ] {
+            assert_file_close_releases_server_file(scenario).await;
+        }
+    }
+
+    async fn assert_file_close_releases_server_file(scenario: &str) {
+        use crate::ExecutorFileSystem as _;
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use tokio::io::AsyncReadExt as _;
+
+        let home = tempfile::tempdir().expect("temporary directory");
+        let path = home.path().join("held-file.txt");
+        tokio::fs::write(&path, b"held until close")
+            .await
+            .expect("write fixture");
+        let (client_stdin, relay_reader) = duplex(1);
+        let (server_writer, client_stdout) = duplex(1 << 20);
+        let (mut relay_writer, server_reader) = duplex(1 << 20);
+        let (relay_paused_tx, relay_paused_rx) = oneshot::channel();
+        let (release_relay_tx, release_relay_rx) = oneshot::channel();
+        let relay = tokio::spawn(async move {
+            let mut reader = BufReader::new(relay_reader);
+            loop {
+                let mut line = String::new();
+                assert_ne!(
+                    reader
+                        .read_line(&mut line)
+                        .await
+                        .expect("read client bytes"),
+                    0
+                );
+                let message: JSONRPCMessage = serde_json::from_str(&line).expect("client request");
+                let opened = matches!(&message, JSONRPCMessage::Request(request)
+                    if request.method == crate::protocol::FS_OPEN_METHOD);
+                relay_writer
+                    .write_all(line.as_bytes())
+                    .await
+                    .expect("forward client bytes");
+                if opened {
+                    relay_paused_tx.send(()).expect("observe pause");
+                    release_relay_rx.await.expect("release stalled transport");
+                    // The stalled writer may leave an incomplete prefix in the wire buffer.
+                    // Once the client closes its transport, EOF must arrive without another
+                    // request being sent to the real server.
+                    let mut abandoned_bytes = Vec::new();
+                    reader
+                        .read_to_end(&mut abandoned_bytes)
+                        .await
+                        .expect("client transport EOF");
+                    assert!(
+                        abandoned_bytes.len() <= 1,
+                        "writer must not resume queued requests"
+                    );
+                    drop(relay_writer);
+                    return;
+                }
+            }
+        });
+        let processor = Arc::new(crate::server::ConnectionProcessor::new(
+            crate::ExecServerRuntimePaths::new(
+                std::env::current_exe().expect("current executable"),
+            )
+            .expect("runtime paths"),
+        ));
+        let server_processor = Arc::clone(&processor);
+        let server = tokio::spawn(async move {
+            server_processor
+                .run_connection(
+                    JsonRpcConnection::from_stdio(
+                        server_reader,
+                        server_writer,
+                        "file-close-server".to_string(),
+                    ),
+                    crate::telemetry::ConnectionTransport::Stdio,
+                )
+                .await;
+        });
+        let (transport, termination_requested, termination_completed) =
+            crate::connection::JsonRpcTransport::pending_supervisor_for_test();
+        let mut connection = JsonRpcConnection::from_stdio(
+            client_stdout,
+            client_stdin,
+            "file-close-client".to_string(),
+        );
+        // Only the external OS supervisor is withheld. JSON-RPC queues, client
+        // cleanup and the registered server/file handler remain real.
+        connection.transport = transport;
+        let client =
+            ExecServerClient::connect(connection, ExecServerClientConnectOptions::default())
+                .await
+                .expect("connect real server");
+        let stream = if scenario == "stream_drop" {
+            // Supply the already connected real transport to the usual filesystem.
+            let lazy = LazyRemoteExecServerClient::new(ExecServerTransportParams::WebSocketUrl {
+                websocket_url: "ws://127.0.0.1:1".to_string(),
+                connect_timeout: Duration::from_secs(1),
+                initialize_timeout: Duration::from_secs(1),
+            });
+            *lazy.current_client.lock().expect("client cache") = Some(client.clone());
+            let fs = crate::remote_file_system::RemoteFileSystem::new(lazy);
+            Some(
+                fs.read_file_stream(
+                    &PathUri::from_host_native_path(&path).expect("file URI"),
+                    None,
+                )
+                .await
+                .expect("normal filesystem stream open"),
+            )
+        } else {
+            client
+                .fs_open(crate::protocol::FsOpenParams {
+                    handle_id: "held-read".to_string(),
+                    path: PathUri::from_host_native_path(&path).expect("file URI"),
+                    sandbox: None,
+                })
+                .await
+                .expect("normal fs/open should retain file");
+            None
+        };
+        relay_paused_rx
+            .await
+            .expect("relay stopped after actual open");
+        let exclusive_open = || {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0)
+                .open(&path)
+        };
+        assert_eq!(
+            exclusive_open()
+                .expect_err("server holds real file")
+                .raw_os_error(),
+            Some(32)
+        );
+
+        let rpc = client
+            .inner
+            .rpc_client()
+            .await
+            .expect("live RPC connection");
+        // Stall the existing stdio writer and fill its normal bounded queue.
+        for _ in 0..=crate::connection::CHANNEL_CAPACITY {
+            rpc.notify("queued-behind-open", &serde_json::json!({}))
+                .await
+                .expect("queue notification");
+        }
+        tokio::time::pause();
+        let close_params = crate::protocol::FsCloseParams {
+            handle_id: "held-read".to_string(),
+        };
+        let before = tokio::time::Instant::now();
+        match scenario {
+            "queue_timeout" => {
+                let close = client.fs_close(close_params);
+                tokio::pin!(close);
+                assert!(futures::poll!(close.as_mut()).is_pending());
+                tokio::time::advance(super::PROCESS_TERMINATION_TIMEOUT + Duration::from_millis(1))
+                    .await;
+                assert!(matches!(futures::poll!(close.as_mut()),
+                    std::task::Poll::Ready(Err(super::ExecServerError::Protocol(message)))
+                    if message.contains("fs/close") && message.contains("timed out")));
+            }
+            "expired" => {
+                // The same cleanup entry used by fs_close, with the deadline
+                // already reached when the ready RPC connection is acquired.
+                let close = client.call_for_cleanup_before::<_, crate::protocol::FsCloseResponse>(
+                    crate::protocol::FS_CLOSE_METHOD,
+                    &close_params,
+                    before,
+                );
+                tokio::pin!(close);
+                assert!(matches!(futures::poll!(close.as_mut()),
+                    std::task::Poll::Ready(Err(super::ExecServerError::Protocol(message)))
+                    if message.contains("fs/close") && message.contains("timed out")));
+                assert_eq!(tokio::time::Instant::now(), before);
+            }
+            "stream_drop" => {
+                // Dropping the normal stream must schedule the real registration
+                // cleanup; no direct fs_close invocation drives this scenario.
+                drop(stream);
+                timeout(Duration::from_secs(1), async {
+                    while rpc.pending_request_count().await != 1 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("stream Drop must admit its cleanup owner");
+                tokio::time::advance(super::PROCESS_TERMINATION_TIMEOUT + Duration::from_millis(1))
+                    .await;
+                timeout(Duration::from_millis(1), async {
+                    while !rpc.is_disconnected() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("stream Drop timeout must close transport without supervisor completion");
+            }
+            "cleanup_overflow" => {
+                let mut regular = Vec::new();
+                for _ in 0..1024 {
+                    let mut call = Box::pin(client.fs_get_metadata(
+                        crate::protocol::FsGetMetadataParams {
+                            path: PathUri::from_host_native_path(&path).expect("file URI"),
+                            sandbox: None,
+                        },
+                    ));
+                    assert!(futures::poll!(call.as_mut()).is_pending());
+                    regular.push(call);
+                }
+                let mut reserved = Box::pin(client.fs_close(close_params.clone()));
+                assert!(futures::poll!(reserved.as_mut()).is_pending());
+                // Filling 1024 calls can exhaust Tokio's cooperative poll budget.
+                // Allow normal scheduling, but never supervisor completion or its deadline.
+                let overflow = timeout(Duration::from_millis(1), client.fs_close(close_params))
+                    .await
+                    .expect("cleanup overflow must not wait for the withheld supervisor");
+                assert!(matches!(overflow, Err(super::ExecServerError::Disconnected(_))));
+                assert_eq!(tokio::time::Instant::now(), before);
+                assert_eq!(rpc.pending_request_count().await, 0);
+                drop(regular);
+                drop(reserved);
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            *termination_requested.borrow(),
+            "{scenario}: supervisor must receive termination"
+        );
+        assert!(
+            !*termination_completed.borrow(),
+            "supervisor is still withheld"
+        );
+        termination_completed.send_replace(true);
+        tokio::time::resume();
+        // Keep both client and RPC strong owners alive while verifying actual peer EOF.
+        release_relay_tx.send(()).expect("release peer");
+        timeout(Duration::from_secs(2), relay)
+            .await
+            .expect("timed-out close must terminate wire")
+            .expect("relay task");
+        timeout(Duration::from_secs(2), server)
+            .await
+            .expect("real server should observe disconnect")
+            .expect("server task");
+        drop(exclusive_open().expect("server disconnect must release the real file handle"));
+        assert!(rpc.is_disconnected());
+        assert!(
+            client
+                .fs_open(crate::protocol::FsOpenParams {
+                    handle_id: "must-not-reuse-stale-connection".to_string(),
+                    path: PathUri::from_host_native_path(&path).expect("file URI"),
+                    sandbox: None,
+                })
+                .await
+                .is_err()
+        );
+        processor.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn recovery_timeout_drops_candidate_and_preserves_published_output() {
+        for stall_during_replay in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind listener");
+            let websocket_url =
+                format!("ws://{}", listener.local_addr().expect("listener address"));
+            let (disconnect_tx, disconnect_rx) = oneshot::channel();
+            let (candidate_closed_tx, candidate_closed_rx) = oneshot::channel();
+            let server = tokio::spawn(async move {
+                let mut first = accept_websocket(&listener).await;
+                complete_websocket_initialize(&mut first, "timeout-session", None).await;
+                let start = match read_jsonrpc_websocket(&mut first).await {
+                    JSONRPCMessage::Request(request) if request.method == EXEC_METHOD => request,
+                    other => panic!("expected actual process start: {other:?}"),
+                };
+                let params: ExecParams =
+                    serde_json::from_value(start.params.expect("start parameters"))
+                        .expect("decode start");
+                assert_eq!(params.process_id, ProcessId::from("timeout-process"));
+                write_jsonrpc_websocket(
+                    &mut first,
+                    JSONRPCMessage::Response(JSONRPCResponse {
+                        id: start.id,
+                        result: serde_json::to_value(ExecResponse {
+                            process_id: params.process_id.clone(),
+                        })
+                        .expect("encode process start"),
+                    }),
+                )
+                .await;
+                write_jsonrpc_websocket(
+                    &mut first,
+                    JSONRPCMessage::Notification(JSONRPCNotification {
+                        method: EXEC_OUTPUT_DELTA_METHOD.to_string(),
+                        params: Some(
+                            serde_json::to_value(ExecOutputDeltaNotification {
+                                process_id: params.process_id.clone(),
+                                seq: 1,
+                                stream: ExecOutputStream::Stdout,
+                                chunk: b"before disconnect".to_vec().into(),
+                            })
+                            .expect("encode initial output"),
+                        ),
+                    }),
+                )
+                .await;
+                disconnect_rx.await.expect("consumer saw output");
+                first
+                    .close(None)
+                    .await
+                    .expect("disconnect initial transport");
+                drop(first);
+
+                let mut candidate = accept_websocket(&listener).await;
+                if stall_during_replay {
+                    complete_websocket_session_initialize(
+                        &mut candidate,
+                        "timeout-session",
+                        Some("timeout-session"),
+                    )
+                    .await;
+                    let read = match read_jsonrpc_websocket(&mut candidate).await {
+                        JSONRPCMessage::Request(request) if request.method == EXEC_READ_METHOD => {
+                            request
+                        }
+                        other => panic!("expected replay read: {other:?}"),
+                    };
+                    let read: crate::protocol::ReadParams =
+                        serde_json::from_value(read.params.expect("read parameters"))
+                            .expect("decode replay read");
+                    assert_eq!(read.process_id, params.process_id);
+                    assert_eq!(read.after_seq, Some(1));
+                    assert_eq!(read.wait_ms, Some(0));
+                } else {
+                    let initialize = match read_jsonrpc_websocket(&mut candidate).await {
+                        JSONRPCMessage::Request(request) if request.method == INITIALIZE_METHOD => {
+                            request
+                        }
+                        other => panic!("expected resume initialize: {other:?}"),
+                    };
+                    let initialize: crate::protocol::InitializeParams =
+                        serde_json::from_value(initialize.params.expect("initialize parameters"))
+                            .expect("decode initialize");
+                    assert_eq!(
+                        initialize.resume_session_id.as_deref(),
+                        Some("timeout-session")
+                    );
+                }
+                // Exercise the real candidate notification reader before its request times out.
+                write_jsonrpc_websocket(
+                    &mut candidate,
+                    JSONRPCMessage::Notification(JSONRPCNotification {
+                        method: EXEC_OUTPUT_DELTA_METHOD.to_string(),
+                        params: Some(
+                            serde_json::to_value(ExecOutputDeltaNotification {
+                                process_id: params.process_id,
+                                seq: 2,
+                                stream: ExecOutputStream::Stdout,
+                                chunk: b"during recovery".to_vec().into(),
+                            })
+                            .expect("encode recovery output"),
+                        ),
+                    }),
+                )
+                .await;
+                timeout(Duration::from_secs(2), async {
+                    loop {
+                        match candidate.next().await {
+                            None | Some(Ok(Message::Close(_))) | Some(Err(_)) => break,
+                            Some(Ok(Message::Ping(payload))) => {
+                                candidate
+                                    .send(Message::Pong(payload))
+                                    .await
+                                    .expect("keep candidate transport alive");
+                            }
+                            Some(Ok(Message::Pong(_))) => {}
+                            other => panic!(
+                                "timed-out candidate must not send a later request: {other:?}"
+                            ),
+                        }
+                    }
+                })
+                .await
+                .expect("recovery timeout must close candidate transport");
+                candidate_closed_tx
+                    .send(())
+                    .expect("report actual peer closure");
+            });
+            let client = LazyRemoteExecServerClient::new(ExecServerTransportParams::WebSocketUrl {
+                websocket_url,
+                connect_timeout: Duration::from_secs(2),
+                initialize_timeout: Duration::from_secs(2),
+            });
+            let stable_client = client.get().await.expect("initial connection");
+            let session = stable_client
+                .start_process(ExecParams {
+                    process_id: ProcessId::from("timeout-process"),
+                    argv: vec!["running-command".to_string()],
+                    cwd: PathUri::from_host_native_path(std::env::current_dir().expect("cwd"))
+                        .expect("cwd URI"),
+                    env_policy: None,
+                    env: HashMap::new(),
+                    tty: false,
+                    pipe_stdin: false,
+                    arg0: None,
+                    sandbox: None,
+                    enforce_managed_network: false,
+                    managed_network: None,
+                })
+                .await
+                .expect("normal process start");
+            let mut events = session.subscribe_events();
+            assert_eq!(
+                timeout(Duration::from_secs(2), events.recv())
+                    .await
+                    .expect("initial output")
+                    .expect("event"),
+                ExecProcessEvent::Output(ProcessOutputChunk {
+                    seq: 1,
+                    stream: ExecOutputStream::Stdout,
+                    chunk: b"before disconnect".to_vec().into()
+                })
+            );
+            disconnect_tx.send(()).expect("begin real recovery");
+            assert_eq!(
+                timeout(Duration::from_secs(2), events.recv())
+                    .await
+                    .expect("recovery output")
+                    .expect("event"),
+                ExecProcessEvent::Output(ProcessOutputChunk {
+                    seq: 2,
+                    stream: ExecOutputStream::Stdout,
+                    chunk: b"during recovery".to_vec().into()
+                })
+            );
+            let event = timeout(Duration::from_secs(2), events.recv())
+                .await
+                .expect("bounded recovery failure")
+                .expect("event");
+            let ExecProcessEvent::Failed(message) = event else {
+                panic!("expected terminal failure: {event:?}")
+            };
+            assert!(
+                message.contains("recovery timed out after 500ms"),
+                "{message}"
+            );
+            let read = session
+                .read(None, None, None)
+                .await
+                .expect("terminal read response");
+            assert_eq!(read.failure.as_deref(), Some(message.as_str()));
+            assert!(read.closed);
+            assert!(matches!(
+                stable_client
+                    .fs_get_metadata(crate::protocol::FsGetMetadataParams {
+                        path: PathUri::from_host_native_path(std::env::current_dir().expect("cwd"))
+                            .expect("cwd URI"),
+                        sandbox: None,
+                    })
+                    .await,
+                Err(super::ExecServerError::Disconnected(_))
+            ));
+            timeout(Duration::from_secs(2), candidate_closed_rx)
+                .await
+                .expect("peer closure before client drop")
+                .expect("closure observed");
+            server.await.expect("server task");
+        }
     }
 
     #[tokio::test]

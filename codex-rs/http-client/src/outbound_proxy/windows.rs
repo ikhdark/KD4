@@ -136,6 +136,9 @@ fn resolve_with_winhttp_options(
         lpszProxyBypass: ptr::null_mut(),
     };
     let result = with_shared_winhttp_session(|session| {
+        // SAFETY: the session stays owned for this call, request_url is a live
+        // NUL-terminated UTF-16 buffer, and both output structures are writable.
+        // Any PAC URL referenced by options stays alive in the synchronous caller.
         let ok = unsafe {
             WinHttpGetProxyForUrl(
                 session.raw_handle(),
@@ -204,6 +207,8 @@ fn current_user_ie_proxy_config() -> Result<IeProxyConfig, RouteFailureClass> {
         lpszProxy: ptr::null_mut(),
         lpszProxyBypass: ptr::null_mut(),
     };
+    // SAFETY: raw is an initialized writable output structure. On success its
+    // returned strings are transferred to GlobalWideString for one-time freeing.
     let ok = unsafe { WinHttpGetIEProxyConfigForCurrentUser(&mut raw) };
     if ok == FALSE {
         let error = last_error();
@@ -264,6 +269,8 @@ impl GlobalWideString {
         if self.0.is_null() {
             return None;
         }
+        // SAFETY: private from_raw callers transfer WinHTTP-owned, terminated
+        // UTF-16 strings; self retains the allocation until after this copy.
         let string = unsafe { wide_ptr_to_string(self.0) };
         if string.is_empty() {
             None
@@ -276,6 +283,8 @@ impl GlobalWideString {
 impl Drop for GlobalWideString {
     fn drop(&mut self) {
         if !self.0.is_null() {
+            // SAFETY: private constructors take ownership of WinHTTP output
+            // strings allocated for GlobalFree; this owner frees each once.
             unsafe {
                 GlobalFree(self.0.cast::<c_void>());
             }
@@ -288,6 +297,8 @@ struct WinHttpSession(usize);
 impl WinHttpSession {
     fn open() -> Result<Self, u32> {
         let agent = wide_null("Codex");
+        // SAFETY: agent is a live NUL-terminated UTF-16 buffer; null proxy
+        // parameters are valid for WINHTTP_ACCESS_TYPE_NO_PROXY.
         let handle = unsafe {
             WinHttpOpen(
                 agent.as_ptr(),
@@ -313,6 +324,8 @@ impl Drop for WinHttpSession {
     fn drop(&mut self) {
         let handle = self.raw_handle();
         if !handle.is_null() {
+            // SAFETY: WinHttpSession owns the successful WinHttpOpen handle;
+            // the final Arc drop closes it after all operations release ownership.
             unsafe {
                 WinHttpCloseHandle(handle);
             }
@@ -362,14 +375,20 @@ fn wide_null(value: &str) -> Vec<u16> {
 
 unsafe fn wide_ptr_to_string(ptr: PWSTR) -> String {
     let mut len = 0;
+    // SAFETY: the caller guarantees a readable NUL-terminated UTF-16 allocation,
+    // so every element through the first terminator belongs to that allocation.
     while unsafe { *ptr.add(len) } != 0 {
         len += 1;
     }
+    // SAFETY: the scan above established len readable UTF-16 elements, and the
+    // caller keeps the allocation alive for the duration of this copy.
     let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
     String::from_utf16_lossy(slice)
 }
 
 fn last_error() -> u32 {
+    // SAFETY: GetLastError reads only the calling thread's last-error value and
+    // has no pointer, handle, or initialization preconditions.
     unsafe { GetLastError() }
 }
 

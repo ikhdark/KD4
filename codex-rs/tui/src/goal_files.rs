@@ -56,6 +56,8 @@ pub(crate) async fn materialize_goal_draft(
         .filter(|placeholder| !placeholder.is_empty())
         .collect::<Vec<_>>();
     let mut output_dir = None;
+    let mut paste_files = Vec::new();
+    let mut image_files = Vec::new();
     let mut replacements = Vec::new();
     for (placeholder, text) in draft.pending_pastes.iter() {
         let Some(active_idx) = active_placeholders
@@ -65,10 +67,9 @@ pub(crate) async fn materialize_goal_draft(
             continue;
         };
         active_placeholders.swap_remove(active_idx);
-        let path = ensure_goal_output_dir(app_server, codex_home, &mut output_dir)
-            .await?
+        let path = goal_output_dir(codex_home, &mut output_dir)?
             .join(format!("pasted-text-{}.txt", replacements.len() + 1));
-        write_goal_file(app_server, path.clone(), text.as_bytes().to_vec()).await?;
+        paste_files.push((path.clone(), text.as_bytes()));
 
         replacements.push((
             placeholder.clone(),
@@ -88,13 +89,12 @@ pub(crate) async fn materialize_goal_draft(
             active_placeholders.swap_remove(active_idx);
         }
         let extension = image_extension(&image.path);
-        let path = ensure_goal_output_dir(app_server, codex_home, &mut output_dir)
-            .await?
-            .join(format!("image-{}.{}", idx + 1, extension));
-        let bytes = tokio::fs::read(&image.path)
-            .await
-            .with_context(|| format!("Could not read goal image {}", image.path.display()))?;
-        write_goal_file(app_server, path.clone(), bytes).await?;
+        let path = goal_output_dir(codex_home, &mut output_dir)?.join(format!(
+            "image-{}.{}",
+            idx + 1,
+            extension
+        ));
+        image_files.push((path.clone(), &image.path));
         if image.placeholder.is_empty() {
             image_lines.push(format!("- [Image #{}]: {path}", idx + 1));
         } else {
@@ -118,21 +118,34 @@ pub(crate) async fn materialize_goal_draft(
             .collect(),
     );
 
-    if objective.chars().count() > MAX_THREAD_GOAL_OBJECTIVE_CHARS {
-        let path = ensure_goal_output_dir(app_server, codex_home, &mut output_dir)
-            .await?
-            .join(GOAL_FILE_NAME);
-        let reference = match objective_file_reference(&path) {
-            Ok(reference) => reference,
-            Err(err) => {
-                if let Some(output_dir) = output_dir.as_ref() {
-                    let _ = app_server.fs_remove_path(output_dir).await;
-                }
-                return Err(err);
-            }
-        };
-        write_goal_file(app_server, path.clone(), objective.as_bytes().to_vec()).await?;
-        objective = reference;
+    let objective_file = if objective.chars().count() > MAX_THREAD_GOAL_OBJECTIVE_CHARS {
+        let path = goal_output_dir(codex_home, &mut output_dir)?.join(GOAL_FILE_NAME);
+        let reference = objective_file_reference(&path)?;
+        Some((path, std::mem::replace(&mut objective, reference)))
+    } else {
+        None
+    };
+
+    // Validate the final reference before creating any directory or writing attachments.
+    // Borrow paste payloads and image source paths until this point; do not buffer image bytes.
+    if let Some(path) = output_dir.as_ref() {
+        app_server
+            .fs_create_directory_all_path(path)
+            .await
+            .map_err(|err| anyhow::anyhow!("{err}"))
+            .with_context(|| format!("Could not create goal attachment directory {path}"))?;
+    }
+    for (path, bytes) in paste_files {
+        write_goal_file(app_server, path, bytes.to_vec()).await?;
+    }
+    for (path, source) in image_files {
+        let bytes = tokio::fs::read(source)
+            .await
+            .with_context(|| format!("Could not read goal image {}", source.display()))?;
+        write_goal_file(app_server, path, bytes).await?;
+    }
+    if let Some((path, content)) = objective_file {
+        write_goal_file(app_server, path, content.into_bytes()).await?;
     }
     Ok((objective, output_dir))
 }
@@ -182,8 +195,7 @@ pub(crate) fn objective_file_reference(path: &GoalFilePath) -> Result<String> {
     Ok(reference)
 }
 
-async fn ensure_goal_output_dir(
-    app_server: &mut AppServerSession,
+fn goal_output_dir(
     codex_home: Option<&GoalFilePath>,
     output_dir: &mut Option<GoalFilePath>,
 ) -> Result<GoalFilePath> {
@@ -195,11 +207,6 @@ async fn ensure_goal_output_dir(
     let path = codex_home
         .join(GOAL_ATTACHMENT_DIR)
         .join(Uuid::new_v4().to_string());
-    app_server
-        .fs_create_directory_all_path(&path)
-        .await
-        .map_err(|err| anyhow::anyhow!("{err}"))
-        .with_context(|| format!("Could not create goal attachment directory {path}"))?;
     *output_dir = Some(path.clone());
     Ok(path)
 }

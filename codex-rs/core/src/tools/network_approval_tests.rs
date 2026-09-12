@@ -11,6 +11,215 @@ use core_test_support::test_path_buf;
 use pretty_assertions::assert_eq;
 use tokio_util::sync::CancellationToken;
 
+use std::time::Duration;
+use tokio::io::AsyncReadExt;
+use tokio::io::AsyncWriteExt;
+use tokio::net::TcpStream;
+use tokio::time::timeout;
+
+// Supply an ongoing workload through normal task registration. Approval,
+// transport, and cancellation behavior all use their production owners.
+struct NetworkApprovalActiveTask;
+impl crate::tasks::SessionTask for NetworkApprovalActiveTask {
+    fn kind(&self) -> crate::state::TaskKind {
+        crate::state::TaskKind::Regular
+    }
+
+    fn span_name(&self) -> &'static str {
+        "session_task.network_disconnect_test"
+    }
+
+    fn run(
+        self: Arc<Self>,
+        _session: Arc<Session>,
+        _ctx: Arc<crate::session::turn_context::TurnContext>,
+        _input: Vec<crate::session::TurnInput>,
+        cancellation_token: CancellationToken,
+    ) -> futures::future::BoxFuture<'static, crate::tasks::SessionTaskResult> {
+        Box::pin(async move {
+            cancellation_token.cancelled().await;
+            Err(codex_protocol::error::CodexErr::TurnAborted)
+        })
+    }
+}
+
+async fn open_network_approval_http_request(
+    proxy_address: std::net::SocketAddr,
+    target: &str,
+) -> anyhow::Result<TcpStream> {
+    let mut socket = TcpStream::connect(proxy_address).await?;
+    socket
+        .write_all(
+            format!(
+                "GET http://{target}/approval-disconnect HTTP/1.1\r\nHost: {target}\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await?;
+    Ok(socket)
+}
+
+async fn next_network_approval_event(
+    events: &async_channel::Receiver<Event>,
+) -> codex_protocol::protocol::ExecApprovalRequestEvent {
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if let EventMsg::ExecApprovalRequest(approval) = events.recv().await.unwrap().msg {
+                break approval;
+            }
+        }
+    })
+    .await
+    .expect("real HTTP request should publish a command approval")
+}
+
+#[tokio::test]
+async fn http_disconnect_denies_follower_and_requires_fresh_approval() -> anyhow::Result<()> {
+    let upstream = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/approval-disconnect"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("fresh-approval-only"))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let (session, mut turn, events) =
+        crate::session::tests::make_session_and_context_with_rx().await;
+    let context = Arc::get_mut(&mut turn).expect("fixture has one turn context owner");
+    context.permission_profile = PermissionProfile::read_only();
+    context.approval_policy = codex_config::Constrained::allow_any(AskForApproval::OnRequest);
+    Arc::make_mut(&mut context.config).approvals_reviewer =
+        codex_config::types::ApprovalsReviewer::User;
+    let service = Arc::clone(&session.services.network_approval);
+    let spec = crate::config::NetworkProxySpec::from_config_and_constraints(
+        codex_network_proxy::NetworkProxyConfig {
+            enabled: true,
+            proxy_url: "http://127.0.0.1:0".to_string(),
+            enable_socks5: false,
+            allow_local_binding: true,
+            allow_upstream_proxy: false,
+            ..Default::default()
+        },
+        None,
+        &turn.permission_profile(),
+    )?;
+    let proxy_owner = spec
+        .start_proxy(
+            turn.config.codex_home.as_path(),
+            &turn.permission_profile(),
+            Some(build_network_policy_decider(
+                Arc::clone(&service),
+                Arc::new(RwLock::new(Arc::downgrade(&session))),
+            )),
+            None,
+            true,
+            codex_network_proxy::NetworkProxyAuditMetadata::default(),
+        )
+        .await?;
+    let proxy_address = proxy_owner.proxy().http_addr();
+    session
+        .spawn_task(Arc::clone(&turn), Vec::new(), NetworkApprovalActiveTask)
+        .await;
+
+    let target = upstream.address().to_string();
+    let owner = open_network_approval_http_request(proxy_address, &target).await?;
+    let first_approval = next_network_approval_event(&events).await;
+    assert_eq!(first_approval.turn_id, turn.sub_id);
+    let context = first_approval.network_approval_context.as_ref().unwrap();
+    assert_eq!(context.host, "127.0.0.1");
+    assert_eq!(context.protocol, NetworkApprovalProtocol::Http);
+    let key = {
+        let pending = service.pending_host_approvals.lock().await;
+        assert_eq!(pending.len(), 1);
+        pending.keys().next().unwrap().clone()
+    };
+    assert_eq!(key.port, upstream.address().port());
+    let mut follower = open_network_approval_http_request(proxy_address, &target).await?;
+    timeout(Duration::from_secs(5), async {
+        loop {
+            // The map and owner hold two references; the third establishes
+            // that the real second HTTP handler is waiting on this same entry.
+            if service
+                .pending_host_approvals
+                .lock()
+                .await
+                .get(&key)
+                .is_some_and(|pending| Arc::strong_count(pending) >= 3)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("same-host HTTP follower should join the pending approval");
+    assert!(upstream.received_requests().await.unwrap().is_empty());
+
+    // The stimulus is actual client EOF, not aborting a decider/handler task.
+    drop(owner);
+    let mut denied = Vec::new();
+    timeout(Duration::from_secs(5), follower.read_to_end(&mut denied)).await??;
+    let denied = String::from_utf8(denied)?;
+    assert!(denied.starts_with("HTTP/1.1 403"), "{denied}");
+    assert!(denied.contains("\"status\":\"blocked\""), "{denied}");
+    assert!(denied.contains("\"reason\":\"not_allowed\""), "{denied}");
+    timeout(Duration::from_secs(5), async {
+        while service
+            .pending_host_approvals
+            .lock()
+            .await
+            .contains_key(&key)
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("disconnected owner must remove its pending identity");
+    assert!(!service.session_denied_hosts.lock().await.contains(&key));
+    assert!(!service.session_approved_hosts.lock().await.contains(&key));
+
+    let mut fresh = open_network_approval_http_request(proxy_address, &target).await?;
+    let fresh_approval = next_network_approval_event(&events).await;
+    assert_ne!(fresh_approval.call_id, first_approval.call_id);
+    assert_eq!(
+        fresh_approval.network_approval_context,
+        first_approval.network_approval_context
+    );
+    session
+        .notify_approval(&first_approval.call_id, ReviewDecision::ApprovedForSession)
+        .await;
+    let mut premature_byte = [0_u8; 1];
+    assert!(
+        timeout(Duration::from_millis(100), fresh.read(&mut premature_byte))
+            .await
+            .is_err(),
+        "late approval for the disconnected owner must not resolve the new request"
+    );
+    assert!(upstream.received_requests().await.unwrap().is_empty());
+    assert!(!service.session_approved_hosts.lock().await.contains(&key));
+    session
+        .notify_approval(&fresh_approval.call_id, ReviewDecision::Approved)
+        .await;
+    let mut allowed = Vec::new();
+    timeout(Duration::from_secs(5), fresh.read_to_end(&mut allowed)).await??;
+    let allowed = String::from_utf8(allowed)?;
+    assert!(allowed.starts_with("HTTP/1.1 200"), "{allowed}");
+    assert!(allowed.contains("fresh-approval-only"), "{allowed}");
+    assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+    assert!(
+        !service
+            .pending_host_approvals
+            .lock()
+            .await
+            .contains_key(&key)
+    );
+    assert!(session.active_turn.lock().await.is_some());
+    session
+        .abort_all_tasks(codex_protocol::protocol::TurnAbortReason::Interrupted)
+        .await;
+    drop(proxy_owner);
+    Ok(())
+}
+
 #[tokio::test]
 async fn pending_approvals_are_deduped_per_host_protocol_and_port() {
     let service = NetworkApprovalService::default();
@@ -376,7 +585,7 @@ async fn register_call_with_default_shell_trigger(
                 call_id: "call-1".to_string(),
                 tool_name: "shell_command".to_string(),
                 command: vec!["curl".to_string(), "https://example.com".to_string()],
-                cwd: test_path_buf("/tmp").abs(),
+                cwd: test_path_buf("/tmp").abs().into(),
                 sandbox_permissions: SandboxPermissions::UseDefault,
                 additional_permissions: None,
                 justification: None,
@@ -398,7 +607,7 @@ async fn active_call_preserves_triggering_command_context() {
         call_id: "call-1".to_string(),
         tool_name: "shell_command".to_string(),
         command: vec!["curl".to_string(), "https://example.com".to_string()],
-        cwd: test_path_buf("/repo").abs(),
+        cwd: test_path_buf("/repo").abs().into(),
         sandbox_permissions: SandboxPermissions::UseDefault,
         additional_permissions: None,
         justification: Some("fetch release metadata".to_string()),
@@ -574,27 +783,130 @@ async fn ambiguous_unattributed_blocked_request_marks_and_cancels_every_candidat
     }
 }
 
-#[tokio::test]
-async fn dropped_network_registration_is_unregistered_without_explicit_finish() {
-    let service = Arc::new(NetworkApprovalService::default());
-    register_call_with_default_shell_trigger(&service, "registration-1").await;
-    let registration = Arc::new(NetworkApprovalRegistration::new(
-        "registration-1".to_string(),
-        Arc::clone(&service),
-    ));
-
-    drop(registration);
-
-    tokio::time::timeout(std::time::Duration::from_secs(1), async {
-        loop {
-            if service.resolve_single_active_call().await.is_none() {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("dropped registration should clean up its active call");
+#[test]
+fn dropped_network_registration_is_unregistered_without_explicit_finish() -> anyhow::Result<()> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let (session, proxy_owner, deferred, immediate) = runtime.block_on(async {
+        let (session, turn, _) = crate::session::tests::make_session_and_context_with_rx().await;
+        let proxy_spec = crate::config::NetworkProxySpec::from_config_and_constraints(
+            codex_network_proxy::NetworkProxyConfig {
+                enabled: true,
+                proxy_url: "http://127.0.0.1:0".to_string(),
+                enable_socks5: false,
+                allow_local_binding: true,
+                allow_upstream_proxy: false,
+                ..Default::default()
+            },
+            None,
+            &turn.permission_profile(),
+        )?;
+        let proxy_owner = proxy_spec
+            .start_proxy(
+                turn.config.codex_home.as_path(),
+                &turn.permission_profile(),
+                None,
+                None,
+                true,
+                codex_network_proxy::NetworkProxyAuditMetadata::default(),
+            )
+            .await?;
+        let spec = |mode| NetworkApprovalSpec {
+            network: Some(proxy_owner.proxy().clone()),
+            mode,
+            trigger: GuardianNetworkAccessTrigger {
+                call_id: "drop-registration".to_string(),
+                tool_name: "shell_command".to_string(),
+                command: vec!["curl".to_string(), "https://example.com".to_string()],
+                cwd: turn.cwd().clone().into(),
+                sandbox_permissions: SandboxPermissions::UseDefault,
+                additional_permissions: None,
+                justification: None,
+                tty: None,
+            },
+            command: "curl https://example.com".to_string(),
+            environment_id: "local".to_string(),
+            approval_scope_id: "local-scope".to_string(),
+        };
+        let deferred = begin_network_approval(
+            &session,
+            &turn.sub_id,
+            true,
+            Some(spec(NetworkApprovalMode::Deferred)),
+        )
+        .await
+        .expect("normal deferred registration succeeds")
+        .expect("normal registration returns its owner")
+        .into_deferred()
+        .expect("deferred mode transfers its owner");
+        let immediate = begin_network_approval(
+            &session,
+            &turn.sub_id,
+            true,
+            Some(spec(NetworkApprovalMode::Immediate)),
+        )
+        .await
+        .expect("normal immediate registration succeeds")
+        .expect("independent immediate registration");
+        Ok::<_, anyhow::Error>((session, proxy_owner, deferred, immediate))
+    })?;
+    let service = &session.services.network_approval;
+    let deferred_id = deferred.registration_id().to_string();
+    let immediate_id = immediate
+        .registration
+        .as_ref()
+        .unwrap()
+        .registration_id()
+        .to_string();
+    let survivor_token = immediate.cancellation_token();
+    runtime.block_on(
+        service.record_blocked_request(denied_blocked_request_for_execution(
+            "example.com",
+            &deferred_id,
+        )),
+    );
+    assert!(deferred.is_cancelled());
+    assert!(!survivor_token.is_cancelled());
+    let final_owner = deferred.clone();
+    assert!(tokio::runtime::Handle::try_current().is_err());
+    drop(deferred);
+    {
+        let calls = service.calls.lock().unwrap();
+        assert_eq!(calls.active_calls.len(), 2);
+        assert!(calls.call_outcomes.contains_key(&deferred_id));
+    }
+    drop(final_owner);
+    {
+        let calls = service.calls.lock().unwrap();
+        assert_eq!(
+            calls.active_calls.keys().collect::<Vec<_>>(),
+            vec![&immediate_id]
+        );
+        assert!(calls.call_outcomes.is_empty());
+    }
+    runtime.block_on(
+        service.record_blocked_request(denied_blocked_request_for_execution(
+            "example.com",
+            &deferred_id,
+        )),
+    );
+    assert!(
+        !survivor_token.is_cancelled(),
+        "late attribution cannot cancel a different owner"
+    );
+    assert!(service.calls.lock().unwrap().call_outcomes.is_empty());
+    drop(runtime);
+    drop(immediate);
+    let calls = service.calls.lock().unwrap();
+    assert!(
+        calls.active_calls.is_empty(),
+        "last-owner cleanup survives runtime shutdown"
+    );
+    assert!(calls.call_outcomes.is_empty());
+    drop(calls);
+    drop(proxy_owner);
+    Ok(())
 }
 
 #[tokio::test]
@@ -619,4 +931,173 @@ async fn attributed_blocked_request_targets_one_of_multiple_active_calls() {
             "Network access to \"example.com\" was blocked: domain is not on the allowlist for the current sandbox mode.".to_string()
         ))
     );
+}
+
+#[tokio::test]
+async fn http_network_approval_preserves_foreign_environment_cwd_uri() -> anyhow::Result<()> {
+    use crate::tools::sandboxing::ToolRuntime;
+    use codex_utils_path_uri::PathUri;
+
+    let foreign_cwd = PathUri::parse(if cfg!(windows) {
+        "file:///home/remote/network-project"
+    } else {
+        "file:///C:/remote/network-project"
+    })?;
+    assert!(foreign_cwd.to_abs_path().is_err());
+    let upstream = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/approval-disconnect"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("foreign-cwd-approved"))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let (session, mut turn, events) =
+        crate::session::tests::make_session_and_context_with_rx().await;
+    let host_cwd = turn.cwd().clone();
+    let context = Arc::get_mut(&mut turn).expect("fixture has one turn context owner");
+    context.permission_profile = PermissionProfile::read_only();
+    context.approval_policy = codex_config::Constrained::allow_any(AskForApproval::OnRequest);
+    Arc::make_mut(&mut context.config).approvals_reviewer =
+        codex_config::types::ApprovalsReviewer::User;
+    let shell = context.environments.primary().unwrap().shell.clone();
+    context.environments.turn_environments[0] = crate::session::turn_context::TurnEnvironment::new(
+        "remote-network-approval".to_string(),
+        Arc::new(codex_exec_server::Environment::default_for_tests()),
+        foreign_cwd.clone(),
+        shell,
+    );
+    let service = Arc::clone(&session.services.network_approval);
+    let spec = crate::config::NetworkProxySpec::from_config_and_constraints(
+        codex_network_proxy::NetworkProxyConfig {
+            enabled: true,
+            proxy_url: "http://127.0.0.1:0".to_string(),
+            enable_socks5: false,
+            allow_local_binding: true,
+            allow_upstream_proxy: false,
+            ..Default::default()
+        },
+        None,
+        &turn.permission_profile(),
+    )?;
+    let proxy_owner = spec
+        .start_proxy(
+            turn.config.codex_home.as_path(),
+            &turn.permission_profile(),
+            Some(build_network_policy_decider(
+                Arc::clone(&service),
+                Arc::new(RwLock::new(Arc::downgrade(&session))),
+            )),
+            None,
+            true,
+            codex_network_proxy::NetworkProxyAuditMetadata::default(),
+        )
+        .await?;
+    let command = vec!["curl".to_string(), upstream.uri()];
+    let request = crate::tools::runtimes::unified_exec::UnifiedExecRequest {
+        command: command.clone(),
+        command_for_approval: command.clone(),
+        normalization_cwd: None,
+        approved_powershell_direct_argv: None,
+        raw_output_artifact: crate::tools::command_output_artifact::RawOutputArtifact::Failed {
+            id: None,
+            message: "network registration fixture does not launch a process".to_string(),
+            owned_path: None,
+            bytes: 0,
+        },
+        shell_type: crate::shell::ShellType::Sh,
+        hook_command: format!("curl {}", upstream.uri()),
+        process_id: 1000,
+        cwd: foreign_cwd.clone(),
+        sandbox_cwd: foreign_cwd.clone(),
+        turn_environment: turn.environments.primary().unwrap().clone(),
+        env: std::collections::HashMap::new(),
+        exec_server_env_config: None,
+        explicit_env_overrides: std::collections::HashMap::new(),
+        network: Some(proxy_owner.proxy().clone()),
+        tty: false,
+        sandbox_permissions: SandboxPermissions::UseDefault,
+        additional_permissions: None,
+        additional_permissions_uri: None,
+        justification: None,
+        exec_approval_requirement: crate::tools::sandboxing::ExecApprovalRequirement::Skip {
+            bypass_sandbox: false,
+            proposed_execpolicy_amendment: None,
+        },
+        validation_launch: None,
+        known_delta_hit: None,
+    };
+    let runtime = crate::tools::runtimes::unified_exec::UnifiedExecRuntime::new(
+        &session.services.unified_exec_manager,
+    );
+    let context = crate::tools::sandboxing::ToolCtx {
+        session: session.clone(),
+        turn: turn.clone(),
+        call_id: "foreign-network-exec".to_string(),
+        tool_name: codex_tools::ToolName::plain("exec_command"),
+    };
+    let registered = begin_network_approval(
+        &session,
+        &turn.sub_id,
+        true,
+        runtime.network_approval_spec(&request, &context),
+    )
+    .await
+    .expect("normal runtime network registration")
+    .expect("foreign cwd must retain its triggering execution owner")
+    .into_deferred()
+    .expect("unified execution uses deferred approval ownership");
+    let call = service
+        .resolve_single_active_call()
+        .await
+        .expect("registered execution context");
+    assert_eq!(call.trigger.call_id, "foreign-network-exec");
+    assert_eq!(call.trigger.command, command);
+    assert_eq!(call.trigger.cwd, foreign_cwd);
+    assert_eq!(
+        serde_json::to_value(&call.trigger)?["cwd"],
+        serde_json::json!(foreign_cwd)
+    );
+    drop(call);
+    session
+        .spawn_task(Arc::clone(&turn), Vec::new(), NetworkApprovalActiveTask)
+        .await;
+    let target = upstream.address().to_string();
+    let mut client =
+        open_network_approval_http_request(proxy_owner.proxy().http_addr(), &target).await?;
+    let approval = next_network_approval_event(&events).await;
+    assert_eq!(approval.turn_id, turn.sub_id);
+    assert_eq!(
+        approval.environment_id.as_deref(),
+        Some("remote-network-approval")
+    );
+    assert_eq!(approval.cwd_uri, Some(foreign_cwd));
+    // Legacy native-only clients retain the host fallback; the URI is authoritative.
+    assert_eq!(approval.cwd, host_cwd);
+    assert_eq!(
+        approval.network_approval_context,
+        Some(NetworkApprovalContext {
+            host: "127.0.0.1".to_string(),
+            protocol: NetworkApprovalProtocol::Http,
+        })
+    );
+    assert!(upstream.received_requests().await.unwrap().is_empty());
+    session
+        .notify_approval(&approval.call_id, ReviewDecision::Approved)
+        .await;
+    let mut response = Vec::new();
+    timeout(Duration::from_secs(5), client.read_to_end(&mut response)).await??;
+    let response = String::from_utf8(response)?;
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert!(response.contains("foreign-cwd-approved"), "{response}");
+    assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+    assert!(service.pending_host_approvals.lock().await.is_empty());
+    finish_deferred_network_approval(&session, Some(registered))
+        .await
+        .expect("completed network request releases its normal registration");
+    assert!(service.calls.lock().unwrap().active_calls.is_empty());
+    session
+        .abort_all_tasks(codex_protocol::protocol::TurnAbortReason::Interrupted)
+        .await;
+    drop(proxy_owner);
+    Ok(())
 }

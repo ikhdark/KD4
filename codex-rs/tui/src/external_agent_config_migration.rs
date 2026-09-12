@@ -75,12 +75,45 @@ enum RenderLineKind {
     ItemDetail,
 }
 
+/// Terminal I/O used by this prompt; the migration state machine stays in its normal entry point.
+pub(crate) trait ExternalAgentConfigMigrationTerminal {
+    fn frame_requester(&self) -> FrameRequester;
+    fn event_stream(
+        &mut self,
+    ) -> std::pin::Pin<Box<dyn tokio_stream::Stream<Item = TuiEvent> + Send + 'static>>;
+    fn draw(
+        &mut self,
+        height: u16,
+        draw_fn: impl FnOnce(&mut crate::custom_terminal::Frame<'_>),
+    ) -> std::io::Result<()>;
+}
+
+impl ExternalAgentConfigMigrationTerminal for Tui {
+    fn frame_requester(&self) -> FrameRequester {
+        Tui::frame_requester(self)
+    }
+
+    fn event_stream(
+        &mut self,
+    ) -> std::pin::Pin<Box<dyn tokio_stream::Stream<Item = TuiEvent> + Send + 'static>> {
+        Tui::event_stream(self)
+    }
+
+    fn draw(
+        &mut self,
+        height: u16,
+        draw_fn: impl FnOnce(&mut crate::custom_terminal::Frame<'_>),
+    ) -> std::io::Result<()> {
+        Tui::draw(self, height, draw_fn)
+    }
+}
+
 pub(crate) async fn run_external_agent_config_migration_prompt(
-    tui: &mut Tui,
+    tui: &mut impl ExternalAgentConfigMigrationTerminal,
     items: &[ExternalAgentConfigMigrationItem],
     selected_items: &[ExternalAgentConfigMigrationItem],
     error: Option<&str>,
-) -> ExternalAgentConfigMigrationOutcome {
+) -> std::io::Result<ExternalAgentConfigMigrationOutcome> {
     let mut screen = ExternalAgentConfigMigrationScreen::new(
         tui.frame_requester(),
         items,
@@ -88,9 +121,9 @@ pub(crate) async fn run_external_agent_config_migration_prompt(
         error.map(str::to_owned),
     );
 
-    let _ = tui.draw(u16::MAX, |frame| {
+    tui.draw(u16::MAX, |frame| {
         frame.render_widget_ref(&screen, frame.area());
-    });
+    })?;
 
     let events = tui.event_stream();
     tokio::pin!(events);
@@ -101,9 +134,9 @@ pub(crate) async fn run_external_agent_config_migration_prompt(
                 TuiEvent::Key(key_event) => screen.handle_key(key_event),
                 TuiEvent::Paste(_) => {}
                 TuiEvent::Draw | TuiEvent::Resize => {
-                    let _ = tui.draw(u16::MAX, |frame| {
+                    tui.draw(u16::MAX, |frame| {
                         frame.render_widget_ref(&screen, frame.area());
-                    });
+                    })?;
                 }
             }
         } else {
@@ -112,7 +145,7 @@ pub(crate) async fn run_external_agent_config_migration_prompt(
         }
     }
 
-    screen.outcome()
+    Ok(screen.outcome())
 }
 
 struct ExternalAgentConfigMigrationScreen {

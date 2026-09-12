@@ -1522,16 +1522,8 @@ them."#
         };
 
         let mapped = map_owned_wrapped_line_to_range(text, /*cursor*/ 0, line.as_ref(), "- ");
-        let expected_len = line
-            .as_ref()
-            .strip_prefix("- ")
-            .unwrap_or(line.as_ref())
-            .len();
-        let mapped_len = mapped.end.saturating_sub(mapped.start);
-        assert!(
-            mapped_len <= expected_len,
-            "overconsumed source: text={text:?} line={line:?} mapped={mapped:?} expected_len={expected_len}"
-        );
+        assert_eq!(line.as_ref(), "- -");
+        assert_eq!(mapped, 0..1);
     }
 
     #[test]

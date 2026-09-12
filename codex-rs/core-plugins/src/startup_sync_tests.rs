@@ -25,6 +25,291 @@ fn test_http_clients() -> RouteAwareClientPool {
     )
 }
 
+#[cfg(unix)]
+#[test]
+fn plugin_git_unix_exit_poll_retains_root_identity_until_cleanup() {
+    use std::os::unix::process::CommandExt;
+    use std::os::unix::process::ExitStatusExt;
+
+    for (script, exit_code, signal) in [
+        ("exit 23", Some(23), None),
+        ("kill -TERM $$", None, Some(libc::SIGTERM)),
+    ] {
+        let child = Command::new("sh")
+            .args(["-c", script])
+            .process_group(0)
+            .spawn()
+            .expect("owned root");
+        let pid = child.id();
+        let mut owner = GitChild {
+            child,
+            completed: false,
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let status = loop {
+            if let Some(status) = owner.try_wait().expect("observe root exit") {
+                break status;
+            }
+            assert!(std::time::Instant::now() < deadline, "root did not exit");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(status.code(), exit_code);
+        assert_eq!(status.signal(), signal);
+
+        // Observe the kernel independently: the owner's poll must not consume
+        // the exited root that pins the numeric group identity during cleanup.
+        // SAFETY: siginfo_t permits zero initialization for a WNOHANG probe.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            // SAFETY: the owned child PID and writable info buffer remain valid;
+            // WNOWAIT prevents this independent observation from reaping it.
+            unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pid as libc::id_t,
+                    &mut info,
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            },
+            0
+        );
+        // SAFETY: successful waitid populated the SIGCHLD fields.
+        assert_eq!(unsafe { info.si_pid() }, pid as libc::pid_t);
+        drop(owner);
+        // SAFETY: waitpid accepts a null status pointer; this probes that the
+        // owner already reaped its exact former child and never sends a signal.
+        let result =
+            unsafe { libc::waitpid(pid as libc::pid_t, std::ptr::null_mut(), libc::WNOHANG) };
+        assert_eq!(result, -1, "owner cleanup must reap the root");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn plugin_git_unix_runner_preserves_only_successful_background_helper() {
+    for exit_code in [0, 23] {
+        let tmp = tempdir().expect("helper markers");
+        let ready = tmp.path().join("ready");
+        let release = tmp.path().join("release");
+        let survived = tmp.path().join("survived");
+        // Positional arguments keep paths out of shell source. The helper is
+        // bounded even if an assertion interrupts the parent before release.
+        let script = r#"
+            (
+                printf ready > "$1"
+                count=0
+                while [ ! -e "$2" ] && [ "$count" -lt 500 ]; do
+                    sleep 0.01
+                    count=$((count + 1))
+                done
+                if [ -e "$2" ]; then printf survived > "$3"; fi
+            ) &
+            while [ ! -e "$1" ]; do sleep 0.01; done
+            printf 'root output'
+            printf 'root diagnostic' >&2
+            exit "$4"
+        "#;
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", script, "git-helper"])
+            .arg(&ready)
+            .arg(&release)
+            .arg(&survived)
+            .arg(exit_code.to_string());
+        let output = run_git_command_with_timeout(
+            &mut command,
+            "Git Unix helper fixture",
+            Duration::from_secs(5),
+        )
+        .expect("root output completes without waiting for helper");
+        assert_eq!(output.status.code(), Some(exit_code));
+        assert_eq!(output.stdout, b"root output");
+        assert_eq!(output.stderr, b"root diagnostic");
+        assert!(ready.exists(), "helper really started before root exit");
+        std::fs::write(&release, b"release").expect("release helper");
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !survived.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            survived.exists(),
+            exit_code == 0,
+            "failed Git roots terminate helpers; successful roots preserve them"
+        );
+        if exit_code == 0 {
+            assert_eq!(std::fs::read(&survived).unwrap(), b"survived");
+        }
+    }
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn plugin_git_large_output_startup_sync() {
+    let tmp = tempdir().expect("temp directory");
+    let repo = curated_plugins_repo_path(tmp.path());
+    std::fs::create_dir_all(repo.join(".git")).expect("existing checkout");
+    std::fs::write(repo.join("retained"), "installed plugin").expect("installed plugin");
+    let sha = "0123456789abcdef0123456789abcdef01234567";
+    let stdout_path = tmp.path().join("stdout.txt");
+    let stderr_path = tmp.path().join("stderr.txt");
+    std::fs::write(
+        &stdout_path,
+        format!("{sha}\tHEAD\n{}", "x".repeat(1024 * 1024)),
+    )
+    .expect("stdout fixture");
+    std::fs::write(&stderr_path, "y".repeat(1024 * 1024)).expect("stderr fixture");
+    let git = tmp.path().join("git.cmd");
+    std::fs::write(&git, format!(
+        "@echo off\r\nif \"%1\"==\"ls-remote\" goto remote\r\necho {sha}\r\nexit /b 0\r\n:remote\r\ntype \"{}\"\r\ntype \"{}\" 1>&2\r\n",
+        stdout_path.display(), stderr_path.display()
+    )).expect("Git subprocess fixture");
+
+    let result = run_sync_with_transport_overrides(
+        tmp.path().to_path_buf(),
+        git.to_str().expect("Git path"),
+        "http://127.0.0.1:1",
+        "http://127.0.0.1:1",
+    )
+    .await
+    .expect("startup Git sync must finish without falling back to HTTP");
+
+    assert_eq!(result, sha);
+    assert_eq!(
+        std::fs::read_to_string(repo.join("retained")).expect("installed plugin"),
+        "installed plugin"
+    );
+    assert!(!has_plugins_clone_dirs(tmp.path()));
+}
+
+#[cfg(windows)]
+#[test]
+fn plugin_git_large_output_preserves_streams_and_exit_status() {
+    let mut command = Command::new("powershell.exe");
+    command.args([
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "[Console]::Out.Write(('x' * 1048576)); [Console]::Error.Write(('y' * 1048576)); exit 23",
+    ]);
+    let output =
+        run_git_command_with_timeout(&mut command, "Git output fixture", Duration::from_secs(10))
+            .expect("large output completes");
+    assert_eq!(output.status.code(), Some(23));
+    assert_eq!(output.stdout, vec![b'x'; 1024 * 1024]);
+    assert_eq!(output.stderr, vec![b'y'; 1024 * 1024]);
+}
+
+#[cfg(windows)]
+#[test]
+fn plugin_git_completion_preserves_only_successful_background_helper() {
+    for exit_code in [0, 23] {
+        let mut command = Command::new("powershell.exe");
+        command.args([
+            "-NoProfile", "-NonInteractive", "-Command",
+            &format!("$info = New-Object System.Diagnostics.ProcessStartInfo; $info.FileName = 'powershell.exe'; $info.Arguments = '-NoProfile -NonInteractive -Command Start-Sleep -Seconds 60'; $info.UseShellExecute = $false; $child = [System.Diagnostics.Process]::Start($info); [Console]::Out.Write($child.Id); exit {exit_code}"),
+        ]);
+        let start = std::time::Instant::now();
+        let output = run_git_command_with_timeout(
+            &mut command,
+            "Git daemon fixture",
+            Duration::from_secs(10),
+        )
+        .expect("root finishes despite inherited output handles");
+        let pid = String::from_utf8(output.stdout)
+            .expect("PID output")
+            .parse::<u32>()
+            .expect("background PID");
+        // Observe the real daemon, then explicitly clean up any ownership
+        // transferred by successful completion before asserting the observation.
+        let cleanup = Command::new("powershell.exe").args([
+            "-NoProfile", "-NonInteractive", "-Command",
+            &format!("$child = Get-Process -Id {pid} -ErrorAction SilentlyContinue; if (!$child) {{ exit 1 }}; $child.Kill(); $child.WaitForExit(); exit 0"),
+        ]).output().expect("observe and clean up background helper");
+        assert_eq!(output.status.code(), Some(exit_code));
+        assert_eq!(
+            cleanup.status.success(),
+            exit_code == 0,
+            "only successful Git commands may retain a daemon"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(15),
+            "background handles must not keep output collection open"
+        );
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn plugin_git_timeout_reaps_descendants_and_preserves_stderr() {
+    let tmp = tempdir().expect("temp directory");
+    let pids = tmp.path().join("pids.txt");
+    let script = tmp.path().join("process-tree.ps1");
+    let pid_path = pids.to_string_lossy().replace('\'', "''");
+    std::fs::write(
+        &script,
+        format!(
+            "$childInfo = New-Object System.Diagnostics.ProcessStartInfo\n\
+         $childInfo.FileName = 'powershell.exe'\n\
+         $childInfo.Arguments = '-NoProfile -NonInteractive -Command Start-Sleep -Seconds 60'\n\
+         $childInfo.UseShellExecute = $false\n\
+         $child = [System.Diagnostics.Process]::Start($childInfo)\n\
+         [System.IO.File]::WriteAllText('{pid_path}', \"$PID $($child.Id)\")\n\
+         [Console]::Error.Write('waiting for Git helper')\n\
+         Start-Sleep -Seconds 60\n"
+        ),
+    )
+    .expect("process tree script");
+    let mut command = Command::new("powershell.exe");
+    command
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+        ])
+        .arg(&script);
+    let start = std::time::Instant::now();
+    let error =
+        run_git_command_with_timeout(&mut command, "Git timeout fixture", Duration::from_secs(5))
+            .expect_err("tree must time out");
+    assert!(
+        start.elapsed() < Duration::from_secs(15),
+        "descendant handles must not extend the timeout"
+    );
+    assert_eq!(
+        error,
+        "Git timeout fixture timed out after 5s: waiting for Git helper"
+    );
+    let pids = std::fs::read_to_string(&pids).expect("root and descendant started");
+    let pids = pids
+        .split_whitespace()
+        .map(|pid| pid.parse::<u32>().expect("process id"))
+        .collect::<Vec<_>>();
+    assert_eq!(pids.len(), 2);
+    for pid in pids {
+        let output = Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &format!(
+                    "if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ exit 1 }}; exit 0"
+                ),
+            ])
+            .output()
+            .expect("check process termination");
+        assert!(
+            output.status.success(),
+            "Git process {pid} survived timeout"
+        );
+    }
+}
+
 #[test]
 fn git_command_sanitizes_ambient_repository_environment() {
     let command = git_command(Path::new("git"));
@@ -243,6 +528,79 @@ async fn sync_openai_plugins_repo_uses_http_without_git_transport() {
     assert_curated_gmail_repo(&curated_plugins_repo_path(tmp.path()));
 }
 
+#[cfg(windows)]
+#[tokio::test]
+async fn startup_sync_sha_publish_failure_preserves_existing_snapshot_and_allows_retry() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let tmp = tempdir().expect("tempdir");
+    let repo_path = curated_plugins_repo_path(tmp.path());
+    std::fs::create_dir_all(repo_path.join(".agents/plugins")).expect("existing repository");
+    let old_manifest = r#"{"name":"existing-marketplace","plugins":[]}"#;
+    std::fs::write(
+        repo_path.join(".agents/plugins/marketplace.json"),
+        old_manifest,
+    )
+    .expect("existing manifest");
+    std::fs::write(repo_path.join("retained.txt"), "existing installed plugin")
+        .expect("existing plugin contents");
+    let sha_path = curated_plugins_sha_path(tmp.path());
+    let old_sha = "1111111111111111111111111111111111111111";
+    std::fs::write(&sha_path, format!("{old_sha}\n")).expect("existing SHA");
+    // A reader that does not share writes/deletes models another Windows process
+    // holding the published revision open, without replacing filesystem behavior.
+    let sha_reader = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(1)
+        .open(&sha_path)
+        .expect("lock revision publication");
+    let server = MockServer::start().await;
+    let new_sha = "2222222222222222222222222222222222222222";
+    mount_github_repo_and_ref(&server, new_sha).await;
+    mount_github_zipball(&server, new_sha, curated_repo_zipball_bytes(new_sha)).await;
+
+    let error = run_sync_without_git(
+        tmp.path().to_path_buf(),
+        server.uri(),
+        "http://127.0.0.1:9/backend-api/plugins/export/curated",
+    )
+    .await
+    .expect_err("locked SHA must fail publication");
+    assert!(error.contains("curated plugins sha"), "{error}");
+    assert_eq!(
+        read_curated_plugins_sha(tmp.path()).as_deref(),
+        Some(old_sha)
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo_path.join("retained.txt")).expect("retained plugin"),
+        "existing installed plugin"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo_path.join(".agents/plugins/marketplace.json"))
+            .expect("retained manifest"),
+        old_manifest
+    );
+    assert!(!repo_path.join("plugins/gmail").exists());
+    assert!(!has_plugins_clone_dirs(tmp.path()));
+
+    drop(sha_reader);
+    let revision = run_sync_without_git(
+        tmp.path().to_path_buf(),
+        server.uri(),
+        "http://127.0.0.1:9/backend-api/plugins/export/curated",
+    )
+    .await
+    .expect("retry after unlocking SHA");
+    assert_eq!(revision, new_sha);
+    assert_eq!(
+        read_curated_plugins_sha(tmp.path()).as_deref(),
+        Some(new_sha)
+    );
+    assert_curated_gmail_repo(&repo_path);
+    assert!(!repo_path.join("retained.txt").exists());
+    assert!(!has_plugins_clone_dirs(tmp.path()));
+}
+
 #[tokio::test]
 async fn startup_sync_http_fallback_uses_configured_proxy_routes() {
     let tmp = tempdir().expect("tempdir");
@@ -278,6 +636,111 @@ async fn startup_sync_http_fallback_uses_configured_proxy_routes() {
 
     assert_eq!(synced_sha, sha);
     assert_curated_gmail_repo(&curated_plugins_repo_path(tmp.path()));
+}
+
+#[tokio::test]
+async fn startup_sync_sha_publish_failure_removes_unpublished_initial_snapshot() {
+    for use_backup_archive in [false, true] {
+        let tmp = tempdir().expect("tempdir");
+        let sha_path = curated_plugins_sha_path(tmp.path());
+        std::fs::create_dir_all(&sha_path).expect("block SHA publication with a directory");
+        let server = MockServer::start().await;
+        let sha = "3333333333333333333333333333333333333333";
+        let backup_url = if use_backup_archive {
+            mount_export_archive(&server, curated_repo_backup_archive_zip_bytes(sha)).await
+        } else {
+            mount_github_repo_and_ref(&server, sha).await;
+            mount_github_zipball(&server, sha, curated_repo_zipball_bytes(sha)).await;
+            "http://127.0.0.1:9/backend-api/plugins/export/curated".to_string()
+        };
+
+        let error = run_sync_without_git(tmp.path().to_path_buf(), server.uri(), &backup_url)
+            .await
+            .expect_err("SHA publication should fail");
+        assert!(error.contains("curated plugins sha"), "{error}");
+        assert!(!curated_plugins_repo_path(tmp.path()).exists());
+        assert!(sha_path.is_dir());
+        assert!(!has_plugins_clone_dirs(tmp.path()));
+
+        std::fs::remove_dir(&sha_path).expect("unblock SHA publication");
+        let revision = run_sync_without_git(tmp.path().to_path_buf(), server.uri(), &backup_url)
+            .await
+            .expect("retry initial publication");
+        assert_eq!(revision, sha);
+        assert_eq!(read_curated_plugins_sha(tmp.path()).as_deref(), Some(sha));
+        assert_curated_gmail_repo(&curated_plugins_repo_path(tmp.path()));
+        assert!(!has_plugins_clone_dirs(tmp.path()));
+    }
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn startup_sync_git_publishes_checkout_and_revision_together() {
+    let tmp = tempdir().expect("tempdir");
+    let source = tempdir().expect("Git source");
+    std::fs::create_dir_all(source.path().join(".agents/plugins")).expect("source directory");
+    std::fs::write(
+        source.path().join(".agents/plugins/marketplace.json"),
+        r#"{"name":"git-marketplace","plugins":[]}"#,
+    )
+    .expect("source manifest");
+    let run_git = |args: &[&str]| {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(source.path())
+            .args(args)
+            .output()
+            .expect("run source Git");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout)
+            .expect("Git output")
+            .trim()
+            .to_string()
+    };
+    run_git(&["init"]);
+    run_git(&["add", "."]);
+    run_git(&[
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.com",
+        "commit",
+        "-m",
+        "marketplace",
+    ]);
+    let revision = run_git(&["rev-parse", "HEAD"]);
+    let git_wrapper = tmp.path().join("git-local-source.cmd");
+    std::fs::write(
+        &git_wrapper,
+        format!(
+            "@git -c \"url.{}.insteadOf=https://github.com/openai/plugins.git\" %*\r\n",
+            source.path().to_string_lossy().replace('\\', "/")
+        ),
+    )
+    .expect("local Git URL routing fixture");
+
+    let actual_revision = run_sync_with_transport_overrides(
+        tmp.path().to_path_buf(),
+        git_wrapper.to_string_lossy(),
+        "http://127.0.0.1:9",
+        "http://127.0.0.1:9",
+    )
+    .await
+    .expect("real local Git sync");
+    assert_eq!(actual_revision, revision);
+    assert_eq!(read_curated_plugins_sha(tmp.path()), Some(revision));
+    assert_eq!(
+        std::fs::read_to_string(
+            curated_plugins_repo_path(tmp.path()).join(".agents/plugins/marketplace.json")
+        )
+        .expect("activated Git manifest"),
+        r#"{"name":"git-marketplace","plugins":[]}"#
+    );
+    assert!(!has_plugins_clone_dirs(tmp.path()));
 }
 
 #[tokio::test]

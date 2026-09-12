@@ -421,6 +421,14 @@ impl WorldState {
             };
             let fragment = section.render_diff(previous);
             let snapshot_advanced = match fragment {
+                Some(fragment) if !matches!(fragment.role(), "developer" | "user") => {
+                    tracing::warn!(
+                        section_id = *id,
+                        role = fragment.role(),
+                        "world-state section used an unsupported model-context role"
+                    );
+                    false
+                }
                 Some(fragment) => {
                     let rendered = fragment.render();
                     if !budget.try_take(&rendered) {

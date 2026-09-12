@@ -401,14 +401,34 @@ async fn enable_typed_router_task(
     session: &mut crate::session::session::Session,
     turn: &mut crate::session::turn_context::TurnContext,
     repo: &Path,
-    write_path: &str,
+    write_paths: &[&str],
+) -> (
+    codex_agent_task_store::AttemptId,
+    Arc<codex_agent_task_store::LocalAgentTaskStore>,
+) {
+    enable_typed_router_task_with_state_home(
+        session,
+        turn,
+        repo,
+        write_paths,
+        &repo.join(".typed-task-home"),
+    )
+    .await
+}
+
+async fn enable_typed_router_task_with_state_home(
+    session: &mut crate::session::session::Session,
+    turn: &mut crate::session::turn_context::TurnContext,
+    repo: &Path,
+    write_paths: &[&str],
+    state_home: &Path,
 ) -> (
     codex_agent_task_store::AttemptId,
     Arc<codex_agent_task_store::LocalAgentTaskStore>,
 ) {
     let root_session_id = "router-apply-patch-root".to_string();
     let state_runtime =
-        codex_state::StateRuntime::init(repo.join(".typed-task-home"), "test-provider".to_string())
+        codex_state::StateRuntime::init(state_home.to_path_buf(), "test-provider".to_string())
             .await
             .expect("typed task state initializes");
     let coordinator = session.services.agent_control.task_coordinator();
@@ -430,10 +450,13 @@ async fn enable_typed_router_task(
                     text: "router-dispatched apply_patch finalizes mutation evidence".to_string(),
                 }],
                 read_scope: Vec::new(),
-                write_scope: vec![codex_agent_task_store::RepoScope {
-                    path: write_path.to_string(),
-                    recursive: false,
-                }],
+                write_scope: write_paths
+                    .iter()
+                    .map(|path| codex_agent_task_store::RepoScope {
+                        path: (*path).to_string(),
+                        recursive: false,
+                    })
+                    .collect(),
                 stop_condition: "mutation evidence finalized".to_string(),
                 dependencies: Vec::new(),
                 risk_hints: Vec::new(),
@@ -449,16 +472,23 @@ async fn enable_typed_router_task(
         .expect("typed assignment is created");
     let agent_path =
         AgentPath::try_from("/root/router_apply_patch_worker").expect("valid agent path");
-    coordinator
+    let binding = coordinator
         .bind_agent_task(codex_agent_task_store::AgentTaskBindingDraft {
             assignment_id: assignment.assignment_id,
             attempt_id: attempt.attempt_id,
             agent_path: agent_path.to_string(),
             task_name: "router_apply_patch_worker".to_string(),
-            thread_id: None,
+            thread_id: Some(session.thread_id.to_string()),
         })
         .await
         .expect("typed assignment is bound");
+    assert!(
+        coordinator
+            .heartbeat_typed_actor_binding(&binding)
+            .await
+            .expect("bound fixture actor heartbeat is persisted"),
+        "normal typed routing requires an active assignment bound to this session thread"
+    );
     turn.session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
         parent_thread_id: ThreadId::new(),
         depth: 1,
@@ -940,7 +970,8 @@ async fn inactive_typed_assignment_is_a_blocked_tool_call() {
     let repo = temp.path().join("repo");
     std::fs::create_dir_all(&repo).expect("create repository");
     let (mut session, mut turn) = make_session_and_context().await;
-    let (_, store) = enable_typed_router_task(&mut session, &mut turn, &repo, "tracked.txt").await;
+    let (_, store) =
+        enable_typed_router_task(&mut session, &mut turn, &repo, &["tracked.txt"]).await;
     let assignment_id = session
         .services
         .agent_control
@@ -982,6 +1013,458 @@ async fn inactive_typed_assignment_is_a_blocked_tool_call() {
     ));
 }
 
+struct PatchReplyBarrierFileSystem {
+    first: PathUri,
+    writes: std::sync::Mutex<Vec<PathUri>>,
+    committed: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    release: Arc<tokio::sync::Notify>,
+    reply_dropped: Arc<std::sync::atomic::AtomicBool>,
+}
+
+struct PatchReplyLifetime(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for PatchReplyLifetime {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+impl codex_exec_server::ExecutorFileSystem for PatchReplyBarrierFileSystem {
+    fn canonicalize<'a>(
+        &'a self,
+        path: &'a PathUri,
+        sandbox: Option<&'a codex_exec_server::FileSystemSandboxContext>,
+    ) -> codex_exec_server::ExecutorFileSystemFuture<'a, PathUri> {
+        codex_exec_server::LOCAL_FS.canonicalize(path, sandbox)
+    }
+
+    fn read_file<'a>(
+        &'a self,
+        path: &'a PathUri,
+        sandbox: Option<&'a codex_exec_server::FileSystemSandboxContext>,
+    ) -> codex_exec_server::ExecutorFileSystemFuture<'a, Vec<u8>> {
+        codex_exec_server::LOCAL_FS.read_file(path, sandbox)
+    }
+
+    fn read_file_stream<'a>(
+        &'a self,
+        path: &'a PathUri,
+        sandbox: Option<&'a codex_exec_server::FileSystemSandboxContext>,
+    ) -> codex_exec_server::ExecutorFileSystemFuture<'a, codex_exec_server::FileSystemReadStream>
+    {
+        codex_exec_server::LOCAL_FS.read_file_stream(path, sandbox)
+    }
+
+    fn write_file<'a>(
+        &'a self,
+        path: &'a PathUri,
+        contents: Vec<u8>,
+        sandbox: Option<&'a codex_exec_server::FileSystemSandboxContext>,
+    ) -> codex_exec_server::ExecutorFileSystemFuture<'a, ()> {
+        Box::pin(async move {
+            self.writes.lock().expect("write log").push(path.clone());
+            codex_exec_server::LOCAL_FS
+                .write_file(path, contents, sandbox)
+                .await?;
+            if path == &self.first {
+                let _reply_lifetime = PatchReplyLifetime(Arc::clone(&self.reply_dropped));
+                if let Some(committed) = self.committed.lock().expect("commit signal").take() {
+                    let _ = committed.send(());
+                }
+                self.release.notified().await;
+            }
+            Ok(())
+        })
+    }
+
+    fn create_directory<'a>(
+        &'a self,
+        path: &'a PathUri,
+        options: codex_exec_server::CreateDirectoryOptions,
+        sandbox: Option<&'a codex_exec_server::FileSystemSandboxContext>,
+    ) -> codex_exec_server::ExecutorFileSystemFuture<'a, ()> {
+        codex_exec_server::LOCAL_FS.create_directory(path, options, sandbox)
+    }
+
+    fn get_metadata<'a>(
+        &'a self,
+        path: &'a PathUri,
+        sandbox: Option<&'a codex_exec_server::FileSystemSandboxContext>,
+    ) -> codex_exec_server::ExecutorFileSystemFuture<'a, codex_exec_server::FileMetadata> {
+        codex_exec_server::LOCAL_FS.get_metadata(path, sandbox)
+    }
+
+    fn read_directory<'a>(
+        &'a self,
+        path: &'a PathUri,
+        sandbox: Option<&'a codex_exec_server::FileSystemSandboxContext>,
+    ) -> codex_exec_server::ExecutorFileSystemFuture<'a, Vec<codex_exec_server::ReadDirectoryEntry>>
+    {
+        codex_exec_server::LOCAL_FS.read_directory(path, sandbox)
+    }
+
+    fn remove<'a>(
+        &'a self,
+        path: &'a PathUri,
+        options: codex_exec_server::RemoveOptions,
+        sandbox: Option<&'a codex_exec_server::FileSystemSandboxContext>,
+    ) -> codex_exec_server::ExecutorFileSystemFuture<'a, ()> {
+        codex_exec_server::LOCAL_FS.remove(path, options, sandbox)
+    }
+
+    fn copy<'a>(
+        &'a self,
+        source_path: &'a PathUri,
+        destination_path: &'a PathUri,
+        options: codex_exec_server::CopyOptions,
+        sandbox: Option<&'a codex_exec_server::FileSystemSandboxContext>,
+    ) -> codex_exec_server::ExecutorFileSystemFuture<'a, ()> {
+        codex_exec_server::LOCAL_FS.copy(source_path, destination_path, options, sandbox)
+    }
+}
+
+#[tokio::test]
+async fn router_apply_patch_cancellation_settles_committed_write_and_skips_tail()
+-> anyhow::Result<()> {
+    for (cancel, drop_caller) in [(true, false), (true, true), (false, false)] {
+        let temp = tempfile::tempdir()?;
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo)?;
+        assert!(
+            Command::new("git")
+                .args(["init", "--quiet"])
+                .current_dir(&repo)
+                .status()?
+                .success()
+        );
+        std::fs::write(repo.join("first.txt"), "before\n")?;
+        let first = PathUri::from_abs_path(&AbsolutePathBuf::from_absolute_path(
+            repo.join("first.txt"),
+        )?);
+        let tail =
+            PathUri::from_abs_path(&AbsolutePathBuf::from_absolute_path(repo.join("tail.txt"))?);
+        let (committed_tx, committed_rx) = tokio::sync::oneshot::channel();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let reply_dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let filesystem = Arc::new(PatchReplyBarrierFileSystem {
+            first: first.clone(),
+            writes: std::sync::Mutex::new(Vec::new()),
+            committed: std::sync::Mutex::new(Some(committed_tx)),
+            release: Arc::clone(&release),
+            reply_dropped: Arc::clone(&reply_dropped),
+        });
+        let (mut session, mut turn) = make_session_and_context().await;
+        set_router_environment(&mut turn, &repo);
+        turn.environments.turn_environments[0].environment = Arc::new(
+            codex_exec_server::Environment::default_for_tests_with_filesystem(filesystem.clone()),
+        );
+        turn.permission_profile = PermissionProfile::Disabled;
+        turn.model_info.apply_patch_tool_type = Some(ApplyPatchToolType::Freeform);
+        let (attempt_id, store) =
+            enable_typed_router_task(&mut session, &mut turn, &repo, &["first.txt", "tail.txt"])
+                .await;
+        let turn = Arc::new(turn);
+        let step = StepContext::for_test(Arc::clone(&turn));
+        let router = Arc::new(ToolRouter::from_context(
+            step.as_ref(),
+            ToolRouterParams {
+                tool_suggest_candidates: None,
+                deferred_mcp_tools: None,
+                mcp_tools: None,
+                extension_tool_executors: Vec::new(),
+                dynamic_tools: turn.dynamic_tools.as_slice(),
+                exposure_identity: Default::default(),
+            },
+            &Default::default(),
+        ));
+        assert!(
+            router
+                .registered_tool_names_for_test()
+                .contains(&ToolName::plain("apply_patch"))
+        );
+        let step = step.with_tool_router_for_test(router);
+        let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
+        let session = Arc::new(session);
+        let runtime = crate::tools::parallel::ToolCallRuntime::new(
+            Arc::clone(&session),
+            step,
+            Arc::clone(&tracker),
+        );
+        let call_id = if drop_caller {
+            "dropped-caller-patch-prefix"
+        } else if cancel {
+            "cancelled-patch-prefix"
+        } else {
+            "successful-two-hunk-patch"
+        };
+        let call = ToolRouter::build_tool_call(ResponseItem::CustomToolCall {
+            id: None, status: None, call_id: call_id.to_string(), name: "apply_patch".to_string(), namespace: None,
+            input: "*** Begin Patch\n*** Update File: first.txt\n@@\n-before\n+after\n*** Add File: tail.txt\n+must-not-be-written\n*** End Patch".to_string(),
+            internal_chat_message_metadata_passthrough: None,
+        })?.expect("normal custom apply_patch call");
+        let initial_gate =
+            crate::workspace_operation_gate::acquire_workspace_operation(&repo).await;
+        let gate = Arc::clone(tokio::sync::OwnedMutexGuard::mutex(&initial_gate));
+        drop(initial_gate);
+        let cancellation = CancellationToken::new();
+        let mut response = Box::pin(runtime.handle_tool_call(call, cancellation.clone()));
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::select! {
+                committed = committed_rx => committed.expect("real first write committed"),
+                result = response.as_mut() => panic!("patch finished before held write reply: {result:?}"),
+            }
+        }).await.expect("patch reaches actual first filesystem write");
+        assert_eq!(std::fs::read_to_string(repo.join("first.txt"))?, "after\n");
+        assert!(!repo.join("tail.txt").exists());
+        assert_eq!(
+            *filesystem.writes.lock().expect("write log"),
+            vec![first.clone()]
+        );
+        assert!(
+            gate.try_lock().is_err(),
+            "in-flight committed write owns the workspace gate"
+        );
+        if cancel {
+            cancellation.cancel();
+            assert!(
+                futures::poll!(response.as_mut()).is_pending(),
+                "cancelled dispatch must retain the admitted filesystem response and its delta"
+            );
+            assert!(
+                gate.try_lock().is_err(),
+                "cancellation must not release the active write gate"
+            );
+            assert!(!reply_dropped.load(std::sync::atomic::Ordering::Acquire));
+            assert!(!repo.join("tail.txt").exists());
+        }
+        if drop_caller {
+            // The commit-barrier supervisor is inline in this caller. Its owned
+            // AbortOnDropHandle aborts dispatch when dropped, while the Session's
+            // terminal task must retain the admitted patch operation itself.
+            drop(response);
+            assert!(gate.try_lock().is_err());
+            assert!(!reply_dropped.load(std::sync::atomic::Ordering::Acquire));
+            release.notify_one();
+            session.terminal_tasks.close();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                session.terminal_tasks.wait(),
+            )
+            .await
+            .expect("Session owns committed patch settlement after caller drop");
+        } else {
+            release.notify_one();
+            let result = tokio::time::timeout(std::time::Duration::from_secs(10), response)
+                .await
+                .expect("released filesystem operation must settle")?;
+            let ResponseInputItem::CustomToolCallOutput {
+                call_id: result_id,
+                output,
+                ..
+            } = result
+            else {
+                anyhow::bail!("apply_patch must return custom tool output");
+            };
+            assert_eq!(result_id, call_id);
+            let FunctionCallOutputBody::Text(text) = output.body else {
+                anyhow::bail!("patch output must be text");
+            };
+            if cancel {
+                assert!(text.contains("aborted by user"), "{text}");
+            }
+        }
+        assert!(reply_dropped.load(std::sync::atomic::Ordering::Acquire));
+        assert!(
+            gate.try_lock().is_ok(),
+            "settled mutation releases the exact workspace gate"
+        );
+        assert_eq!(std::fs::read_to_string(repo.join("first.txt"))?, "after\n");
+        let expected_writes = if cancel {
+            vec![first.clone()]
+        } else {
+            vec![first.clone(), tail.clone()]
+        };
+        assert_eq!(
+            *filesystem.writes.lock().expect("write log"),
+            expected_writes
+        );
+        if cancel {
+            assert!(!repo.join("tail.txt").exists());
+        } else {
+            assert_eq!(
+                std::fs::read_to_string(repo.join("tail.txt"))?,
+                "must-not-be-written\n"
+            );
+        }
+        let diff = tracker
+            .lock()
+            .await
+            .get_unified_diff()
+            .expect("committed patch must be visible in the turn diff");
+        assert!(
+            diff.contains("first.txt") && diff.contains("-before") && diff.contains("+after"),
+            "{diff}"
+        );
+        assert_eq!(diff.contains("tail.txt"), !cancel, "{diff}");
+        let evidence = store
+            .list_mutation_evidence(
+                attempt_id,
+                Some(codex_agent_task_store::MAX_MUTATION_EVIDENCE_LIMIT),
+            )
+            .await?;
+        let first_evidence = evidence
+            .iter()
+            .find(|entry| entry.path == "first.txt")
+            .expect("first mutation evidence");
+        assert_eq!(first_evidence.attempt_id, attempt_id);
+        assert!(first_evidence.pre_write_existed);
+        assert_eq!(first_evidence.final_write_existed, Some(true));
+        assert_eq!(
+            first_evidence.pre_write_hash.as_deref(),
+            Some("9160d4be34c8695bd172a76c7c7966587ea5a4d991ad22c87b2b91af54aa9ebb")
+        );
+        assert_eq!(
+            first_evidence.final_hash.as_deref(),
+            Some("7b9a72466d3960eb2aacccfc848939453490db0678bd4725def3f789b891c919")
+        );
+        assert!(first_evidence.finalized_at.is_some() && first_evidence.end_epoch.is_some());
+        let tail_evidence = evidence
+            .iter()
+            .find(|entry| entry.path == "tail.txt")
+            .expect("both intended paths were registered before mutation");
+        assert_eq!(tail_evidence.attempt_id, attempt_id);
+        assert!(!tail_evidence.pre_write_existed);
+        assert!(tail_evidence.pre_write_hash.is_none());
+        assert!(tail_evidence.finalized_at.is_some() && tail_evidence.end_epoch.is_some());
+        if cancel {
+            assert_eq!(tail_evidence.final_write_existed, Some(false));
+            assert!(
+                tail_evidence.final_hash.is_none(),
+                "unapplied tail cannot claim written content"
+            );
+        } else {
+            assert_eq!(tail_evidence.final_write_existed, Some(true));
+            assert_eq!(
+                tail_evidence.final_hash.as_deref(),
+                Some("34bb655f4c80ce8343296f6427f36e9f49e2061548f709a10d022da25e819441")
+            );
+        }
+        store.close().await;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn router_apply_patch_partial_mutation_admission_failure_finalizes_begun_paths()
+-> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
+    let repo = temp.path().join("repo");
+    std::fs::create_dir_all(&repo)?;
+    assert!(
+        Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&repo)
+            .status()?
+            .success()
+    );
+    for path in ["a.txt", "b.txt"] {
+        std::fs::write(repo.join(path), "before\n")?;
+    }
+    let (mut session, mut turn) = make_session_and_context().await;
+    set_router_environment(&mut turn, &repo);
+    turn.permission_profile = PermissionProfile::Disabled;
+    turn.model_info.apply_patch_tool_type = Some(ApplyPatchToolType::Freeform);
+    let (attempt_id, store) =
+        enable_typed_router_task(&mut session, &mut turn, &repo, &["a.txt", "b.txt"]).await;
+    // A prior completed mutation makes the second begin fail through the real
+    // store contract, after the first path's new admission has committed.
+    store
+        .begin_mutation(
+            attempt_id,
+            &repo,
+            "b.txt".to_string(),
+            codex_agent_task_store::AttributionConfidence::Definitive,
+        )
+        .await?;
+    let previous = store
+        .finalize_mutation(attempt_id, &repo, "b.txt".to_string())
+        .await?;
+    let session = Arc::new(session);
+    let step = StepContext::for_test(Arc::new(turn));
+    let router = Arc::new(ToolRouter::from_context(
+        step.as_ref(),
+        ToolRouterParams {
+            tool_suggest_candidates: None,
+            deferred_mcp_tools: None,
+            mcp_tools: None,
+            extension_tool_executors: Vec::new(),
+            dynamic_tools: &[],
+            exposure_identity: Default::default(),
+        },
+        &Default::default(),
+    ));
+    assert!(step.set_tool_router(router).is_ok());
+    let runtime = crate::tools::parallel::ToolCallRuntime::new(
+        session,
+        step,
+        Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+    );
+    let response = runtime.handle_tool_call(
+        ToolCall {
+            tool_name: ToolName::plain("apply_patch"),
+            call_id: "partial-mutation-admission".to_string(),
+            payload: ToolPayload::Custom {
+                input: "*** Begin Patch\n*** Update File: a.txt\n@@\n-before\n+after\n*** Update File: b.txt\n@@\n-before\n+after\n*** End Patch".to_string(),
+            },
+        },
+        CancellationToken::new(),
+    ).await?;
+    let response_text = serde_json::to_string(&response)?;
+    assert!(
+        response_text.contains("mutation evidence could not be recorded for `b.txt`"),
+        "{response_text}"
+    );
+    assert!(
+        !response_text.contains("Success. Updated"),
+        "{response_text}"
+    );
+    for path in ["a.txt", "b.txt"] {
+        assert_eq!(
+            std::fs::read_to_string(repo.join(path))?,
+            "before\n",
+            "admission failure must prevent every patch write"
+        );
+    }
+    let evidence = store
+        .list_mutation_evidence(
+            attempt_id,
+            Some(codex_agent_task_store::MAX_MUTATION_EVIDENCE_LIMIT),
+        )
+        .await?;
+    assert_eq!(evidence.len(), 2);
+    let begun = evidence
+        .iter()
+        .find(|entry| entry.path == "a.txt")
+        .expect("first begin committed");
+    assert!(
+        begun.finalized_at.is_some(),
+        "failed second admission must not strand first admission"
+    );
+    assert!(begun.end_epoch.is_some());
+    assert_eq!(
+        begun.final_hash, begun.pre_write_hash,
+        "no-write finalization must retain the original bytes"
+    );
+    let retained = evidence
+        .iter()
+        .find(|entry| entry.path == "b.txt")
+        .expect("prior completed evidence retained");
+    assert_eq!(retained.finalized_at, previous.finalized_at);
+    assert_eq!(retained.final_hash, previous.final_hash);
+    store.close().await;
+    Ok(())
+}
+
 #[tokio::test]
 async fn router_apply_patch_finalizes_typed_mutation_evidence() -> anyhow::Result<()> {
     let temp = tempfile::tempdir().expect("temporary repository");
@@ -994,13 +1477,21 @@ async fn router_apply_patch_finalizes_typed_mutation_evidence() -> anyhow::Resul
         .expect("launch git init");
     assert!(status.success(), "git init failed");
     std::fs::write(repo.join("tracked.txt"), "before\n").expect("write patch fixture");
+    std::fs::write(repo.join("executable.sh"), "echo before\n")
+        .expect("write executable deletion fixture");
+    for args in [
+        vec!["add", "tracked.txt", "executable.sh"],
+        vec!["update-index", "--chmod=+x", "executable.sh"],
+    ] {
+        assert!(Command::new("git").args(args).current_dir(&repo).status()?.success());
+    }
 
     let (mut session, mut turn) = make_session_and_context().await;
     set_router_environment(&mut turn, &repo);
     turn.permission_profile = PermissionProfile::Disabled;
     turn.model_info.apply_patch_tool_type = Some(ApplyPatchToolType::Freeform);
     let (attempt_id, store) =
-        enable_typed_router_task(&mut session, &mut turn, &repo, "tracked.txt").await;
+        enable_typed_router_task(&mut session, &mut turn, &repo, &["tracked.txt", "executable.sh"]).await;
     let assignment_id = session
         .services
         .agent_control
@@ -1045,18 +1536,19 @@ async fn router_apply_patch_finalizes_typed_mutation_evidence() -> anyhow::Resul
         call_id: "router-apply-patch".to_string(),
         name: "apply_patch".to_string(),
         namespace: None,
-        input: "*** Begin Patch\n*** Update File: tracked.txt\n@@\n-before\n+after\n*** End Patch"
+        input: "*** Begin Patch\n*** Update File: tracked.txt\n@@\n-before\n+after\n*** Delete File: executable.sh\n*** End Patch"
             .to_string(),
         internal_chat_message_metadata_passthrough: None,
     })?
     .expect("custom tool call");
     let terminal_outcome_reached = admitted_tool_dispatch_state();
+    let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
     router
         .dispatch_tool_call_with_terminal_outcome(
             Arc::new(session),
             step_context,
             CancellationToken::new(),
-            Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+            Arc::clone(&tracker),
             call,
             ToolCallSource::Direct,
             Arc::clone(&terminal_outcome_reached),
@@ -1067,6 +1559,10 @@ async fn router_apply_patch_finalizes_typed_mutation_evidence() -> anyhow::Resul
         std::fs::read_to_string(repo.join("tracked.txt")).expect("read patched file"),
         "after\n"
     );
+    assert!(!repo.join("executable.sh").exists());
+    let diff = tracker.lock().await.get_unified_diff().expect("published patch diff");
+    assert!(diff.contains("deleted file mode 100755"), "{diff}");
+    assert!(diff.contains("executable.sh"), "{diff}");
 
     let evidence = store
         .list_mutation_evidence(
@@ -1075,11 +1571,16 @@ async fn router_apply_patch_finalizes_typed_mutation_evidence() -> anyhow::Resul
         )
         .await
         .expect("mutation evidence remains queryable");
-    assert_eq!(evidence.len(), 1);
-    assert_eq!(evidence[0].path, "tracked.txt");
-    assert_ne!(evidence[0].pre_write_hash, evidence[0].final_hash);
-    assert!(evidence[0].finalized_at.is_some());
-    assert!(evidence[0].end_epoch.is_some());
+    assert_eq!(evidence.len(), 2);
+    let updated = evidence.iter().find(|item| item.path == "tracked.txt").expect("updated-file evidence");
+    assert_ne!(updated.pre_write_hash, updated.final_hash);
+    let deleted = evidence.iter().find(|item| item.path == "executable.sh").expect("deleted-file evidence");
+    assert!(deleted.pre_write_hash.is_some());
+    assert!(deleted.final_hash.is_none());
+    for item in evidence {
+        assert!(item.finalized_at.is_some());
+        assert!(item.end_epoch.is_some());
+    }
 
     Ok(())
 }
@@ -1198,4 +1699,704 @@ fn namespace_function_names(specs: &[ToolSpec], namespace_name: &str) -> Vec<Str
             | ToolSpec::Namespace(_) => None,
         })
         .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn router_apply_patch_cancel_during_approval_has_no_mutation() -> anyhow::Result<()> {
+    use codex_protocol::protocol::{AskForApproval, EventMsg, ReviewDecision, TurnAbortReason};
+    use std::time::Duration;
+
+    struct ApprovalWaitTask;
+    impl crate::tasks::SessionTask for ApprovalWaitTask {
+        fn kind(&self) -> crate::state::TaskKind {
+            crate::state::TaskKind::Regular
+        }
+        fn span_name(&self) -> &'static str {
+            "test.patch_approval_owner"
+        }
+        fn run(
+            self: Arc<Self>,
+            _session: Arc<crate::session::Session>,
+            _turn: Arc<crate::TurnContext>,
+            _input: Vec<crate::session::TurnInput>,
+            cancellation: CancellationToken,
+        ) -> futures::future::BoxFuture<'static, crate::tasks::SessionTaskResult> {
+            Box::pin(async move {
+                cancellation.cancelled().await;
+                Ok(crate::tasks::TurnTaskResult::default())
+            })
+        }
+    }
+
+    let temp = tempfile::tempdir()?;
+    let repo = temp.path().join("repo");
+    std::fs::create_dir_all(&repo)?;
+    assert!(
+        Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&repo)
+            .status()?
+            .success()
+    );
+    std::fs::write(repo.join("tracked.txt"), "before\n")?;
+    let (session, mut turn, events) =
+        crate::session::tests::make_session_and_context_with_rx().await;
+    let turn_mut = Arc::get_mut(&mut turn).expect("uniquely owned turn fixture");
+    set_router_environment(turn_mut, &repo);
+    turn_mut.permission_profile = PermissionProfile::Disabled;
+    let mut config = (*turn_mut.config).clone();
+    config.approvals_reviewer = codex_protocol::config_types::ApprovalsReviewer::User;
+    turn_mut.config = Arc::new(config);
+    turn_mut
+        .approval_policy
+        .set(AskForApproval::UnlessTrusted)
+        .expect("configure real approval policy");
+    turn_mut.model_info.apply_patch_tool_type = Some(ApplyPatchToolType::Freeform);
+    // Register a live normal turn so request_patch_approval retains its actual response sender.
+    session
+        .spawn_task(Arc::clone(&turn), Vec::new(), ApprovalWaitTask)
+        .await;
+    let step = StepContext::for_test(Arc::clone(&turn));
+    let router = Arc::new(ToolRouter::from_context(
+        step.as_ref(),
+        ToolRouterParams {
+            tool_suggest_candidates: None,
+            deferred_mcp_tools: None,
+            mcp_tools: None,
+            extension_tool_executors: Vec::new(),
+            dynamic_tools: turn.dynamic_tools.as_slice(),
+            exposure_identity: Default::default(),
+        },
+        &Default::default(),
+    ));
+    assert!(
+        router
+            .registered_tool_names_for_test()
+            .contains(&ToolName::plain("apply_patch"))
+    );
+    let step = step.with_tool_router_for_test(router);
+    let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
+    let runtime = crate::tools::parallel::ToolCallRuntime::new(
+        Arc::clone(&session),
+        step,
+        Arc::clone(&tracker),
+    );
+    let call_id = "cancel-patch-before-approval";
+    let call = ToolRouter::build_tool_call(ResponseItem::CustomToolCall {
+        id: None, status: None, call_id: call_id.to_string(), name: "apply_patch".to_string(), namespace: None,
+        input: "*** Begin Patch\n*** Update File: tracked.txt\n@@\n-before\n+after\n*** Add File: tail.txt\n+must-not-be-written\n*** End Patch".to_string(),
+        internal_chat_message_metadata_passthrough: None,
+    })?.expect("normal custom apply_patch call");
+    let initial_gate = crate::workspace_operation_gate::acquire_workspace_operation(&repo).await;
+    let gate = Arc::clone(tokio::sync::OwnedMutexGuard::mutex(&initial_gate));
+    drop(initial_gate);
+    let paused = session.services.elicitations.subscribe();
+    let cancellation = CancellationToken::new();
+    let mut response = Box::pin(runtime.handle_tool_call(call, cancellation.clone()));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            tokio::select! {
+                event = events.recv() => {
+                    if let EventMsg::ApplyPatchApprovalRequest(request) = event.expect("live event stream").msg {
+                        assert_eq!(request.call_id, call_id);
+                        assert_eq!(request.changes.len(), 2);
+                        break;
+                    }
+                }
+                result = response.as_mut() => panic!("patch completed before approval: {result:?}"),
+            }
+        }
+    }).await.expect("normal handler requests actual user approval");
+    assert!(
+        *paused.borrow(),
+        "actual approval registration remains live"
+    );
+    assert!(futures::poll!(response.as_mut()).is_pending());
+    assert_eq!(
+        std::fs::read_to_string(repo.join("tracked.txt"))?,
+        "before\n"
+    );
+    assert!(!repo.join("tail.txt").exists());
+    assert!(
+        gate.try_lock().is_ok(),
+        "approval waits do not own the mutation gate"
+    );
+    cancellation.cancel();
+    let result = tokio::time::timeout(Duration::from_secs(5), response)
+        .await
+        .expect(
+            "cancel must not await unanswered approval or the thirty-second cleanup deadline",
+        )?;
+    let ResponseInputItem::CustomToolCallOutput {
+        call_id: output_id,
+        output,
+        ..
+    } = result
+    else {
+        panic!("normal apply_patch response expected");
+    };
+    assert_eq!(output_id, call_id);
+    let FunctionCallOutputBody::Text(text) = output.body else {
+        panic!("text output expected");
+    };
+    assert!(text.contains("aborted by user"), "{text}");
+    assert!(
+        !*paused.borrow(),
+        "cancelled approval must release the live elicitation lease"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.join("tracked.txt"))?,
+        "before\n"
+    );
+    assert!(!repo.join("tail.txt").exists());
+    assert!(tracker.lock().await.get_unified_diff().is_none());
+    assert!(gate.try_lock().is_ok());
+    // A stale UI approval cannot revive the cancelled registered operation.
+    session
+        .notify_approval(call_id, ReviewDecision::Approved)
+        .await;
+    assert_eq!(
+        std::fs::read_to_string(repo.join("tracked.txt"))?,
+        "before\n"
+    );
+    assert!(!repo.join("tail.txt").exists());
+    assert!(tracker.lock().await.get_unified_diff().is_none());
+    session.abort_all_tasks(TurnAbortReason::Interrupted).await;
+    Ok(())
+}
+
+struct TaskAuthorityFixture {
+    _temp: tempfile::TempDir,
+    repo: std::path::PathBuf,
+    runtime: crate::tools::parallel::ToolCallRuntime,
+    call: ToolCall,
+    store: Arc<codex_agent_task_store::LocalAgentTaskStore>,
+    worker: codex_agent_task_store::AgentTask,
+    actor_assignment_id: codex_agent_task_store::AssignmentId,
+}
+
+async fn task_authority_fixture(
+    review: bool,
+    wrong_workspace: bool,
+) -> anyhow::Result<TaskAuthorityFixture> {
+    use codex_agent_task_store::*;
+    let temp = tempfile::tempdir()?;
+    let repo = temp.path().join("repo");
+    std::fs::create_dir_all(&repo)?;
+    assert!(
+        Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&repo)
+            .status()?
+            .success()
+    );
+    // A real Git pointer preserves the original repository identity when the Windows
+    // scheduling scenario temporarily substitutes its commondir read with a native pipe.
+    std::fs::rename(repo.join(".git"), temp.path().join(".git-authority"))?;
+    std::fs::write(
+        repo.join(".git"),
+        format!("gitdir: {}\n", temp.path().join(".git-authority").display()),
+    )?;
+    std::fs::write(repo.join("tracked.txt"), "before\n")?;
+    assert!(
+        Command::new("git")
+            .args(["add", "tracked.txt"])
+            .current_dir(&repo)
+            .status()?
+            .success()
+    );
+    let (mut session, mut turn) = make_session_and_context().await;
+    Arc::make_mut(&mut turn.config).cwd = AbsolutePathBuf::from_absolute_path(&repo)?;
+    turn.multi_agent_version = codex_protocol::protocol::MultiAgentVersion::V2;
+    turn.permission_profile = PermissionProfile::Disabled;
+    set_router_environment(&mut turn, &repo);
+    // Keep mutable state and Git metadata outside the captured source workspace.
+    let (worker_attempt, store) = enable_typed_router_task_with_state_home(
+        &mut session,
+        &mut turn,
+        &repo,
+        &["tracked.txt"],
+        &temp.path().join("task-home"),
+    )
+    .await;
+    let coordinator = session.services.agent_control.task_coordinator();
+    let worker_binding = coordinator
+        .binding_for_source(&turn.session_source)
+        .expect("real worker binding");
+    // These are persisted inputs to the authority consumer, not substitutes for its logic.
+    store
+        .begin_mutation(
+            worker_attempt,
+            &repo,
+            "tracked.txt".to_string(),
+            AttributionConfidence::Definitive,
+        )
+        .await?;
+    std::fs::write(repo.join("tracked.txt"), "after\n")?;
+    store
+        .finalize_mutation(worker_attempt, &repo, "tracked.txt".to_string())
+        .await?;
+    // Fulfill the real persisted validation prerequisite with an actual command;
+    // the authority tests below still enter through the registered tool router.
+    let validation_id = "authority-diff-check";
+    let mut validation = ValidationCall {
+        call_id: validation_id.to_string(),
+        attempt_id: worker_attempt,
+        command_summary: "router boundary test".to_string(),
+        evidence: ValidationEvidence::default(),
+        status: ValidationCallStatus::Running,
+        recorded_at: chrono::Utc::now(),
+    };
+    store.record_validation_call(validation.clone()).await?;
+    let validation_started = std::time::Instant::now();
+    let validation_output = Command::new("git")
+        .args(["diff", "--check"])
+        .current_dir(&repo)
+        .output()?;
+    assert!(validation_output.status.success(), "{validation_output:?}");
+    assert_eq!(
+        std::fs::read_to_string(repo.join("tracked.txt"))?,
+        "after\n"
+    );
+    validation.status = ValidationCallStatus::Succeeded;
+    validation.recorded_at = chrono::Utc::now();
+    validation.evidence.validation_result = Some(json!({
+        "argv": ["git", "diff", "--check"], "coveredPaths": ["tracked.txt"],
+        "callId": validation_id, "processId": null, "status": "succeeded",
+        "durationMs": validation_started.elapsed().as_millis() as u64,
+    }));
+    store.record_validation_call(validation).await?;
+    let receipt_args = json!({"status":"completed", "summary":"authority-checked persisted receipt", "criterion_results":[{"criterion_id":"router-mutation-evidence", "status":"passed", "evidence":"tracked bytes changed before to after"}], "declared_changes":[{"path":"tracked.txt", "summary":"before to after"}], "validation_call_ids":[validation_id], "blockers":[], "risks":[], "next_action":null});
+    if review {
+        // Reviewer admission requires a sealed target with its review gate pending.
+        // This is persisted input to get_agent_task; the non-review arm separately
+        // proves normal submit_agent_receipt registration and persistence.
+        let draft: ReceiptDraft = serde_json::from_value(receipt_args.clone())?;
+        store
+            .submit_agent_receipt_with_review(
+                worker_attempt,
+                draft,
+                "authority fixture awaits cold review".to_string(),
+            )
+            .await?;
+    }
+    let worker = store
+        .get_agent_task(worker_binding.assignment_id, Some(0))
+        .await?;
+    assert_eq!(worker.receipt.is_some(), review);
+    assert_eq!(
+        worker.current_attempt.state,
+        if review {
+            AttemptState::Completed
+        } else {
+            AttemptState::Active
+        }
+    );
+    let assignment_id = if review {
+        let (mut reviewer_session, mut reviewer_turn) = make_session_and_context().await;
+        reviewer_session.services.agent_control = session.services.agent_control.clone();
+        Arc::make_mut(&mut reviewer_turn.config).cwd = AbsolutePathBuf::from_absolute_path(&repo)?;
+        reviewer_turn.multi_agent_version = codex_protocol::protocol::MultiAgentVersion::V2;
+        reviewer_turn.permission_profile = PermissionProfile::Disabled;
+        set_router_environment(&mut reviewer_turn, &repo);
+        let (assignment, attempt) = coordinator
+            .create_assignment(
+                &repo,
+                AssignmentDraft {
+                    root_session_id: worker.assignment.root_session_id.clone(),
+                    admission_origin: AssignmentAdmissionOrigin::Typed,
+                    role: AgentRole::Reviewer,
+                    capability_profile: CapabilityProfile::ReadSearchDiff,
+                    objective: "review the persisted tracked-file mutation".to_string(),
+                    acceptance_criteria: vec![AcceptanceCriterion {
+                        id: "review".to_string(),
+                        text: "review exact target evidence".to_string(),
+                    }],
+                    read_scope: vec![RepoScope {
+                        path: "tracked.txt".to_string(),
+                        recursive: false,
+                    }],
+                    write_scope: Vec::new(),
+                    stop_condition: "target evidence inspected".to_string(),
+                    dependencies: vec![worker.assignment.assignment_id],
+                    risk_hints: Vec::new(),
+                    required_evidence: Vec::new(),
+                    prohibited_changes: Vec::new(),
+                    contract_claims: Vec::new(),
+                    workspace_strategy: WorkspaceStrategy::Shared,
+                    relation: Some(AssignmentRelation {
+                        kind: RelationKind::Review,
+                        target_assignment_ids: vec![worker.assignment.assignment_id],
+                    }),
+                    architecture_contract_ref: None,
+                },
+            )
+            .await?;
+        let path =
+            AgentPath::try_from("/root/authority_reviewer").expect("valid reviewer fixture path");
+        let binding = coordinator
+            .bind_agent_task(AgentTaskBindingDraft {
+                assignment_id: assignment.assignment_id,
+                attempt_id: attempt.attempt_id,
+                agent_path: path.to_string(),
+                task_name: "authority_reviewer".to_string(),
+                thread_id: Some(reviewer_session.thread_id.to_string()),
+            })
+            .await?;
+        assert!(coordinator.heartbeat_typed_actor_binding(&binding).await?);
+        session = reviewer_session;
+        turn = reviewer_turn;
+        turn.session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+            parent_thread_id: ThreadId::new(),
+            depth: 1,
+            agent_path: Some(path),
+            agent_nickname: None,
+            agent_role: Some("reviewer".to_string()),
+        });
+        assignment.assignment_id
+    } else {
+        worker.assignment.assignment_id
+    };
+    if wrong_workspace {
+        let wrong = temp.path().join("wrong-repository");
+        std::fs::create_dir_all(wrong.join(".git"))?;
+        Arc::make_mut(&mut turn.config).cwd = AbsolutePathBuf::from_absolute_path(&wrong)?;
+        set_router_environment(&mut turn, &wrong);
+    }
+    let turn = Arc::new(turn);
+    let step = StepContext::for_test(Arc::clone(&turn));
+    let router = Arc::new(ToolRouter::from_context(
+        step.as_ref(),
+        ToolRouterParams {
+            tool_suggest_candidates: None,
+            deferred_mcp_tools: None,
+            mcp_tools: None,
+            extension_tool_executors: Vec::new(),
+            dynamic_tools: turn.dynamic_tools.as_slice(),
+            exposure_identity: ToolExposureIdentity {
+                agent_surface_stage: crate::tools::exposure::AgentSurfaceStage::TypedAdministration,
+                ..Default::default()
+            },
+        },
+        &Default::default(),
+    ));
+    let name = if review {
+        "get_agent_task"
+    } else {
+        "submit_agent_receipt"
+    };
+    let registered = router
+        .registered_tool_names_for_test()
+        .into_iter()
+        .find(|tool| tool.name == name)
+        .expect("normal typed administration registration");
+    let args = if review {
+        json!({"assignment_id": assignment_id.to_string(), "observation_limit": 0})
+    } else {
+        receipt_args
+    };
+    let call = ToolRouter::build_tool_call(ResponseItem::FunctionCall {
+        id: None,
+        name: registered.name,
+        namespace: registered.namespace,
+        arguments: args.to_string(),
+        call_id: "task-authority".to_string(),
+        internal_chat_message_metadata_passthrough: None,
+    })?
+    .expect("normal function tool call");
+    let runtime = crate::tools::parallel::ToolCallRuntime::new(
+        Arc::new(session),
+        step.with_tool_router_for_test(router),
+        Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+    );
+    Ok(TaskAuthorityFixture {
+        _temp: temp,
+        repo,
+        runtime,
+        call,
+        store,
+        worker,
+        actor_assignment_id: assignment_id,
+    })
+}
+
+fn task_authority_response_text(response: ResponseInputItem) -> String {
+    let ResponseInputItem::FunctionCallOutput { call_id, output } = response else {
+        panic!("normal function response expected")
+    };
+    assert_eq!(call_id, "task-authority");
+    let FunctionCallOutputBody::Text(text) = output.body else {
+        panic!("text function output expected")
+    };
+    text
+}
+
+async fn assert_task_authority_success(
+    review: bool,
+    text: &str,
+    store: &codex_agent_task_store::LocalAgentTaskStore,
+    worker: &codex_agent_task_store::AgentTask,
+    actor_assignment_id: codex_agent_task_store::AssignmentId,
+) -> anyhow::Result<()> {
+    // Normal registry output may frame selected JSON with a projection header.
+    // Decode that contract without bypassing the consumer-visible payload checks.
+    let mut documents = serde_json::Deserializer::from_str(text).into_iter::<serde_json::Value>();
+    let first = documents
+        .next()
+        .transpose()?
+        .ok_or_else(|| anyhow::anyhow!("empty authority response"))?;
+    let value = if first["selected_text_follows"] == true {
+        assert_eq!(first["outcome"], "success");
+        assert_eq!(first["canonical_complete"], true);
+        assert_eq!(first["artifact"]["complete"], true);
+        documents
+            .next()
+            .transpose()?
+            .ok_or_else(|| anyhow::anyhow!("authority header promised absent selected JSON"))?
+    } else {
+        first
+    };
+    assert!(
+        documents.next().is_none(),
+        "unexpected trailing authority output: {text}"
+    );
+    let persisted = store
+        .get_agent_task(worker.assignment.assignment_id, Some(0))
+        .await?;
+    if review {
+        let context = &value["cold_review_context"];
+        assert_eq!(
+            context["assignment"]["assignment_id"],
+            worker.assignment.assignment_id.to_string()
+        );
+        assert_eq!(
+            context["attempt_id"],
+            worker.current_attempt.attempt_id.to_string()
+        );
+        assert_eq!(context["nearest_tests"], json!(["router boundary test"]));
+        let diff = context["attempt_specific_diff"]
+            .as_str()
+            .expect("persisted snapshot diff");
+        assert!(diff.contains("-before\n"), "{diff}");
+        assert!(diff.contains("+after\n"), "{diff}");
+        assert_eq!(
+            context["observed_writes"]
+                .as_array()
+                .expect("write evidence")
+                .len(),
+            1
+        );
+        assert_eq!(context["observed_writes"][0]["path"], "tracked.txt");
+        assert_eq!(context["observed_writes"][0]["pre_write_existed"], true);
+        assert_eq!(context["observed_writes"][0]["final_write_existed"], true);
+        assert_ne!(
+            context["observed_writes"][0]["pre_write_hash"],
+            context["observed_writes"][0]["final_hash"]
+        );
+        assert!(context.get("worker_reasoning").is_none());
+        assert!(context.get("conversation_history").is_none());
+        assert_eq!(
+            persisted.receipt, worker.receipt,
+            "cold review must preserve its sealed target receipt"
+        );
+        let reviewer = store.get_agent_task(actor_assignment_id, Some(0)).await?;
+        assert!(reviewer.receipt.is_none());
+        assert_eq!(
+            reviewer.current_attempt.state,
+            codex_agent_task_store::AttemptState::Active
+        );
+    } else {
+        let receipt = persisted
+            .receipt
+            .expect("normal receipt handler must persist the receipt");
+        assert_eq!(receipt.summary, "authority-checked persisted receipt");
+        assert_eq!(
+            receipt.status,
+            codex_agent_task_store::AgentStatusClaim::Completed
+        );
+        assert_eq!(receipt.declared_changes.len(), 1);
+        assert_eq!(receipt.declared_changes[0].path, "tracked.txt");
+        assert_eq!(
+            value["receipt"]["assignment_id"],
+            receipt.assignment_id.to_string()
+        );
+        assert_eq!(
+            value["receipt"]["attempt_id"],
+            receipt.attempt_id.to_string()
+        );
+        assert_eq!(value["receipt"]["summary"], receipt.summary);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn router_task_authority_returns_persisted_receipt_and_cold_review() -> anyhow::Result<()> {
+    for review in [false, true] {
+        let fixture = task_authority_fixture(review, false).await?;
+        let text = task_authority_response_text(
+            fixture
+                .runtime
+                .handle_tool_call(fixture.call, CancellationToken::new())
+                .await?,
+        );
+        assert_task_authority_success(
+            review,
+            &text,
+            fixture.store.as_ref(),
+            &fixture.worker,
+            fixture.actor_assignment_id,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn router_task_authority_rejects_wrong_repository_without_receipt() -> anyhow::Result<()> {
+    for review in [false, true] {
+        let fixture = task_authority_fixture(review, true).await?;
+        let text = task_authority_response_text(
+            fixture
+                .runtime
+                .handle_tool_call(fixture.call, CancellationToken::new())
+                .await?,
+        );
+        assert!(
+            text.contains("evidence is invalid: assignment repository"),
+            "{text}"
+        );
+        let persisted = fixture
+            .store
+            .get_agent_task(fixture.worker.assignment.assignment_id, Some(0))
+            .await?;
+        assert_eq!(
+            persisted.receipt, fixture.worker.receipt,
+            "authority rejection must preserve the target's prior receipt state"
+        );
+        assert_eq!(
+            persisted.current_attempt.state,
+            fixture.worker.current_attempt.state
+        );
+        let actor = fixture
+            .store
+            .get_agent_task(fixture.actor_assignment_id, Some(0))
+            .await?;
+        assert!(
+            actor.receipt.is_none(),
+            "authority failure must not seal the caller"
+        );
+        assert_eq!(
+            actor.current_attempt.state,
+            codex_agent_task_store::AttemptState::Active
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.repo.join("tracked.txt"))?,
+            "after\n"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "current_thread")]
+async fn router_task_authority_git_read_keeps_executor_responsive() -> anyhow::Result<()> {
+    use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::windows::named_pipe::ServerOptions;
+    for review in [false, true] {
+        let fixture = task_authority_fixture(review, false).await?;
+        let marker = fixture.repo.join(".git");
+        let original = std::fs::read(&marker)?;
+        let common_dir = fixture
+            .repo
+            .parent()
+            .expect("fixture repository has a temp parent")
+            .join(".git-authority")
+            .to_string_lossy()
+            .into_owned();
+        let pipe_root = format!(r"\\.\pipe\codex-task-authority-{}", uuid::Uuid::new_v4());
+        let pipe_name = format!(r"{pipe_root}\commondir");
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        // Receipt finalization performs exactly one already-offloaded identity read.
+        // Keep the pipe marker installed through it so that only the subsequent
+        // risk-policy read can satisfy the gated handshake. Cold review has no prior read.
+        let prior_reads = usize::from(!review);
+        let server = std::thread::spawn(move || -> anyhow::Result<bool> {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            let _entered_runtime = runtime.enter();
+            let mut pipes = Vec::new();
+            for index in 0..=prior_reads {
+                pipes.push(
+                    ServerOptions::new()
+                        .first_pipe_instance(index == 0)
+                        .create(&pipe_name)?,
+                );
+            }
+            ready_tx.send(()).ok();
+            let mut entered_tx = Some(entered_tx);
+            let mut responsive = false;
+            for (index, mut pipe) in pipes.into_iter().enumerate() {
+                runtime.block_on(tokio::time::timeout(
+                    Duration::from_secs(10),
+                    pipe.connect(),
+                ))??;
+                if index == prior_reads {
+                    entered_tx
+                        .take()
+                        .expect("single policy-read handshake")
+                        .send(())
+                        .ok();
+                    // Independent OS watchdog releases the real read even when the old
+                    // inline implementation blocks the only async executor thread.
+                    responsive = release_rx.recv_timeout(Duration::from_secs(3)).is_ok();
+                    std::fs::write(&marker, &original)?;
+                }
+                runtime.block_on(pipe.write_all(common_dir.as_bytes()))?;
+            }
+            Ok(responsive)
+        });
+        ready_rx.await?;
+        std::fs::write(fixture.repo.join(".git"), format!("gitdir: {pipe_root}\n"))?;
+        let mut response = Box::pin(
+            fixture
+                .runtime
+                .handle_tool_call(fixture.call, CancellationToken::new()),
+        );
+        let mut early = None;
+        let entered = tokio::select! {
+            result = entered_rx => result.is_ok(),
+            result = &mut response => { early = Some(result); false },
+        };
+        let _ = release_tx.send(());
+        let responsive = tokio::task::spawn_blocking(move || {
+            server.join().expect("native pipe thread must not panic")
+        })
+        .await??;
+        assert!(
+            entered,
+            "registered authority handler must reach the gated native Git read; early result: {early:?}"
+        );
+        assert!(
+            responsive,
+            "the policy Git read blocked the only async executor until the OS watchdog released it"
+        );
+        let result = match early {
+            Some(result) => result,
+            None => tokio::time::timeout(Duration::from_secs(10), response).await?,
+        }?;
+        let text = task_authority_response_text(result);
+        assert_task_authority_success(
+            review,
+            &text,
+            fixture.store.as_ref(),
+            &fixture.worker,
+            fixture.actor_assignment_id,
+        )
+        .await?;
+    }
+    Ok(())
 }

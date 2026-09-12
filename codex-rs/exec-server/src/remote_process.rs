@@ -113,9 +113,6 @@ impl ExecProcess for RemoteExecProcess {
 
 impl Drop for RemoteExecProcess {
     fn drop(&mut self) {
-        let session = self.session.clone();
-        tokio::spawn(async move {
-            session.unregister().await;
-        });
+        self.session.unregister();
     }
 }

@@ -1783,6 +1783,348 @@ async fn cancelled_spawn_cleans_hidden_thread_and_releases_path() {
 }
 
 #[tokio::test]
+async fn cancelled_spawn_after_thread_created_cleans_child_and_releases_path() {
+    let (home, mut config) = test_config().await;
+    let _ = config.features.enable(Feature::MultiAgentV2);
+    let harness = AgentControlHarness::new_with_config(home, config).await;
+    let (parent_thread_id, _parent_thread) = harness.start_thread().await;
+    let initial_thread_ids = harness.manager.list_thread_ids().await;
+    let agent_path = AgentPath::try_from("/root/worker").expect("agent path");
+    let barrier = Arc::new(AgentControlTestBarrier::default());
+    *harness
+        .control
+        .test_hooks
+        .after_thread_created
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&barrier));
+    let mut thread_created = harness.manager.subscribe_thread_created();
+
+    let spawn_control = harness.control.clone();
+    let spawn_config = harness.config.clone();
+    let spawn_path = agent_path.clone();
+    let spawn = tokio::spawn(async move {
+        spawn_control
+            .spawn_agent_with_metadata(
+                spawn_config,
+                text_input("initial assignment"),
+                Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                    parent_thread_id,
+                    depth: 1,
+                    agent_path: Some(spawn_path),
+                    agent_nickname: None,
+                    agent_role: None,
+                })),
+                SpawnAgentOptions {
+                    parent_thread_id: Some(parent_thread_id),
+                    ..Default::default()
+                },
+            )
+            .await
+    });
+    timeout(Duration::from_secs(5), barrier.wait_until_reached())
+        .await
+        .expect("spawn should pause after child publication");
+    let published_thread_ids = harness
+        .manager
+        .list_thread_ids()
+        .await
+        .into_iter()
+        .filter(|thread_id| !initial_thread_ids.contains(thread_id))
+        .collect::<Vec<_>>();
+    assert_eq!(published_thread_ids.len(), 1);
+    let published_thread_id = published_thread_ids[0];
+
+    spawn.abort();
+    let join_error = spawn.await.expect_err("spawn task should be cancelled");
+    assert!(join_error.is_cancelled());
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if matches!(
+                harness.manager.get_thread(published_thread_id).await,
+                Err(CodexErr::ThreadNotFound(_))
+            ) {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("cancelled published child should be cleaned up");
+    assert_eq!(harness.control.state.agent_id_for_path(&agent_path), None);
+    assert_eq!(
+        thread_created.try_recv().expect("child was published before cancellation"),
+        published_thread_id,
+    );
+    assert_matches!(
+        thread_created.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    );
+
+    *harness
+        .control
+        .test_hooks
+        .after_thread_created
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    let retry = harness
+        .control
+        .spawn_agent_with_metadata(
+            harness.config.clone(),
+            text_input("retry assignment"),
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id,
+                depth: 1,
+                agent_path: Some(agent_path.clone()),
+                agent_nickname: None,
+                agent_role: None,
+            })),
+            SpawnAgentOptions {
+                parent_thread_id: Some(parent_thread_id),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("cancelled spawn should release its path reservation");
+    assert_eq!(
+        harness.control.state.agent_id_for_path(&agent_path),
+        Some(retry.thread_id)
+    );
+}
+
+#[test]
+fn registered_cancelled_spawn_retains_usage_until_child_termination() {
+    run_current_thread_test_with_stack(
+        "registered_cancelled_spawn_retains_usage_until_child_termination",
+        || async {
+            use crate::session::step_context::StepContext;
+            use crate::tools::context::ToolPayload;
+            use crate::tools::parallel::ToolCallRuntime;
+            use crate::tools::router::{ToolCall, ToolRouter, ToolRouterParams};
+            use codex_protocol::models::ResponseInputItem;
+            use core_test_support::responses;
+            use core_test_support::streaming_sse::{StreamingSseChunk, start_streaming_sse_server};
+            let (release_model, model_gate) = tokio::sync::oneshot::channel();
+            let (server, _) = start_streaming_sse_server(vec![vec![StreamingSseChunk {
+                gate: Some(model_gate),
+                body: responses::sse(vec![
+                    responses::ev_response_created("cancelled-child-response"),
+                    responses::ev_assistant_message(
+                        "cancelled-child-answer",
+                        "Late completed result.",
+                    ),
+                    responses::ev_completed_with_tokens("cancelled-child-response", 41),
+                ]),
+            }]])
+            .await;
+            let (home, mut config) = test_config().await;
+            config
+                .features
+                .enable(Feature::MultiAgentV2)
+                .expect("enable V2");
+            config
+                .features
+                .enable(Feature::Collab)
+                .expect("enable normal registration");
+            config.model_provider.base_url = Some(format!("{}/v1", server.uri()));
+            config.model_provider.supports_websockets = false;
+            config.model_provider.request_max_retries = Some(0);
+            config.model_provider.stream_max_retries = Some(0);
+            let harness = AgentControlHarness::new_with_config(home, config).await;
+            let (parent_id, parent) = harness.start_thread().await;
+            let control = parent.codex.session.services.agent_control.clone();
+            let turn = parent.codex.session.new_default_turn().await;
+            turn.multi_agent_spawn_authorized
+                .store(true, std::sync::atomic::Ordering::Release);
+            let step = StepContext::for_test(turn);
+            let tool_name = codex_tools::ToolName::namespaced("agents", "spawn_agent");
+            let router = Arc::new(ToolRouter::from_context(
+                step.as_ref(),
+                ToolRouterParams {
+                    tool_suggest_candidates: None,
+                    deferred_mcp_tools: None,
+                    mcp_tools: None,
+                    extension_tool_executors: Vec::new(),
+                    dynamic_tools: &[],
+                    exposure_identity: Default::default(),
+                },
+                &Default::default(),
+            ));
+            assert!(
+                router.registered_tool_names_for_test().contains(&tool_name),
+                "default V2 namespace must be registered: {:?}",
+                router.registered_tool_names_for_test()
+            );
+            // Normal turn setup installs the current advertised capability revisions.
+            // Dispatch still performs its ordinary deferred-tool activation.
+            step.turn
+                .refresh_deferred_tool_capabilities(router.deferred_tool_capability_revisions());
+            assert!(step.set_tool_router(router).is_ok());
+            let runtime = ToolCallRuntime::new(
+                Arc::clone(&parent.codex.session),
+                step,
+                Arc::new(tokio::sync::Mutex::new(
+                    crate::turn_diff_tracker::TurnDiffTracker::default(),
+                )),
+            );
+            let published = Arc::new(AgentControlTestBarrier::default());
+            let rollback = Arc::new(AgentControlTestBarrier::default());
+            struct ReleaseRollback(Arc<AgentControlTestBarrier>);
+            impl Drop for ReleaseRollback {
+                fn drop(&mut self) {
+                    self.0.release_one();
+                }
+            }
+            let _release_rollback_on_failure = ReleaseRollback(rollback.clone());
+            *control
+                .test_hooks
+                .after_thread_created
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(published.clone());
+            *control
+                .test_hooks
+                .before_spawn_rollback
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(rollback.clone());
+            let cancellation = tokio_util::sync::CancellationToken::new();
+            let cancel_spawn = cancellation.clone();
+            let mut spawn = tokio::spawn(async move {
+                runtime.handle_tool_call(ToolCall {
+                    tool_name, call_id: "cancelled-spawn-metrics".to_string(),
+                    payload: ToolPayload::Function { arguments: serde_json::json!({
+                        "task_name": "late_usage", "message": "Return the result after checking it."
+                    }).to_string() },
+                }, cancel_spawn).await
+            });
+            tokio::select! {
+                result = &mut spawn => panic!("registered spawn returned before child publication: {result:?}"),
+                result = timeout(Duration::from_secs(15), published.wait_until_reached()) => {
+                    result.expect("child published");
+                }
+            }
+            timeout(Duration::from_secs(15), server.wait_for_request_count(1))
+                .await
+                .expect("actual child model request");
+            let child_path = AgentPath::try_from("/root/late_usage").expect("child path");
+            let coordinator = control.task_coordinator();
+            let binding = coordinator
+                .binding_for_agent_path(&child_path)
+                .expect("normal spawn bound child");
+            let child_id =
+                ThreadId::from_string(binding.thread_id.as_ref().expect("concrete child"))
+                    .expect("thread id");
+            let child = harness
+                .manager
+                .get_thread(child_id)
+                .await
+                .expect("registered child");
+            cancellation.cancel();
+            timeout(Duration::from_secs(5), rollback.wait_until_reached())
+                .await
+                .expect("real queued rollback entered");
+            assert!(
+                timeout(Duration::from_millis(50), &mut spawn)
+                    .await
+                    .is_err(),
+                "failure result must wait for child cleanup"
+            );
+            let task = coordinator
+                .get_agent_task(binding.assignment_id, Some(0))
+                .await
+                .expect("task readable");
+            assert_eq!(
+                task.current_attempt.state,
+                codex_agent_task_store::AttemptState::Active
+            );
+            assert!(
+                task.receipt.is_none(),
+                "caller cancellation must not seal the still-live child"
+            );
+            assert_eq!(
+                coordinator.binding_for_agent_path(&child_path),
+                Some(binding.clone())
+            );
+            let child_source = child.config_snapshot().await.session_source;
+            assert!(
+                coordinator.record_task_usage_for_source(&child_source, 0, 0),
+                "live child accounting remains open"
+            );
+            release_model
+                .send(())
+                .expect("deliver late actual model usage");
+            timeout(Duration::from_secs(15), async {
+                loop {
+                    if matches!(
+                        child.next_event().await.expect("child event").msg,
+                        EventMsg::TurnComplete(_)
+                    ) {
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("late child result completes normally");
+            assert_eq!(
+                child
+                    .token_usage_info()
+                    .await
+                    .expect("actual model usage")
+                    .total_token_usage
+                    .total_tokens,
+                41
+            );
+            rollback.release_one();
+            let output = timeout(Duration::from_secs(10), spawn)
+                .await
+                .expect("cancelled caller returns after actual cleanup")
+                .expect("spawn caller joins")
+                .expect("normal router produces failure output");
+            let ResponseInputItem::FunctionCallOutput { call_id, output } = output else {
+                panic!("function output expected")
+            };
+            assert_eq!(call_id, "cancelled-spawn-metrics");
+            assert_eq!(output.success, None, "user abort uses the canonical abort envelope");
+            let codex_protocol::models::FunctionCallOutputBody::Text(message) = output.body else {
+                panic!("model-visible cancellation text expected");
+            };
+            let elapsed = message
+                .strip_prefix("aborted by user after ")
+                .and_then(|duration| duration.strip_suffix('s'))
+                .expect("canonical user cancellation message")
+                .parse::<f32>()
+                .expect("finite elapsed seconds");
+            assert!(elapsed.is_finite() && elapsed >= 0.1);
+
+            timeout(Duration::from_secs(15), async {
+                loop {
+                    if coordinator.binding_for_agent_path(&child_path).is_none() {
+                        break;
+                    }
+                    sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("failure owner removes binding after termination");
+            timeout(Duration::from_secs(5), child.wait_until_terminated())
+                .await
+                .expect("child loop terminated");
+            assert!(!coordinator.record_task_usage_for_source(&child_source, 1, 1));
+            let task = coordinator
+                .get_agent_task(binding.assignment_id, Some(0))
+                .await
+                .expect("terminal task readable");
+            assert_ne!(
+                task.current_attempt.state,
+                codex_agent_task_store::AttemptState::Active
+            );
+            control
+                .shutdown_live_agent(parent_id)
+                .await
+                .expect("parent shutdown");
+        },
+    );
+}
+
+#[tokio::test]
 async fn spawn_agent_creates_thread_and_sends_prompt() {
     let harness = AgentControlHarness::new().await;
     let thread_id = harness
@@ -4894,6 +5236,622 @@ fn resume_agent_from_rollout_closes_unrecoverable_child_and_does_not_retry() {
                 .shutdown_live_agent(parent_thread_id)
                 .await
                 .expect("parent shutdown after second resume should succeed");
+        },
+    );
+}
+
+#[test]
+fn registered_v2_child_completion_records_only_delivered_parent_result() {
+    const CHILD_ENV: &str = "CODEX_TEST_REGISTERED_PARENT_RESULT_TRACE";
+    if std::env::var_os(CHILD_ENV).is_none() {
+        let trace_root = TempDir::new().expect("isolated trace root");
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .arg("--exact")
+            .arg("agent::control::tests::registered_v2_child_completion_records_only_delivered_parent_result")
+            .arg("--nocapture")
+            .env(CHILD_ENV, "1")
+            .env(codex_rollout_trace::CODEX_ROLLOUT_TRACE_ROOT_ENV, trace_root.path())
+            .output()
+            .expect("isolated parent result test");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "isolated parent result failed: {stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    run_current_thread_test_with_stack(
+        "registered_v2_child_completion_records_only_delivered_parent_result",
+        || async {
+            use crate::session::TurnInput;
+            use codex_rollout_trace::RawTraceEvent;
+            use codex_rollout_trace::RawTraceEventPayload;
+
+            let trace_root = std::path::PathBuf::from(
+                std::env::var_os(codex_rollout_trace::CODEX_ROLLOUT_TRACE_ROOT_ENV)
+                    .expect("normal trace configuration"),
+            );
+            let (home, mut config) = test_config().await;
+            config
+                .features
+                .enable(Feature::MultiAgentV2)
+                .expect("enable V2");
+            let harness = AgentControlHarness::new_with_config(home, config).await;
+            let (parent_id, parent) = harness.start_thread().await;
+            assert_eq!(
+                parent
+                    .codex
+                    .session
+                    .new_default_turn()
+                    .await
+                    .multi_agent_version,
+                MultiAgentVersion::V2
+            );
+            let child_path = AgentPath::root().join("trace_child").expect("child path");
+            let mut options = harness.manager.start_thread_options(harness.config.clone());
+            options.session_source = Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id: parent_id,
+                depth: 1,
+                agent_path: Some(child_path.clone()),
+                agent_nickname: None,
+                agent_role: Some("worker".to_string()),
+            }));
+            let child = harness
+                .manager
+                .start_thread_with_options(options)
+                .await
+                .expect("registered child");
+            assert!(
+                parent
+                    .codex
+                    .session
+                    .services
+                    .rollout_thread_trace
+                    .is_enabled()
+            );
+            assert!(
+                child
+                    .thread
+                    .codex
+                    .session
+                    .services
+                    .rollout_thread_trace
+                    .is_enabled()
+            );
+            let turn = child.thread.codex.session.new_default_turn().await;
+            assert_eq!(turn.multi_agent_version, MultiAgentVersion::V2);
+            child
+                .thread
+                .codex
+                .session
+                .send_event(
+                    turn.as_ref(),
+                    EventMsg::TurnComplete(TurnCompleteEvent {
+                        surfaced_result: None,
+                        turn_id: turn.sub_id.clone(),
+                        last_agent_message: Some("completed child payload".to_string()),
+                        error: None,
+                        completed_at: None,
+                        duration_ms: None,
+                        time_to_first_token_ms: None,
+                        timing: None,
+                    }),
+                )
+                .await;
+
+            timeout(Duration::from_secs(5), async {
+                while !parent
+                    .codex
+                    .session
+                    .input_queue
+                    .has_pending_mailbox_items()
+                    .await
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("actual parent mailbox delivery");
+            let pending = parent
+                .codex
+                .session
+                .input_queue
+                .get_pending_input(&parent.codex.session.active_turn)
+                .await;
+            let [TurnInput::InterAgentCommunication(delivered)] = pending.as_slice() else {
+                panic!("one delivered parent message expected: {pending:?}");
+            };
+            let expected_message = "Message Type: FINAL_ANSWER\nTask name: /root\nSender: /root/trace_child\nPayload:\ncompleted child payload";
+            assert_eq!(delivered.author, child_path);
+            assert_eq!(delivered.recipient, AgentPath::root());
+            assert_eq!(delivered.content, expected_message);
+            assert!(delivered.other_recipients.is_empty());
+            assert!(!delivered.trigger_turn);
+            assert!(parent.codex.session.active_turn.lock().await.is_none());
+
+            let bundles = std::fs::read_dir(&trace_root)
+                .expect("read trace root")
+                .map(|entry| entry.expect("trace bundle entry").path())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                bundles.len(),
+                1,
+                "child must inherit its parent's actual trace bundle"
+            );
+            let bundle = &bundles[0];
+            let read_results = || -> Vec<RawTraceEvent> {
+                std::fs::read_to_string(bundle.join("trace.jsonl"))
+                    .expect("read raw trace")
+                    .lines()
+                    .map(|line| {
+                        serde_json::from_str::<RawTraceEvent>(line).expect("raw trace event")
+                    })
+                    .filter(|event| {
+                        matches!(
+                            event.payload,
+                            RawTraceEventPayload::AgentResultObserved { .. }
+                        )
+                    })
+                    .collect()
+            };
+            let results = read_results();
+            assert_eq!(
+                results.len(),
+                1,
+                "one delivered terminal must produce exactly one result edge"
+            );
+            let event = &results[0];
+            assert_eq!(
+                event.thread_id.as_deref(),
+                Some(child.thread_id.to_string().as_str())
+            );
+            assert_eq!(event.codex_turn_id.as_deref(), Some(turn.sub_id.as_str()));
+            let RawTraceEventPayload::AgentResultObserved {
+                child_thread_id,
+                child_codex_turn_id,
+                parent_thread_id,
+                message,
+                carried_payload,
+                ..
+            } = &event.payload
+            else {
+                unreachable!("filtered result event")
+            };
+            assert_eq!(child_thread_id, &child.thread_id.to_string());
+            assert_eq!(child_codex_turn_id, &turn.sub_id);
+            assert_eq!(parent_thread_id, &parent_id.to_string());
+            assert_eq!(message, expected_message);
+            let payload = carried_payload.as_ref().expect("actual carried payload");
+            assert_eq!(
+                payload.kind,
+                codex_rollout_trace::RawPayloadKind::AgentResult
+            );
+            let payload: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(bundle.join(&payload.path)).expect("read carried payload"),
+            )
+            .expect("agent result payload JSON");
+            assert_eq!(
+                payload,
+                serde_json::json!({
+                    "child_agent_path": "/root/trace_child",
+                    "message": expected_message,
+                    "status": {"completed": "completed child payload"}
+                })
+            );
+
+            harness
+                .control
+                .shutdown_live_agent(parent_id)
+                .await
+                .expect("normal parent shutdown");
+            assert!(harness.manager.get_thread(parent_id).await.is_err());
+            let undelivered_turn = child.thread.codex.session.new_default_turn().await;
+            child
+                .thread
+                .codex
+                .session
+                .send_event(
+                    undelivered_turn.as_ref(),
+                    EventMsg::TurnComplete(TurnCompleteEvent {
+                        surfaced_result: None,
+                        turn_id: undelivered_turn.sub_id.clone(),
+                        last_agent_message: Some("missing parent payload".to_string()),
+                        error: None,
+                        completed_at: None,
+                        duration_ms: None,
+                        time_to_first_token_ms: None,
+                        timing: None,
+                    }),
+                )
+                .await;
+            assert_eq!(
+                read_results(),
+                results,
+                "a failed delivery must not create a result edge"
+            );
+            assert!(
+                parent
+                    .codex
+                    .session
+                    .input_queue
+                    .get_pending_input(&parent.codex.session.active_turn)
+                    .await
+                    .is_empty()
+            );
+            assert!(!harness.manager.captured_ops().into_iter().any(|(id, op)| {
+                id == parent_id
+                    && matches!(op, Op::InterAgentCommunication { communication }
+                    if communication.content.contains("missing parent payload"))
+            }));
+            harness
+                .control
+                .shutdown_live_agent(child.thread_id)
+                .await
+                .expect("normal child shutdown");
+        },
+    );
+}
+
+#[test]
+fn registered_v2_child_publication_panic_preserves_parent_result() {
+    run_current_thread_test_with_stack(
+        "registered_v2_child_publication_panic_preserves_parent_result",
+        || async {
+            use codex_app_server_protocol::ThreadHistoryBuilder;
+            use codex_app_server_protocol::TurnStatus;
+            use codex_protocol::models::AgentMessageInputContent;
+            use core_test_support::responses;
+            use core_test_support::streaming_sse::StreamingSseChunk;
+            use core_test_support::streaming_sse::start_streaming_sse_server;
+
+            let (release_child, child_gate) = tokio::sync::oneshot::channel();
+            let (server, _streams_sent) = start_streaming_sse_server(vec![
+                vec![StreamingSseChunk {
+                    gate: Some(child_gate),
+                    body: responses::sse(vec![
+                        responses::ev_response_created("child-publication-response"),
+                        responses::ev_assistant_message(
+                            "child-publication-answer",
+                            "Child verified 7 * 6 = 42.",
+                        ),
+                        responses::ev_completed("child-publication-response"),
+                    ]),
+                }],
+                vec![StreamingSseChunk {
+                    gate: None,
+                    body: responses::sse(vec![
+                        responses::ev_response_created("parent-initial-response"),
+                        responses::ev_assistant_message(
+                            "parent-initial-answer",
+                            "Child result received.",
+                        ),
+                        responses::ev_completed("parent-initial-response"),
+                    ]),
+                }],
+                vec![StreamingSseChunk {
+                    gate: None,
+                    body: responses::sse(vec![
+                        responses::ev_response_created("parent-mailbox-response"),
+                        responses::ev_assistant_message(
+                            "parent-mailbox-answer",
+                            "Child completion consumed.",
+                        ),
+                        responses::ev_completed("parent-mailbox-response"),
+                    ]),
+                }],
+            ])
+            .await;
+            let (home, mut config) = test_config().await;
+            config
+                .features
+                .enable(Feature::MultiAgentV2)
+                .expect("enable V2");
+            config.model_provider.base_url = Some(format!("{}/v1", server.uri()));
+            config.model_provider.supports_websockets = false;
+            config.model_provider.request_max_retries = Some(0);
+            config.model_provider.stream_max_retries = Some(0);
+            let harness = AgentControlHarness::new_with_config(home, config).await;
+            let (parent_id, parent) = harness.start_thread().await;
+            let child_path = AgentPath::root()
+                .join("publication_child")
+                .expect("child path");
+            let mut options = harness.manager.start_thread_options(harness.config.clone());
+            options.session_source = Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id: parent_id,
+                depth: 1,
+                agent_path: Some(child_path.clone()),
+                agent_nickname: None,
+                agent_role: Some("worker".to_string()),
+            }));
+            let child = harness
+                .manager
+                .start_thread_with_options(options)
+                .await
+                .expect("normal registered child");
+            let child = child.thread;
+            let child_turn_id = child
+                .submit(Op::UserInput {
+                    items: text_input("Verify the multiplication and return the result."),
+                    final_output_json_schema: None,
+                    responsesapi_client_metadata: None,
+                    additional_context: Default::default(),
+                    thread_settings: Default::default(),
+                })
+                .await
+                .expect("normal child input");
+            timeout(Duration::from_secs(15), server.wait_for_request_count(1))
+                .await
+                .expect("real child model request");
+            let terminal = {
+                let active = child.codex.session.active_turn.lock().await;
+                let active = active.as_ref().expect("gated child still running");
+                let context = &active.task.as_ref().expect("installed worker").turn_context;
+                assert_eq!(context.sub_id, child_turn_id);
+                assert_eq!(context.multi_agent_version, MultiAgentVersion::V2);
+                active.terminal.clone().expect("installed terminal owner")
+            };
+            terminal.request_panic_after_terminal_publication();
+            release_child
+                .send(())
+                .expect("release actual HTTP completion");
+            let mut child_events = Vec::new();
+            timeout(Duration::from_secs(15), async {
+                loop {
+                    let event = child.next_event().await.expect("child event").msg;
+                    let completed = matches!(&event, EventMsg::TurnComplete(turn) if turn.turn_id == child_turn_id);
+                    child_events.push(event);
+                    if completed { break; }
+                }
+                terminal.wait_cleanup_completed().await;
+            }).await.expect("published child terminal and owned fallback cleanup");
+            assert!(
+                terminal.panic_after_terminal_publication_was_consumed_for_test(),
+                "the fault must actually occur between live publication and parent dispatch"
+            );
+            assert_eq!(
+                child.agent_status().await,
+                AgentStatus::Completed(Some("Child verified 7 * 6 = 42.".to_string()))
+            );
+            timeout(Duration::from_secs(10), async {
+                while !parent
+                    .codex
+                    .session
+                    .input_queue
+                    .has_pending_mailbox_items()
+                    .await
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("original completion must reach the actual parent mailbox");
+            assert!(
+                parent.codex.session.active_turn.lock().await.is_none(),
+                "completion delivery is queue-only"
+            );
+            assert_eq!(
+                server.requests().await.len(),
+                1,
+                "parent must not start an unsolicited turn"
+            );
+            child.submit(Op::Shutdown).await.expect("child shutdown");
+            timeout(Duration::from_secs(15), async {
+                loop {
+                    let event = child.next_event().await.expect("child shutdown event").msg;
+                    let done = matches!(event, EventMsg::ShutdownComplete);
+                    child_events.push(event);
+                    if done {
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("child physical writer shutdown");
+            let child_rollout = crate::rollout::recorder::RolloutRecorder::get_rollout_history(
+                &child.rollout_path().expect("child physical rollout"),
+            )
+            .await
+            .expect("read child physical history");
+            let child_persisted_events = child_rollout
+                .get_rollout_items()
+                .iter()
+                .filter_map(|item| {
+                    if let RolloutItem::EventMsg(event) = item {
+                        Some(event.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+            let mut terminal_payloads = Vec::new();
+            for (boundary, events) in [
+                ("child live stream", child_events.as_slice()),
+                ("child physical rollout", child_persisted_events.as_slice()),
+            ] {
+                assert_eq!(events.iter().filter(|event| matches!(event, EventMsg::TurnStarted(turn) if turn.turn_id == child_turn_id)).count(), 1, "{boundary}: one start");
+                let terminals = events
+                    .iter()
+                    .filter(|event| {
+                        matches!(event, EventMsg::TurnComplete(_) | EventMsg::TurnAborted(_))
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    terminals.len(),
+                    1,
+                    "{boundary}: fallback must not publish another terminal"
+                );
+                let EventMsg::TurnComplete(completed) = terminals[0] else {
+                    panic!("{boundary}: original completed outcome required");
+                };
+                assert_eq!(completed.turn_id, child_turn_id);
+                assert_eq!(
+                    completed.last_agent_message.as_deref(),
+                    Some("Child verified 7 * 6 = 42.")
+                );
+                assert!(
+                    completed.error.is_none(),
+                    "{boundary}: original success must survive panic"
+                );
+                terminal_payloads.push(serde_json::to_value(completed).expect("terminal JSON"));
+                let mut consumer = ThreadHistoryBuilder::new();
+                for event in events {
+                    consumer.handle_event(event);
+                }
+                let turns = consumer.finish();
+                assert_eq!(turns.len(), 1);
+                assert_eq!(turns[0].id, child_turn_id);
+                assert_eq!(turns[0].status, TurnStatus::Completed);
+                assert!(turns[0].error.is_none());
+            }
+            assert_eq!(
+                terminal_payloads[0], terminal_payloads[1],
+                "persisted child outcome matches the delivered original"
+            );
+
+            // The parent consumes the real pending completion on its next normal turn.
+            let parent_turn_id = parent
+                .submit(Op::UserInput {
+                    items: text_input("Use the queued child result."),
+                    final_output_json_schema: None,
+                    responsesapi_client_metadata: None,
+                    additional_context: Default::default(),
+                    thread_settings: Default::default(),
+                })
+                .await
+                .expect("normal parent continuation");
+            timeout(Duration::from_secs(15), async {
+                loop {
+                    match parent.next_event().await.expect("parent event").msg {
+                        EventMsg::TurnComplete(completed)
+                            if completed.turn_id == parent_turn_id =>
+                        {
+                            assert!(
+                                completed.error.is_none(),
+                                "parent consumer turn succeeds: {:?}; actual request count {}",
+                                completed.error,
+                                server.requests().await.len()
+                            );
+                            break;
+                        }
+                        EventMsg::TurnAborted(_) => panic!("parent consumer must not abort"),
+                        _ => {}
+                    }
+                }
+            })
+            .await
+            .expect("parent consumes the retained original child completion");
+            let expected_envelope = "Message Type: FINAL_ANSWER\nTask name: /root\nSender: /root/publication_child\nPayload:\nChild verified 7 * 6 = 42.";
+            let requests = server.requests().await;
+            assert_eq!(
+                requests.len(),
+                3,
+                "one child request, the initial user generation, then queued mailbox consumption"
+            );
+            let initial_parent_request: serde_json::Value =
+                serde_json::from_slice(&requests[1]).expect("initial actual parent request");
+            assert!(
+                initial_parent_request["input"]
+                    .as_array()
+                    .expect("initial parent input")
+                    .iter()
+                    .all(|item| item["type"] != "agent_message"),
+                "a nonempty user turn drains its queued mailbox after the first generation"
+            );
+            let parent_request: serde_json::Value =
+                serde_json::from_slice(&requests[2]).expect("actual mailbox consumer request");
+            let mail = parent_request["input"]
+                .as_array()
+                .expect("parent request input")
+                .iter()
+                .filter(|item| item["type"] == "agent_message")
+                .collect::<Vec<_>>();
+            assert_eq!(
+                mail.len(),
+                1,
+                "actual parent request receives one completion envelope"
+            );
+            assert_eq!(mail[0]["author"], "/root/publication_child");
+            assert_eq!(mail[0]["recipient"], "/root");
+            assert_eq!(
+                mail[0]["content"],
+                serde_json::json!([{"type":"input_text", "text":expected_envelope}])
+            );
+            assert!(
+                !parent
+                    .codex
+                    .session
+                    .input_queue
+                    .has_pending_mailbox_items()
+                    .await,
+                "normal parent turn consumes the queued completion"
+            );
+            let parent_live = parent.codex.session.clone_history().await;
+            parent.submit(Op::Shutdown).await.expect("parent shutdown");
+            timeout(Duration::from_secs(15), async {
+                loop {
+                    if matches!(
+                        parent
+                            .next_event()
+                            .await
+                            .expect("parent shutdown event")
+                            .msg,
+                        EventMsg::ShutdownComplete
+                    ) {
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("parent physical writer shutdown");
+            let parent_rollout = crate::rollout::recorder::RolloutRecorder::get_rollout_history(
+                &parent.rollout_path().expect("parent physical rollout"),
+            )
+            .await
+            .expect("read parent physical history");
+            let parent_persisted = parent_rollout
+                .get_rollout_items()
+                .iter()
+                .filter_map(|item| {
+                    if let RolloutItem::ResponseItem(item) = item {
+                        Some(item.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+            for (boundary, items) in [
+                ("parent live history", parent_live.raw_items()),
+                ("parent physical history", parent_persisted.as_slice()),
+            ] {
+                let mail = items
+                    .iter()
+                    .filter_map(|item| match item {
+                        ResponseItem::AgentMessage {
+                            author,
+                            recipient,
+                            content,
+                            ..
+                        } => Some((author, recipient, content)),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    mail.len(),
+                    1,
+                    "{boundary}: original child completion appears exactly once"
+                );
+                assert_eq!(mail[0].0, "/root/publication_child");
+                assert_eq!(mail[0].1, "/root");
+                assert_eq!(
+                    mail[0].2.as_slice(),
+                    &[AgentMessageInputContent::InputText {
+                        text: expected_envelope.to_string()
+                    }]
+                );
+            }
+            server.shutdown().await;
         },
     );
 }

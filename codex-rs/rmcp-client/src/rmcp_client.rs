@@ -1000,13 +1000,22 @@ impl RmcpClient {
                     && auth_provider.is_none()
                     && !default_headers.contains_key(AUTHORIZATION)
                 {
-                    match load_oauth_tokens(
-                        codex_home,
-                        server_name,
-                        url,
-                        *store_mode,
-                        *keyring_backend_kind,
-                    ) {
+                    let codex_home = codex_home.clone();
+                    let name = server_name.clone();
+                    let url = url.clone();
+                    let store_mode = *store_mode;
+                    let keyring_backend_kind = *keyring_backend_kind;
+                    match tokio::task::spawn_blocking(move || {
+                        load_oauth_tokens(
+                            &codex_home,
+                            &name,
+                            &url,
+                            store_mode,
+                            keyring_backend_kind,
+                        )
+                    })
+                    .await?
+                    {
                         Ok(tokens) => tokens,
                         Err(err) => {
                             warn!("failed to read tokens for server `{server_name}`: {err}");
@@ -1453,6 +1462,56 @@ mod tests {
     use tokio::time;
 
     use super::*;
+
+    #[tokio::test]
+    async fn http_client_construction_yields_while_credential_store_is_locked() -> Result<()> {
+        let codex_home = tempfile::tempdir()?;
+        let lock_dir = codex_home.path().join("mcp-oauth-locks");
+        std::fs::create_dir_all(&lock_dir)?;
+        let lock = std::fs::File::options()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(lock_dir.join("file-store.lock"))?;
+        lock.lock()?;
+        let (release, released) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _ = released.recv_timeout(Duration::from_secs(2));
+            drop(lock);
+        });
+        let mut client = Box::pin(RmcpClient::new_streamable_http_client(
+            "locked-server",
+            codex_home.path().to_path_buf(),
+            "http://127.0.0.1:1/mcp",
+            None,
+            None,
+            None,
+            OAuthCredentialsStoreMode::File,
+            AuthKeyringBackendKind::Direct,
+            Arc::new(codex_exec_server::ReqwestHttpClient),
+            None,
+        ));
+        let first_poll = std::future::poll_fn(|context| {
+            std::task::Poll::Ready(std::future::Future::poll(client.as_mut(), context))
+        })
+        .await;
+        let _ = release.send(());
+        holder.join().expect("lock holder should exit");
+        assert!(
+            first_poll.is_pending(),
+            "client construction must yield while credential lookup waits for the lock"
+        );
+        let client = client.await?;
+        assert!(matches!(
+            *client.state.lock().await,
+            ClientState::Connecting {
+                transport: Some(PendingTransport::StreamableHttp { .. })
+            }
+        ));
+        assert!(!codex_home.path().join(".credentials.json").exists());
+        Ok(())
+    }
 
     #[test]
     fn client_operation_timeout_rounds_duration() {

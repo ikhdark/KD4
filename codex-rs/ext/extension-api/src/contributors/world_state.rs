@@ -35,6 +35,10 @@ pub struct RenderedWorldStateFragment {
 }
 
 impl RenderedWorldStateFragment {
+    /// Creates a fragment for the `developer` or `user` model-context role.
+    ///
+    /// The host omits fragments with other roles and retains the previously delivered section
+    /// snapshot, or leaves it absent when the section has not been delivered yet.
     pub fn new(
         role: &'static str,
         markers: (&'static str, &'static str),

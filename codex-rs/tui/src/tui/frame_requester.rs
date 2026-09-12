@@ -12,6 +12,8 @@
 //! [“Actors with Tokio”](https://ryhl.io/blog/actors-with-tokio/), with a
 //! dedicated scheduler task and lightweight request handles.
 
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -29,7 +31,8 @@ use super::frame_rate_limiter::FrameRateLimiter;
 /// from anywhere in the TUI code.
 #[derive(Clone, Debug)]
 pub struct FrameRequester {
-    frame_schedule_tx: mpsc::UnboundedSender<Instant>,
+    frame_schedule_tx: mpsc::Sender<()>,
+    pending_deadline: Arc<Mutex<Option<Instant>>>,
 }
 
 impl FrameRequester {
@@ -37,22 +40,32 @@ impl FrameRequester {
     ///
     /// The provided `draw_tx` is used to notify the TUI event loop of scheduled draws.
     pub fn new(draw_tx: broadcast::Sender<()>) -> Self {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let scheduler = FrameScheduler::new(rx, draw_tx);
+        let (tx, rx) = mpsc::channel(1);
+        let pending_deadline = Arc::new(Mutex::new(None));
+        let scheduler = FrameScheduler::new(rx, pending_deadline.clone(), draw_tx);
         tokio::spawn(scheduler.run());
         Self {
             frame_schedule_tx: tx,
+            pending_deadline,
         }
     }
 
     /// Schedule a frame draw as soon as possible.
     pub fn schedule_frame(&self) {
-        let _ = self.frame_schedule_tx.send(Instant::now());
+        self.schedule_at(Instant::now());
     }
 
     /// Schedule a frame draw to occur after the specified duration.
     pub fn schedule_frame_in(&self, dur: Duration) {
-        let _ = self.frame_schedule_tx.send(Instant::now() + dur);
+        self.schedule_at(Instant::now() + dur);
+    }
+
+    fn schedule_at(&self, draw_at: Instant) {
+        let mut pending = self.pending_deadline.lock().unwrap();
+        *pending = Some(pending.map_or(draw_at, |current| current.min(draw_at)));
+        // A full wake slot already guarantees the scheduler will read this minimum.
+        // Keep the update and notification together so a racing receiver cannot miss it.
+        let _ = self.frame_schedule_tx.try_send(());
     }
 }
 
@@ -60,9 +73,10 @@ impl FrameRequester {
 impl FrameRequester {
     /// Create a no-op frame requester for tests.
     pub(crate) fn test_dummy() -> Self {
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = mpsc::channel(1);
         FrameRequester {
             frame_schedule_tx: tx,
+            pending_deadline: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -74,16 +88,22 @@ impl FrameRequester {
 /// To avoid wasted redraw work, draw notifications are clamped to a maximum of 120 FPS (see
 /// [`FrameRateLimiter`]).
 struct FrameScheduler {
-    receiver: mpsc::UnboundedReceiver<Instant>,
+    receiver: mpsc::Receiver<()>,
+    pending_deadline: Arc<Mutex<Option<Instant>>>,
     draw_tx: broadcast::Sender<()>,
     rate_limiter: FrameRateLimiter,
 }
 
 impl FrameScheduler {
     /// Create a new FrameScheduler with the provided receiver and draw notification sender.
-    fn new(receiver: mpsc::UnboundedReceiver<Instant>, draw_tx: broadcast::Sender<()>) -> Self {
+    fn new(
+        receiver: mpsc::Receiver<()>,
+        pending_deadline: Arc<Mutex<Option<Instant>>>,
+        draw_tx: broadcast::Sender<()>,
+    ) -> Self {
         Self {
             receiver,
+            pending_deadline,
             draw_tx,
             rate_limiter: FrameRateLimiter::default(),
         }
@@ -102,10 +122,13 @@ impl FrameScheduler {
             tokio::pin!(deadline);
 
             tokio::select! {
-                draw_at = self.receiver.recv() => {
-                    let Some(draw_at) = draw_at else {
+                wake = self.receiver.recv() => {
+                    let Some(()) = wake else {
                         // All senders dropped; exit the scheduler.
                         break
+                    };
+                    let Some(draw_at) = self.pending_deadline.lock().unwrap().take() else {
+                        continue;
                     };
                     let draw_at = self.rate_limiter.clamp_deadline(draw_at);
                     next_deadline = Some(next_deadline.map_or(draw_at, |cur| cur.min(draw_at)));
@@ -132,6 +155,58 @@ mod tests {
     use super::*;
     use tokio::time;
     use tokio_util::time::FutureExt;
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn request_burst_keeps_earliest_deadline_without_growing_admission() {
+        let (draw_tx, mut draw_rx) = broadcast::channel(16);
+        let requester = FrameRequester::new(draw_tx);
+        let second_handle = requester.clone();
+
+        // No await: the scheduler cannot consume any request during this burst.
+        for _ in 0..10_000 {
+            requester.schedule_frame_in(Duration::from_secs(60));
+        }
+        second_handle.schedule_frame();
+        for _ in 0..10_000 {
+            requester.schedule_frame_in(Duration::from_secs(120));
+        }
+        assert_eq!(requester.frame_schedule_tx.max_capacity(), 1);
+        assert_eq!(requester.frame_schedule_tx.capacity(), 0);
+
+        time::advance(Duration::from_millis(1)).await;
+        assert!(
+            draw_rx
+                .recv()
+                .timeout(Duration::from_millis(50))
+                .await
+                .unwrap()
+                .is_ok()
+        );
+        assert!(
+            draw_rx
+                .recv()
+                .timeout(Duration::from_secs(121))
+                .await
+                .is_err()
+        );
+
+        // Consuming the first batch must not swallow a later, independent request.
+        second_handle.schedule_frame();
+        assert!(
+            draw_rx
+                .recv()
+                .timeout(Duration::from_millis(50))
+                .await
+                .unwrap()
+                .is_ok()
+        );
+        drop(requester);
+        drop(second_handle);
+        assert!(matches!(
+            draw_rx.recv().await,
+            Err(broadcast::error::RecvError::Closed)
+        ));
+    }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn test_schedule_frame_immediate_triggers_once() {

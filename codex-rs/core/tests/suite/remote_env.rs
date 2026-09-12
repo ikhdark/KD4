@@ -601,10 +601,34 @@ async fn deferred_executor_wait_reports_startup_failure() -> Result<()> {
         .await
         .context("exec-server connection should arrive")??;
     drop(stream);
-    wait_for_event(&test.codex, |event| {
+    let EventMsg::TurnComplete(completed) = wait_for_event(&test.codex, |event| {
         matches!(event, EventMsg::TurnComplete(_))
     })
-    .await;
+    .await
+    else {
+        unreachable!("predicate accepts only the actual terminal event");
+    };
+    let timing = completed
+        .timing
+        .context("normal completed turn includes tool outcomes")?;
+    let wait_calls = timing
+        .tool_calls
+        .iter()
+        .filter(|call| call.call_id == wait_call_id)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        wait_calls.len(),
+        1,
+        "registered failure has exactly one runtime outcome"
+    );
+    assert_eq!(wait_calls[0].tool_name, "wait_for_environment");
+    assert_eq!(
+        wait_calls[0].outcome.as_deref(),
+        Some("failure"),
+        "the actual failed environment handler must never be classified as success"
+    );
+    assert!(wait_calls[0].output_model_visible_at_ms.is_some());
+    assert!(wait_calls[0].model_resumed_at_ms.is_some());
 
     let requests = response_mock.requests();
     assert_eq!(requests.len(), 2);

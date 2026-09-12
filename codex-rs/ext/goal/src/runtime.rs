@@ -136,6 +136,8 @@ impl GoalRuntimeHandle {
             return Ok(());
         }
 
+        self.retry_pending_goal_progress(None).await?;
+
         if let Some(turn_id) = self.inner.accounting_state.current_turn_id() {
             self.account_active_goal_progress(
                 turn_id.as_str(),
@@ -429,6 +431,44 @@ impl GoalRuntimeHandle {
     }
 
     pub(crate) async fn account_active_goal_progress(
+        &self,
+        turn_id: &str,
+        event_id: &str,
+        mode: codex_state::GoalAccountingMode,
+        budget_limited_goal_disposition: BudgetLimitedGoalDisposition,
+    ) -> Result<Option<AccountedGoalProgress>, String> {
+        self.retry_pending_goal_progress(Some(turn_id)).await?;
+        self.account_goal_progress_for_turn(
+            turn_id,
+            event_id,
+            mode,
+            budget_limited_goal_disposition,
+        )
+        .await
+    }
+
+    pub(crate) async fn retry_pending_goal_progress(
+        &self,
+        excluded_turn_id: Option<&str>,
+    ) -> Result<(), String> {
+        let accounting = self.accounting_state();
+        for turn_id in accounting.pending_turn_ids() {
+            if excluded_turn_id == Some(turn_id.as_str()) {
+                continue;
+            }
+            self.account_goal_progress_for_turn(
+                &turn_id,
+                &format!("{turn_id}:terminal-accounting-retry"),
+                codex_state::GoalAccountingMode::ActiveOnly,
+                BudgetLimitedGoalDisposition::ClearActive,
+            )
+            .await?;
+            accounting.finish_turn(&turn_id);
+        }
+        Ok(())
+    }
+
+    async fn account_goal_progress_for_turn(
         &self,
         turn_id: &str,
         event_id: &str,

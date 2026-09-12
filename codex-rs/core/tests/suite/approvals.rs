@@ -786,25 +786,78 @@ fn body_contains(req: &Request, text: &str) -> bool {
         .is_some_and(|body| body.contains(text))
 }
 
-async fn wait_for_spawned_thread(test: &TestCodex) -> Result<Arc<CodexThread>> {
-    let deadline = tokio::time::Instant::now() + APPROVAL_EVENT_TIMEOUT;
-    loop {
-        let ids = test.thread_manager.list_thread_ids().await;
-        if let Some(thread_id) = ids
-            .iter()
-            .find(|id| **id != test.session_configured.thread_id)
-        {
-            return test
-                .thread_manager
-                .get_thread(*thread_id)
-                .await
-                .map_err(anyhow::Error::from);
+async fn wait_for_spawned_thread(
+    test: &TestCodex,
+    deadline: tokio::time::Instant,
+) -> Result<Arc<CodexThread>> {
+    // One absolute deadline covers both manager lock waits and polling sleeps.
+    tokio::time::timeout_at(deadline, async {
+        loop {
+            let ids = test.thread_manager.list_thread_ids().await;
+            if let Some(thread_id) = ids
+                .iter()
+                .find(|id| **id != test.session_configured.thread_id)
+            {
+                return test
+                    .thread_manager
+                    .get_thread(*thread_id)
+                    .await
+                    .map_err(anyhow::Error::from);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        if tokio::time::Instant::now() >= deadline {
-            anyhow::bail!("timed out waiting for spawned thread");
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("timed out waiting for spawned thread"))?
+}
+
+#[tokio::test]
+async fn spawned_thread_wait_obeys_deadline_shorter_than_poll_interval() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = start_mock_server().await;
+    let test = test_codex().build(&server).await?;
+    assert_eq!(
+        test.thread_manager.list_thread_ids().await,
+        vec![test.session_configured.thread_id],
+        "normal manager has only the parent, so no child can satisfy the wait"
+    );
+
+    tokio::time::pause();
+    let start = tokio::time::Instant::now();
+    let deadline = start + Duration::from_millis(3);
+    let wait = wait_for_spawned_thread(&test, deadline);
+    tokio::pin!(wait);
+    assert!(futures::poll!(wait.as_mut()).is_pending());
+    tokio::time::advance(Duration::from_millis(2)).await;
+    assert!(futures::poll!(wait.as_mut()).is_pending());
+    // Tokio timers round deadlines to driver ticks; allow one tick after expiry.
+    // Four milliseconds is still strictly before the old ten-ms polling sleep.
+    tokio::time::advance(Duration::from_millis(2)).await;
+    let std::task::Poll::Ready(result) = futures::poll!(wait.as_mut()) else {
+        panic!("the child wait must expire at its deadline, before its ten-ms poll sleep");
+    };
+    assert_eq!(
+        result.err().expect("no child exists").to_string(),
+        "timed out waiting for spawned thread"
+    );
+    assert_eq!(
+        tokio::time::Instant::now() - start,
+        Duration::from_millis(4)
+    );
+    assert!(tokio::time::Instant::now() - start < Duration::from_millis(10));
+    tokio::time::resume();
+    assert_eq!(
+        test.thread_manager.list_thread_ids().await,
+        vec![test.session_configured.thread_id]
+    );
+    test.codex.submit(Op::Shutdown).await?;
+    wait_for_event_with_timeout(
+        &test.codex,
+        |event| matches!(event, EventMsg::ShutdownComplete),
+        APPROVAL_EVENT_TIMEOUT,
+    )
+    .await;
+    Ok(())
 }
 
 fn scenarios() -> Vec<ScenarioSpec> {
@@ -1898,7 +1951,9 @@ async fn spawned_subagent_execpolicy_amendment_propagates_to_parent_session() ->
     )
     .await?;
 
-    let child = wait_for_spawned_thread(&test).await?;
+    let child =
+        wait_for_spawned_thread(&test, tokio::time::Instant::now() + APPROVAL_EVENT_TIMEOUT)
+            .await?;
     let approval_event = wait_for_event_with_timeout(
         &child,
         |event| {

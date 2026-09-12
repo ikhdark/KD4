@@ -89,6 +89,21 @@ impl JsonRpcTransport {
     }
 
     #[cfg(test)]
+    pub(crate) fn pending_supervisor_for_test() -> (Self, watch::Receiver<bool>, watch::Sender<bool>)
+    {
+        let (terminate_tx, terminate_rx) = watch::channel(false);
+        let (terminated_tx, terminated_rx) = watch::channel(false);
+        let transport = StdioTransport {
+            handle: Arc::new(StdioTransportHandle {
+                terminate_tx,
+                terminated_rx,
+                terminate_requested: AtomicBool::new(false),
+            }),
+        };
+        (Self::Stdio { transport }, terminate_rx, terminated_tx)
+    }
+
+    #[cfg(test)]
     pub(crate) fn termination_completed(&self) -> bool {
         match self {
             Self::Plain => true,

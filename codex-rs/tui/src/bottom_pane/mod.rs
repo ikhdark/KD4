@@ -562,12 +562,14 @@ impl BottomPane {
                 let view = &mut self.view_stack[last_index];
                 let prefer_esc =
                     key_event.code == KeyCode::Esc && view.prefer_esc_to_handle_key_event();
-                let ctrl_c_completed = key_event.code == KeyCode::Esc
+                let ctrl_c_handled = key_event.code == KeyCode::Esc
                     && !prefer_esc
-                    && matches!(view.on_ctrl_c(), CancellationEvent::Handled)
-                    && view.is_complete();
-                if ctrl_c_completed {
-                    (true, true, view.completion(), false)
+                    && matches!(view.on_ctrl_c(), CancellationEvent::Handled);
+                if ctrl_c_handled {
+                    // A handled cancellation can advance an internal request queue.
+                    // Do not deliver the same Escape to the newly active request.
+                    let complete = view.is_complete();
+                    (complete, complete, view.completion(), false)
                 } else {
                     view.handle_key_event(key_event);
                     (
@@ -1916,6 +1918,72 @@ mod tests {
 
         fn view_id(&self) -> Option<&'static str> {
             self.id
+        }
+    }
+
+    #[test]
+    fn cancelling_approval_preserves_requests_from_other_threads() {
+        for ctrl_c in [false, true] {
+            let (tx_raw, mut rx) = unbounded_channel();
+            let mut pane = test_pane(AppEventSender::new(tx_raw));
+            let features = Features::with_defaults();
+            let first_thread = codex_protocol::ThreadId::new();
+            let second_thread = codex_protocol::ThreadId::new();
+            for (thread, call_id, label) in [
+                (first_thread, "approval-first", "First thread"),
+                (second_thread, "approval-second", "Second thread"),
+            ] {
+                let mut request = exec_request();
+                if let ApprovalRequest::Exec {
+                    thread_id,
+                    thread_label,
+                    id,
+                    ..
+                } = &mut request
+                {
+                    *thread_id = thread;
+                    *thread_label = Some(label.to_string());
+                    *id = call_id.to_string();
+                }
+                pane.push_approval_request(request, &features);
+            }
+            for (thread, call_id, label) in [
+                (first_thread, "approval-first", "First thread"),
+                (second_thread, "approval-second", "Second thread"),
+            ] {
+                assert!(
+                    pane.has_active_view(),
+                    "each independent request stays actionable"
+                );
+                assert!(render_snapshot(&pane, Rect::new(0, 0, 90, 20)).contains(label));
+                if ctrl_c {
+                    assert_eq!(pane.on_ctrl_c(), CancellationEvent::Handled);
+                } else {
+                    pane.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+                }
+                let AppEvent::SubmitThreadOp { thread_id, op } =
+                    rx.try_recv().expect("targeted approval cancellation")
+                else {
+                    panic!("expected targeted approval response");
+                };
+                assert_eq!(thread_id, thread);
+                assert_eq!(
+                    op,
+                    Op::ExecApproval {
+                        id: call_id.to_string(),
+                        turn_id: None,
+                        decision: CommandExecutionApprovalDecision::Cancel,
+                    }
+                );
+                assert!(
+                    rx.try_recv().is_err(),
+                    "cancelling one request must not affect another"
+                );
+            }
+            assert!(
+                !pane.has_active_view(),
+                "all requests individually resolved"
+            );
         }
     }
 

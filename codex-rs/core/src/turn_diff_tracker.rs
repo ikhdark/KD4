@@ -737,19 +737,8 @@ pub(crate) async fn resolve_patch_index_modes(
         }
         #[cfg(test)]
         PATCH_MODE_QUERY_COUNT.with(|count| count.set(count.get() + 1));
-        let output = tokio::process::Command::new("git")
-            .arg("--literal-pathspecs")
-            .arg("-C")
-            .arg(&root)
-            .args(["ls-files", "--stage", "-z", "--"])
-            .args(&paths[start..end])
-            .kill_on_drop(true)
-            .output()
-            .await;
-        if let Ok(output) = output
-            && output.status.success()
-        {
-            for record in output.stdout.split(|byte| *byte == 0) {
+        if let Some(output) = codex_git_utils::git_index_entries(&root, &paths[start..end]).await {
+            for record in output.split(|byte| *byte == 0) {
                 let Some(tab) = record.iter().position(|byte| *byte == b'\t') else {
                     continue;
                 };

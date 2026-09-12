@@ -124,7 +124,7 @@ struct WrapCache {
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct TextAreaState {
     /// Index into wrapped lines of the first visible line.
-    scroll: u16,
+    scroll: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -403,7 +403,10 @@ impl TextArea {
     }
 
     pub fn desired_height(&self, width: u16) -> u16 {
-        self.wrapped_lines(width).len() as u16
+        self.wrapped_lines(width)
+            .len()
+            .try_into()
+            .unwrap_or(u16::MAX)
     }
 
     #[cfg(test)]
@@ -413,15 +416,18 @@ impl TextArea {
 
     /// Compute the on-screen cursor position taking scrolling into account.
     pub fn cursor_pos_with_state(&self, area: Rect, state: TextAreaState) -> Option<(u16, u16)> {
+        if area.is_empty() {
+            return None;
+        }
         let lines = self.wrapped_lines(area.width);
         let effective_scroll = self.effective_scroll(area.height, &lines, state.scroll);
         let i = Self::wrapped_line_index_by_start(&lines, self.cursor_pos)?;
         let ls = &lines[i];
-        let col = self.text[ls.start..self.cursor_pos].width() as u16;
-        let screen_row = i
-            .saturating_sub(effective_scroll as usize)
-            .try_into()
-            .unwrap_or(0);
+        // Wrapped ranges retain trailing spaces, so their display width can exceed the viewport.
+        let col = self.text[ls.start..self.cursor_pos]
+            .width()
+            .min(usize::from(area.width - 1)) as u16;
+        let screen_row: u16 = i.saturating_sub(effective_scroll).try_into().ok()?;
         Some((area.x + col, area.y + screen_row))
     }
 
@@ -1844,9 +1850,10 @@ impl TextArea {
         &self,
         area_height: u16,
         lines: &[Range<usize>],
-        current_scroll: u16,
-    ) -> u16 {
-        let total_lines = lines.len() as u16;
+        current_scroll: usize,
+    ) -> usize {
+        let area_height = usize::from(area_height);
+        let total_lines = lines.len();
         if area_height >= total_lines {
             return 0;
         }
@@ -1854,7 +1861,7 @@ impl TextArea {
         // Where is the cursor within wrapped lines? Prefer assigning boundary positions
         // (where pos equals the start of a wrapped line) to that later line.
         let cursor_line_idx =
-            Self::wrapped_line_index_by_start(lines, self.cursor_pos).unwrap_or(0) as u16;
+            Self::wrapped_line_index_by_start(lines, self.cursor_pos).unwrap_or(0);
 
         let max_scroll = total_lines.saturating_sub(area_height);
         let mut scroll = current_scroll.min(max_scroll);
@@ -1872,7 +1879,8 @@ impl TextArea {
 impl WidgetRef for &TextArea {
     fn render_ref(&self, area: Rect, buf: &mut Buffer) {
         let lines = self.wrapped_lines(area.width);
-        self.render_lines(area, buf, &lines, 0..lines.len(), Style::default(), &[]);
+        let end = lines.len().min(usize::from(area.height));
+        self.render_lines(area, buf, &lines, 0..end, Style::default(), &[]);
     }
 }
 
@@ -1884,8 +1892,10 @@ impl StatefulWidgetRef for &TextArea {
         let scroll = self.effective_scroll(area.height, &lines, state.scroll);
         state.scroll = scroll;
 
-        let start = scroll as usize;
-        let end = (scroll + area.height).min(lines.len() as u16) as usize;
+        let start = scroll;
+        let end = scroll
+            .saturating_add(usize::from(area.height))
+            .min(lines.len());
         self.render_lines(area, buf, &lines, start..end, Style::default(), &[]);
     }
 }
@@ -1902,8 +1912,10 @@ impl TextArea {
         let scroll = self.effective_scroll(area.height, &lines, state.scroll);
         state.scroll = scroll;
 
-        let start = scroll as usize;
-        let end = (scroll + area.height).min(lines.len() as u16) as usize;
+        let start = scroll;
+        let end = scroll
+            .saturating_add(usize::from(area.height))
+            .min(lines.len());
         self.render_lines_masked(area, buf, &lines, start..end, mask_char);
     }
 
@@ -1923,8 +1935,10 @@ impl TextArea {
         let scroll = self.effective_scroll(area.height, &lines, state.scroll);
         state.scroll = scroll;
 
-        let start = scroll as usize;
-        let end = (scroll + area.height).min(lines.len() as u16) as usize;
+        let start = scroll;
+        let end = scroll
+            .saturating_add(usize::from(area.height))
+            .min(lines.len());
         self.render_lines(area, buf, &lines, start..end, base_style, highlights);
     }
 
@@ -1943,7 +1957,13 @@ impl TextArea {
             let line_range = r.start..r.end - 1;
             buf.set_style(Rect::new(area.x, y, area.width, 1), base_style);
             // Draw base line with the provided style.
-            buf.set_string(area.x, y, &self.text[line_range.clone()], base_style);
+            buf.set_stringn(
+                area.x,
+                y,
+                &self.text[line_range.clone()],
+                usize::from(area.width),
+                base_style,
+            );
 
             // Overlay styled segments for elements that intersect this line.
             for elem in &self.elements {
@@ -1954,9 +1974,18 @@ impl TextArea {
                     continue;
                 }
                 let styled = &self.text[overlap_start..overlap_end];
-                let x_off = self.text[line_range.start..overlap_start].width() as u16;
+                let x_off = self.text[line_range.start..overlap_start].width();
+                if x_off >= usize::from(area.width) {
+                    continue;
+                }
                 let style = base_style.fg(Color::Cyan);
-                buf.set_string(area.x + x_off, y, styled, style);
+                buf.set_stringn(
+                    area.x + x_off as u16,
+                    y,
+                    styled,
+                    usize::from(area.width) - x_off,
+                    style,
+                );
             }
 
             // Overlay render-only highlight ranges last so transient search highlighting remains
@@ -1968,8 +1997,17 @@ impl TextArea {
                     continue;
                 }
                 let highlighted = &self.text[overlap_start..overlap_end];
-                let x_off = self.text[line_range.start..overlap_start].width() as u16;
-                buf.set_string(area.x + x_off, y, highlighted, *style);
+                let x_off = self.text[line_range.start..overlap_start].width();
+                if x_off >= usize::from(area.width) {
+                    continue;
+                }
+                buf.set_stringn(
+                    area.x + x_off as u16,
+                    y,
+                    highlighted,
+                    usize::from(area.width) - x_off,
+                    *style,
+                );
             }
         }
     }
@@ -1990,7 +2028,13 @@ impl TextArea {
                 .chars()
                 .map(|_| mask_char)
                 .collect::<String>();
-            buf.set_string(area.x, y, &masked, Style::default());
+            buf.set_stringn(
+                area.x,
+                y,
+                &masked,
+                usize::from(area.width),
+                Style::default(),
+            );
         }
     }
 }
@@ -3395,7 +3439,113 @@ mod tests {
         ratatui::widgets::StatefulWidgetRef::render_ref(&(&t), small_area, &mut buf, &mut state);
         // After render, state.scroll should be adjusted so cursor row fits
         let effective_lines = t.desired_height(small_area.width);
-        assert!(state.scroll < effective_lines);
+        assert!(state.scroll < usize::from(effective_lines));
+    }
+
+    #[test]
+    fn stateless_render_keeps_text_inside_its_assigned_rows() {
+        let mut textarea = TextArea::new();
+        textarea.insert_str("first\nsecond\nthird");
+        let outer = Rect::new(0, 0, 8, 4);
+        let mut buf = Buffer::empty(outer);
+        for y in 0..4 {
+            buf.set_string(0, y, "........", Style::default());
+        }
+        WidgetRef::render_ref(&(&textarea), Rect::new(1, 1, 6, 1), &mut buf);
+        let rows: Vec<String> = (0..4)
+            .map(|y| (0..8).map(|x| buf[(x, y)].symbol()).collect())
+            .collect();
+        assert_eq!(rows, ["........", ".first..", "........", "........"]);
+        let before_empty_render = buf.clone();
+        WidgetRef::render_ref(&(&textarea), Rect::new(1, 1, 6, 0), &mut buf);
+        assert_eq!(buf, before_empty_render);
+        assert_eq!(textarea.text(), "first\nsecond\nthird");
+    }
+
+    #[test]
+    fn trailing_spaces_keep_rendering_and_cursor_inside_assigned_columns() {
+        let mut textarea = TextArea::new();
+        textarea.insert_str(&format!("x{}", " ".repeat(65_535)));
+        textarea.insert_element(" ");
+        let original_text = textarea.text().to_string();
+        let area = Rect::new(1, 1, 6, 1);
+        for mode in 0..4 {
+            let mut buf = Buffer::empty(Rect::new(0, 0, 8, 3));
+            for y in 0..3 {
+                buf.set_string(0, y, "........", Style::default());
+            }
+            let mut state = TextAreaState::default();
+            match mode {
+                0 => WidgetRef::render_ref(&(&textarea), area, &mut buf),
+                1 => StatefulWidgetRef::render_ref(&(&textarea), area, &mut buf, &mut state),
+                2 => textarea.render_ref_masked(area, &mut buf, &mut state, '*'),
+                _ => textarea.render_ref_styled_with_highlights(
+                    area,
+                    &mut buf,
+                    &mut state,
+                    Style::default(),
+                    &[(65_536..65_537, Style::default().fg(Color::Red))],
+                ),
+            }
+            let rows: Vec<String> = (0..3)
+                .map(|y| (0..8).map(|x| buf[(x, y)].symbol()).collect())
+                .collect();
+            assert_eq!(
+                rows,
+                [
+                    "........",
+                    if mode == 2 { ".******." } else { ".x     ." },
+                    "........"
+                ]
+            );
+            assert_eq!(buf[(1, 1)].fg, Color::Reset);
+            assert_eq!(textarea.cursor_pos_with_state(area, state), Some((6, 1)));
+            assert_eq!(textarea.text(), original_text);
+        }
+        assert_eq!(textarea.cursor_pos(Rect::new(1, 1, 0, 1)), None);
+        assert_eq!(textarea.cursor_pos(Rect::new(1, 1, 6, 0)), None);
+    }
+
+    #[test]
+    fn large_text_scrolls_to_cursor_in_every_stateful_render_path() {
+        let prefix = "x\n".repeat(65_536);
+        let text = format!("{prefix}tail");
+        let mut textarea = TextArea::new();
+        textarea.insert_str(&text);
+        let area = Rect::new(0, 0, 8, 2);
+
+        assert_eq!(textarea.desired_height(area.width), u16::MAX);
+        for mode in 0..3 {
+            let mut state = TextAreaState::default();
+            let mut buf = Buffer::empty(area);
+            match mode {
+                0 => StatefulWidgetRef::render_ref(&(&textarea), area, &mut buf, &mut state),
+                1 => textarea.render_ref_masked(area, &mut buf, &mut state, '*'),
+                _ => textarea.render_ref_styled_with_highlights(
+                    area,
+                    &mut buf,
+                    &mut state,
+                    Style::default(),
+                    &[(prefix.len()..text.len(), Style::default().fg(Color::Red))],
+                ),
+            }
+            let tail: String = (0..4).map(|x| buf[(x, 1)].symbol()).collect();
+            assert_eq!(tail, if mode == 1 { "****" } else { "tail" });
+            assert_eq!(state.scroll, 65_535);
+            assert_eq!(textarea.cursor_pos_with_state(area, state), Some((4, 1)));
+            if mode == 2 {
+                assert_eq!(buf[(0, 1)].fg, Color::Red);
+            }
+        }
+
+        textarea.set_cursor(0);
+        let mut state = TextAreaState { scroll: 65_535 };
+        let mut buf = Buffer::empty(area);
+        StatefulWidgetRef::render_ref(&(&textarea), area, &mut buf, &mut state);
+        assert_eq!(state.scroll, 0);
+        assert_eq!(buf[(0, 0)].symbol(), "x");
+        assert_eq!(textarea.cursor_pos_with_state(area, state), Some((0, 0)));
+        assert_eq!(textarea.text(), text);
     }
 
     #[test]
@@ -3470,7 +3620,7 @@ mod tests {
         t.set_cursor(/*pos*/ 1);
         let area = Rect::new(0, 0, wrap_width, 3);
         let state = TextAreaState {
-            scroll: lines.saturating_mul(2),
+            scroll: usize::from(lines).saturating_mul(2),
         };
         let (_x, y) = t.cursor_pos_with_state(area, state).unwrap();
         assert_eq!(y, area.y);

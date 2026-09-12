@@ -346,13 +346,7 @@ fn copy_from_source_if_needed(source: &Path, destination: &Path) -> Result<CopyO
         .with_context(|| format!("flush temporary helper file {}", temp_path_buf.display()))?;
     drop(temp_file);
 
-    if destination.exists() {
-        fs::remove_file(destination).with_context(|| {
-            format!("remove stale helper destination {}", destination.display())
-        })?;
-    }
-
-    match fs::rename(&temp_path_buf, destination) {
+    match replace_helper_file(&temp_path_buf, destination) {
         Ok(()) => Ok(CopyOutcome::ReCopied),
         Err(rename_err) => {
             if destination_is_fresh(source, destination)? {
@@ -368,6 +362,11 @@ fn copy_from_source_if_needed(source: &Path, destination: &Path) -> Result<CopyO
             }
         }
     }
+}
+
+fn replace_helper_file(temp_path: &Path, destination: &Path) -> std::io::Result<()> {
+    // Replace in one operation so a failed rename leaves the previous helper intact.
+    fs::rename(temp_path, destination)
 }
 
 fn destination_is_fresh(source: &Path, destination: &Path) -> Result<bool> {
@@ -413,13 +412,20 @@ mod tests {
     use super::helper_bin_dir;
     use super::helper_version_suffix;
     use super::materialized_file_name;
-    use super::resolve_exe_for_launch_with_status;
+    use super::replace_helper_file;
     use super::store_helper_path;
+    use crate::resolve_exe_for_launch_with_status;
     use pretty_assertions::assert_eq;
     use std::fs;
+    use std::io::Read;
+    use std::os::windows::fs::OpenOptionsExt;
     use std::path::Path;
     use std::path::PathBuf;
+    use std::sync::Barrier;
     use tempfile::TempDir;
+    use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_DELETE;
+    use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+    use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_WRITE;
 
     #[test]
     fn copy_from_source_if_needed_copies_missing_destination() {
@@ -498,6 +504,179 @@ mod tests {
         assert_eq!(first_path, second_path);
         assert_eq!(HelperMaterializationStatus::ReCopied, first_status);
         assert_eq!(HelperMaterializationStatus::Reused, second_status);
+    }
+
+    #[test]
+    fn failed_helper_replacement_preserves_existing_destination() {
+        let tmp = TempDir::new().expect("tempdir");
+        let destination = tmp.path().join("helper.exe");
+        let staged = tmp.path().join("staged.exe");
+        fs::write(&destination, b"previous helper").expect("write destination");
+        fs::write(&staged, b"replacement helper").expect("write staged helper");
+        // A reader that does not share DELETE prevents renaming the staged file.
+        let reader = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(&staged)
+            .expect("lock staged helper against rename");
+
+        let result = replace_helper_file(&staged, &destination);
+
+        assert!(
+            result.is_err(),
+            "replacement must fail while staged file is locked"
+        );
+        assert_eq!(
+            fs::read(&destination).expect("read old helper"),
+            b"previous helper"
+        );
+        assert_eq!(
+            fs::read(&staged).expect("read staged helper"),
+            b"replacement helper"
+        );
+        drop(reader);
+    }
+
+    #[test]
+    fn public_resolution_replaces_stale_helper_and_cleans_temporary_file() {
+        let tmp = TempDir::new().expect("tempdir");
+        let source = tmp.path().join("source.exe");
+        let codex_home = tmp.path().join("codex-home");
+        fs::write(&source, b"old").expect("write source");
+        let (destination, _) = resolve_exe_for_launch_with_status(&source, &codex_home);
+        fs::write(&source, b"replacement helper").expect("update source");
+
+        let (resolved, status) = resolve_exe_for_launch_with_status(&source, &codex_home);
+
+        assert_eq!(resolved, destination);
+        assert_eq!(status, HelperMaterializationStatus::ReCopied);
+        assert_eq!(
+            fs::read(&resolved).expect("read replacement"),
+            b"replacement helper"
+        );
+        let entries = fs::read_dir(helper_bin_dir(&codex_home))
+            .expect("read helper directory")
+            .map(|entry| entry.expect("helper directory entry").path())
+            .collect::<Vec<_>>();
+        assert_eq!(entries, vec![destination]);
+    }
+
+    #[test]
+    fn public_resolution_preserves_locked_helper_and_cleans_temporary_file() {
+        let tmp = TempDir::new().expect("tempdir");
+        let source = tmp.path().join("source.exe");
+        let codex_home = tmp.path().join("codex-home");
+        fs::write(&source, b"old").expect("write source");
+        let (destination, _) = resolve_exe_for_launch_with_status(&source, &codex_home);
+        let reader = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(&destination)
+            .expect("lock existing helper against replacement");
+        fs::write(&source, b"replacement helper").expect("update source");
+
+        let (resolved, status) = resolve_exe_for_launch_with_status(&source, &codex_home);
+
+        assert_eq!(resolved, source);
+        assert_eq!(status, HelperMaterializationStatus::SourceFallback);
+        assert_eq!(fs::read(&destination).expect("read old helper"), b"old");
+        assert_eq!(
+            fs::read(&resolved).expect("read fallback helper"),
+            b"replacement helper"
+        );
+        let entries = fs::read_dir(helper_bin_dir(&codex_home))
+            .expect("read helper directory")
+            .map(|entry| entry.expect("helper directory entry").path())
+            .collect::<Vec<_>>();
+        assert_eq!(entries, vec![destination.clone()]);
+        drop(reader);
+
+        let (resolved, status) = resolve_exe_for_launch_with_status(&source, &codex_home);
+        assert_eq!(resolved, destination);
+        assert_eq!(status, HelperMaterializationStatus::ReCopied);
+        assert_eq!(
+            fs::read(&resolved).expect("read recovered helper"),
+            b"replacement helper"
+        );
+    }
+
+    #[test]
+    fn public_resolution_replaces_helper_while_shared_reader_keeps_old_contents() {
+        let tmp = TempDir::new().expect("tempdir");
+        let source = tmp.path().join("source.exe");
+        let codex_home = tmp.path().join("codex-home");
+        fs::write(&source, b"old").expect("write source");
+        let (destination, status) = resolve_exe_for_launch_with_status(&source, &codex_home);
+        assert_eq!(status, HelperMaterializationStatus::ReCopied);
+        let mut reader = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .open(&destination)
+            .expect("open shared helper reader");
+        fs::write(&source, b"replacement helper").expect("update source");
+
+        let (resolved, status) = resolve_exe_for_launch_with_status(&source, &codex_home);
+
+        assert_eq!(resolved, destination);
+        assert_eq!(status, HelperMaterializationStatus::ReCopied);
+        assert_eq!(
+            fs::read(&resolved).expect("read replacement helper"),
+            b"replacement helper"
+        );
+        let mut previous_contents = Vec::new();
+        reader
+            .read_to_end(&mut previous_contents)
+            .expect("read previous helper through open handle");
+        assert_eq!(previous_contents, b"old");
+        let entries = fs::read_dir(helper_bin_dir(&codex_home))
+            .expect("read helper directory")
+            .map(|entry| entry.expect("helper directory entry").path())
+            .collect::<Vec<_>>();
+        assert_eq!(entries, vec![destination]);
+    }
+
+    #[test]
+    fn public_resolution_concurrent_replacements_return_complete_helpers() {
+        let tmp = TempDir::new().expect("tempdir");
+        let source = tmp.path().join("source.exe");
+        let codex_home = tmp.path().join("codex-home");
+        fs::write(&source, b"old").expect("write source");
+        let (destination, status) = resolve_exe_for_launch_with_status(&source, &codex_home);
+        assert_eq!(status, HelperMaterializationStatus::ReCopied);
+        let replacement = vec![0x5a; 1024 * 1024];
+        fs::write(&source, &replacement).expect("update source");
+        let start = Barrier::new(8);
+
+        std::thread::scope(|scope| {
+            let workers = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        start.wait();
+                        let (resolved, status) =
+                            resolve_exe_for_launch_with_status(&source, &codex_home);
+                        assert_eq!(resolved, destination);
+                        assert!(matches!(
+                            status,
+                            HelperMaterializationStatus::ReCopied
+                                | HelperMaterializationStatus::Reused
+                        ));
+                        assert_eq!(
+                            fs::read(&resolved).expect("read concurrently resolved helper"),
+                            replacement
+                        );
+                    })
+                })
+                .collect::<Vec<_>>();
+            for worker in workers {
+                worker.join().expect("helper resolution worker");
+            }
+        });
+
+        let entries = fs::read_dir(helper_bin_dir(&codex_home))
+            .expect("read helper directory")
+            .map(|entry| entry.expect("helper directory entry").path())
+            .collect::<Vec<_>>();
+        assert_eq!(entries, vec![destination]);
     }
 
     #[test]

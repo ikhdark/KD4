@@ -4,7 +4,6 @@ use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
-use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::protocol::ReviewRequest;
 use codex_protocol::protocol::ReviewTarget;
 use core_test_support::responses::ev_apply_patch_custom_tool_call;
@@ -24,56 +23,74 @@ use core_test_support::wait_for_event_with_timeout;
 use pretty_assertions::assert_eq;
 use std::time::Duration;
 
-/// Delegate should surface ExecApprovalRequest from sub-agent and proceed
-/// after parent submits an approval decision.
-#[ignore = "TODO once we have a delegate that can ask for approvals"]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn codex_delegate_forwards_exec_approval_and_proceeds_on_approval() {
-    skip_if_no_network!();
+async fn assert_review_completes_without_approval(
+    codex: &codex_core::CodexThread,
+    explanation: &str,
+) {
+    let mut entered = false;
+    let mut exited = false;
+    loop {
+        match wait_for_event_with_timeout(codex, |_| true, Duration::from_secs(30)).await {
+            EventMsg::EnteredReviewMode(_) => entered = true,
+            EventMsg::ExecApprovalRequest(_) | EventMsg::ApplyPatchApprovalRequest(_) => {
+                panic!("the review child must honor its Never policy without asking the parent");
+            }
+            EventMsg::ExitedReviewMode(event) => {
+                let output = event
+                    .review_output
+                    .expect("review returns its final result");
+                assert_eq!(output.overall_explanation, explanation);
+                exited = true;
+            }
+            EventMsg::TurnComplete(_) => break,
+            _ => {}
+        }
+    }
+    assert!(entered && exited, "the real review lifecycle must complete");
+}
 
-    // Sub-agent turn 1: emit a shell_command function_call requiring approval, then complete.
+/// Review children reject escalation even when the parent permits approval prompts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_delegate_review_rejects_exec_escalation_without_parent_approval() {
     let call_id = "call-exec-1";
     let args = serde_json::json!({
-        "command": "rm -rf delegated",
+        "command": "echo forbidden > delegated.txt",
         "timeout_ms": 1000,
         "sandbox_permissions": SandboxPermissions::RequireEscalated,
     })
     .to_string();
-    let sse1 = sse(vec![
-        ev_response_created("resp-1"),
-        ev_function_call(call_id, "shell_command", &args),
-        ev_completed("resp-1"),
-    ]);
-
-    // Sub-agent turn 2: return structured review output and complete.
     let review_json = serde_json::json!({
         "findings": [],
         "overall_correctness": "ok",
-        "overall_explanation": "delegate approved exec",
+        "overall_explanation": "exec escalation rejected",
         "overall_confidence_score": 0.5
     })
     .to_string();
-    let sse2 = sse(vec![
-        ev_response_created("resp-2"),
-        ev_assistant_message("msg-1", &review_json),
-        ev_completed("resp-2"),
-    ]);
-
     let server = start_mock_server().await;
-    mount_sse_sequence(&server, vec![sse1, sse2]).await;
-
-    // Build a conversation configured to require approvals so the delegate
-    // routes ExecApprovalRequest via the parent.
+    let responses = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-1"),
+                ev_function_call(call_id, "shell_command", &args),
+                ev_completed("resp-1"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-2"),
+                ev_assistant_message("msg-1", &review_json),
+                ev_completed("resp-2"),
+            ]),
+        ],
+    )
+    .await;
     let mut builder = test_codex().with_model("gpt-5.4").with_config(|config| {
         config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
         config
             .permissions
             .set_permission_profile(PermissionProfile::read_only())
-            .expect("set permission profile");
+            .unwrap();
     });
     let test = builder.build(&server).await.expect("build test codex");
-
-    // Kick off review (sub-agent starts internally).
     test.codex
         .submit(Op::Review {
             review_request: ReviewRequest {
@@ -85,79 +102,42 @@ async fn codex_delegate_forwards_exec_approval_and_proceeds_on_approval() {
         })
         .await
         .expect("submit review");
-
-    // Lifecycle: Entered -> ExecApprovalRequest -> Exited(Some) -> TurnComplete.
-    wait_for_event(&test.codex, |ev| {
-        matches!(ev, EventMsg::EnteredReviewMode(_))
-    })
-    .await;
-
-    // Expect parent-side approval request (forwarded by delegate).
-    let approval_event = wait_for_event(&test.codex, |ev| {
-        matches!(ev, EventMsg::ExecApprovalRequest(_))
-    })
-    .await;
-    let EventMsg::ExecApprovalRequest(approval) = approval_event else {
-        panic!("expected ExecApprovalRequest event");
-    };
-
-    // Approve via parent using the emitted approval call ID.
-    test.codex
-        .submit(Op::ExecApproval {
-            id: approval.effective_approval_id(),
-            turn_id: None,
-            decision: ReviewDecision::Approved,
-        })
-        .await
-        .expect("submit exec approval");
-
-    wait_for_event(&test.codex, |ev| {
-        matches!(ev, EventMsg::ExitedReviewMode(_))
-    })
-    .await;
-    wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    assert_review_completes_without_approval(&test.codex, "exec escalation rejected").await;
+    let requests = responses.requests();
+    assert_eq!(requests.len(), 2);
+    let output = requests[1]
+        .function_call_output_text(call_id)
+        .expect("rejected exec reaches model");
+    assert_eq!(
+        output,
+        "independent reviewers cannot request shell sandbox overrides or additional permissions"
+    );
+    assert!(!test.cwd.path().join("delegated.txt").exists());
 }
 
-/// Delegate should surface ApplyPatchApprovalRequest and honor parent decision
-/// so the sub-agent can proceed to completion.
-#[ignore = "TODO once we have a delegate that can ask for approvals"]
+/// Review children reject writes in a read-only sandbox without asking the parent.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn codex_delegate_forwards_patch_approval_and_proceeds_on_decision() {
-    skip_if_no_network!();
-
+async fn codex_delegate_review_rejects_patch_without_parent_approval() {
     let call_id = "call-patch-1";
     let patch = "*** Begin Patch\n*** Add File: delegated.txt\n+hello\n*** End Patch\n";
-    let sse1 = sse(vec![
-        ev_response_created("resp-1"),
-        ev_apply_patch_custom_tool_call(call_id, patch),
-        ev_completed("resp-1"),
-    ]);
-    let review_json = serde_json::json!({
-        "findings": [],
-        "overall_correctness": "ok",
-        "overall_explanation": "delegate patch handled",
-        "overall_confidence_score": 0.5
-    })
-    .to_string();
-    let sse2 = sse(vec![
-        ev_response_created("resp-2"),
-        ev_assistant_message("msg-1", &review_json),
-        ev_completed("resp-2"),
-    ]);
-
     let server = start_mock_server().await;
-    mount_sse_sequence(&server, vec![sse1, sse2]).await;
-
+    let responses = mount_sse_sequence(
+        &server,
+        vec![sse(vec![
+            ev_response_created("resp-1"),
+            ev_apply_patch_custom_tool_call(call_id, patch),
+            ev_completed("resp-1"),
+        ])],
+    )
+    .await;
     let mut builder = test_codex().with_model("gpt-5.4").with_config(|config| {
         config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
-        // Use a restricted sandbox so patch approval is required
         config
             .permissions
             .set_permission_profile(PermissionProfile::read_only())
-            .expect("set permission profile");
+            .unwrap();
     });
     let test = builder.build(&server).await.expect("build test codex");
-
     test.codex
         .submit(Op::Review {
             review_request: ReviewRequest {
@@ -169,33 +149,15 @@ async fn codex_delegate_forwards_patch_approval_and_proceeds_on_decision() {
         })
         .await
         .expect("submit review");
-
-    wait_for_event(&test.codex, |ev| {
-        matches!(ev, EventMsg::EnteredReviewMode(_))
-    })
-    .await;
-    let approval_event = wait_for_event(&test.codex, |ev| {
-        matches!(ev, EventMsg::ApplyPatchApprovalRequest(_))
-    })
-    .await;
-    let EventMsg::ApplyPatchApprovalRequest(approval) = approval_event else {
-        panic!("expected ApplyPatchApprovalRequest event");
-    };
-
-    // Deny via parent so delegate can continue, using the emitted approval call ID.
-    test.codex
-        .submit(Op::PatchApproval {
-            id: approval.call_id,
-            decision: ReviewDecision::Denied,
-        })
-        .await
-        .expect("submit patch approval");
-
-    wait_for_event(&test.codex, |ev| {
-        matches!(ev, EventMsg::ExitedReviewMode(_))
-    })
-    .await;
-    wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    assert_review_completes_without_approval(&test.codex, "required tool `apply_patch` blocked")
+        .await;
+    let requests = responses.requests();
+    assert_eq!(
+        requests.len(),
+        1,
+        "required mutation denial ends the review without another model call"
+    );
+    assert!(!test.cwd.path().join("delegated.txt").exists());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

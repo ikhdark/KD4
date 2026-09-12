@@ -323,26 +323,24 @@ pub(crate) fn apply_legacy_session_acl_rules(
                     .with_context(|| format!("add required deny-write ACL for {}", p.display()))?;
             }
         }
-        if !additional_deny_read_paths.is_empty() {
-            if let Some(readonly_sid) = acl_sids.readonly_sid {
-                let Some(readonly_sid_str) = acl_sids.readonly_sid_str else {
-                    anyhow::bail!("readonly capability SID string missing");
-                };
+        if let Some(readonly_sid) = acl_sids.readonly_sid {
+            let Some(readonly_sid_str) = acl_sids.readonly_sid_str else {
+                anyhow::bail!("readonly capability SID string missing");
+            };
+            sync_persistent_deny_read_acls(
+                codex_home,
+                readonly_sid_str,
+                additional_deny_read_paths,
+                readonly_sid.as_ptr(),
+            )?;
+        } else {
+            for root_sid in acl_sids.write_root_sids {
                 sync_persistent_deny_read_acls(
                     codex_home,
-                    readonly_sid_str,
+                    &root_sid.sid_str,
                     additional_deny_read_paths,
-                    readonly_sid.as_ptr(),
+                    root_sid.sid.as_ptr(),
                 )?;
-            } else {
-                for root_sid in acl_sids.write_root_sids {
-                    sync_persistent_deny_read_acls(
-                        codex_home,
-                        &root_sid.sid_str,
-                        additional_deny_read_paths,
-                        root_sid.sid.as_ptr(),
-                    )?;
-                }
             }
         }
         for root_sid in acl_sids.write_root_sids {
@@ -512,6 +510,51 @@ mod tests {
 
     fn workspace_roots_for(root: &Path) -> Vec<AbsolutePathBuf> {
         vec![AbsolutePathBuf::from_absolute_path(root).expect("absolute workspace root")]
+    }
+
+    #[test]
+    fn legacy_acl_rules_revoke_persistent_denies_when_profile_becomes_empty() -> anyhow::Result<()>
+    {
+        let home = TempDir::new()?;
+        let workspace = TempDir::new()?;
+        let secret = workspace.path().join("secret.txt");
+        std::fs::write(&secret, b"preserved secret")?;
+        let principal = load_or_create_cap_sids(home.path())?.readonly;
+        let sid = crate::token::LocalSid::from_string(&principal)?;
+        let permissions = ResolvedWindowsSandboxPermissions::try_from_permission_profile(
+            &PermissionProfile::read_only(),
+        )?;
+        let has_deny = || -> anyhow::Result<bool> {
+            // SAFETY: secret exists and LocalSid owns the SID; inspect before
+            // freeing the returned descriptor backing the DACL.
+            unsafe {
+                let (dacl, descriptor) = crate::acl::fetch_dacl_handle(&secret)?;
+                let result = crate::acl::dacl_has_read_deny_for_sid(dacl, sid.as_ptr());
+                if !descriptor.is_null() {
+                    windows_sys::Win32::Foundation::LocalFree(descriptor);
+                }
+                Ok(result)
+            }
+        };
+        assert!(!has_deny()?);
+        for (paths, expected_deny) in [(vec![secret.clone()], true), (Vec::new(), false)] {
+            super::apply_legacy_session_acl_rules(
+                &permissions,
+                home.path(),
+                workspace.path(),
+                &HashMap::new(),
+                &paths,
+                &[],
+                super::LegacyAclSids {
+                    readonly_sid: Some(&sid),
+                    readonly_sid_str: Some(&principal),
+                    write_root_sids: &[],
+                },
+            )?;
+            assert_eq!(has_deny()?, expected_deny);
+        }
+        assert_eq!(std::fs::read(&secret)?, b"preserved secret");
+        Ok(())
     }
 
     #[test]
@@ -761,5 +804,76 @@ mod tests {
         assert!(roots.contains(&dunce::canonicalize(&active_root).expect("active root")));
         assert!(!roots.contains(&dunce::canonicalize(&codex_home).expect("codex home")));
         assert!(!roots.contains(&dunce::canonicalize(&sandbox_root).expect("sandbox root")));
+    }
+
+    #[test]
+    fn legacy_acl_admission_propagates_required_native_write_failure() -> anyhow::Result<()> {
+        use crate::acl::native_deny_write_test;
+        use crate::acl::native_deny_write_test::Stage;
+        use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
+        for (stage, operation) in [
+            (Stage::Entries, "SetEntriesInAclW"),
+            (Stage::Security, "SetNamedSecurityInfoW"),
+        ] {
+            let home = TempDir::new()?;
+            let workspace = TempDir::new()?;
+            let protected = workspace.path().join("protected");
+            std::fs::write(&protected, b"protected contents")?;
+            let roots = workspace_roots_for(workspace.path());
+            let profile = workspace_profile(NetworkSandboxPolicy::Restricted, &roots, true, true);
+            let permissions =
+                ResolvedWindowsSandboxPermissions::try_from_permission_profile_for_workspace_roots(
+                    &profile, &roots,
+                )?;
+            let root_sids = root_capability_sids(
+                home.path(),
+                workspace.path(),
+                vec![workspace.path().to_path_buf()],
+            )?;
+            assert_eq!(root_sids.len(), 1);
+            let has_write_deny = || -> anyhow::Result<bool> {
+                unsafe {
+                    let (dacl, descriptor) = crate::acl::fetch_dacl_handle(&protected)?;
+                    let denied =
+                        crate::acl::dacl_has_write_deny_for_sid(dacl, root_sids[0].sid.as_ptr());
+                    windows_sys::Win32::Foundation::LocalFree(descriptor);
+                    Ok(denied)
+                }
+            };
+            assert!(!has_write_deny()?);
+            let prepare = || {
+                super::apply_legacy_session_acl_rules(
+                    &permissions,
+                    home.path(),
+                    workspace.path(),
+                    &HashMap::new(),
+                    &[],
+                    &[protected.clone()],
+                    super::LegacyAclSids {
+                        readonly_sid: None,
+                        readonly_sid_str: None,
+                        write_root_sids: &root_sids,
+                    },
+                )
+            };
+            let error =
+                native_deny_write_test::with_error(&protected, stage, ERROR_ACCESS_DENIED, prepare)
+                    .expect_err(
+                        "required deny-write failure must reject native admission preparation",
+                    );
+            assert!(format!("{error:#}").contains(operation), "{error:#}");
+            assert!(error.chain().any(|cause| {
+                cause
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|io| io.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32))
+            }));
+            assert!(!has_write_deny()?);
+            assert_eq!(std::fs::read(&protected)?, b"protected contents");
+            // Same real caller succeeds once the external Windows error clears.
+            prepare()?;
+            assert!(has_write_deny()?);
+            assert_eq!(std::fs::read(&protected)?, b"protected contents");
+        }
+        Ok(())
     }
 }

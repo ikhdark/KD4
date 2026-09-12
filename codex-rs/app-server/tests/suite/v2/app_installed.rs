@@ -140,11 +140,51 @@ async fn installed_apps_workspace_policy_retains_identities_as_disabled() -> Res
         let mut app_server = start_app_server(codex_home.path()).await?;
         send_installed_request(&mut app_server, /*force_refresh*/ true).await?
     };
-    let mut expected_disabled = committed;
-    for app in &mut expected_disabled.apps {
-        app.enabled = false;
-        app.callable = false;
-    }
+    assert_eq!(
+        committed.apps,
+        vec![
+            InstalledApp {
+                id: "alpha".to_string(),
+                runtime_name: Some("Alpha Tool Name".to_string()),
+                enabled: true,
+                callable: true,
+            },
+            InstalledApp {
+                id: "blocked".to_string(),
+                runtime_name: Some("Policy Blocked Tool Name".to_string()),
+                enabled: true,
+                callable: false,
+            },
+            InstalledApp {
+                id: "disabled".to_string(),
+                runtime_name: Some("Locally Disabled Tool Name".to_string()),
+                enabled: false,
+                callable: false,
+            },
+        ]
+    );
+    let expected_disabled = AppsInstalledResponse {
+        apps: vec![
+            InstalledApp {
+                id: "alpha".to_string(),
+                runtime_name: Some("Alpha Tool Name".to_string()),
+                enabled: false,
+                callable: false,
+            },
+            InstalledApp {
+                id: "blocked".to_string(),
+                runtime_name: Some("Policy Blocked Tool Name".to_string()),
+                enabled: false,
+                callable: false,
+            },
+            InstalledApp {
+                id: "disabled".to_string(),
+                runtime_name: Some("Locally Disabled Tool Name".to_string()),
+                enabled: false,
+                callable: false,
+            },
+        ],
+    };
 
     fixture.set_workspace_plugins_enabled(/*enabled*/ false);
     let mut app_server = start_app_server(codex_home.path()).await?;

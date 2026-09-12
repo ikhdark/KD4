@@ -2,6 +2,285 @@ use super::*;
 use codex_http_client::OutboundProxyPolicy;
 use pretty_assertions::assert_eq;
 
+#[tokio::test]
+async fn remote_marketplace_pagination_rejects_token_cycles() {
+    use wiremock::matchers::{method, path, query_param, query_param_is_missing};
+
+    for endpoint in [
+        "/ps/plugins/list",
+        "/ps/plugins/installed",
+        "/ps/plugins/workspace/shared",
+    ] {
+        for tokens in [
+            &["opaque A", "opaque A"][..],
+            &["opaque A", "opaque B", "opaque A"][..],
+        ] {
+            let server = wiremock::MockServer::start().await;
+            let config = RemotePluginServiceConfig::new(
+                server.uri(),
+                HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+            );
+            let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
+            let home = tempfile::tempdir().unwrap();
+            let other_endpoint = if endpoint == "/ps/plugins/installed" {
+                "/ps/plugins/list"
+            } else {
+                "/ps/plugins/installed"
+            };
+            wiremock::Mock::given(method("GET"))
+                .and(path(other_endpoint))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({
+                        "plugins": [], "pagination": {"next_page_token": null}
+                    }),
+                ))
+                .mount(&server)
+                .await;
+            for (index, token) in tokens.iter().enumerate() {
+                let request = wiremock::Mock::given(method("GET")).and(path(endpoint));
+                let request = if index == 0 {
+                    request.and(query_param_is_missing("pageToken"))
+                } else {
+                    request.and(query_param("pageToken", tokens[index - 1]))
+                };
+                request
+                    .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                        serde_json::json!({
+                            "plugins": [], "pagination": {"next_page_token": token}
+                        }),
+                    ))
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+            }
+            let source = if endpoint == "/ps/plugins/workspace/shared" {
+                RemoteMarketplaceSource::SharedWithMe
+            } else {
+                RemoteMarketplaceSource::Global
+            };
+            let result = tokio::time::timeout(
+                Duration::from_secs(2),
+                fetch_remote_marketplaces(&config, Some(&auth), &[source], Some(home.path())),
+            )
+            .await
+            .expect("a repeated token must terminate the catalog fetch");
+            let error = result.expect_err("a partial catalog must not be returned as complete");
+            assert_eq!(
+                error.error_data(),
+                PluginRemoteErrorData {
+                    reason: PluginRemoteErrorReason::InvalidResponse,
+                    retryable: false,
+                }
+            );
+            assert!(
+                matches!(error, RemotePluginCatalogError::UnexpectedResponse(message)
+                if message == "remote plugin catalog returned a repeated pagination token")
+            );
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|request| request.url.path() == endpoint)
+                    .count(),
+                tokens.len()
+            );
+            assert!(
+                fs::read_dir(home.path()).unwrap().next().is_none(),
+                "failed pagination must not cache a partial catalog"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn remote_marketplace_pagination_preserves_opaque_tokens_and_all_pages() {
+    use wiremock::matchers::{method, path, query_param, query_param_is_missing};
+
+    for endpoint in [
+        "/ps/plugins/list",
+        "/ps/plugins/installed",
+        "/ps/plugins/workspace/shared",
+    ] {
+        let server = wiremock::MockServer::start().await;
+        let config = RemotePluginServiceConfig::new(
+            server.uri(),
+            HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+        );
+        let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
+        let other_endpoint = if endpoint == "/ps/plugins/installed" {
+            "/ps/plugins/list"
+        } else {
+            "/ps/plugins/installed"
+        };
+        wiremock::Mock::given(method("GET"))
+            .and(path(other_endpoint))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "plugins": [], "pagination": {"next_page_token": null}
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        // Empty and whitespace-bearing tokens are distinct opaque values, not end markers.
+        for (index, (name, next_token)) in [
+            ("first", Some("")),
+            ("second", Some(" /+= opaque ")),
+            ("third", None),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let request = wiremock::Mock::given(method("GET")).and(path(endpoint));
+            let request = match index {
+                0 => request.and(query_param_is_missing("pageToken")),
+                1 => request.and(query_param("pageToken", "")),
+                _ => request.and(query_param("pageToken", " /+= opaque ")),
+            };
+            let mut plugin = directory_plugin(&format!("plugin-{name}"), name);
+            if endpoint == "/ps/plugins/workspace/shared" {
+                plugin.scope = RemotePluginScope::Workspace;
+                plugin.discoverability = Some(RemotePluginShareDiscoverability::Private);
+            }
+            let mut plugin = serde_json::to_value(plugin).unwrap();
+            if endpoint == "/ps/plugins/installed" {
+                plugin["enabled"] = serde_json::json!(true);
+            }
+            request
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({
+                        "plugins": [plugin], "pagination": {"next_page_token": next_token}
+                    }),
+                ))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        let source = if endpoint == "/ps/plugins/workspace/shared" {
+            RemoteMarketplaceSource::SharedWithMe
+        } else {
+            RemoteMarketplaceSource::Global
+        };
+        let result = fetch_remote_marketplaces(&config, Some(&auth), &[source], None)
+            .await
+            .unwrap();
+        let names = result
+            .iter()
+            .flat_map(|marketplace| &marketplace.plugins)
+            .map(|plugin| plugin.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["first", "second", "third"]);
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests.len(),
+            4,
+            "three pages and one companion scope request"
+        );
+    }
+}
+
+#[tokio::test]
+async fn resolve_remote_plugin_uninstall_target_rejects_substituted_identity_before_mutation() {
+    let server = wiremock::MockServer::start().await;
+    let config = RemotePluginServiceConfig::new(
+        server.uri(),
+        HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+    );
+    let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
+    let home = tempfile::tempdir().expect("temporary Codex home");
+    let cache = home
+        .path()
+        .join(PLUGINS_CACHE_DIR)
+        .join(REMOTE_GLOBAL_MARKETPLACE_NAME)
+        .join("plugin-other");
+    fs::create_dir_all(&cache).expect("create cached plugin");
+    fs::write(cache.join("retained.txt"), "installed plugin").expect("write cached plugin");
+
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/ps/plugins/plugin-requested"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(directory_plugin("plugin-other", "other")),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let result = async {
+        let target =
+            resolve_remote_plugin_uninstall_target(&config, Some(&auth), "plugin-requested")
+                .await?;
+        uninstall_remote_plugin(&config, Some(&auth), home.path().to_path_buf(), target).await
+    }
+    .await;
+
+    assert!(matches!(
+        result,
+        Err(RemotePluginCatalogError::UnexpectedPluginId { expected, actual })
+            if expected == "plugin-requested" && actual == "plugin-other"
+    ));
+    assert_eq!(
+        fs::read_to_string(cache.join("retained.txt")).expect("cached plugin must remain"),
+        "installed plugin"
+    );
+    let requests = server.received_requests().await.expect("recorded requests");
+    assert_eq!(requests.len(), 1, "no uninstall mutation may be sent");
+    assert_eq!(requests[0].method.as_str(), "GET");
+}
+
+#[tokio::test]
+async fn resolve_remote_plugin_uninstall_target_preserves_matching_identity_through_uninstall() {
+    let server = wiremock::MockServer::start().await;
+    let config = RemotePluginServiceConfig::new(
+        server.uri(),
+        HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+    );
+    let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
+    let home = tempfile::tempdir().expect("temporary Codex home");
+    let cache = home
+        .path()
+        .join(PLUGINS_CACHE_DIR)
+        .join(REMOTE_GLOBAL_MARKETPLACE_NAME)
+        .join("plugin-requested");
+    fs::create_dir_all(&cache).expect("create legacy cached plugin");
+    fs::write(cache.join("installed.txt"), "installed plugin").expect("write cached plugin");
+
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/ps/plugins/plugin-requested"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(directory_plugin("plugin-requested", "requested")),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path(
+            "/ps/plugins/plugin-requested/uninstall",
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "plugin-requested",
+                "enabled": false,
+            })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let target = resolve_remote_plugin_uninstall_target(&config, Some(&auth), "plugin-requested")
+        .await
+        .expect("matching detail identity should resolve");
+    assert_eq!(target.remote_plugin_id, "plugin-requested");
+    assert_eq!(target.plugin_id.plugin_name(), "requested");
+    uninstall_remote_plugin(&config, Some(&auth), home.path().to_path_buf(), target)
+        .await
+        .expect("matching plugin should uninstall");
+    assert!(
+        !cache.exists(),
+        "successful uninstall removes its legacy cache"
+    );
+}
+
 #[test]
 fn remote_service_pool_retains_the_effective_proxy_policy() {
     let config = RemotePluginServiceConfig::new(

@@ -50,6 +50,140 @@ use serde_json::json;
 use tempfile::TempDir;
 
 #[tokio::test]
+async fn terminal_goal_accounting_failure_preserves_and_retries_progress() -> anyhow::Result<()> {
+    for abort in [false, true] {
+        for (failed_turns, expected_recovered_tokens) in [(1, 17), (2, 27)] {
+            let runtime = test_runtime().await?;
+            let thread_id = test_thread_id()?;
+            seed_thread_metadata(runtime.as_ref(), thread_id).await?;
+            let harness = GoalExtensionHarness::new(runtime.clone(), thread_id).await?;
+            let tools = harness.tools();
+            tool_by_name(&tools, "create_goal")
+                .handle(tool_call(
+                    "create_goal",
+                    "create-accounting-goal",
+                    json!({ "objective": "preserve terminal usage during storage failures" }),
+                ))
+                .await?;
+            let fault_db = sqlx::SqlitePool::connect_with(
+                sqlx::sqlite::SqliteConnectOptions::new()
+                    .filename(codex_state::goals_db_path(runtime.codex_home())),
+            )
+            .await?;
+            sqlx::query(
+                "CREATE TRIGGER fail_terminal_usage BEFORE UPDATE OF tokens_used ON thread_goals \
+                 BEGIN SELECT RAISE(ABORT, 'terminal usage write unavailable'); END",
+            )
+            .execute(&fault_db)
+            .await?;
+
+            for index in 0..failed_turns {
+                let turn_id = format!("failed-turn-{index}");
+                let before = index * 10;
+                harness
+                    .start_turn(&turn_id, &token_usage(before, 0, 0, 0, before))
+                    .await;
+                harness
+                    .record_token_usage(&turn_id, &token_usage(before + 10, 0, 0, 0, before + 10))
+                    .await;
+                if abort {
+                    let turn_store = ExtensionData::new(&turn_id);
+                    for contributor in harness.registry.turn_lifecycle_contributors() {
+                        contributor
+                            .on_turn_abort(codex_extension_api::TurnAbortInput {
+                                reason: codex_protocol::protocol::TurnAbortReason::Interrupted,
+                                session_store: &harness.session_store,
+                                thread_store: &harness.thread_store,
+                                turn_store: &turn_store,
+                            })
+                            .await;
+                    }
+                } else {
+                    harness.stop_turn(&turn_id).await;
+                }
+                let goal = runtime
+                    .thread_goals()
+                    .get_thread_goal(thread_id)
+                    .await?
+                    .unwrap();
+                assert_eq!(
+                    goal.tokens_used, 0,
+                    "failed storage must not publish charged usage"
+                );
+            }
+
+            if !abort {
+                sqlx::query("DROP TRIGGER fail_terminal_usage")
+                    .execute(&fault_db)
+                    .await?;
+            }
+            let before = failed_turns * 10;
+            harness
+                .start_turn("recovered-turn", &token_usage(before, 0, 0, 0, before))
+                .await;
+            harness
+                .record_token_usage(
+                    "recovered-turn",
+                    &token_usage(before + 7, 0, 0, 0, before + 7),
+                )
+                .await;
+            if abort {
+                // Recover after the next turn has already started, then finish via
+                // the registered goal tool instead of the lifecycle accounting path.
+                sqlx::query("DROP TRIGGER fail_terminal_usage")
+                    .execute(&fault_db)
+                    .await?;
+                let mut invocation = tool_call(
+                    "update_goal",
+                    "block-after-accounting-recovery",
+                    json!({ "status": "blocked" }),
+                );
+                invocation.turn_id = "recovered-turn".to_string();
+                let tools = harness.tools();
+                tool_by_name(&tools, "update_goal")
+                    .handle(invocation)
+                    .await?;
+            } else {
+                harness.stop_turn("recovered-turn").await;
+            }
+            let goal = runtime
+                .thread_goals()
+                .get_thread_goal(thread_id)
+                .await?
+                .unwrap();
+            assert_eq!(
+                goal.tokens_used, expected_recovered_tokens,
+                "abort={abort}, failed_turns={failed_turns}"
+            );
+            assert_eq!(
+                goal.status,
+                if abort {
+                    codex_state::ThreadGoalStatus::Blocked
+                } else {
+                    codex_state::ThreadGoalStatus::Active
+                }
+            );
+
+            // Normal repeated terminal/mutation paths must not charge a retried delta twice.
+            harness.stop_turn("recovered-turn").await;
+            harness
+                .runtime_handle()
+                .prepare_external_goal_mutation()
+                .await
+                .map_err(anyhow::Error::msg)?;
+            let goal = runtime
+                .thread_goals()
+                .get_thread_goal(thread_id)
+                .await?
+                .unwrap();
+            assert_eq!(goal.tokens_used, expected_recovered_tokens);
+            fault_db.close().await;
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn installed_goal_tools_create_goal_and_fill_empty_preview() -> anyhow::Result<()> {
     let runtime = test_runtime().await?;
     let thread_id = test_thread_id()?;

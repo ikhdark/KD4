@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use app_test_support::TestAppServer;
+use app_test_support::create_mock_responses_server_repeating_assistant;
 use app_test_support::to_response;
 use codex_app_server_protocol::ConfigBatchWriteParams;
 use codex_app_server_protocol::ConfigEdit;
@@ -269,7 +270,7 @@ async fn hooks_list_shows_discovered_plugin_hook() -> Result<()> {
 #[tokio::test]
 async fn hooks_list_warms_plugin_capabilities_for_thread_start() -> Result<()> {
     let codex_home = TempDir::new()?;
-    let cwd = TempDir::new()?;
+    let model_server = create_mock_responses_server_repeating_assistant("Done").await;
     write_plugin_hook_config(
         codex_home.path(),
         r#"{
@@ -301,15 +302,41 @@ async fn hooks_list_warms_plugin_capabilities_for_thread_start() -> Result<()> {
 }"#,
     )?;
 
+    let config_path = codex_home.path().join("config.toml");
+    let plugin_config = std::fs::read_to_string(&config_path)?;
+    let server_uri = model_server.uri();
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"model = "mock-model"
+model_provider = "hooks_test"
+sandbox_mode = "read-only"
+chatgpt_base_url = "{server_uri}"
+
+{plugin_config}
+
+[model_providers.hooks_test]
+name = "Local hooks fixture provider"
+base_url = "{server_uri}/v1"
+wire_api = "responses"
+requires_openai_auth = false
+supports_websockets = false
+request_max_retries = 0
+stream_max_retries = 0
+"#,
+        ),
+    )?;
+
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
         .build()
         .await?;
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
+    let cwd = mcp.auto_env()?.selection().cwd.to_path_buf();
 
     let hooks_list_id = mcp
         .send_hooks_list_request(HooksListParams {
-            cwds: vec![cwd.path().to_path_buf()],
+            cwds: vec![cwd.clone()],
         })
         .await?;
     timeout(
@@ -321,15 +348,19 @@ async fn hooks_list_warms_plugin_capabilities_for_thread_start() -> Result<()> {
     std::fs::remove_file(plugin_mcp_path)?;
 
     let thread_start_id = mcp
-        .send_thread_start_request_with_auto_env(ThreadStartParams::default())
+        .send_thread_start_request_with_auto_env(ThreadStartParams {
+            cwd: Some(cwd.to_string_lossy().into_owned()),
+            ..Default::default()
+        })
         .await?;
-    let _: ThreadStartResponse = to_response(
+    let thread: ThreadStartResponse = to_response(
         timeout(
             DEFAULT_TIMEOUT,
             mcp.read_stream_until_response_message(RequestId::Integer(thread_start_id)),
         )
         .await??,
     )?;
+    assert_eq!(thread.model_provider, "hooks_test");
     timeout(
         DEFAULT_TIMEOUT,
         mcp.read_stream_until_matching_notification("plugin MCP server starting", |notification| {
@@ -550,6 +581,13 @@ async fn hooks_list_uses_root_repo_hooks_for_linked_worktrees() -> Result<()> {
     )
     .await??;
     let _: codex_app_server_protocol::ConfigWriteResponse = to_response(response)?;
+    let written: toml::Value = toml::from_str(&std::fs::read_to_string(
+        codex_home.path().join("config.toml"),
+    )?)?;
+    assert_eq!(
+        written["hooks"]["state"][&repo_hook.key]["trusted_hash"].as_str(),
+        Some(repo_hook.current_hash.as_str()),
+    );
 
     let list_id = mcp
         .send_hooks_list_request(HooksListParams {
@@ -616,6 +654,13 @@ async fn config_batch_write_toggles_user_hook() -> Result<()> {
     )
     .await??;
     let _: codex_app_server_protocol::ConfigWriteResponse = to_response(response)?;
+    let written: toml::Value = toml::from_str(&std::fs::read_to_string(
+        codex_home.path().join("config.toml"),
+    )?)?;
+    assert_eq!(
+        written["hooks"]["state"][&hook.key]["enabled"].as_bool(),
+        Some(false),
+    );
 
     let request_id = mcp
         .send_hooks_list_request(HooksListParams {
@@ -654,6 +699,13 @@ async fn config_batch_write_toggles_user_hook() -> Result<()> {
     )
     .await??;
     let _: codex_app_server_protocol::ConfigWriteResponse = to_response(response)?;
+    let written: toml::Value = toml::from_str(&std::fs::read_to_string(
+        codex_home.path().join("config.toml"),
+    )?)?;
+    assert_eq!(
+        written["hooks"]["state"][&hook.key]["enabled"].as_bool(),
+        Some(true),
+    );
 
     let request_id = mcp
         .send_hooks_list_request(HooksListParams {

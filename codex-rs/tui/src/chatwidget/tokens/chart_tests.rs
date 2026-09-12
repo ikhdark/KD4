@@ -5,6 +5,74 @@ use insta::assert_snapshot;
 use pretty_assertions::assert_eq;
 
 #[test]
+fn loaded_usage_preserves_activity_at_maximum_token_counts() {
+    let today = NaiveDate::from_ymd_opt(2026, 5, 29).expect("valid date");
+    let response = GetAccountTokenUsageResponse {
+        summary: AccountTokenUsageSummary {
+            lifetime_tokens: None,
+            peak_daily_tokens: None,
+            longest_running_turn_sec: None,
+            current_streak_days: None,
+            longest_streak_days: None,
+        },
+        daily_usage_buckets: Some(
+            ["2026-05-18", "2026-05-28", "2026-05-29", "2026-05-29"]
+                .into_iter()
+                .map(|date| AccountTokenUsageDailyBucket {
+                    start_date: date.to_string(),
+                    tokens: i64::MAX,
+                })
+                .collect(),
+        ),
+    };
+
+    for view in [
+        TokenActivityView::Daily,
+        TokenActivityView::Weekly,
+        TokenActivityView::Cumulative,
+    ] {
+        let rendered = loaded_lines(view, &response, today, 22)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(rendered[0], " Token activity   last 12 months");
+        match view {
+            TokenActivityView::Daily => {
+                for weekday in [" Th ", " Fr "] {
+                    let row = rendered
+                        .iter()
+                        .find(|line| line.starts_with(weekday))
+                        .expect("weekday row");
+                    assert!(row.ends_with('■'), "active day must remain visible: {row}");
+                }
+            }
+            TokenActivityView::Weekly | TokenActivityView::Cumulative => {
+                assert_eq!(
+                    rendered.iter().filter(|line| line.ends_with("█ █")).count(),
+                    7,
+                    "both saturated weeks must retain full-height bars"
+                );
+                assert!(
+                    !rendered
+                        .iter()
+                        .any(|line| line.contains("No token activity"))
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn maximum_token_counts_keep_grades_and_totals_nonnegative() {
+    assert_eq!(
+        graded_levels(&[0, 1, i64::MAX / 4 + 1, i64::MAX / 2 + 1, i64::MAX]),
+        vec![0, 1, 2, 3, 4]
+    );
+    assert_eq!(weekly_totals(&[i64::MAX, i64::MAX]), vec![i64::MAX]);
+    assert_eq!(bar_levels(&[i64::MAX]), vec![4; 7]);
+}
+
+#[test]
 fn duplicate_dates_sum_and_negative_values_clamp() {
     let today =
         NaiveDate::from_ymd_opt(/*year*/ 2026, /*month*/ 5, /*day*/ 29).expect("valid date");

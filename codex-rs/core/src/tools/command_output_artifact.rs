@@ -740,18 +740,26 @@ fn retention_protection_marker_status(marker: &Path, expected: &[u8]) -> std::io
     }
 }
 
+#[cfg(test)]
 async fn artifact_retention_record(
     path: &Path,
 ) -> std::io::Result<Option<ArtifactRetentionRecord>> {
-    let bytes = logical_artifact_disk_bytes(path).await?;
-    artifact_retention_record_with_bytes(path, bytes).await
+    let path = path.to_path_buf();
+    run_blocking_artifact_io(move || artifact_retention_record_blocking(&path)).await
 }
 
-async fn artifact_retention_record_with_bytes(
+fn artifact_retention_record_blocking(
+    path: &Path,
+) -> std::io::Result<Option<ArtifactRetentionRecord>> {
+    let bytes = logical_artifact_disk_bytes(path)?;
+    artifact_retention_record_with_bytes_blocking(path, bytes)
+}
+
+fn artifact_retention_record_with_bytes_blocking(
     path: &Path,
     bytes: u64,
 ) -> std::io::Result<Option<ArtifactRetentionRecord>> {
-    let link_metadata = match tokio::fs::symlink_metadata(path).await {
+    let link_metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(err),
@@ -762,7 +770,7 @@ async fn artifact_retention_record_with_bytes(
             "artifact path is a link or reparse point",
         ));
     }
-    let metadata = match tokio::fs::metadata(path).await {
+    let metadata = match std::fs::metadata(path) {
         Ok(metadata) => metadata,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(err),
@@ -774,15 +782,11 @@ async fn artifact_retention_record_with_bytes(
         ));
     }
     let tool_history_marker = active_tool_history_protection_path(path);
-    let protected = tokio::task::spawn_blocking(move || {
-        retention_protection_marker_status(
-            &tool_history_marker,
-            ACTIVE_TOOL_HISTORY_PROTECTION_MARKER_BYTES,
-        )
-    })
-    .await
-    .map_err(std::io::Error::other)??;
-    let final_link_metadata = tokio::fs::symlink_metadata(path).await?;
+    let protected = retention_protection_marker_status(
+        &tool_history_marker,
+        ACTIVE_TOOL_HISTORY_PROTECTION_MARKER_BYTES,
+    )?;
+    let final_link_metadata = std::fs::symlink_metadata(path)?;
     if final_link_metadata.file_type().is_symlink()
         || metadata_is_reparse_point(&final_link_metadata)
     {
@@ -791,7 +795,7 @@ async fn artifact_retention_record_with_bytes(
             "artifact path changed to a link or reparse point during retention observation",
         ));
     }
-    let final_metadata = tokio::fs::metadata(path).await?;
+    let final_metadata = std::fs::metadata(path)?;
     if final_metadata.len() != metadata.len()
         || final_metadata.modified()? != metadata.modified()?
         || !final_metadata.is_file()
@@ -827,32 +831,33 @@ fn logical_artifact_stem(name: &str) -> Option<&str> {
         .then_some(stem)
 }
 
-async fn scan_retention_root(
+fn scan_retention_root_blocking(
     root: &Path,
     capacity: usize,
 ) -> std::io::Result<(RetentionScanCandidate, u64, u64)> {
     #[cfg(test)]
-    wait_at_reconciliation_barrier(root).await;
+    // Test barriers wait only on their peer; they schedule no filesystem work.
+    tokio::runtime::Handle::current().block_on(wait_at_reconciliation_barrier(root));
 
     let mut index = Some(RetentionIndex::default());
     let mut directories_visited = 0_u64;
     let mut candidates_visited = 0_u64;
     let mut oversized = false;
-    let mut thread_directories = tokio::fs::read_dir(root).await?;
+    let mut thread_directories = std::fs::read_dir(root)?;
     loop {
-        let thread_entry = match thread_directories.next_entry().await? {
+        let thread_entry = match thread_directories.next().transpose()? {
             Some(entry) => entry,
             None => break,
         };
-        if !thread_entry.file_type().await?.is_dir() {
+        if !thread_entry.file_type()?.is_dir() {
             continue;
         }
         directories_visited = directories_visited.saturating_add(1);
-        let mut entries = tokio::fs::read_dir(thread_entry.path()).await?;
+        let mut entries = std::fs::read_dir(thread_entry.path())?;
         let mut log_paths = Vec::new();
         let mut bytes_by_stem = BTreeMap::<String, u64>::new();
         loop {
-            let entry = match entries.next_entry().await? {
+            let entry = match entries.next().transpose()? {
                 Some(entry) => entry,
                 None => break,
             };
@@ -878,7 +883,7 @@ async fn scan_retention_root(
             let Some(stem) = logical_artifact_stem(name) else {
                 continue;
             };
-            let bytes = entry.metadata().await?.len();
+            let bytes = entry.metadata()?.len();
             let entry_bytes = bytes_by_stem.entry(stem.to_string()).or_default();
             *entry_bytes = entry_bytes.checked_add(bytes).ok_or_else(|| {
                 std::io::Error::new(
@@ -896,7 +901,7 @@ async fn scan_retention_root(
                 .and_then(|stem| stem.to_str())
                 .unwrap_or_default();
             let bytes = bytes_by_stem.get(stem).copied().unwrap_or_default();
-            let Some(record) = artifact_retention_record_with_bytes(&path, bytes).await? else {
+            let Some(record) = artifact_retention_record_with_bytes_blocking(&path, bytes)? else {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::NotFound,
                     "artifact disappeared during retention reconciliation",
@@ -1377,6 +1382,20 @@ fn lock_artifact_handle(handle: &Arc<File>, position: SeekFrom) -> std::io::Resu
     Ok(file)
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    static CREATION_UNLOCK_FAILURE_FOR_TEST: ();
+}
+
+fn unlock_created_output_file(file: File) -> std::io::Result<File> {
+    #[cfg(test)]
+    if CREATION_UNLOCK_FAILURE_FOR_TEST.try_with(|()| ()).is_ok() {
+        return Err(std::io::Error::other("injected creation unlock failure"));
+    }
+    file.unlock()?;
+    Ok(file)
+}
+
 impl RawOutputArtifact {
     #[cfg(test)]
     pub(crate) fn artifact_id(&self) -> Option<ToolOutputArtifactId> {
@@ -1462,24 +1481,29 @@ impl RawOutputArtifact {
         }
     }
 
-    pub(crate) fn reduction_notice(&self) -> Option<String> {
+    pub(crate) async fn reduction_notice(&self) -> Option<String> {
         let Self::Stored {
             path, truncated, ..
         } = self
         else {
             return None;
         };
-        if open_regular_artifact(path).is_err() {
-            return None;
-        }
-        let scope = if *truncated {
-            "the retained prefix"
-        } else {
-            "the full retained output"
-        };
-        Some(format!(
-            "[command output reduced; recover {scope} with read_tool_output using the raw output artifact above. Batch exact ranges when possible; do not rerun the producer.]"
-        ))
+        let path = path.clone();
+        let truncated = *truncated;
+        run_blocking_artifact_io(move || {
+            open_regular_artifact(&path)
+                .map_err(|error| std::io::Error::other(error.for_model()))?;
+            let scope = if truncated {
+                "the retained prefix"
+            } else {
+                "the full retained output"
+            };
+            Ok(format!(
+                "[command output reduced; recover {scope} with read_tool_output using the raw output artifact above. Batch exact ranges when possible; do not rerun the producer.]"
+            ))
+        })
+        .await
+        .ok()
     }
 
     pub(crate) fn retained_bytes(&self) -> Option<u64> {
@@ -1575,7 +1599,21 @@ pub(crate) async fn create_raw_output_artifact(
                 .await;
             }
             let file = file.into_std().await;
-            let _ = file.unlock();
+            let file = match unlock_created_output_file(file) {
+                Ok(file) => file,
+                Err(err) => {
+                    return failed_with_owned_path(
+                        path.clone(),
+                        retained.len() as u64,
+                        format!(
+                            "failed to unlock `{}` after creation: {err}",
+                            path.display()
+                        ),
+                        Some(&retention_token),
+                    )
+                    .await;
+                }
+            };
             let handle = Arc::new(file);
             let sync_path = path.clone();
             if let Err(err) =
@@ -1691,8 +1729,14 @@ fn reconcile_logical_artifact_transaction(path: &Path) -> std::io::Result<()> {
         ));
     }
 
-    let metadata = std::fs::read(logical_metadata_path(path))
-        .ok()
+    let metadata_bytes = match std::fs::read(logical_metadata_path(path)) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        // A temporarily unreadable committed metadata file is not evidence of
+        // an uncommitted family. Preserve every segment for a later recovery.
+        Err(error) => return Err(error),
+    };
+    let metadata = metadata_bytes
         .and_then(|bytes| serde_json::from_slice::<LogicalArtifactMetadata>(&bytes).ok())
         .filter(|metadata| metadata.version == LOGICAL_ARTIFACT_METADATA_VERSION);
     if let Some(metadata) = metadata {
@@ -1817,6 +1861,15 @@ fn normalized_unavailable_ranges(
     normalized
 }
 
+struct StagedCanonicalOutput {
+    directory: PathBuf,
+    id: ToolOutputArtifactId,
+    canonical: CanonicalToolResult,
+    existing: Vec<u8>,
+    segments: Vec<StagedLogicalSegment>,
+    cleanup: StagedLogicalSegmentCleanup,
+}
+
 struct StagedLogicalSegment {
     index: u32,
     range: CanonicalByteRange,
@@ -1848,23 +1901,22 @@ fn staged_logical_segment_path(directory: &Path, id: ToolOutputArtifactId, index
     directory.join(format!(".{id}.segment-{index:06}.pending"))
 }
 
-async fn remove_staged_logical_segments(segments: &[StagedLogicalSegment]) {
+fn remove_staged_logical_segments_blocking(segments: &[StagedLogicalSegment]) {
     for segment in segments {
-        let _ = tokio::fs::remove_file(&segment.path).await;
+        let _ = std::fs::remove_file(&segment.path);
     }
 }
 
-async fn write_staged_logical_segment(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let mut file = tokio::fs::OpenOptions::new()
+fn write_staged_logical_segment_blocking(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut file = std::fs::OpenOptions::new()
         .create_new(true)
         .write(true)
-        .open(path)
-        .await?;
-    file.write_all(bytes).await?;
-    file.sync_all().await
+        .open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
 }
 
-async fn stage_logical_segments(
+fn stage_logical_segments_blocking(
     directory: &Path,
     id: ToolOutputArtifactId,
     bytes: &[u8],
@@ -1876,9 +1928,9 @@ async fn stage_logical_segments(
         let index = first_index + offset as u32;
         let start = canonical_start + offset as u64 * MAX_RAW_OUTPUT_ARTIFACT_BYTES as u64;
         let path = staged_logical_segment_path(directory, id, index);
-        if let Err(err) = write_staged_logical_segment(&path, chunk).await {
-            let _ = tokio::fs::remove_file(&path).await;
-            remove_staged_logical_segments(&staged).await;
+        if let Err(err) = write_staged_logical_segment_blocking(&path, chunk) {
+            let _ = std::fs::remove_file(&path);
+            remove_staged_logical_segments_blocking(&staged);
             return Err((start, path, err));
         }
         staged.push(StagedLogicalSegment {
@@ -1889,8 +1941,8 @@ async fn stage_logical_segments(
     }
     if bytes.is_empty() && first_index == 0 {
         let path = staged_logical_segment_path(directory, id, 0);
-        if let Err(err) = write_staged_logical_segment(&path, &[]).await {
-            let _ = tokio::fs::remove_file(&path).await;
+        if let Err(err) = write_staged_logical_segment_blocking(&path, &[]) {
+            let _ = std::fs::remove_file(&path);
             return Err((canonical_start, path, err));
         }
         staged.push(StagedLogicalSegment {
@@ -1902,7 +1954,7 @@ async fn stage_logical_segments(
     Ok(staged)
 }
 
-async fn install_staged_logical_segments(
+fn install_staged_logical_segments_blocking(
     final_path: &Path,
     staged: Vec<StagedLogicalSegment>,
     retained_bytes: u64,
@@ -1910,58 +1962,48 @@ async fn install_staged_logical_segments(
     let mut installed: Vec<LogicalArtifactSegment> = Vec::new();
     for segment in staged {
         if segment.range.start >= retained_bytes && !segment.range.is_empty() {
-            let _ = tokio::fs::remove_file(&segment.path).await;
+            let _ = std::fs::remove_file(&segment.path);
             continue;
         }
         let end = segment.range.end.min(retained_bytes);
         if end < segment.range.end {
-            match tokio::fs::OpenOptions::new()
-                .write(true)
-                .open(&segment.path)
-                .await
-            {
+            match std::fs::OpenOptions::new().write(true).open(&segment.path) {
                 Ok(file) => {
-                    if let Err(err) = file.set_len(end.saturating_sub(segment.range.start)).await {
+                    if let Err(err) = file.set_len(end.saturating_sub(segment.range.start)) {
                         for installed_segment in &installed {
-                            let _ = tokio::fs::remove_file(logical_segment_path(
+                            let _ = std::fs::remove_file(logical_segment_path(
                                 final_path,
                                 installed_segment.index,
-                            ))
-                            .await;
+                            ));
                         }
                         return Err((segment.range.start, segment.path, err));
                     }
-                    if let Err(err) = file.sync_all().await {
+                    if let Err(err) = file.sync_all() {
                         for installed_segment in &installed {
-                            let _ = tokio::fs::remove_file(logical_segment_path(
+                            let _ = std::fs::remove_file(logical_segment_path(
                                 final_path,
                                 installed_segment.index,
-                            ))
-                            .await;
+                            ));
                         }
                         return Err((segment.range.start, segment.path, err));
                     }
                 }
                 Err(err) => {
                     for installed_segment in &installed {
-                        let _ = tokio::fs::remove_file(logical_segment_path(
+                        let _ = std::fs::remove_file(logical_segment_path(
                             final_path,
                             installed_segment.index,
-                        ))
-                        .await;
+                        ));
                     }
                     return Err((segment.range.start, segment.path, err));
                 }
             }
         }
         let destination = logical_segment_path(final_path, segment.index);
-        if let Err(err) = tokio::fs::rename(&segment.path, &destination).await {
+        if let Err(err) = std::fs::rename(&segment.path, &destination) {
             for installed_segment in &installed {
-                let _ = tokio::fs::remove_file(logical_segment_path(
-                    final_path,
-                    installed_segment.index,
-                ))
-                .await;
+                let _ =
+                    std::fs::remove_file(logical_segment_path(final_path, installed_segment.index));
             }
             return Err((segment.range.start, segment.path, err));
         }
@@ -1972,9 +2014,7 @@ async fn install_staged_logical_segments(
     }
     if let Err(err) = sync_parent_directory(final_path) {
         for installed_segment in &installed {
-            let _ =
-                tokio::fs::remove_file(logical_segment_path(final_path, installed_segment.index))
-                    .await;
+            let _ = std::fs::remove_file(logical_segment_path(final_path, installed_segment.index));
         }
         return Err((retained_bytes, final_path.to_path_buf(), err));
     }
@@ -2159,24 +2199,81 @@ async fn create_canonical_output_artifact_with_id(
     canonical: &CanonicalToolResult,
     id: ToolOutputArtifactId,
 ) -> CanonicalOutputArtifact {
+    let codex_home = codex_home.to_path_buf();
+    let thread_id = thread_id.to_string();
+    let exact_bytes = canonical.exact_bytes;
+    let canonical = canonical.clone();
+    // The coordinator only transfers ownership between flat filesystem workers.
+    // Each worker owns pending-path cleanup and, during commit, the retention permit.
+    // Caller cancellation detaches the coordinator; runtime shutdown cannot drop a
+    // permit or pending-path guard while its filesystem operation is still running.
+    tokio::spawn(async move {
+        let staged = tokio::task::spawn_blocking(move || {
+            stage_create_canonical_output_artifact(codex_home, thread_id, canonical, id)
+        })
+        .await?;
+        let staged = match staged {
+            Ok(staged) => staged,
+            Err(result) => return Ok(result),
+        };
+        let root = tool_output_root_for_directory(&staged.directory);
+        let process_permit = match retention_sweep_semaphore(&root).acquire_owned().await {
+            Ok(permit) => permit,
+            Err(error) => {
+                record_retention_sweep_permit_failure(&root, &error);
+                return Ok(CanonicalOutputArtifact {
+                    id: Some(staged.id),
+                    retained_bytes: 0,
+                    complete: false,
+                    unavailable_ranges: vec![CanonicalByteRange::new(
+                        0,
+                        staged.canonical.exact_bytes,
+                    )],
+                    error: Some(format!("failed to admit canonical artifact: {error}")),
+                });
+            }
+        };
+        tokio::task::spawn_blocking(move || {
+            commit_create_canonical_output_artifact(staged, process_permit)
+        })
+        .await
+    })
+    .await
+    .and_then(std::convert::identity)
+    .unwrap_or_else(|error| CanonicalOutputArtifact {
+        id: Some(id),
+        retained_bytes: 0,
+        complete: false,
+        unavailable_ranges: vec![CanonicalByteRange::new(0, exact_bytes)],
+        error: Some(format!("canonical artifact worker failed: {error}")),
+    })
+}
+
+fn stage_create_canonical_output_artifact(
+    codex_home: PathBuf,
+    thread_id: String,
+    canonical: CanonicalToolResult,
+    id: ToolOutputArtifactId,
+) -> Result<StagedCanonicalOutput, CanonicalOutputArtifact> {
     let directory = codex_home.join("tool-output").join(thread_id);
-    if let Err(err) = tokio::fs::create_dir_all(&directory).await {
-        return CanonicalOutputArtifact {
+    if let Err(err) = std::fs::create_dir_all(&directory) {
+        return Err(CanonicalOutputArtifact {
             id: None,
             retained_bytes: 0,
             complete: false,
             unavailable_ranges: vec![CanonicalByteRange::new(0, canonical.exact_bytes)],
             error: Some(format!("failed to create `{}`: {err}", directory.display())),
-        };
+        });
     }
     let max_staged_bytes = MAX_RETAINED_ARTIFACT_BYTES_PER_THREAD
         .min(MAX_RETAINED_ARTIFACT_BYTES_TOTAL)
         .min(canonical.exact_bytes) as usize;
     let staged_bytes = &canonical.bytes[..canonical.bytes.len().min(max_staged_bytes)];
-    let staged_segments = match stage_logical_segments(&directory, id, staged_bytes, 0, 0).await {
+    let staged_segments = match stage_logical_segments_blocking(&directory, id, staged_bytes, 0, 0)
+    {
         Ok(segments) => segments,
         Err((start, staged_path, err)) => {
-            return CanonicalOutputArtifact {
+            return Err(CanonicalOutputArtifact {
                 id: Some(id),
                 retained_bytes: start,
                 complete: false,
@@ -2185,16 +2282,53 @@ async fn create_canonical_output_artifact_with_id(
                     "failed to stage `{}`: {err}",
                     staged_path.display()
                 )),
+            });
+        }
+    };
+    let cleanup = StagedLogicalSegmentCleanup::new(&staged_segments);
+
+    Ok(StagedCanonicalOutput {
+        directory,
+        id,
+        canonical,
+        existing: Vec::new(),
+        segments: staged_segments,
+        cleanup,
+    })
+}
+
+fn commit_create_canonical_output_artifact(
+    staged: StagedCanonicalOutput,
+    process_permit: OwnedSemaphorePermit,
+) -> CanonicalOutputArtifact {
+    let StagedCanonicalOutput {
+        directory,
+        id,
+        canonical,
+        existing: _,
+        segments: staged_segments,
+        cleanup: _staged_cleanup,
+    } = staged;
+    let root = tool_output_root_for_directory(&directory);
+    let _retention_permit = match retention_sweep_permit_blocking(&root, process_permit) {
+        Ok(permit) => permit,
+        Err(error) => {
+            record_retention_sweep_permit_failure(&root, &error);
+            return CanonicalOutputArtifact {
+                id: Some(id),
+                retained_bytes: 0,
+                complete: false,
+                unavailable_ranges: vec![CanonicalByteRange::new(0, canonical.exact_bytes)],
+                error: Some(format!(
+                    "failed to acquire canonical artifact retention lock: {error}"
+                )),
             };
         }
     };
-    let _staged_cleanup = StagedLogicalSegmentCleanup::new(&staged_segments);
-
-    // Bulk output writes use per-artifact staging paths. Hold the process-wide
-    // permit only while admitting the retained bytes and installing the staged
-    // family, so independent tool completions can persist their output in
-    // parallel without racing retention accounting.
-    let _retention_permit = retention_sweep_permit_for_directory(&directory).await;
+    let staged_bytes = staged_segments
+        .iter()
+        .map(|segment| segment.range.end - segment.range.start)
+        .sum::<u64>();
     let path = directory.join(format!("{id}.log"));
     if let Err(err) = reconcile_logical_artifact_transactions(&directory) {
         return CanonicalOutputArtifact {
@@ -2205,15 +2339,12 @@ async fn create_canonical_output_artifact_with_id(
             error: Some(format!("failed to reconcile artifact transactions: {err}")),
         };
     }
-    enforce_retention_locked(&directory, &path, canonical.exact_bytes, 1).await;
-    let usage = retention_usage_locked(&directory).await;
+    enforce_retention_locked_blocking(&directory, &path, canonical.exact_bytes, 1);
+    let usage = retention_usage_locked_blocking(&directory);
     let available = MAX_RETAINED_ARTIFACT_BYTES_PER_THREAD
         .saturating_sub(usage.thread_bytes)
         .min(MAX_RETAINED_ARTIFACT_BYTES_TOTAL.saturating_sub(usage.global_bytes));
-    let retained_bytes = canonical
-        .exact_bytes
-        .min(available)
-        .min(staged_bytes.len() as u64);
+    let retained_bytes = canonical.exact_bytes.min(available).min(staged_bytes);
     let retention_token = capture_retention_token(&directory);
     let complete = canonical.complete && retained_bytes == canonical.exact_bytes;
     let unavailable_ranges = normalized_unavailable_ranges(
@@ -2233,7 +2364,7 @@ async fn create_canonical_output_artifact_with_id(
         };
     }
     let segments =
-        match install_staged_logical_segments(&path, staged_segments, retained_bytes).await {
+        match install_staged_logical_segments_blocking(&path, staged_segments, retained_bytes) {
             Ok(segments) => segments,
             Err((start, staged_path, err)) => {
                 rollback_logical_artifact_creation(&retention_token, &path);
@@ -2299,7 +2430,7 @@ async fn create_canonical_output_artifact_with_id(
             error: Some(format!("failed to commit artifact transaction: {err}")),
         };
     }
-    match artifact_retention_record(&path).await {
+    match artifact_retention_record_blocking(&path) {
         Ok(Some(record)) => {
             publish_known_record(&retention_token, record, LogicalRetentionMutation::Create)
         }
@@ -2329,36 +2460,96 @@ pub(crate) async fn attach_canonical_output_artifact(
     artifact_id: &str,
     canonical: &CanonicalToolResult,
 ) -> CanonicalOutputArtifact {
+    let codex_home = codex_home.to_path_buf();
+    let thread_id = thread_id.to_string();
+    let artifact_id = artifact_id.to_string();
+    let id = artifact_id.parse::<ToolOutputArtifactId>().ok();
+    let exact_bytes = canonical.exact_bytes;
+    let canonical = canonical.clone();
+    // The coordinator only transfers ownership between flat filesystem workers.
+    // Each worker owns pending-path cleanup and, during commit, the retention permit.
+    // Caller cancellation detaches the coordinator; runtime shutdown cannot drop a
+    // permit or pending-path guard while its filesystem operation is still running.
+    tokio::spawn(async move {
+        let staged = tokio::task::spawn_blocking(move || {
+            stage_attach_canonical_output_artifact(codex_home, thread_id, artifact_id, canonical)
+        })
+        .await?;
+        let staged = match staged {
+            Ok(staged) => staged,
+            Err(result) => return Ok(result),
+        };
+        let root = tool_output_root_for_directory(&staged.directory);
+        let process_permit = match retention_sweep_semaphore(&root).acquire_owned().await {
+            Ok(permit) => permit,
+            Err(error) => {
+                record_retention_sweep_permit_failure(&root, &error);
+                return Ok(CanonicalOutputArtifact {
+                    id: Some(staged.id),
+                    retained_bytes: 0,
+                    complete: false,
+                    unavailable_ranges: vec![CanonicalByteRange::new(
+                        0,
+                        staged.canonical.exact_bytes,
+                    )],
+                    error: Some(format!("failed to admit canonical artifact: {error}")),
+                });
+            }
+        };
+        tokio::task::spawn_blocking(move || {
+            commit_attach_canonical_output_artifact(staged, process_permit)
+        })
+        .await
+    })
+    .await
+    .and_then(std::convert::identity)
+    .unwrap_or_else(|error| CanonicalOutputArtifact {
+        id,
+        retained_bytes: 0,
+        complete: false,
+        unavailable_ranges: vec![CanonicalByteRange::new(0, exact_bytes)],
+        error: Some(format!(
+            "canonical artifact attachment worker failed: {error}"
+        )),
+    })
+}
+
+fn stage_attach_canonical_output_artifact(
+    codex_home: PathBuf,
+    thread_id: String,
+    artifact_id: String,
+    canonical: CanonicalToolResult,
+) -> Result<StagedCanonicalOutput, CanonicalOutputArtifact> {
     let id = match artifact_id.parse::<ToolOutputArtifactId>() {
         Ok(id) if id.to_string() == artifact_id => id,
         _ => {
-            return CanonicalOutputArtifact {
+            return Err(CanonicalOutputArtifact {
                 id: None,
                 retained_bytes: 0,
                 complete: false,
                 unavailable_ranges: vec![CanonicalByteRange::new(0, canonical.exact_bytes)],
                 error: Some("existing artifact ID is invalid".to_string()),
-            };
+            });
         }
     };
     let directory = codex_home.join("tool-output").join(thread_id);
     let path = directory.join(format!("{id}.log"));
-    let existing = match tokio::fs::read(&path).await {
+    let existing = match std::fs::read(&path) {
         Ok(bytes) => bytes,
         Err(err) => {
-            return CanonicalOutputArtifact {
+            return Err(CanonicalOutputArtifact {
                 id: Some(id),
                 retained_bytes: 0,
                 complete: false,
                 unavailable_ranges: vec![CanonicalByteRange::new(0, canonical.exact_bytes)],
                 error: Some(format!("failed to read existing artifact: {err}")),
-            };
+            });
         }
     };
     let expected_prefix =
         &canonical.bytes[..canonical.bytes.len().min(MAX_RAW_OUTPUT_ARTIFACT_BYTES)];
     if existing != expected_prefix {
-        return CanonicalOutputArtifact {
+        return Err(CanonicalOutputArtifact {
             id: Some(id),
             retained_bytes: existing.len() as u64,
             complete: false,
@@ -2367,7 +2558,7 @@ pub(crate) async fn attach_canonical_output_artifact(
                 canonical.exact_bytes,
             )],
             error: Some("existing artifact does not match the canonical byte prefix".to_string()),
-        };
+        });
     }
     let max_staged_total = MAX_RETAINED_ARTIFACT_BYTES_PER_THREAD
         .min(MAX_RETAINED_ARTIFACT_BYTES_TOTAL)
@@ -2377,26 +2568,75 @@ pub(crate) async fn attach_canonical_output_artifact(
         .bytes
         .get(existing.len()..staged_end)
         .unwrap_or_default();
-    let staged_segments =
-        match stage_logical_segments(&directory, id, staged_additional, existing.len() as u64, 1)
-            .await
-        {
-            Ok(segments) => segments,
-            Err((start, staged_path, err)) => {
-                return CanonicalOutputArtifact {
-                    id: Some(id),
-                    retained_bytes: start,
-                    complete: false,
-                    unavailable_ranges: vec![CanonicalByteRange::new(start, canonical.exact_bytes)],
-                    error: Some(format!(
-                        "failed to stage artifact segment `{}`: {err}",
-                        staged_path.display()
-                    )),
-                };
-            }
-        };
-    let _staged_cleanup = StagedLogicalSegmentCleanup::new(&staged_segments);
-    let _retention_permit = retention_sweep_permit_for_directory(&directory).await;
+    let staged_segments = match stage_logical_segments_blocking(
+        &directory,
+        id,
+        staged_additional,
+        existing.len() as u64,
+        1,
+    ) {
+        Ok(segments) => segments,
+        Err((start, staged_path, err)) => {
+            return Err(CanonicalOutputArtifact {
+                id: Some(id),
+                retained_bytes: start,
+                complete: false,
+                unavailable_ranges: vec![CanonicalByteRange::new(start, canonical.exact_bytes)],
+                error: Some(format!(
+                    "failed to stage artifact segment `{}`: {err}",
+                    staged_path.display()
+                )),
+            });
+        }
+    };
+    let cleanup = StagedLogicalSegmentCleanup::new(&staged_segments);
+    Ok(StagedCanonicalOutput {
+        directory,
+        id,
+        canonical,
+        existing: existing,
+        segments: staged_segments,
+        cleanup,
+    })
+}
+
+fn commit_attach_canonical_output_artifact(
+    staged: StagedCanonicalOutput,
+    process_permit: OwnedSemaphorePermit,
+) -> CanonicalOutputArtifact {
+    let StagedCanonicalOutput {
+        directory,
+        id,
+        canonical,
+        existing,
+        segments: staged_segments,
+        cleanup: _staged_cleanup,
+    } = staged;
+    let root = tool_output_root_for_directory(&directory);
+    let _retention_permit = match retention_sweep_permit_blocking(&root, process_permit) {
+        Ok(permit) => permit,
+        Err(error) => {
+            record_retention_sweep_permit_failure(&root, &error);
+            return CanonicalOutputArtifact {
+                id: Some(id),
+                retained_bytes: existing.len() as u64,
+                complete: false,
+                unavailable_ranges: normalized_unavailable_ranges(
+                    canonical.exact_bytes,
+                    &canonical.unavailable_ranges,
+                    existing.len() as u64,
+                ),
+                error: Some(format!(
+                    "failed to acquire canonical artifact retention lock: {error}"
+                )),
+            };
+        }
+    };
+    let path = directory.join(format!("{id}.log"));
+    let staged_additional_bytes = staged_segments
+        .iter()
+        .map(|segment| segment.range.end - segment.range.start)
+        .sum::<u64>();
     if let Err(err) = reconcile_logical_artifact_transactions(&directory) {
         return CanonicalOutputArtifact {
             id: Some(id),
@@ -2410,21 +2650,20 @@ pub(crate) async fn attach_canonical_output_artifact(
             error: Some(format!("failed to reconcile artifact transactions: {err}")),
         };
     }
-    enforce_retention_locked(
+    enforce_retention_locked_blocking(
         &directory,
         &path,
         canonical.exact_bytes.saturating_sub(existing.len() as u64),
         0,
-    )
-    .await;
-    let usage = retention_usage_locked(&directory).await;
+    );
+    let usage = retention_usage_locked_blocking(&directory);
     let additional_available = MAX_RETAINED_ARTIFACT_BYTES_PER_THREAD
         .saturating_sub(usage.thread_bytes)
         .min(MAX_RETAINED_ARTIFACT_BYTES_TOTAL.saturating_sub(usage.global_bytes));
     let retained_bytes = canonical
         .exact_bytes
         .min(existing.len() as u64 + additional_available)
-        .min(existing.len() as u64 + staged_additional.len() as u64);
+        .min(existing.len() as u64 + staged_additional_bytes);
     let retention_token = capture_retention_token(&directory);
     let retained = &canonical.bytes[..retained_bytes as usize];
     let mut segments = vec![LogicalArtifactSegment {
@@ -2446,7 +2685,7 @@ pub(crate) async fn attach_canonical_output_artifact(
         };
     }
     let additional_segments =
-        match install_staged_logical_segments(&path, staged_segments, retained_bytes).await {
+        match install_staged_logical_segments_blocking(&path, staged_segments, retained_bytes) {
             Ok(additional_segments) => additional_segments,
             Err((start, staged_path, err)) => {
                 reject_stale_delta(&retention_token);
@@ -2513,7 +2752,7 @@ pub(crate) async fn attach_canonical_output_artifact(
             error: Some(format!("failed to commit artifact transaction: {err}")),
         };
     }
-    match artifact_retention_record(&path).await {
+    match artifact_retention_record_blocking(&path) {
         Ok(Some(record)) => publish_known_record(
             &retention_token,
             record,
@@ -2660,13 +2899,15 @@ pub(crate) async fn remint_tool_history_artifact_for_thread(
             .clone()
             .unwrap_or_else(|| "artifact remint failed".to_string())
     })?;
-    let target_retention_token =
-        capture_retention_token(target_path.parent().unwrap_or_else(|| Path::new(".")));
+    // Tests can pause after the actual target commit to inject a filesystem
+    // failure or hold the real retention registry before rollback starts.
+    #[cfg(test)]
+    wait_at_reconciliation_barrier(&normalized_retention_path(&target_path)).await;
     if !reminted.complete
         || reminted.retained_bytes != expected_bytes
         || !reminted.unavailable_ranges.is_empty()
     {
-        rollback_logical_artifact_creation(&target_retention_token, &target_path);
+        rollback_reminted_artifact_creation(target_path, false).await;
         return Err(reminted
             .error
             .clone()
@@ -2681,11 +2922,27 @@ pub(crate) async fn remint_tool_history_artifact_for_thread(
     )
     .await
     {
-        let _ = tokio::fs::remove_file(active_tool_history_protection_path(&target_path)).await;
-        rollback_logical_artifact_creation(&target_retention_token, &target_path);
+        rollback_reminted_artifact_creation(target_path, true).await;
         return Err(format!("failed to protect reminted artifact: {err}"));
     }
     Ok(reminted_id)
+}
+
+async fn rollback_reminted_artifact_creation(path: PathBuf, remove_protection: bool) {
+    // The worker owns the complete cleanup and index publication. Dropping the
+    // awaiting remint caller cannot discard an admitted cleanup operation.
+    if let Err(error) = run_blocking_artifact_io(move || {
+        let token = capture_retention_token(path.parent().unwrap_or_else(|| Path::new(".")));
+        if remove_protection {
+            let _ = std::fs::remove_file(active_tool_history_protection_path(&path));
+        }
+        rollback_logical_artifact_creation(&token, &path);
+        Ok(())
+    })
+    .await
+    {
+        tracing::warn!(%error, "reminted artifact cleanup worker failed");
+    }
 }
 
 fn rollback_logical_artifact_creation(token: &RetentionIndexToken, path: &Path) {
@@ -2739,6 +2996,29 @@ fn create_new_protection_marker(marker: &Path, contents: &[u8]) -> std::io::Resu
     Ok(())
 }
 
+fn verified_artifact_digest(reader: impl Read, expected_bytes: u64) -> Result<String, String> {
+    // The file can change after its metadata was inspected. Bound both
+    // memory and the read, including one extra byte to detect growth.
+    let mut reader = reader.take(expected_bytes.saturating_add(1));
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut hasher = Sha256::new();
+    let mut verified_bytes = 0_u64;
+    loop {
+        let count = match reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(count) => count,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(format!("failed to verify artifact: {err}")),
+        };
+        verified_bytes += count as u64;
+        hasher.update(&buffer[..count]);
+    }
+    if verified_bytes != expected_bytes {
+        return Err("artifact byte count does not match receipt metadata".to_string());
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
 /// Ensures an exact artifact referenced by an active completed-tool receipt is
 /// protected independently from tool-history retention. The marker is only
 /// created after thread confinement, regular-file, byte-count, and digest
@@ -2757,80 +3037,169 @@ pub(crate) async fn protect_active_tool_history_artifact(
         return Err("non-canonical tool-output artifact id".to_string());
     }
     let directory = codex_home.join("tool-output").join(thread_id);
-    let path = directory.join(format!("{id}.log"));
-    let marker = active_tool_history_protection_path(&path);
-    let retention_token = capture_retention_token(&directory);
-    let _retention_permit = retention_sweep_permit_for_directory(&directory).await;
+    let root = tool_output_root_for_directory(&directory);
+    let process_permit = retention_sweep_semaphore(&root)
+        .acquire_owned()
+        .await
+        .map_err(|error| format!("failed to acquire artifact retention admission: {error}"))?;
     let expected_sha256 = expected_sha256.to_string();
-    let path_for_check = path.clone();
-    let marker_for_check = marker.clone();
-    let protection_result = tokio::task::spawn_blocking(move || -> Result<(), String> {
-        let (mut file, artifact_bytes) = open_regular_artifact(&path_for_check)
-            .map_err(|err| format!("artifact is not retrievable: {}", err.for_model()))?;
-        if artifact_bytes != expected_bytes {
-            return Err("artifact byte count does not match receipt metadata".to_string());
-        }
-        let capacity = usize::try_from(expected_bytes)
-            .map_err(|_| "artifact is too large to verify".to_string())?;
-        let mut bytes = Vec::with_capacity(capacity);
-        file.read_to_end(&mut bytes)
-            .map_err(|err| format!("failed to verify artifact: {err}"))?;
-        let digest = format!("{:x}", Sha256::digest(&bytes));
-        if digest != expected_sha256 {
-            return Err("artifact digest does not match receipt metadata".to_string());
-        }
-        match std::fs::symlink_metadata(&marker_for_check) {
-            Ok(_) => {
-                if !protection_marker_status(
-                    &marker_for_check,
-                    ACTIVE_TOOL_HISTORY_PROTECTION_MARKER_BYTES,
-                )
-                .unwrap_or(false)
-                {
-                    return Err("active tool-history protection marker is invalid".to_string());
+    // One worker owns every filesystem operation and both retention locks through
+    // publication. It never waits for another worker in the same blocking pool.
+    tokio::task::spawn_blocking(move || {
+        let token = capture_retention_token(&directory);
+        let _permit = retention_sweep_permit_blocking(&root, process_permit).map_err(|error| {
+            record_retention_sweep_permit_failure(&root, &error);
+            format!("failed to acquire artifact retention lock: {error}")
+        })?;
+        let path = directory.join(format!("{id}.log"));
+        let marker = active_tool_history_protection_path(&path);
+        let result = (|| {
+            let (file, artifact_bytes) = open_regular_artifact(&path)
+                .map_err(|error| format!("artifact is not retrievable: {}", error.for_model()))?;
+            if artifact_bytes != expected_bytes {
+                return Err("artifact byte count does not match receipt metadata".to_string());
+            }
+            if verified_artifact_digest(file, expected_bytes)? != expected_sha256 {
+                return Err("artifact digest does not match receipt metadata".to_string());
+            }
+            match std::fs::symlink_metadata(&marker) {
+                Ok(_) => {
+                    if !protection_marker_status(
+                        &marker,
+                        ACTIVE_TOOL_HISTORY_PROTECTION_MARKER_BYTES,
+                    )
+                    .unwrap_or(false)
+                    {
+                        return Err("active tool-history protection marker is invalid".to_string());
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    create_new_protection_marker(
+                        &marker,
+                        ACTIVE_TOOL_HISTORY_PROTECTION_MARKER_BYTES,
+                    )
+                    .map_err(|error| format!("failed to protect artifact: {error}"))?;
+                }
+                Err(error) => {
+                    return Err(format!("failed to inspect artifact protection: {error}"));
                 }
             }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                create_new_protection_marker(
-                    &marker_for_check,
-                    ACTIVE_TOOL_HISTORY_PROTECTION_MARKER_BYTES,
-                )
-                .map_err(|err| format!("failed to protect artifact: {err}"))?;
-            }
-            Err(err) => return Err(format!("failed to inspect artifact protection: {err}")),
+            sync_parent_directory(&marker).map_err(|error| {
+                format!("failed to sync active tool-history protection: {error}")
+            })?;
+            let record = artifact_retention_record_blocking(&path)
+                .map_err(|error| format!("failed to index protected artifact: {error}"))?
+                .ok_or_else(|| "artifact disappeared before protection was indexed".to_string())?;
+            publish_known_record(&token, record, LogicalRetentionMutation::Protection);
+            Ok(())
+        })();
+        if result.is_err() {
+            reject_stale_delta(&token);
         }
-        Ok(())
+        result
     })
     .await
-    .map_err(|err| format!("artifact verification task failed: {err}"))
-    .and_then(std::convert::identity);
-    if let Err(err) = protection_result {
-        reject_stale_delta(&retention_token);
-        return Err(err);
-    }
-    if let Err(err) = sync_parent_directory(&marker) {
-        reject_stale_delta(&retention_token);
-        return Err(format!(
-            "failed to sync active tool-history protection: {err}"
-        ));
-    }
-    let record = match artifact_retention_record(&path).await {
-        Ok(Some(record)) => record,
-        Ok(None) => {
+    .map_err(|error| format!("artifact protection worker failed: {error}"))?
+}
+
+/// Removes obsolete active-history markers after the replacement ledger snapshot
+/// commits, retaining every referenced key without revalidating artifact bytes.
+pub(crate) async fn prune_active_tool_history_artifact_protection(
+    codex_home: &Path,
+    thread_id: &str,
+    referenced_artifacts: &BTreeMap<String, (u64, String)>,
+) -> Result<(), String> {
+    let directory = codex_home.join("tool-output").join(thread_id);
+    let root = tool_output_root_for_directory(&directory);
+    let process_permit = retention_sweep_semaphore(&root)
+        .acquire_owned()
+        .await
+        .map_err(|error| format!("failed to acquire artifact pruning admission: {error}"))?;
+    let referenced_artifacts = referenced_artifacts.clone();
+    // Admission moves into the only filesystem worker before it can block on the
+    // OS lock. Neither cancellation nor a one-thread pool can release ownership
+    // early or strand nested filesystem work behind this worker.
+    tokio::task::spawn_blocking(move || {
+        let retention_token = capture_retention_token(&directory);
+        let _permit = retention_sweep_permit_blocking(&root, process_permit).map_err(|error| {
+            record_retention_sweep_permit_failure(&root, &error);
             reject_stale_delta(&retention_token);
-            return Err("artifact disappeared before protection was indexed".to_string());
+            format!("failed to acquire artifact pruning retention lock: {error}")
+        })?;
+    let pruning: Result<Vec<PathBuf>, String> = (|| {
+        let mut touched = Vec::new();
+        let entries = match std::fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match std::fs::symlink_metadata(&directory) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => { reject_stale_delta(&retention_token); return Ok(touched); },
+                    Err(error) => {
+                        return Err(format!(
+                            "failed to inspect active tool-history protection directory: {error}"
+                        ));
+                    }
+                    Ok(_) => {
+                        return Err(format!(
+                            "failed to read active tool-history protection directory: {error}"
+                        ));
+                    }
+                }
+            }
+            Err(error) => {
+                return Err(format!(
+                    "failed to read active tool-history protection directory: {error}"
+                ));
+            }
+        };
+        for entry in entries {
+            let entry = entry.map_err(|error| format!("failed to read active tool-history protection entry: {error}"))?;
+            let marker = entry.path();
+            if marker.extension().and_then(|extension| extension.to_str())
+                != Some(ACTIVE_TOOL_HISTORY_PROTECTION_EXTENSION)
+            {
+                continue;
+            }
+            if marker
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .is_some_and(|artifact_id| referenced_artifacts.contains_key(artifact_id))
+            {
+                continue;
+            }
+            std::fs::remove_file(&marker).map_err(|error| {
+                format!(
+                    "failed to remove obsolete active tool-history protection `{}`: {error}",
+                    marker.display()
+                )
+            })?;
+            touched.push(marker.with_extension("log"));
         }
-        Err(err) => {
+        sync_parent_directory(&directory.join("retention-sync")).map_err(|error| {
+            format!("failed to sync pruned active tool-history protection: {error}")
+        })?;
+        Ok(touched)
+    })();
+        let result = (|| {
+            // Publish only the artifacts whose protection changed. Referenced
+            // markers and their bytes are never revalidated by pruning.
+            for path in pruning? {
+                match artifact_retention_record_blocking(&path) {
+                    Ok(Some(record)) => publish_known_record(
+                        &retention_token, record, LogicalRetentionMutation::Protection,
+                    ),
+                    Ok(None) => publish_known_remove(
+                        &retention_token, &path, LogicalRetentionMutation::Protection, false,
+                    ),
+                    Err(error) => return Err(format!("failed to index pruned artifact protection: {error}")),
+                }
+            }
+            Ok(())
+        })();
+        if result.is_err() {
             reject_stale_delta(&retention_token);
-            return Err(format!("failed to index protected artifact: {err}"));
         }
-    };
-    publish_known_record(
-        &retention_token,
-        record,
-        LogicalRetentionMutation::Protection,
-    );
-    Ok(())
+        result
+    }).await.map_err(|error| format!("active tool-history protection pruning worker failed: {error}"))?
 }
 
 /// Reconciles the `active_tool_history` owner after resume, fork, compaction,
@@ -2858,48 +3227,62 @@ pub(crate) async fn reconcile_active_tool_history_artifact_protection(
 
     let directory = codex_home.join("tool-output").join(thread_id);
     let retention_token = capture_retention_token(&directory);
-    let _retention_permit = retention_sweep_permit_for_directory(&directory).await;
-    let mut entries = match tokio::fs::read_dir(&directory).await {
-        Ok(entries) => entries,
-        Err(_) => {
-            reject_stale_delta(&retention_token);
-            return live;
-        }
-    };
-    loop {
-        let entry = match entries.next_entry().await {
-            Ok(Some(entry)) => entry,
-            Ok(None) => break,
+    let permit = retention_sweep_permit_for_directory(&directory).await;
+    let fallback_live = live.clone();
+    let failure_token = retention_token.clone();
+    match tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let mut entries = match std::fs::read_dir(&directory) {
+            Ok(entries) => entries,
             Err(_) => {
                 reject_stale_delta(&retention_token);
                 return live;
             }
         };
-        let marker = entry.path();
-        if marker.extension().and_then(|extension| extension.to_str())
-            != Some(ACTIVE_TOOL_HISTORY_PROTECTION_EXTENSION)
-        {
-            continue;
+        loop {
+            let entry = match entries.next().transpose() {
+                Ok(Some(entry)) => entry,
+                Ok(None) => break,
+                Err(_) => {
+                    reject_stale_delta(&retention_token);
+                    return live;
+                }
+            };
+            let marker = entry.path();
+            if marker.extension().and_then(|extension| extension.to_str())
+                != Some(ACTIVE_TOOL_HISTORY_PROTECTION_EXTENSION)
+            {
+                continue;
+            }
+            let Some(artifact_id) = marker.file_stem().and_then(|stem| stem.to_str()) else {
+                continue;
+            };
+            if live.contains(artifact_id) {
+                continue;
+            }
+            match std::fs::remove_file(&marker) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => reject_stale_delta(&retention_token),
+            }
         }
-        let Some(artifact_id) = marker.file_stem().and_then(|stem| stem.to_str()) else {
-            continue;
-        };
-        if live.contains(artifact_id) {
-            continue;
+        if sync_parent_directory(&directory.join("retention-sync")).is_err() {
+            reject_stale_delta(&retention_token);
+            return live;
         }
-        match tokio::fs::remove_file(&marker).await {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => reject_stale_delta(&retention_token),
+        let installed_mode = reconcile_retention_root_blocking(&retention_token.root);
+        note_completed_protection_reconciliation(&retention_token.root, installed_mode);
+        live
+    })
+    .await
+    {
+        Ok(live) => live,
+        Err(error) => {
+            reject_stale_delta(&failure_token);
+            tracing::warn!(%error, "artifact protection reconciliation worker failed");
+            fallback_live
         }
     }
-    if sync_parent_directory(&directory.join("retention-sync")).is_err() {
-        reject_stale_delta(&retention_token);
-        return live;
-    }
-    let installed_mode = reconcile_retention_root(&retention_token.root).await;
-    note_completed_protection_reconciliation(&retention_token.root, installed_mode);
-    live
 }
 
 pub(crate) async fn append_raw_output_artifact(
@@ -4427,16 +4810,11 @@ where
         .map_err(std::io::Error::other)?
 }
 
-async fn artifact_is_protected(artifact_path: &Path) -> std::io::Result<bool> {
-    let tool_history_marker = active_tool_history_protection_path(artifact_path);
-    tokio::task::spawn_blocking(move || {
-        retention_protection_marker_status(
-            &tool_history_marker,
-            ACTIVE_TOOL_HISTORY_PROTECTION_MARKER_BYTES,
-        )
-    })
-    .await
-    .map_err(std::io::Error::other)?
+fn artifact_is_protected_blocking(artifact_path: &Path) -> std::io::Result<bool> {
+    retention_protection_marker_status(
+        &active_tool_history_protection_path(artifact_path),
+        ACTIVE_TOOL_HISTORY_PROTECTION_MARKER_BYTES,
+    )
 }
 
 #[cfg(test)]
@@ -4696,7 +5074,17 @@ fn publish_streaming_abandonment(token: &RetentionIndexToken) {
     }
 }
 
-async fn reconcile_retention_root(root: &Path) -> RetentionModeKind {
+#[cfg(test)]
+async fn prepare_retention_mode(root: &Path, force_reconciliation: bool) -> RetentionModeKind {
+    let root = root.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        prepare_retention_mode_blocking(&root, force_reconciliation)
+    })
+    .await
+    .unwrap_or(RetentionModeKind::Dirty)
+}
+
+fn reconcile_retention_root_blocking(root: &Path) -> RetentionModeKind {
     if indexing_disabled().load(Ordering::Acquire) {
         return RetentionModeKind::Disabled;
     }
@@ -4744,7 +5132,7 @@ async fn reconcile_retention_root(root: &Path) -> RetentionModeKind {
 
     #[cfg(test)]
     let started = Instant::now();
-    let scan = scan_retention_root(&root, capacity).await;
+    let scan = scan_retention_root_blocking(&root, capacity);
     #[cfg(test)]
     let elapsed_nanos = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
     let mut registry = lock_retention_registry();
@@ -4832,7 +5220,7 @@ async fn reconcile_retention_root(root: &Path) -> RetentionModeKind {
     }
 }
 
-async fn prepare_retention_mode(root: &Path, force_reconciliation: bool) -> RetentionModeKind {
+fn prepare_retention_mode_blocking(root: &Path, force_reconciliation: bool) -> RetentionModeKind {
     if indexing_disabled().load(Ordering::Acquire) {
         return RetentionModeKind::Disabled;
     }
@@ -4879,7 +5267,7 @@ async fn prepare_retention_mode(root: &Path, force_reconciliation: bool) -> Rete
     if mode != RetentionModeKind::Dirty {
         return mode;
     }
-    let reconciled = reconcile_retention_root(&root).await;
+    let reconciled = reconcile_retention_root_blocking(&root);
     if reconciled != RetentionModeKind::Indexed {
         if reconciled == RetentionModeKind::ScanOnly {
             #[cfg(test)]
@@ -4922,7 +5310,7 @@ fn invalidate_root_after_ambiguous_failure(root: &Path) {
     }
 }
 
-async fn enforce_indexed_thread_retention(
+fn enforce_indexed_thread_retention_blocking(
     root: &Path,
     directory: &Path,
     keep_path: &Path,
@@ -4970,7 +5358,7 @@ async fn enforce_indexed_thread_retention(
         let Some((path, token)) = candidate else {
             return true;
         };
-        match remove_inactive_output_path(path.clone()).await {
+        match remove_inactive_output_path_blocking(path.clone()) {
             InactiveRemovalOutcome::RemovedOrAbsent => {
                 publish_known_remove(&token, &path, LogicalRetentionMutation::Delete, true);
             }
@@ -4986,7 +5374,7 @@ async fn enforce_indexed_thread_retention(
     }
 }
 
-async fn enforce_indexed_global_retention(
+fn enforce_indexed_global_retention_blocking(
     root: &Path,
     keep_path: &Path,
     reserved_bytes: u64,
@@ -5027,7 +5415,7 @@ async fn enforce_indexed_global_retention(
         let Some((path, token)) = candidate else {
             return true;
         };
-        match remove_inactive_output_path(path.clone()).await {
+        match remove_inactive_output_path_blocking(path.clone()) {
             InactiveRemovalOutcome::RemovedOrAbsent => {
                 publish_known_remove(&token, &path, LogicalRetentionMutation::Delete, true);
             }
@@ -5045,9 +5433,20 @@ async fn enforce_indexed_global_retention(
 
 async fn enforce_retention(directory: &Path, keep_path: &Path) {
     let token = capture_retention_token(directory);
-    let _retention_permit = retention_sweep_permit_for_directory(directory).await;
-    publish_observed_path(&token, keep_path).await;
-    enforce_retention_locked(directory, keep_path, 0, 0).await;
+    let permit = retention_sweep_permit_for_directory(directory).await;
+    let directory = directory.to_path_buf();
+    let keep_path = keep_path.to_path_buf();
+    let failure_token = token.clone();
+    if let Err(error) = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        publish_observed_path_blocking(&token, &keep_path);
+        enforce_retention_locked_blocking(&directory, &keep_path, 0, 0);
+    })
+    .await
+    {
+        reject_stale_delta(&failure_token);
+        tracing::warn!(%error, "artifact retention worker failed");
+    }
 }
 
 async fn enforce_retention_after_observation(
@@ -5055,9 +5454,21 @@ async fn enforce_retention_after_observation(
     path: &Path,
     token: &RetentionIndexToken,
 ) {
-    let _retention_permit = retention_sweep_permit(&token.root).await;
-    publish_observed_path(token, path).await;
-    enforce_retention_locked(directory, path, 0, 0).await;
+    let permit = retention_sweep_permit(&token.root).await;
+    let directory = directory.to_path_buf();
+    let path = path.to_path_buf();
+    let token = token.clone();
+    let failure_token = token.clone();
+    if let Err(error) = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        publish_observed_path_blocking(&token, &path);
+        enforce_retention_locked_blocking(&directory, &path, 0, 0);
+    })
+    .await
+    {
+        reject_stale_delta(&failure_token);
+        tracing::warn!(%error, "artifact retention worker failed");
+    }
 }
 
 async fn enforce_retention_after_upsert(
@@ -5066,17 +5477,29 @@ async fn enforce_retention_after_upsert(
     token: &RetentionIndexToken,
     mutation: LogicalRetentionMutation,
 ) {
-    let _retention_permit = retention_sweep_permit(&token.root).await;
-    match artifact_retention_record(path).await {
-        Ok(Some(record)) => publish_known_record(token, record, mutation),
-        Ok(None) => publish_known_remove(token, path, mutation, false),
-        Err(_) => reject_stale_delta(token),
+    let permit = retention_sweep_permit(&token.root).await;
+    let directory = directory.to_path_buf();
+    let path = path.to_path_buf();
+    let token = token.clone();
+    let failure_token = token.clone();
+    if let Err(error) = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        match artifact_retention_record_blocking(&path) {
+            Ok(Some(record)) => publish_known_record(&token, record, mutation),
+            Ok(None) => publish_known_remove(&token, &path, mutation, false),
+            Err(_) => reject_stale_delta(&token),
+        }
+        enforce_retention_locked_blocking(&directory, &path, 0, 0);
+    })
+    .await
+    {
+        reject_stale_delta(&failure_token);
+        tracing::warn!(%error, "artifact retention worker failed");
     }
-    enforce_retention_locked(directory, path, 0, 0).await;
 }
 
-async fn publish_observed_path(token: &RetentionIndexToken, path: &Path) {
-    match artifact_retention_record(path).await {
+fn publish_observed_path_blocking(token: &RetentionIndexToken, path: &Path) {
+    match artifact_retention_record_blocking(path) {
         Ok(Some(record)) => {
             let Some(generation) = token.generation else {
                 return;
@@ -5113,7 +5536,7 @@ async fn publish_observed_path(token: &RetentionIndexToken, path: &Path) {
     }
 }
 
-async fn enforce_retention_locked(
+fn enforce_retention_locked_blocking(
     directory: &Path,
     keep_path: &Path,
     reserved_bytes: u64,
@@ -5133,42 +5556,38 @@ async fn enforce_retention_locked(
         transition_current_root_to_dirty(&mut registry, &root);
         return;
     }
-    match prepare_retention_mode(&root, external_generation_changed).await {
+    match prepare_retention_mode_blocking(&root, external_generation_changed) {
         RetentionModeKind::Indexed => {
-            if !enforce_indexed_thread_retention(
+            if !enforce_indexed_thread_retention_blocking(
                 &root,
                 directory,
                 keep_path,
                 reserved_bytes,
                 reserved_artifacts,
-            )
-            .await
-            {
+            ) {
                 return;
             }
-            let _ = enforce_indexed_global_retention(
+            let _ = enforce_indexed_global_retention_blocking(
                 &root,
                 keep_path,
                 reserved_bytes,
                 reserved_artifacts,
-            )
-            .await;
+            );
         }
         RetentionModeKind::ScanOnly | RetentionModeKind::Disabled => {
-            run_scan_only_retention(
+            run_scan_only_retention_blocking(
                 &root,
                 directory,
                 keep_path,
                 reserved_bytes,
                 reserved_artifacts,
-            )
-            .await;
+            );
         }
         RetentionModeKind::Dirty | RetentionModeKind::Reconciling => {}
     }
 }
 
-async fn run_scan_only_retention(
+fn run_scan_only_retention_blocking(
     root: &Path,
     directory: &Path,
     keep_path: &Path,
@@ -5177,13 +5596,20 @@ async fn run_scan_only_retention(
 ) {
     #[cfg(test)]
     let started = Instant::now();
-    let thread_scan =
-        enforce_retention_scan_locked(directory, keep_path, reserved_bytes, reserved_artifacts)
-            .await;
+    let thread_scan = enforce_retention_scan_locked_blocking(
+        directory,
+        keep_path,
+        reserved_bytes,
+        reserved_artifacts,
+    );
     #[cfg_attr(not(test), allow(unused_variables))]
     let global_scan = if thread_scan.complete {
-        enforce_global_retention_scan_locked(root, keep_path, reserved_bytes, reserved_artifacts)
-            .await
+        enforce_global_retention_scan_locked_blocking(
+            root,
+            keep_path,
+            reserved_bytes,
+            reserved_artifacts,
+        )
     } else {
         RetentionScanProgress::default()
     };
@@ -5209,21 +5635,21 @@ async fn run_scan_only_retention(
     }
 }
 
-async fn enforce_retention_scan_locked(
+fn enforce_retention_scan_locked_blocking(
     directory: &Path,
     keep_path: &Path,
     reserved_bytes: u64,
     reserved_artifacts: usize,
 ) -> RetentionScanProgress {
     let mut progress = RetentionScanProgress::default();
-    let Ok(mut entries) = tokio::fs::read_dir(directory).await else {
+    let Ok(mut entries) = std::fs::read_dir(directory) else {
         return progress;
     };
     progress.directories_visited = 1;
     let mut paths = Vec::new();
     let mut total_bytes = 0_u64;
     loop {
-        let entry = match entries.next_entry().await {
+        let entry = match entries.next().transpose() {
             Ok(Some(entry)) => entry,
             Ok(None) => break,
             Err(_) => return progress,
@@ -5231,7 +5657,7 @@ async fn enforce_retention_scan_locked(
         let path = entry.path();
         if path.extension().and_then(|extension| extension.to_str()) == Some("log") {
             progress.candidates_visited = progress.candidates_visited.saturating_add(1);
-            let Ok(metadata) = entry.metadata().await else {
+            let Ok(metadata) = entry.metadata() else {
                 return progress;
             };
             let bytes = metadata.len();
@@ -5239,7 +5665,7 @@ async fn enforce_retention_scan_locked(
                 return progress;
             };
             total_bytes = updated_total;
-            let Ok(protected) = artifact_is_protected(&path).await else {
+            let Ok(protected) = artifact_is_protected_blocking(&path) else {
                 return progress;
             };
             paths.push((path.clone(), bytes, protected));
@@ -5262,7 +5688,7 @@ async fn enforce_retention_scan_locked(
         if path == keep_path || protected {
             continue;
         }
-        match remove_inactive_output_path(path).await {
+        match remove_inactive_output_path_blocking(path) {
             InactiveRemovalOutcome::RemovedOrAbsent => {
                 remove_count = remove_count.saturating_sub(1);
                 total_bytes = total_bytes.saturating_sub(bytes);
@@ -5281,42 +5707,48 @@ async fn enforce_retention_scan_locked(
 #[cfg(test)]
 async fn enforce_global_retention(tool_output_root: &Path, keep_path: &Path) {
     let root = normalized_tool_output_root(tool_output_root);
-    let _retention_permit = retention_sweep_permit(&root).await;
-    match prepare_retention_mode(&root, true).await {
-        RetentionModeKind::Indexed => {
-            let _ = enforce_indexed_global_retention(&root, keep_path, 0, 0).await;
+    let keep_path = keep_path.to_path_buf();
+    let permit = retention_sweep_permit(&root).await;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        match prepare_retention_mode_blocking(&root, true) {
+            RetentionModeKind::Indexed => {
+                let _ = enforce_indexed_global_retention_blocking(&root, &keep_path, 0, 0);
+            }
+            RetentionModeKind::ScanOnly | RetentionModeKind::Disabled => {
+                let _ = enforce_global_retention_scan_locked_blocking(&root, &keep_path, 0, 0);
+            }
+            RetentionModeKind::Dirty | RetentionModeKind::Reconciling => {}
         }
-        RetentionModeKind::ScanOnly | RetentionModeKind::Disabled => {
-            let _ = enforce_global_retention_scan_locked(&root, keep_path, 0, 0).await;
-        }
-        RetentionModeKind::Dirty | RetentionModeKind::Reconciling => {}
-    }
+    })
+    .await
+    .expect("global retention worker");
 }
 
-async fn enforce_global_retention_scan_locked(
+fn enforce_global_retention_scan_locked_blocking(
     tool_output_root: &Path,
     keep_path: &Path,
     reserved_bytes: u64,
     reserved_artifacts: usize,
 ) -> RetentionScanProgress {
     let mut progress = RetentionScanProgress::default();
-    let Ok(mut thread_directories) = tokio::fs::read_dir(tool_output_root).await else {
+    let Ok(mut thread_directories) = std::fs::read_dir(tool_output_root) else {
         return progress;
     };
     let mut paths = Vec::new();
     let mut total_bytes = 0_u64;
     loop {
-        let thread_directory = match thread_directories.next_entry().await {
+        let thread_directory = match thread_directories.next().transpose() {
             Ok(Some(entry)) => entry.path(),
             Ok(None) => break,
             Err(_) => return progress,
         };
-        let Ok(mut entries) = tokio::fs::read_dir(&thread_directory).await else {
+        let Ok(mut entries) = std::fs::read_dir(&thread_directory) else {
             return progress;
         };
         progress.directories_visited = progress.directories_visited.saturating_add(1);
         loop {
-            let entry = match entries.next_entry().await {
+            let entry = match entries.next().transpose() {
                 Ok(Some(entry)) => entry,
                 Ok(None) => break,
                 Err(_) => return progress,
@@ -5324,7 +5756,7 @@ async fn enforce_global_retention_scan_locked(
             let path = entry.path();
             if path.extension().and_then(|extension| extension.to_str()) == Some("log") {
                 progress.candidates_visited = progress.candidates_visited.saturating_add(1);
-                let Ok(metadata) = entry.metadata().await else {
+                let Ok(metadata) = entry.metadata() else {
                     return progress;
                 };
                 let bytes = metadata.len();
@@ -5335,7 +5767,7 @@ async fn enforce_global_retention_scan_locked(
                 let Ok(modified) = metadata.modified() else {
                     return progress;
                 };
-                let Ok(protected) = artifact_is_protected(&path).await else {
+                let Ok(protected) = artifact_is_protected_blocking(&path) else {
                     return progress;
                 };
                 paths.push((modified, path.clone(), bytes, protected));
@@ -5360,7 +5792,7 @@ async fn enforce_global_retention_scan_locked(
             break;
         }
         if !protected && path != keep_path {
-            match remove_inactive_output_path(path).await {
+            match remove_inactive_output_path_blocking(path) {
                 InactiveRemovalOutcome::RemovedOrAbsent => {
                     remove_count = remove_count.saturating_sub(1);
                     total_bytes = total_bytes.saturating_sub(bytes);
@@ -5377,7 +5809,7 @@ async fn enforce_global_retention_scan_locked(
     progress
 }
 
-async fn retention_usage_locked(directory: &Path) -> RetentionUsage {
+fn retention_usage_locked_blocking(directory: &Path) -> RetentionUsage {
     let root = tool_output_root_for_directory(directory);
     let indexed_usage = {
         let registry = lock_retention_registry();
@@ -5402,38 +5834,34 @@ async fn retention_usage_locked(directory: &Path) -> RetentionUsage {
         return usage;
     }
     RetentionUsage {
-        thread_bytes: log_bytes_in_directory(directory).await.unwrap_or(u64::MAX),
-        global_bytes: log_bytes_in_tool_output_root(&root)
-            .await
-            .unwrap_or(u64::MAX),
+        thread_bytes: log_bytes_in_directory_blocking(directory).unwrap_or(u64::MAX),
+        global_bytes: log_bytes_in_tool_output_root_blocking(&root).unwrap_or(u64::MAX),
     }
 }
 
-async fn log_bytes_in_directory(directory: &Path) -> std::io::Result<u64> {
-    let mut entries = tokio::fs::read_dir(directory).await?;
+fn log_bytes_in_directory_blocking(directory: &Path) -> std::io::Result<u64> {
+    let mut entries = std::fs::read_dir(directory)?;
     let mut bytes = 0_u64;
-    while let Some(entry) = entries.next_entry().await? {
+    while let Some(entry) = entries.next().transpose()? {
         if entry.path().extension().and_then(|value| value.to_str()) == Some("log") {
-            bytes = bytes
-                .checked_add(entry.metadata().await?.len())
-                .ok_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "thread artifact byte total overflowed",
-                    )
-                })?;
+            bytes = bytes.checked_add(entry.metadata()?.len()).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "thread artifact byte total overflowed",
+                )
+            })?;
         }
     }
     Ok(bytes)
 }
 
-async fn log_bytes_in_tool_output_root(root: &Path) -> std::io::Result<u64> {
-    let mut entries = tokio::fs::read_dir(root).await?;
+fn log_bytes_in_tool_output_root_blocking(root: &Path) -> std::io::Result<u64> {
+    let mut entries = std::fs::read_dir(root)?;
     let mut bytes = 0_u64;
-    while let Some(entry) = entries.next_entry().await? {
-        if entry.metadata().await?.is_dir() {
+    while let Some(entry) = entries.next().transpose()? {
+        if entry.metadata()?.is_dir() {
             bytes = bytes
-                .checked_add(log_bytes_in_directory(&entry.path()).await?)
+                .checked_add(log_bytes_in_directory_blocking(&entry.path())?)
                 .ok_or_else(|| {
                     std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
@@ -5549,37 +5977,45 @@ async fn retention_sweep_permit(root: &Path) -> Option<RetentionSweepPermit> {
             return None;
         }
     };
-    let lock_target = retention_interprocess_lock_target(&root);
     let lock_root = root.clone();
-    let interprocess_lock = match tokio::task::spawn_blocking(move || {
-        #[cfg(test)]
-        match RETENTION_SWEEP_PERMIT_FAILURE_FOR_TEST.swap(0, Ordering::AcqRel) {
-            1 => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "injected retention lock acquisition failure",
-                ));
-            }
-            2 => panic!("injected retention lock task failure"),
-            _ => {}
-        }
-        let lock = acquire_atomic_write_lock(&lock_target)?;
-        advance_retention_interprocess_generation(&lock_root, &lock_target)?;
-        Ok::<_, std::io::Error>(lock)
+    match tokio::task::spawn_blocking(move || {
+        retention_sweep_permit_blocking(&lock_root, process_permit)
     })
     .await
     {
-        Ok(Ok(lock)) => lock,
+        Ok(Ok(permit)) => Some(permit),
         Ok(Err(error)) => {
             record_retention_sweep_permit_failure(&root, &error);
-            return None;
+            None
         }
         Err(error) => {
             record_retention_sweep_permit_failure(&root, &error);
-            return None;
+            None
         }
-    };
-    Some(RetentionSweepPermit {
+    }
+}
+
+fn retention_sweep_permit_blocking(
+    root: &Path,
+    process_permit: OwnedSemaphorePermit,
+) -> std::io::Result<RetentionSweepPermit> {
+    // The OS lock acquisition can outlive its awaiter. Move admission into this
+    // worker before the first filesystem wait, including on error and panic.
+    #[cfg(test)]
+    match RETENTION_SWEEP_PERMIT_FAILURE_FOR_TEST.swap(0, Ordering::AcqRel) {
+        1 => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected retention lock acquisition failure",
+            ));
+        }
+        2 => panic!("injected retention lock task failure"),
+        _ => {}
+    }
+    let lock_target = retention_interprocess_lock_target(root);
+    let interprocess_lock = acquire_atomic_write_lock(&lock_target)?;
+    advance_retention_interprocess_generation(root, &lock_target)?;
+    Ok(RetentionSweepPermit {
         _process_permit: process_permit,
         _interprocess_lock: interprocess_lock,
     })
@@ -5691,47 +6127,49 @@ fn retention_registry_mutex_is_available_for_test() -> bool {
 
 #[cfg(test)]
 async fn force_retention_reconciliation_for_test(root: &Path) -> RetentionModeKind {
-    let _permit = retention_sweep_permit(root).await;
-    reconcile_retention_root(root).await
+    let permit = retention_sweep_permit(root).await;
+    let root = root.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        reconcile_retention_root_blocking(&root)
+    })
+    .await
+    .expect("retention reconciliation worker")
 }
 
 #[cfg(test)]
 #[path = "command_output_artifact_tests.rs"]
 mod hardening_tests;
 
-async fn remove_inactive_output_path(path: PathBuf) -> InactiveRemovalOutcome {
-    tokio::task::spawn_blocking(move || {
-        let file = match std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&path)
-        {
-            Ok(file) => file,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                return InactiveRemovalOutcome::RemovedOrAbsent;
-            }
-            Err(err) => return InactiveRemovalOutcome::Ambiguous(err),
-        };
-        match file.try_lock() {
-            Ok(()) => {}
-            Err(std::fs::TryLockError::WouldBlock) => {
-                return InactiveRemovalOutcome::Active;
-            }
-            Err(err) => return InactiveRemovalOutcome::Ambiguous(err.into()),
+fn remove_inactive_output_path_blocking(path: PathBuf) -> InactiveRemovalOutcome {
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return InactiveRemovalOutcome::RemovedOrAbsent;
         }
-        match remove_logical_artifact_files(&path) {
-            Ok(()) => InactiveRemovalOutcome::RemovedOrAbsent,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                InactiveRemovalOutcome::RemovedOrAbsent
-            }
-            Err(err) => InactiveRemovalOutcome::Ambiguous(err),
+        Err(err) => return InactiveRemovalOutcome::Ambiguous(err),
+    };
+    match file.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => {
+            return InactiveRemovalOutcome::Active;
         }
-    })
-    .await
-    .unwrap_or_else(|err| InactiveRemovalOutcome::Ambiguous(std::io::Error::other(err)))
+        Err(err) => return InactiveRemovalOutcome::Ambiguous(err.into()),
+    }
+    match remove_logical_artifact_files(&path) {
+        Ok(()) => InactiveRemovalOutcome::RemovedOrAbsent,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            InactiveRemovalOutcome::RemovedOrAbsent
+        }
+        Err(err) => InactiveRemovalOutcome::Ambiguous(err),
+    }
 }
 
-async fn logical_artifact_disk_bytes(path: &Path) -> std::io::Result<u64> {
+fn logical_artifact_disk_bytes(path: &Path) -> std::io::Result<u64> {
     let Some(directory) = path.parent() else {
         return Ok(0);
     };
@@ -5739,23 +6177,22 @@ async fn logical_artifact_disk_bytes(path: &Path) -> std::io::Result<u64> {
         .file_stem()
         .and_then(|value| value.to_str())
         .unwrap_or_default();
-    let mut entries = tokio::fs::read_dir(directory).await?;
+    let entries = std::fs::read_dir(directory)?;
     let mut bytes = 0_u64;
-    while let Some(entry) = entries.next_entry().await? {
+    for entry in entries {
+        let entry = entry?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if name == format!("{stem}.log")
             || name == format!("{stem}.meta.json")
             || name.starts_with(&format!("{stem}.segment-"))
         {
-            bytes = bytes
-                .checked_add(entry.metadata().await?.len())
-                .ok_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "logical artifact byte total overflowed",
-                    )
-                })?;
+            bytes = bytes.checked_add(entry.metadata()?.len()).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "logical artifact byte total overflowed",
+                )
+            })?;
         }
     }
     Ok(bytes)
@@ -5766,6 +6203,60 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::*;
+
+    #[tokio::test]
+    async fn artifact_creation_unlock_failure_does_not_publish_stored_handle() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let output = b"retained after unlock failure\n";
+        let failed = CREATION_UNLOCK_FAILURE_FOR_TEST
+            .scope(
+                (),
+                create_raw_output_artifact(temp.path(), "thread", output),
+            )
+            .await;
+        let RawOutputArtifact::Failed {
+            id: Some(_),
+            owned_path: Some(path),
+            bytes,
+            message,
+        } = &failed
+        else {
+            panic!("unlock failure must not publish a stored artifact: {failed:?}");
+        };
+        assert_eq!(*bytes, output.len() as u64);
+        assert!(message.contains("after creation: injected creation unlock failure"));
+        assert_eq!(
+            failed.model_projection(),
+            (
+                None,
+                None,
+                Some("raw output artifact storage failed".to_string())
+            )
+        );
+        assert!(failed.render_for_model().contains("unavailable"));
+        assert_eq!(tokio::fs::read(path).await.expect("retained bytes"), output);
+        // Keep the returned Failed value alive: it must not retain the locked
+        // writer handle. An independent open must acquire the real OS lock.
+        let reopened = File::options()
+            .read(true)
+            .write(true)
+            .open(path)
+            .expect("open");
+        reopened
+            .try_lock()
+            .expect("failed creation released its writer");
+        reopened.unlock().expect("release independent lock");
+        let recovered = create_raw_output_artifact(temp.path(), "thread", b"recovered\n").await;
+        let RawOutputArtifact::Stored { id, .. } = recovered else {
+            panic!("subsequent creation must recover");
+        };
+        assert_eq!(
+            read_exact_tool_output_artifact(temp.path(), "thread", &id.to_string())
+                .await
+                .expect("read recovered artifact"),
+            b"recovered\n"
+        );
+    }
 
     #[tokio::test]
     async fn artifact_retains_exact_bytes_across_chunks() {
@@ -5964,14 +6455,8 @@ mod tests {
         let outside = temp.path().join("outside.log");
         std::fs::write(&outside, b"outside secret\n").expect("write outside artifact");
         let id = ToolOutputArtifactId::new();
-        if let Err(error) = symlink_file(&outside, thread_directory.join(format!("{id}.log"))) {
-            if error.kind() == std::io::ErrorKind::PermissionDenied
-                || error.raw_os_error() == Some(1314)
-            {
-                return;
-            }
-            panic!("create file reparse point: {error}");
-        }
+        symlink_file(&outside, thread_directory.join(format!("{id}.log")))
+            .expect("native file-symlink support is required to verify reparse rejection");
 
         let error = read_tool_output_artifact(temp.path(), "thread", &id.to_string(), 1, 1, 16_384)
             .await

@@ -32,12 +32,18 @@ struct CapturedRequest {
 
 fn read_http_request(
     stream: &mut TcpStream,
+    deadline: Instant,
 ) -> std::io::Result<(String, HashMap<String, String>, Vec<u8>)> {
-    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-    let deadline = Instant::now() + Duration::from_secs(2);
-
     let mut read_next = |buf: &mut [u8]| -> std::io::Result<usize> {
         loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "timed out waiting for request data",
+                ));
+            }
+            stream.set_read_timeout(Some(remaining))?;
             match stream.read(buf) {
                 Ok(n) => return Ok(n),
                 Err(err)
@@ -50,7 +56,10 @@ fn read_http_request(
                             "timed out waiting for request data",
                         ));
                     }
-                    thread::sleep(Duration::from_millis(5));
+                    thread::sleep(
+                        Duration::from_millis(5)
+                            .min(deadline.saturating_duration_since(Instant::now())),
+                    );
                 }
                 Err(err) => return Err(err),
             }
@@ -140,6 +149,20 @@ fn write_http_response(stream: &mut TcpStream, status: &str) -> std::io::Result<
 }
 
 #[test]
+fn http_request_deadline_does_not_restart_after_accept() -> std::io::Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let mut client = TcpStream::connect(listener.local_addr()?)?;
+    client.write_all(b"POST /v1/metrics HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}")?;
+    let (mut stream, _) = listener.accept()?;
+
+    let error = read_http_request(&mut stream, Instant::now() - Duration::from_millis(1))
+        .expect_err("an expired collector deadline must reject even a ready request");
+
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    Ok(())
+}
+
+#[test]
 fn otlp_http_exporter_sends_metrics_to_collector() -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("local_addr");
@@ -153,7 +176,7 @@ fn otlp_http_exporter_sends_metrics_to_collector() -> Result<()> {
         while Instant::now() < deadline {
             match listener.accept() {
                 Ok((mut stream, _)) => {
-                    let result = read_http_request(&mut stream);
+                    let result = read_http_request(&mut stream, deadline);
                     let _ = write_http_response(&mut stream, "202 Accepted");
                     if let Ok((path, headers, body)) = result {
                         captured.push(CapturedRequest {
@@ -164,7 +187,10 @@ fn otlp_http_exporter_sends_metrics_to_collector() -> Result<()> {
                     }
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(10));
+                    thread::sleep(
+                        Duration::from_millis(10)
+                            .min(deadline.saturating_duration_since(Instant::now())),
+                    );
                 }
                 Err(_) => break,
             }
@@ -245,7 +271,7 @@ fn otlp_http_exporter_sends_logs_to_collector()
         while Instant::now() < deadline {
             match listener.accept() {
                 Ok((mut stream, _)) => {
-                    let result = read_http_request(&mut stream);
+                    let result = read_http_request(&mut stream, deadline);
                     let _ = write_http_response(&mut stream, "202 Accepted");
                     if let Ok((path, headers, body)) = result {
                         captured.push(CapturedRequest {
@@ -256,7 +282,10 @@ fn otlp_http_exporter_sends_logs_to_collector()
                     }
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(10));
+                    thread::sleep(
+                        Duration::from_millis(10)
+                            .min(deadline.saturating_duration_since(Instant::now())),
+                    );
                 }
                 Err(_) => break,
             }
@@ -369,7 +398,7 @@ fn otlp_http_exporter_sends_traces_to_collector()
         while Instant::now() < deadline {
             match listener.accept() {
                 Ok((mut stream, _)) => {
-                    let result = read_http_request(&mut stream);
+                    let result = read_http_request(&mut stream, deadline);
                     let _ = write_http_response(&mut stream, "202 Accepted");
                     if let Ok((path, headers, body)) = result {
                         captured.push(CapturedRequest {
@@ -380,7 +409,10 @@ fn otlp_http_exporter_sends_traces_to_collector()
                     }
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(10));
+                    thread::sleep(
+                        Duration::from_millis(10)
+                            .min(deadline.saturating_duration_since(Instant::now())),
+                    );
                 }
                 Err(_) => break,
             }
@@ -514,7 +546,7 @@ async fn otlp_http_exporter_sends_traces_to_collector_in_tokio_runtime()
         while Instant::now() < deadline {
             match listener.accept() {
                 Ok((mut stream, _)) => {
-                    let result = read_http_request(&mut stream);
+                    let result = read_http_request(&mut stream, deadline);
                     let _ = write_http_response(&mut stream, "202 Accepted");
                     if let Ok((path, headers, body)) = result {
                         captured.push(CapturedRequest {
@@ -525,7 +557,10 @@ async fn otlp_http_exporter_sends_traces_to_collector_in_tokio_runtime()
                     }
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(10));
+                    thread::sleep(
+                        Duration::from_millis(10)
+                            .min(deadline.saturating_duration_since(Instant::now())),
+                    );
                 }
                 Err(_) => break,
             }
@@ -617,7 +652,7 @@ fn otlp_http_exporter_sends_traces_to_collector_in_current_thread_tokio_runtime(
         while Instant::now() < deadline {
             match listener.accept() {
                 Ok((mut stream, _)) => {
-                    let result = read_http_request(&mut stream);
+                    let result = read_http_request(&mut stream, deadline);
                     let _ = write_http_response(&mut stream, "202 Accepted");
                     if let Ok((path, headers, body)) = result {
                         captured.push(CapturedRequest {
@@ -628,7 +663,10 @@ fn otlp_http_exporter_sends_traces_to_collector_in_current_thread_tokio_runtime(
                     }
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(10));
+                    thread::sleep(
+                        Duration::from_millis(10)
+                            .min(deadline.saturating_duration_since(Instant::now())),
+                    );
                 }
                 Err(_) => break,
             }

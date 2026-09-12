@@ -586,7 +586,9 @@ static SYSTEM_PROXY_CACHE: OnceLock<Mutex<HashMap<String, CachedSystemProxyDecis
 
 fn cached_system_proxy_decision(request_url: &str) -> Option<SystemProxyDecision> {
     let cache = SYSTEM_PROXY_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut cache = cache.lock().ok()?;
+    // A platform lookup holds this lock while resolving PAC/WPAD. Treat contention as a
+    // cache miss so async callers wait on the semaphore and blocking pool instead of here.
+    let mut cache = cache.try_lock().ok()?;
     let key = system_proxy_cache_key(request_url);
     cached_system_proxy_decision_from_cache(&mut cache, &key, Instant::now())
 }
@@ -864,3 +866,73 @@ mod redirect_integration_tests;
 #[cfg(test)]
 #[path = "outbound_proxy_tests.rs"]
 mod tests;
+
+#[cfg(all(test, any(target_os = "windows", target_os = "macos")))]
+mod cache_contention_tests {
+    use super::RequestOrigin;
+    use super::SYSTEM_PROXY_CACHE;
+    use super::SystemProxyDecision;
+    use super::resolve_system_proxy_with;
+    use crate::HttpClientFactory;
+    use crate::OutboundProxyPolicy;
+    use crate::OutboundProxyRoute;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_resolution_keeps_runtime_responsive_during_cache_contention() {
+        let request_url = "https://async-cache-contention.test/request";
+        let proxy_url = "http://resolved-system-proxy.test:8080";
+        let cache = SYSTEM_PROXY_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        let origin = RequestOrigin::parse(request_url).expect("valid request URL");
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut runtime_progressed = false;
+            let decision = resolve_system_proxy_with(cache, request_url, &origin, |_, _| {
+                started_tx.send(()).expect("test is waiting for resolver");
+                // Model a pending platform lookup while retaining the real production cache
+                // lock. Bound the wait outside Tokio so a blocking regression cannot hang it.
+                runtime_progressed = release_rx.recv_timeout(Duration::from_secs(2)).is_ok();
+                SystemProxyDecision::Proxy {
+                    url: proxy_url.to_string(),
+                }
+            });
+            (decision, runtime_progressed)
+        });
+        started_rx.await.expect("platform resolver acquired cache");
+        let unrelated_task = tokio::spawn(async move {
+            // A current-thread runtime can run this only after the public resolver yields.
+            let _ = release_tx.send(());
+        });
+        let factory = HttpClientFactory::new(OutboundProxyPolicy::RespectSystemProxy);
+
+        let route = factory
+            .resolve_proxy_route_async(request_url.to_string())
+            .await
+            .expect("resolve route after cache contention");
+        unrelated_task
+            .await
+            .expect("unrelated runtime task finished");
+        let (decision, runtime_progressed) = worker.join().expect("platform resolver finished");
+
+        assert!(
+            runtime_progressed,
+            "cache lookup blocked the Tokio worker until the platform lookup timed out"
+        );
+        assert_eq!(
+            decision,
+            SystemProxyDecision::Proxy {
+                url: proxy_url.to_string()
+            }
+        );
+        assert_eq!(
+            route,
+            OutboundProxyRoute::Proxy {
+                url: proxy_url.to_string(),
+                no_proxy: None
+            }
+        );
+    }
+}

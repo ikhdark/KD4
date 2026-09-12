@@ -3,6 +3,7 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -200,6 +201,7 @@ struct SessionBinding {
 }
 
 struct SessionInner {
+    runtime: OnceLock<tokio::runtime::Handle>,
     process_host: Arc<OwnedProcessHost>,
     host_lease: StdMutex<Option<HostSessionLease>>,
     delegate: Arc<dyn CodeModeSessionDelegate>,
@@ -230,6 +232,7 @@ impl ProcessOwnedCodeModeSession {
         let host_lease = process_host.acquire_session();
         Self {
             inner: Arc::new(SessionInner {
+                runtime: OnceLock::new(),
                 process_host,
                 host_lease: StdMutex::new(Some(host_lease)),
                 delegate,
@@ -268,6 +271,7 @@ impl ProcessOwnedCodeModeSession {
 
 impl SessionInner {
     async fn connection(self: &Arc<Self>) -> Result<SessionBinding, String> {
+        self.runtime.get_or_init(tokio::runtime::Handle::current);
         loop {
             if self.shutdown_requested.load(Ordering::Acquire) {
                 return Err("code mode session is shutting down".to_string());
@@ -495,7 +499,16 @@ where
 
 impl Drop for ProcessOwnedCodeModeSession {
     fn drop(&mut self) {
-        if tokio::runtime::Handle::try_current().is_ok() {
+        // A Send session may be dropped on a thread that has not entered Tokio.
+        // Keep cleanup on the runtime that owns its connection and host tasks.
+        if let Some(runtime) = self
+            .inner
+            .runtime
+            .get()
+            .cloned()
+            .or_else(|| tokio::runtime::Handle::try_current().ok())
+        {
+            let _entered = runtime.enter();
             self.inner.request_shutdown();
         }
     }

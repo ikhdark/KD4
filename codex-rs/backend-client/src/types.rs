@@ -441,16 +441,22 @@ mod tests {
 
     #[test]
     fn unified_diff_prefers_current_diff_task_turn() {
-        let details = fixture("diff");
+        let mut details = fixture("diff");
+        // Both candidates contain valid diffs, so choosing the assistant turn
+        // first must fail this precedence assertion.
+        details.current_assistant_turn = fixture("error").current_assistant_turn;
         let diff = details.unified_diff().expect("diff present");
-        assert!(diff.contains("diff --git"));
+        assert_eq!(
+            diff,
+            "diff --git a/src/main.rs b/src/main.rs\n+fn main() { println!(\"hi\"); }\n"
+        );
     }
 
     #[test]
     fn unified_diff_falls_back_to_pr_output_diff() {
         let details = fixture("error");
         let diff = details.unified_diff().expect("diff from pr output");
-        assert!(diff.contains("lib.rs"));
+        assert_eq!(diff, "diff --git a/lib.rs b/lib.rs\n+pub fn hello() {}\n");
     }
 
     #[test]

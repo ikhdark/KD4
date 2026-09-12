@@ -345,10 +345,11 @@ fn thread_id_from_rollout_path(path: &Path) -> Option<ThreadId> {
         return None;
     }
     let uuid_start = stem.len().saturating_sub(36);
-    if !stem[..uuid_start].ends_with('-') {
+    let (prefix, uuid) = stem.split_at_checked(uuid_start)?;
+    if !prefix.ends_with('-') {
         return None;
     }
-    ThreadId::from_string(&stem[uuid_start..]).ok()
+    ThreadId::from_string(uuid).ok()
 }
 
 #[cfg(test)]
@@ -400,6 +401,50 @@ mod tests {
                 compressed_path.with_file_name(format!("rollout-2025-01-03T12-00-00-{uuid}.jsonl"))
             )
         );
+    }
+
+    #[test]
+    fn stored_thread_from_rollout_item_handles_unicode_file_names() {
+        let thread_id =
+            ThreadId::from_string("00000000-0000-0000-0000-000000000001").expect("valid thread id");
+        for suffix in [".jsonl", ".jsonl.zst"] {
+            let valid_path = PathBuf::from(format!("rollout-\u{00e9}-{thread_id}{suffix}"));
+            let valid = stored_thread_from_rollout_item(
+                ThreadItem {
+                    path: valid_path,
+                    ..Default::default()
+                },
+                /*archived*/ false,
+                "test-provider",
+            )
+            .expect("Unicode prefix preserves the UUID");
+            assert_eq!(valid.thread_id, thread_id);
+
+            // The 36-byte suffix starts inside the two-byte character.
+            let invalid_path = PathBuf::from(format!("rollout-\u{00e9}{}{suffix}", "x".repeat(35)));
+            assert!(
+                stored_thread_from_rollout_item(
+                    ThreadItem {
+                        path: invalid_path.clone(),
+                        ..Default::default()
+                    },
+                    /*archived*/ false,
+                    "test-provider",
+                )
+                .is_none()
+            );
+            let explicit = stored_thread_from_rollout_item(
+                ThreadItem {
+                    path: invalid_path,
+                    thread_id: Some(thread_id),
+                    ..Default::default()
+                },
+                /*archived*/ false,
+                "test-provider",
+            )
+            .expect("explicit metadata identity takes precedence over file name");
+            assert_eq!(explicit.thread_id, thread_id);
+        }
     }
 
     #[test]

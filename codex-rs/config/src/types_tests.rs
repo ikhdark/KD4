@@ -2,12 +2,32 @@ use super::*;
 use pretty_assertions::assert_eq;
 
 #[test]
-fn otel_value_types_are_protocol_owned() {
-    let protocol: codex_protocol::config_types::OtelHttpProtocol = OtelHttpProtocol::Binary;
-    let tls: codex_protocol::config_types::OtelTlsConfig = OtelTlsConfig::default();
-
+fn otel_value_types_preserve_wire_names_and_optional_tls_paths() {
+    let protocol: codex_protocol::config_types::OtelHttpProtocol =
+        serde_json::from_str("\"binary\"").expect("binary protocol should deserialize");
     assert_eq!(protocol, OtelHttpProtocol::Binary);
-    assert_eq!(tls, OtelTlsConfig::default());
+    assert_eq!(
+        serde_json::to_string(&OtelHttpProtocol::Json).unwrap(),
+        "\"json\""
+    );
+    assert!(serde_json::from_str::<OtelHttpProtocol>("\"unknown\"").is_err());
+
+    let home = tempfile::tempdir().expect("temporary directory");
+    let ca_path = home.path().join("ca.pem");
+    let tls: codex_protocol::config_types::OtelTlsConfig =
+        serde_json::from_value(serde_json::json!({"ca-certificate": ca_path}))
+            .expect("TLS paths should deserialize");
+    assert_eq!(tls.ca_certificate.as_ref().unwrap().as_path(), ca_path);
+    assert_eq!(tls.client_certificate, None);
+    assert_eq!(tls.client_private_key, None);
+    assert_eq!(
+        serde_json::to_value(&tls).unwrap(),
+        serde_json::json!({
+            "ca-certificate": ca_path,
+            "client-certificate": null,
+            "client-private-key": null,
+        })
+    );
 }
 
 #[test]

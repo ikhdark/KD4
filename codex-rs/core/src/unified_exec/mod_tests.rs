@@ -108,8 +108,6 @@ async fn exec_command_with_tty(
             "-NoLogo".to_string(),
             "-NoProfile".to_string(),
             "-NoExit".to_string(),
-            "-Command".to_string(),
-            "-".to_string(),
         ]
     } else {
         vec![
@@ -207,6 +205,7 @@ async fn exec_command_with_tty(
     }
 
     Ok(ExecCommandToolOutput {
+        validation: None,
         event_call_id: context.call_id,
         chunk_id: generate_chunk_id(),
         wall_time,
@@ -219,6 +218,7 @@ async fn exec_command_with_tty(
         original_token_count: Some(approx_token_count(&text)),
         hook_command: Some(cmd.to_string()),
         raw_output_artifact: None,
+        raw_output_reduction_notice: None,
         repair_notice: None,
     })
 }
@@ -332,7 +332,8 @@ async fn write_stdin(
 }
 
 #[tokio::test(start_paused = true)]
-async fn nonempty_write_stdin_yield_deadline_includes_process_reaction() -> anyhow::Result<()> {
+async fn write_stdin_yield_deadlines_include_reaction_and_cap_background_wait() -> anyhow::Result<()>
+{
     let (session, turn) = test_session_and_turn().await;
     let manager = &session.services.unified_exec_manager;
     let process_id = manager.allocate_process_id().await;
@@ -378,6 +379,18 @@ async fn nonempty_write_stdin_yield_deadline_includes_process_reaction() -> anyh
     assert_eq!(output.wall_time, Duration::from_millis(MIN_YIELD_TIME_MS));
     assert_eq!(output.process_id, Some(process_id));
 
+    let started_at = Instant::now();
+    let output = write_stdin(&session, process_id, "", /*yield_time_ms*/ 120_000).await?;
+    assert_eq!(
+        Instant::now().saturating_duration_since(started_at),
+        Duration::from_secs(60)
+    );
+    assert_eq!(output.wall_time, Duration::from_secs(60));
+    assert!(output.raw_output.is_empty());
+    assert_eq!(output.process_id, Some(process_id));
+    assert_eq!(output.exit_code, None);
+    assert!(!output.process_exited);
+
     manager.release_process_id(process_id).await;
     allow_terminate.notify_one();
     process.terminate();
@@ -395,16 +408,10 @@ fn push_chunk_preserves_prefix_and_suffix() {
     assert_eq!(buffer.retained_bytes(), UNIFIED_EXEC_OUTPUT_MAX_BYTES);
     let snapshot = buffer.snapshot_chunks();
 
-    let first = snapshot.first().expect("expected at least one chunk");
-    assert_eq!(first.first(), Some(&b'a'));
-    assert!(snapshot.iter().any(|chunk| chunk.as_slice() == b"b"));
-    assert_eq!(
-        snapshot
-            .last()
-            .expect("expected at least one chunk")
-            .as_slice(),
-        b"c"
-    );
+    let mut expected = vec![b'a'; UNIFIED_EXEC_OUTPUT_MAX_BYTES - 2];
+    expected.extend_from_slice(b"bc");
+    assert_eq!(snapshot.concat(), expected);
+    assert_eq!(buffer.omitted_bytes(), 2);
 }
 
 #[test]
@@ -431,7 +438,9 @@ async fn unified_exec_persists_across_requests() -> anyhow::Result<()> {
         /*workdir*/ None,
     )
     .await?;
-    let process_id = open_shell.process_id.expect("expected process_id");
+    let process_id = open_shell
+        .process_id
+        .unwrap_or_else(|| panic!("interactive shell exited before input: {open_shell:?}"));
     assert_eq!(
         session.list_background_terminals().await,
         vec![BackgroundTerminalInfo {
@@ -473,60 +482,207 @@ async fn unified_exec_persists_across_requests() -> anyhow::Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn multi_unified_exec_sessions() -> anyhow::Result<()> {
-    let (session, turn) = test_session_and_turn().await;
+    let (session, mut turn) = make_session_and_context().await;
+    turn.permission_profile = codex_protocol::models::PermissionProfile::Disabled;
+    let mut config = (*turn.config).clone();
+    config
+        .features
+        .enable(codex_features::Feature::UnifiedExec)?;
+    config.permissions.approval_policy =
+        crate::config::Constrained::allow_any(codex_protocol::protocol::AskForApproval::Never);
+    turn.config = Arc::new(config);
+    let session = Arc::new(session);
+    let step = crate::session::step_context::StepContext::for_test(Arc::new(turn));
+    let router = Arc::new(crate::tools::router::ToolRouter::from_context(
+        step.as_ref(),
+        crate::tools::router::ToolRouterParams {
+            tool_suggest_candidates: None,
+            deferred_mcp_tools: None,
+            mcp_tools: None,
+            extension_tool_executors: Vec::new(),
+            dynamic_tools: &[],
+            exposure_identity: Default::default(),
+        },
+        &Default::default(),
+    ));
+    assert!(step.set_tool_router(router).is_ok());
+    let runtime = crate::tools::parallel::ToolCallRuntime::new(
+        Arc::clone(&session),
+        step,
+        Arc::new(tokio::sync::Mutex::new(
+            crate::turn_diff_tracker::TurnDiffTracker::new(),
+        )),
+    );
+    assert!(runtime.has_registered_tool(&codex_tools::ToolName::plain("exec_command")));
+    assert!(runtime.has_registered_tool(&codex_tools::ToolName::plain("write_stdin")));
 
-    let shell_a = exec_command(
-        &session,
-        &turn,
-        "powershell.exe -NoExit",
-        /*yield_time_ms*/ 2_500,
-        /*workdir*/ None,
+    // This helper only dispatches registered calls and extracts their real
+    // model-visible payload; it does not create processes or synthesize status.
+    async fn dispatch(
+        runtime: &crate::tools::parallel::ToolCallRuntime,
+        tool_name: &str,
+        call_id: &str,
+        arguments: serde_json::Value,
+    ) -> anyhow::Result<(Option<bool>, String)> {
+        let response = runtime
+            .clone()
+            .handle_tool_call(
+                crate::tools::router::ToolCall {
+                    tool_name: codex_tools::ToolName::plain(tool_name),
+                    call_id: call_id.to_string(),
+                    payload: crate::tools::context::ToolPayload::Function {
+                        arguments: arguments.to_string(),
+                    },
+                },
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await?;
+        let codex_protocol::models::ResponseInputItem::FunctionCallOutput {
+            call_id: returned_call_id,
+            output,
+        } = response
+        else {
+            panic!("expected registered function output: {response:?}")
+        };
+        assert_eq!(returned_call_id, call_id);
+        Ok((
+            output.success,
+            output.body.to_text().expect("textual command output"),
+        ))
+    }
+
+    let (_, opened) = dispatch(
+        &runtime,
+        "exec_command",
+        "multi-shell-a",
+        serde_json::json!({
+            "kind": "argv", "program": "powershell.exe",
+            "args": ["-NoLogo", "-NoProfile", "-NoExit"],
+            "tty": true, "yield_time_ms": 2500,
+        }),
     )
     .await?;
-    let session_a = shell_a.process_id.expect("expected process id");
-
-    write_stdin(
-        &session,
-        session_a,
-        "$env:CODEX_INTERACTIVE_SHELL_VAR = 'codex'\n",
-        /*yield_time_ms*/ 2_500,
-    )
-    .await?;
-
-    let out_2 = exec_command(
-        &session,
-        &turn,
-        "Write-Output $env:CODEX_INTERACTIVE_SHELL_VAR",
-        /*yield_time_ms*/ 2_500,
-        /*workdir*/ None,
-    )
-    .await?;
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    let terminals = session.list_background_terminals().await;
+    assert_eq!(
+        terminals.len(),
+        1,
+        "registered shell must remain alive: {opened}"
+    );
+    let process_id = terminals[0].process_id.parse::<u32>()?;
     assert!(
-        out_2.process_id.is_none(),
-        "short command should not report a process id if it exits quickly"
+        opened.contains(&format!("Process running with session ID {process_id};")),
+        "{opened}"
+    );
+
+    // A unique name makes isolation independent of the host environment.
+    let variable = format!("CODEX_MULTI_SESSION_{}", uuid::Uuid::new_v4().simple());
+    let value = "codex-session-state";
+    dispatch(
+        &runtime,
+        "write_stdin",
+        "multi-set-a",
+        serde_json::json!({
+            "session_id": process_id,
+            "chars": format!("$env:{variable} = '{value}'\n"),
+            "yield_time_ms": 2500,
+        }),
+    )
+    .await?;
+
+    let (short_success, short_output) = dispatch(
+        &runtime,
+        "exec_command",
+        "multi-fresh-shell",
+        serde_json::json!({
+            "kind": "argv", "program": "powershell.exe",
+            "args": ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
+                format!("Write-Output ('FRESH:' + $env:{variable} + ':DONE')")],
+            "tty": false, "yield_time_ms": 30_000,
+        }),
+    )
+    .await?;
+    assert_eq!(
+        short_success,
+        Some(true),
+        "fresh shell failed: {short_output}"
     );
     assert!(
-        !out_2
-            .truncated_output(TEST_MAX_OUTPUT_TOKENS)
-            .contains("codex"),
-        "short command should run in a fresh shell"
+        short_output.starts_with("Process exited with code 0;"),
+        "short command must complete inline: {short_output}"
     );
+    assert!(
+        !short_output.contains("Process running with session ID"),
+        "completed command must not return a live session: {short_output}"
+    );
+    let normalized = short_output.replace("\r\n", "\n");
+    let (_, fresh_output) = normalized
+        .split_once("\nOutput:\n")
+        .expect("real output section");
+    assert_eq!(
+        fresh_output.trim(),
+        "FRESH::DONE",
+        "fresh shell must not inherit A's state"
+    );
+    assert!(!fresh_output.contains(value));
+    let remaining = session.list_background_terminals().await;
+    assert_eq!(
+        remaining.len(),
+        1,
+        "inline command must not leave a second process"
+    );
+    assert_eq!(remaining[0].process_id, process_id.to_string());
+    {
+        let store = session
+            .services
+            .unified_exec_manager
+            .process_store
+            .lock()
+            .await;
+        assert_eq!(store.processes.len(), 1);
+        assert!(store.processes.contains_key(&process_id));
+        assert_eq!(store.reserved_process_ids.len(), 1);
+        assert!(store.reserved_process_ids.contains(&process_id));
+    }
 
-    let out_3 = write_stdin(
-        &session,
-        shell_a.process_id.expect("expected process id"),
-        "Write-Output $env:CODEX_INTERACTIVE_SHELL_VAR\n",
-        /*yield_time_ms*/ 2_500,
+    let (_, preserved) = dispatch(
+        &runtime,
+        "write_stdin",
+        "multi-read-a",
+        serde_json::json!({
+            "session_id": process_id,
+            // The expected contiguous marker never occurs in the echoed input.
+            "chars": format!("Write-Output ('PERSISTED:' + $env:{variable})\n"),
+            "yield_time_ms": 2500,
+        }),
     )
     .await?;
     assert!(
-        out_3
-            .truncated_output(TEST_MAX_OUTPUT_TOKENS)
-            .contains("codex"),
-        "session should preserve state"
+        preserved.contains(&format!("Process running with session ID {process_id};")),
+        "{preserved}"
+    );
+    assert!(
+        preserved.contains("PERSISTED:codex-session-state"),
+        "A must preserve its own state: {preserved}"
     );
 
+    assert!(session.terminate_background_terminal(process_id).await);
+    assert!(session.list_background_terminals().await.is_empty());
+    assert!(
+        session
+            .services
+            .command_execution
+            .running_process(process_id)
+            .await
+            .is_none()
+    );
+    let store = session
+        .services
+        .unified_exec_manager
+        .process_store
+        .lock()
+        .await;
+    assert!(store.processes.is_empty());
+    assert!(store.reserved_process_ids.is_empty());
     Ok(())
 }
 
@@ -544,7 +700,9 @@ async fn unified_exec_timeouts() -> anyhow::Result<()> {
         /*workdir*/ None,
     )
     .await?;
-    let process_id = open_shell.process_id.expect("expected process id");
+    let process_id = open_shell
+        .process_id
+        .unwrap_or_else(|| panic!("interactive shell exited before input: {open_shell:?}"));
 
     write_stdin(
         &session,
@@ -567,6 +725,8 @@ async fn unified_exec_timeouts() -> anyhow::Result<()> {
             .contains(TEST_VAR_VALUE),
         "timeout too short should yield incomplete output"
     );
+    assert_eq!(out_2.process_id, Some(process_id));
+    assert_eq!(out_2.exit_code, None);
 
     tokio::time::sleep(Duration::from_secs(7)).await;
 
@@ -578,6 +738,8 @@ async fn unified_exec_timeouts() -> anyhow::Result<()> {
             .contains(TEST_VAR_VALUE),
         "subsequent poll should retrieve output"
     );
+    assert!(session.terminate_background_terminal(process_id).await);
+    assert!(session.list_background_terminals().await.is_empty());
 
     Ok(())
 }
@@ -622,21 +784,95 @@ async fn unified_exec_pause_blocks_yield_timeout() -> anyhow::Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reusing_completed_process_returns_unknown_process() -> anyhow::Result<()> {
-    let (session, turn) = test_session_and_turn().await;
+    let (session, mut turn) = make_session_and_context().await;
+    turn.permission_profile = codex_protocol::models::PermissionProfile::Disabled;
+    let mut config = (*turn.config).clone();
+    config
+        .features
+        .enable(codex_features::Feature::UnifiedExec)?;
+    config.permissions.approval_policy =
+        crate::config::Constrained::allow_any(codex_protocol::protocol::AskForApproval::Never);
+    turn.config = Arc::new(config);
+    let session = Arc::new(session);
+    let step = crate::session::step_context::StepContext::for_test(Arc::new(turn));
+    let router = Arc::new(crate::tools::router::ToolRouter::from_context(
+        step.as_ref(),
+        crate::tools::router::ToolRouterParams {
+            tool_suggest_candidates: None,
+            deferred_mcp_tools: None,
+            mcp_tools: None,
+            extension_tool_executors: Vec::new(),
+            dynamic_tools: &[],
+            exposure_identity: Default::default(),
+        },
+        &Default::default(),
+    ));
+    assert!(step.set_tool_router(router).is_ok());
+    let runtime = crate::tools::parallel::ToolCallRuntime::new(
+        session.clone(),
+        step,
+        Arc::new(tokio::sync::Mutex::new(
+            crate::turn_diff_tracker::TurnDiffTracker::new(),
+        )),
+    );
+    let opened = runtime
+        .handle_tool_call(
+            crate::tools::router::ToolCall {
+                tool_name: codex_tools::ToolName::plain("exec_command"),
+                call_id: "interactive-cleanup".to_string(),
+                payload: crate::tools::context::ToolPayload::Function {
+                    arguments: serde_json::json!({
+                        "kind": "argv",
+                        "program": "powershell.exe",
+                        "args": ["-NoLogo", "-NoProfile", "-NoExit"],
+                        "tty": true,
+                        "yield_time_ms": 2500
+                    })
+                    .to_string(),
+                },
+            },
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await?;
+    let terminals = session.list_background_terminals().await;
+    assert_eq!(
+        terminals.len(),
+        1,
+        "registered shell must stay alive: {opened:?}"
+    );
+    let process_id = terminals[0].process_id.parse::<u32>()?;
 
-    let open_shell = exec_command(
+    let mut closed = write_stdin(
         &session,
-        &turn,
-        "powershell.exe -NoExit",
+        process_id,
+        "Write-Output ('final-' + 'output-preserved'); exit\n",
         /*yield_time_ms*/ 2_500,
-        /*workdir*/ None,
     )
     .await?;
-    let process_id = open_shell.process_id.expect("expected process id");
-
-    write_stdin(&session, process_id, "exit\n", /*yield_time_ms*/ 2_500).await?;
-
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    let mut final_output = closed.raw_output.clone();
+    assert_eq!(closed.exit_code, Some(0), "shell did not exit: {closed:?}");
+    assert!(closed.process_exited);
+    // Exit status may arrive before the PTY output closes. Consume the retained
+    // session until the public response confirms that its output has drained.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(retained_id) = closed.process_id {
+            assert_eq!(retained_id, process_id);
+            closed = write_stdin(&session, process_id, "", /*yield_time_ms*/ 100).await?;
+            final_output.extend_from_slice(&closed.raw_output);
+            assert_eq!(closed.exit_code, Some(0));
+            assert!(closed.process_exited);
+            tokio::task::yield_now().await;
+        }
+        Ok::<(), UnifiedExecError>(())
+    })
+    .await
+    .expect("exited shell output must close and release its process id")?;
+    assert_eq!(closed.process_id, None);
+    assert!(
+        String::from_utf8_lossy(&final_output).contains("final-output-preserved"),
+        "final command output must survive PTY cleanup: {:?}",
+        String::from_utf8_lossy(&final_output)
+    );
 
     let err = write_stdin(&session, process_id, "", /*yield_time_ms*/ 100)
         .await
@@ -659,6 +895,7 @@ async fn reusing_completed_process_returns_unknown_process() -> anyhow::Result<(
             .processes
             .is_empty()
     );
+    assert!(session.list_background_terminals().await.is_empty());
 
     Ok(())
 }

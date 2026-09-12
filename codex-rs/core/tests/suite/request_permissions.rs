@@ -1624,3 +1624,288 @@ async fn request_permissions_grants_do_not_carry_across_turns() -> Result<()> {
 
     Ok(())
 }
+
+#[test_case(AdditionalPermissionsCommandTool::ShellCommand, false, true, true; "shell_escalated_approved")]
+#[test_case(AdditionalPermissionsCommandTool::ShellCommand, false, true, false; "shell_escalated_denied")]
+#[test_case(AdditionalPermissionsCommandTool::ShellCommand, false, false, false; "shell_escalated_disabled")]
+#[test_case(AdditionalPermissionsCommandTool::ShellCommand, true, true, true; "shell_additional_approved")]
+#[test_case(AdditionalPermissionsCommandTool::ShellCommand, true, true, false; "shell_additional_denied")]
+#[test_case(AdditionalPermissionsCommandTool::ShellCommand, true, false, false; "shell_additional_disabled")]
+#[test_case(AdditionalPermissionsCommandTool::ExecCommand, false, true, true; "exec_escalated_approved")]
+#[test_case(AdditionalPermissionsCommandTool::ExecCommand, false, true, false; "exec_escalated_denied")]
+#[test_case(AdditionalPermissionsCommandTool::ExecCommand, false, false, false; "exec_escalated_disabled")]
+#[test_case(AdditionalPermissionsCommandTool::ExecCommand, true, true, true; "exec_additional_approved")]
+#[test_case(AdditionalPermissionsCommandTool::ExecCommand, true, true, false; "exec_additional_denied")]
+#[test_case(AdditionalPermissionsCommandTool::ExecCommand, true, false, false; "exec_additional_disabled")]
+#[cfg_attr(target_os = "windows", serial_test::serial(codex_home))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn granular_inline_execution_approval(
+    command_tool: AdditionalPermissionsCommandTool,
+    additional: bool,
+    sandbox_approval: bool,
+    approve: bool,
+) -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    #[cfg(target_os = "windows")]
+    let _windows_sandbox_test_lock = super::lock_windows_sandbox_tests()?;
+    #[cfg(target_os = "windows")]
+    super::stage_windows_sandbox_helpers()?;
+
+    let server = start_mock_server().await;
+    let approval_policy = AskForApproval::Granular(GranularApprovalConfig {
+        sandbox_approval,
+        rules: false,
+        skill_approval: false,
+        request_permissions: false,
+        mcp_elicitations: false,
+    });
+    let mut builder = test_codex()
+        .with_model_info_override("gpt-5.4", move |model| {
+            model.shell_type = match command_tool {
+                AdditionalPermissionsCommandTool::ShellCommand => {
+                    codex_protocol::openai_models::ConfigShellToolType::ShellCommand
+                }
+                AdditionalPermissionsCommandTool::ExecCommand => {
+                    codex_protocol::openai_models::ConfigShellToolType::UnifiedExec
+                }
+            };
+        })
+        .with_config(move |config| {
+            config.permissions.approval_policy = Constrained::allow_any(approval_policy);
+            config.set_windows_elevated_sandbox_enabled(true);
+            config
+                .permissions
+                .set_permission_profile(CorePermissionProfile::read_only())
+                .expect("set read-only baseline");
+            config
+                .features
+                .enable(Feature::ShellTool)
+                .expect("enable shell tools");
+            config
+                .features
+                .enable(Feature::ExecPermissionApprovals)
+                .expect("enable inline permission requests");
+            match command_tool {
+                AdditionalPermissionsCommandTool::ShellCommand => {
+                    config
+                        .features
+                        .disable(Feature::UnifiedExec)
+                        .expect("select shell_command");
+                }
+                AdditionalPermissionsCommandTool::ExecCommand => {
+                    config
+                        .features
+                        .enable(Feature::UnifiedExec)
+                        .expect("select exec_command");
+                }
+            }
+        });
+    let test = builder.build(&server).await?;
+    let outside = tempfile::tempdir()?;
+    let outside_path = outside.path().canonicalize()?;
+    let marker = outside_path.join("granular-marker.txt");
+    let command = format!(
+        "$ErrorActionPreference = 'Stop'; {}",
+        write_and_read_command(&marker, "approved-granular-write")
+    );
+    let requested = native_permissions(RequestPermissionProfile {
+        file_system: Some(FileSystemPermissions::from_read_write_roots(
+            Some(vec![]),
+            Some(vec![absolute_path(&outside_path)]),
+        )),
+        ..Default::default()
+    })?;
+    let call_id = "granular-inline-exec";
+    let (tool_name, mut args) = match command_tool {
+        AdditionalPermissionsCommandTool::ShellCommand => (
+            "shell_command",
+            json!({"kind": "script", "command": command, "timeout_ms": 10_000_u64}),
+        ),
+        AdditionalPermissionsCommandTool::ExecCommand => (
+            "exec_command",
+            json!({"kind": "script", "cmd": command, "yield_time_ms": 30_000_u64}),
+        ),
+    };
+    args["sandbox_permissions"] = json!(if additional {
+        SandboxPermissions::WithAdditionalPermissions
+    } else {
+        SandboxPermissions::RequireEscalated
+    });
+    args["justification"] = json!("Allow this test command to write its marker?");
+    if additional {
+        args["additional_permissions"] = json!(requested);
+    }
+    let initial = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("granular-response-1"),
+            ev_function_call(call_id, tool_name, &serde_json::to_string(&args)?),
+            ev_completed("granular-response-1"),
+        ]),
+    )
+    .await;
+    let results = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_assistant_message("granular-final", "done"),
+            ev_completed("granular-response-2"),
+        ]),
+    )
+    .await;
+
+    submit_turn(
+        &test,
+        call_id,
+        approval_policy,
+        CorePermissionProfile::read_only(),
+    )
+    .await?;
+    let shell_denied = matches!(command_tool, AdditionalPermissionsCommandTool::ShellCommand)
+        && sandbox_approval
+        && !approve;
+    if sandbox_approval {
+        let approval = expect_exec_approval(&test, &command).await;
+        assert!(
+            !marker.exists(),
+            "the child must not write before the approval reply"
+        );
+        assert_eq!(
+            approval.additional_permissions,
+            additional.then_some(requested)
+        );
+        test.codex
+            .submit(Op::ExecApproval {
+                id: approval.effective_approval_id(),
+                turn_id: None,
+                decision: if approve {
+                    ReviewDecision::Approved
+                } else {
+                    ReviewDecision::Denied
+                },
+            })
+            .await?;
+        if shell_denied {
+            // The shell emitter reports a terminal user denial; the turn must
+            // publish that result rather than ask the model to continue.
+            let event = wait_for_event_with_timeout(
+                &test.codex,
+                |event| match event {
+                    EventMsg::ItemCompleted(completed) => matches!(
+                        &completed.item,
+                        codex_protocol::items::TurnItem::CommandExecution(item)
+                            if item.id == call_id
+                    ),
+                    EventMsg::TurnComplete(_)
+                    | EventMsg::ExecApprovalRequest(_)
+                    | EventMsg::RequestPermissions(_) => true,
+                    _ => false,
+                },
+                REQUEST_PERMISSIONS_EVENT_TIMEOUT,
+            )
+            .await;
+            let EventMsg::ItemCompleted(completed) = event else {
+                panic!("expected the denied command item before terminal completion: {event:?}");
+            };
+            let codex_protocol::items::TurnItem::CommandExecution(item) = completed.item else {
+                panic!("expected the registered shell's command item");
+            };
+            assert_eq!(item.id, call_id);
+            assert_eq!(
+                item.status,
+                codex_protocol::items::CommandExecutionStatus::Declined
+            );
+            assert_eq!(item.exit_code, Some(-1));
+            assert_eq!(
+                item.stderr.as_deref(),
+                Some("exec command rejected by user")
+            );
+            assert_eq!(
+                item.aggregated_output.as_deref(),
+                Some("exec command rejected by user")
+            );
+            assert!(
+                !marker.exists(),
+                "denial notification cannot follow a child write"
+            );
+        }
+        wait_for_completion(&test).await;
+    } else {
+        let event = wait_for_event_with_timeout(
+            &test.codex,
+            |event| {
+                matches!(
+                    event,
+                    EventMsg::ExecApprovalRequest(_)
+                        | EventMsg::RequestPermissions(_)
+                        | EventMsg::TurnComplete(_)
+                )
+            },
+            REQUEST_PERMISSIONS_EVENT_TIMEOUT,
+        )
+        .await;
+        assert!(
+            matches!(event, EventMsg::TurnComplete(_)),
+            "sandbox_approval=false must reject without an approval prompt: {event:?}"
+        );
+    }
+    let initial_body = initial.single_request().body_json();
+    let advertised = initial_body["tools"]
+        .as_array()
+        .expect("advertised tool definitions")
+        .iter()
+        .find(|tool| tool["name"].as_str() == Some(tool_name))
+        .expect("the invoked tool must be registered and advertised normally");
+    let permission_values = advertised["parameters"]["properties"]["sandbox_permissions"]["enum"]
+        .as_array()
+        .expect("sandbox permission choices");
+    assert_eq!(
+        permission_values.contains(&json!("require_escalated")),
+        sandbox_approval,
+        "the model's escalation choices must agree with runtime approval policy"
+    );
+    if shell_denied {
+        assert!(
+            results.requests().is_empty(),
+            "a terminal shell denial must not start a follow-up model request"
+        );
+        assert!(
+            !marker.exists(),
+            "rejected execution must leave no child write"
+        );
+        return Ok(());
+    }
+    let output = results.single_request().function_call_output(call_id);
+    let result = parse_result(&output);
+    if sandbox_approval && approve {
+        assert_eq!(fs::read_to_string(&marker)?, "approved-granular-write");
+        assert!(
+            result.stdout.contains("approved-granular-write"),
+            "{}",
+            result.stdout
+        );
+        assert!(
+            result.exit_code.is_none() || result.exit_code == Some(0),
+            "{}",
+            result.stdout
+        );
+    } else {
+        assert!(
+            !marker.exists(),
+            "rejected execution must leave no child write"
+        );
+        if sandbox_approval {
+            assert!(
+                result.stdout.contains("rejected by user"),
+                "{}",
+                result.stdout
+            );
+        } else {
+            assert!(
+                result.stdout.contains("approval policy"),
+                "{}",
+                result.stdout
+            );
+        }
+    }
+    Ok(())
+}

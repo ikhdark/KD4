@@ -232,7 +232,7 @@ pub(crate) trait HistoryCell: std::fmt::Debug + Send + Sync + Any {
             .wrap(Wrap { trim: false })
             .line_count(width)
             .try_into()
-            .unwrap_or(0)
+            .unwrap_or(u16::MAX)
     }
 
     /// Returns lines for the transcript overlay (`Ctrl+T`).

@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
@@ -101,7 +102,6 @@ use crate::stream_events_utils::finalize_non_tool_response_item;
 use crate::stream_events_utils::handle_non_tool_response_item;
 use crate::stream_events_utils::handle_output_item_done;
 use crate::stream_events_utils::last_assistant_message_from_item;
-use crate::stream_events_utils::mark_thread_memory_mode_polluted_if_external_context;
 use crate::stream_events_utils::raw_assistant_output_text_from_item;
 use crate::stream_events_utils::record_completed_response_item_with_finalized_facts;
 use crate::tasks::TurnTaskResult;
@@ -852,7 +852,7 @@ pub(crate) async fn run_turn(
                     );
                 }
 
-                // as long as compaction works well in getting us way below the token limit, we shouldn't worry about being in an infinite loop.
+                // Automatic compaction verifies that the replacement fits before continuing.
                 if needs_follow_up && token_limit_reached {
                     record_convergence_decision(
                         sess.as_ref(),
@@ -2214,16 +2214,26 @@ async fn commit_pending_turn_plan_effects(
     }
 
     if !plan.mentioned_plugins.is_empty() {
-        for summary in &plan.mentioned_plugins {
-            if let Some(plugin) = sess
-                .services
-                .plugins_manager
-                .telemetry_metadata_for_capability_summary(summary)
-            {
-                sess.services
-                    .analytics_events_client
-                    .track_plugin_used(plan.tracking.clone(), plugin);
+        let plugins_manager = Arc::clone(&sess.services.plugins_manager);
+        let mentioned_plugins = plan.mentioned_plugins.clone();
+        let metadata = tokio::task::spawn_blocking(move || {
+            mentioned_plugins
+                .iter()
+                .filter_map(|summary| {
+                    plugins_manager.telemetry_metadata_for_capability_summary(summary)
+                })
+                .collect::<Vec<_>>()
+        })
+        .await;
+        match metadata {
+            Ok(plugins) => {
+                for plugin in plugins {
+                    sess.services
+                        .analytics_events_client
+                        .track_plugin_used(plan.tracking.clone(), plugin);
+                }
             }
+            Err(error) => warn!(%error, "plugin mention telemetry metadata task failed"),
         }
         turn_context
             .turn_timing_state
@@ -2644,8 +2654,14 @@ async fn run_pending_input_pre_sampling_compact(
         projected_prompt_pressure.auto_compact_scope_tokens,
     )
     .await;
-    if !allow_pending_input_compaction || !token_status.token_limit_reached {
+    if !token_status.token_limit_reached {
         return Ok(None);
+    }
+    if !allow_pending_input_compaction {
+        return Err(planning_failure_with_timing(
+            turn_context,
+            "the prompt still exceeds its configured token limit after compaction; stopping before another model request. Reduce attached context or start a new task",
+        ));
     }
 
     // Reuse the step context the pending-turn plan was built from. Capturing another one
@@ -2817,6 +2833,7 @@ async fn run_auto_compact(
     cancellation_token: &CancellationToken,
 ) -> CodexResult<()> {
     let turn_context = &step_context.turn;
+    let budget_turn_context = Arc::clone(turn_context);
     let initial_context_injection = match initial_context_injection {
         InitialContextInjection::DoNotInject => {
             let world_state =
@@ -2914,6 +2931,26 @@ async fn run_auto_compact(
                 }
                 fallback_result?;
             }
+        }
+    }
+    if matches!(reason, CompactionReason::ContextLimit) {
+        let token_status =
+            super::context_window::context_window_token_status(sess, budget_turn_context.as_ref())
+                .await;
+        if token_status.token_limit_reached {
+            let error = CodexErr::Stream(
+                "Compaction did not bring the context below its configured token limit. Stopped automatic continuation to prevent repeated compaction and usage drain; reduce context or start a new task.".to_string(),
+                None,
+            );
+            sess.send_event(
+                &budget_turn_context,
+                EventMsg::Error(ErrorEvent {
+                    message: error.to_string(),
+                    codex_error_info: Some(error.to_codex_protocol_error()),
+                }),
+            )
+            .await;
+            return Err(error);
         }
     }
     Ok(())
@@ -4226,6 +4263,8 @@ struct ProposedPlanItemState {
     item_id: String,
     started: bool,
     completed: bool,
+    /// Text already delivered to clients, retained if the final item never arrives.
+    streamed_text: String,
 }
 
 /// Aggregated state used only while streaming a plan-mode response.
@@ -4234,7 +4273,7 @@ struct PlanModeStreamState {
     /// Agent message items started by the model but deferred until we see non-plan text.
     pending_agent_message_items: HashMap<String, TurnItem>,
     /// Agent message items whose start notification has been emitted.
-    started_agent_message_items: HashSet<String>,
+    started_agent_message_items: BTreeMap<String, TurnItem>,
     /// Leading whitespace buffered until we see non-whitespace text for an item.
     leading_whitespace_by_item: HashMap<String, String>,
     /// Raw citation payloads already surfaced through live delta events.
@@ -4247,7 +4286,7 @@ impl PlanModeStreamState {
     fn new(turn_id: &str) -> Self {
         Self {
             pending_agent_message_items: HashMap::new(),
-            started_agent_message_items: HashSet::new(),
+            started_agent_message_items: BTreeMap::new(),
             leading_whitespace_by_item: HashMap::new(),
             emitted_memory_citations: HashSet::new(),
             plan_item_state: ProposedPlanItemState::new(turn_id),
@@ -4311,6 +4350,7 @@ impl ProposedPlanItemState {
             item_id: format!("{turn_id}-plan"),
             started: false,
             completed: false,
+            streamed_text: String::new(),
         }
     }
 
@@ -4341,6 +4381,7 @@ impl ProposedPlanItemState {
         if delta.is_empty() && memory_citation.is_none() {
             return;
         }
+        self.streamed_text.push_str(delta);
         let event = PlanDeltaEvent {
             thread_id: sess.thread_id.to_string(),
             turn_id: turn_context.sub_id.clone(),
@@ -4373,20 +4414,45 @@ impl ProposedPlanItemState {
 /// In plan mode we defer agent message starts until the parser emits non-plan
 /// text. The parser buffers each line until it can rule out a tag prefix, so
 /// plan-only outputs never show up as empty assistant messages.
+#[cfg(test)]
+static PLAN_START_PUBLICATION_GATES: OnceLock<
+    Mutex<
+        HashMap<
+            codex_protocol::ThreadId,
+            (
+                async_channel::Sender<()>,
+                tokio::sync::oneshot::Receiver<()>,
+            ),
+        >,
+    >,
+> = OnceLock::new();
+
 async fn maybe_emit_pending_agent_message_start(
     sess: &Session,
     turn_context: &TurnContext,
     state: &mut PlanModeStreamState,
     item_id: &str,
 ) {
-    if state.started_agent_message_items.contains(item_id) {
+    if state.started_agent_message_items.contains_key(item_id) {
         return;
     }
     if let Some(item) = state.pending_agent_message_items.remove(item_id) {
+        #[cfg(test)]
+        {
+            let gate = PLAN_START_PUBLICATION_GATES
+                .get_or_init(Default::default)
+                .lock()
+                .unwrap()
+                .remove(&sess.thread_id);
+            if let Some((reached, release)) = gate {
+                let _ = reached.send(()).await;
+                let _ = release.await;
+            }
+        }
         sess.emit_turn_item_started(turn_context, &item).await;
         state
             .started_agent_message_items
-            .insert(item_id.to_string());
+            .insert(item_id.to_string(), item);
     }
 }
 
@@ -4411,10 +4477,103 @@ fn agent_message_text(item: &codex_protocol::items::AgentMessageItem) -> String 
         .collect()
 }
 
+// A first prose batch can await ItemStarted publication after extracting buffered
+// whitespace. Retain that accepted batch across sampling-worker abort, including
+// the interval where its returned state is queued but the caller has not resumed.
+struct OwnedPlanStreamState {
+    state: Option<PlanModeStreamState>,
+    session: Arc<Session>,
+    turn: Arc<TurnContext>,
+    in_flight: Option<super::DurableHistoryCommitInFlight>,
+    runtime: tokio::runtime::Handle,
+}
+
+impl Drop for OwnedPlanStreamState {
+    fn drop(&mut self) {
+        let Some(mut state) = self.state.take() else {
+            return;
+        };
+        let session = Arc::clone(&self.session);
+        let turn = Arc::clone(&self.turn);
+        let in_flight = self.in_flight.take();
+        self.runtime.spawn(async move {
+            let _in_flight = in_flight;
+            complete_partial_plan_items(&session, &turn, &mut state).await;
+        });
+    }
+}
+
+async fn complete_partial_plan_items(
+    sess: &Session,
+    turn_context: &TurnContext,
+    state: &mut PlanModeStreamState,
+) {
+    for (_, item) in std::mem::take(&mut state.started_agent_message_items) {
+        sess.emit_turn_item_completed(turn_context, item).await;
+    }
+    let plan_text = std::mem::take(&mut state.plan_item_state.streamed_text);
+    state
+        .plan_item_state
+        .complete_with_text(sess, turn_context, plan_text)
+        .await;
+}
+
+async fn handle_plan_segments(
+    sess: &Arc<Session>,
+    turn_context: &Arc<TurnContext>,
+    state: &mut PlanModeStreamState,
+    item_id: &str,
+    segments: Vec<ProposedPlanSegment>,
+) {
+    let starts_prose = !state.started_agent_message_items.contains_key(item_id)
+        && segments.iter().any(|segment| {
+            matches!(segment,
+            ProposedPlanSegment::Normal(delta) if delta.chars().any(|ch| !ch.is_whitespace()))
+        });
+    if !starts_prose {
+        handle_plan_segments_inner(sess, turn_context, state, item_id, segments).await;
+        return;
+    }
+    sess.durable_history_commits_in_flight
+        .fetch_add(1, Ordering::AcqRel);
+    let mut owned = OwnedPlanStreamState {
+        state: Some(std::mem::replace(
+            state,
+            PlanModeStreamState::new(&turn_context.sub_id),
+        )),
+        session: Arc::clone(sess),
+        turn: Arc::clone(turn_context),
+        in_flight: Some(super::DurableHistoryCommitInFlight {
+            session: Arc::clone(sess),
+        }),
+        runtime: tokio::runtime::Handle::current(),
+    };
+    let session = Arc::clone(sess);
+    let turn = Arc::clone(turn_context);
+    let item_id = item_id.to_string();
+    let (send_state, receive_state) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        handle_plan_segments_inner(
+            &session,
+            &turn,
+            owned.state.as_mut().expect("owned plan state"),
+            &item_id,
+            segments,
+        )
+        .await;
+        // On an abandoned receiver, Drop closes the actual published prefix.
+        let _ = send_state.send(owned);
+    });
+    let mut returned = receive_state
+        .await
+        .expect("owned plan publication task must return its state");
+    *state = returned.state.take().expect("returned plan state");
+}
+
 /// Split the stream into normal assistant text vs. proposed plan content.
 /// Normal text becomes AgentMessage deltas; plan content becomes PlanDelta +
 /// TurnItem::Plan.
-async fn handle_plan_segments(
+async fn handle_plan_segments_inner(
     sess: &Session,
     turn_context: &TurnContext,
     state: &mut PlanModeStreamState,
@@ -4428,7 +4587,7 @@ async fn handle_plan_segments(
                     continue;
                 }
                 let has_non_whitespace = delta.chars().any(|ch| !ch.is_whitespace());
-                if !has_non_whitespace && !state.started_agent_message_items.contains(item_id) {
+                if !has_non_whitespace && !state.started_agent_message_items.contains_key(item_id) {
                     let entry = state
                         .leading_whitespace_by_item
                         .entry(item_id.to_string())
@@ -4436,7 +4595,7 @@ async fn handle_plan_segments(
                     entry.push_str(&delta);
                     continue;
                 }
-                let delta = if !state.started_agent_message_items.contains(item_id) {
+                let delta = if !state.started_agent_message_items.contains_key(item_id) {
                     if let Some(prefix) = state.leading_whitespace_by_item.remove(item_id) {
                         format!("{prefix}{delta}")
                     } else {
@@ -4454,6 +4613,9 @@ async fn handle_plan_segments(
                     delta,
                     memory_citation: None,
                 };
+                if let Some(item) = state.started_agent_message_items.get_mut(item_id) {
+                    apply_partial_agent_message_delta(item, &event);
+                }
                 sess.send_event(turn_context, EventMsg::AgentMessageContentDelta(event))
                     .await;
             }
@@ -4478,15 +4640,57 @@ async fn handle_plan_segments(
     }
 }
 
+fn append_partial_reasoning_text(parts: &mut Vec<String>, index: i64, delta: &str) {
+    let Ok(index) = usize::try_from(index) else {
+        return;
+    };
+    if let Some(part) = parts.get_mut(index) {
+        part.push_str(delta);
+    } else if index == parts.len() {
+        parts.push(delta.to_string());
+    }
+}
+
+fn apply_partial_agent_message_delta(item: &mut TurnItem, event: &AgentMessageContentDeltaEvent) {
+    let TurnItem::AgentMessage(message) = item else {
+        return;
+    };
+    if !event.delta.is_empty() {
+        match message.content.last_mut() {
+            Some(codex_protocol::items::AgentMessageContent::Text { text }) => {
+                text.push_str(&event.delta);
+            }
+            None => message
+                .content
+                .push(codex_protocol::items::AgentMessageContent::Text {
+                    text: event.delta.clone(),
+                }),
+        }
+    }
+    if let Some(citation) = &event.memory_citation {
+        let accumulated = message.memory_citation.get_or_insert_with(Default::default);
+        for entry in &citation.entries {
+            if !accumulated.entries.contains(entry) {
+                accumulated.entries.push(entry.clone());
+            }
+        }
+        for rollout_id in &citation.rollout_ids {
+            if !accumulated.rollout_ids.contains(rollout_id) {
+                accumulated.rollout_ids.push(rollout_id.clone());
+            }
+        }
+    }
+}
+
 async fn emit_streamed_assistant_text_delta(
-    sess: &Session,
-    turn_context: &TurnContext,
+    sess: &Arc<Session>,
+    turn_context: &Arc<TurnContext>,
     plan_mode_state: Option<&mut PlanModeStreamState>,
     item_id: &str,
     parsed: ParsedAssistantTextDelta,
-) {
+) -> Option<AgentMessageContentDeltaEvent> {
     if parsed.is_empty() {
-        return;
+        return None;
     }
     if let Some(state) = plan_mode_state {
         if let Some(memory_citation) = take_new_memory_citation(state, parsed.citations) {
@@ -4498,17 +4702,20 @@ async fn emit_streamed_assistant_text_delta(
                 delta: String::new(),
                 memory_citation: Some(memory_citation),
             };
+            if let Some(item) = state.started_agent_message_items.get_mut(item_id) {
+                apply_partial_agent_message_delta(item, &event);
+            }
             sess.send_event(turn_context, EventMsg::AgentMessageContentDelta(event))
                 .await;
         }
         if !parsed.plan_segments.is_empty() {
             handle_plan_segments(sess, turn_context, state, item_id, parsed.plan_segments).await;
         }
-        return;
+        return None;
     }
     let memory_citation = parse_memory_citation(parsed.citations);
     if parsed.visible_text.is_empty() && memory_citation.is_none() {
-        return;
+        return None;
     }
     let event = AgentMessageContentDeltaEvent {
         thread_id: sess.thread_id.to_string(),
@@ -4517,39 +4724,50 @@ async fn emit_streamed_assistant_text_delta(
         delta: parsed.visible_text,
         memory_citation,
     };
-    sess.send_event(turn_context, EventMsg::AgentMessageContentDelta(event))
-        .await;
+    sess.send_event(
+        turn_context,
+        EventMsg::AgentMessageContentDelta(event.clone()),
+    )
+    .await;
+    Some(event)
 }
 
 /// Flush buffered assistant text parser state when an assistant message item ends.
 async fn flush_assistant_text_segments_for_item(
-    sess: &Session,
-    turn_context: &TurnContext,
+    sess: &Arc<Session>,
+    turn_context: &Arc<TurnContext>,
     plan_mode_state: Option<&mut PlanModeStreamState>,
     parsers: &mut AssistantMessageStreamParsers,
     item_id: &str,
 ) {
     let parsed = parsers.finish_item(item_id);
-    emit_streamed_assistant_text_delta(sess, turn_context, plan_mode_state, item_id, parsed).await;
+    let _ =
+        emit_streamed_assistant_text_delta(sess, turn_context, plan_mode_state, item_id, parsed)
+            .await;
 }
 
 /// Flush any remaining buffered assistant text parser state at response completion.
 async fn flush_assistant_text_segments_all(
-    sess: &Session,
-    turn_context: &TurnContext,
+    sess: &Arc<Session>,
+    turn_context: &Arc<TurnContext>,
     mut plan_mode_state: Option<&mut PlanModeStreamState>,
     parsers: &mut AssistantMessageStreamParsers,
-) {
+) -> Vec<AgentMessageContentDeltaEvent> {
+    let mut emitted = Vec::new();
     for (item_id, parsed) in parsers.drain_finished() {
-        emit_streamed_assistant_text_delta(
+        if let Some(event) = emit_streamed_assistant_text_delta(
             sess,
             turn_context,
             plan_mode_state.as_deref_mut(),
             &item_id,
             parsed,
         )
-        .await;
+        .await
+        {
+            emitted.push(event);
+        }
     }
+    emitted
 }
 
 /// Emit completion for plan items by parsing the finalized assistant message.
@@ -4598,7 +4816,10 @@ async fn emit_agent_message_in_plan_mode(
     let text = agent_message_text(&agent_message);
     if text.trim().is_empty() {
         state.pending_agent_message_items.remove(&agent_message_id);
-        state.started_agent_message_items.remove(&agent_message_id);
+        if let Some(started_item) = state.started_agent_message_items.remove(&agent_message_id) {
+            sess.emit_turn_item_completed(turn_context, started_item)
+                .await;
+        }
         return;
     }
 
@@ -4606,7 +4827,7 @@ async fn emit_agent_message_in_plan_mode(
 
     if !state
         .started_agent_message_items
-        .contains(&agent_message_id)
+        .contains_key(&agent_message_id)
     {
         let start_item = state
             .pending_agent_message_items
@@ -4622,7 +4843,7 @@ async fn emit_agent_message_in_plan_mode(
         sess.emit_turn_item_started(turn_context, &start_item).await;
         state
             .started_agent_message_items
-            .insert(agent_message_id.clone());
+            .insert(agent_message_id.clone(), start_item);
     }
 
     sess.emit_turn_item_completed(turn_context, TurnItem::AgentMessage(agent_message))
@@ -4784,14 +5005,9 @@ async fn drain_in_flight_with_buffer(
                 }
             },
         };
-        let mut response_items = vec![response_input.into()];
-        response_items.extend(
-            turn_context
-                .take_post_tool_contexts(&completion.call_id)
-                .await,
-        );
+        let response_items = vec![response_input.into()];
         if let Err(err) = sess
-            .record_conversation_items_ordered(&turn_context, &response_items)
+            .record_tool_completion_ordered(&turn_context, &completion.call_id, &response_items)
             .await
         {
             let interrupt_terminal = sess
@@ -4814,14 +5030,6 @@ async fn drain_in_flight_with_buffer(
             return Err(CodexErr::Fatal(format!(
                 "failed to durably append tool output in order: {err}"
             )));
-        }
-        for response_item in &response_items {
-            mark_thread_memory_mode_polluted_if_external_context(
-                sess.as_ref(),
-                turn_context.as_ref(),
-                response_item,
-            )
-            .await;
         }
         record_reconciliation(
             &turn_context.turn_timing_state,
@@ -5360,6 +5568,12 @@ async fn try_run_sampling_request(
             Ok(sampling_admission)
         })
     });
+    // Background tool completion can publish a durability obligation after
+    // response preparation. Resolve it at the actual provider boundary.
+    sess.drain_tool_history_persistence()
+        .or_cancel(&cancellation_token)
+        .await
+        .map_err(|_| CodexErr::TurnAborted)??;
     let stream_result = client_session
         .stream_with_attempt_prepared(
             prompt,
@@ -5688,7 +5902,7 @@ async fn try_run_sampling_request(
                             seeded_item_id.as_deref(),
                             seeded_parsed,
                         ) {
-                            emit_streamed_assistant_text_delta(
+                            let _ = emit_streamed_assistant_text_delta(
                                 &sess,
                                 &turn_context,
                                 Some(state),
@@ -5767,13 +5981,20 @@ async fn try_run_sampling_request(
                 turn_context
                     .turn_timing_state
                     .record_generation_token_usage(token_usage.as_ref());
-                flush_assistant_text_segments_all(
+                let remaining_deltas = flush_assistant_text_segments_all(
                     &sess,
                     &turn_context,
                     plan_mode_state.as_mut(),
                     &mut assistant_message_stream_parsers,
                 )
                 .await;
+                if let Some(active) = active_item.as_mut() {
+                    for delta in remaining_deltas {
+                        if delta.item_id == active.id() {
+                            apply_partial_agent_message_delta(active, &delta);
+                        }
+                    }
+                }
                 let budget_result = sess
                     .record_token_usage_info(&turn_context, token_usage.as_ref())
                     .await;
@@ -5806,21 +6027,24 @@ async fn try_run_sampling_request(
             ResponseEvent::OutputTextDelta(delta) => {
                 // In review child threads, suppress assistant text deltas; the
                 // UI will show a selection popup from the final ReviewOutput.
-                if let Some(active) = active_item.as_ref() {
+                if let Some(active) = active_item.as_mut() {
                     if !active_item_is_streaming_to_client {
                         continue;
                     }
                     let item_id = active.id();
                     if matches!(active, TurnItem::AgentMessage(_)) {
                         let parsed = assistant_message_stream_parsers.parse_delta(&item_id, &delta);
-                        emit_streamed_assistant_text_delta(
+                        if let Some(event) = emit_streamed_assistant_text_delta(
                             &sess,
                             &turn_context,
                             plan_mode_state.as_mut(),
                             &item_id,
                             parsed,
                         )
-                        .await;
+                        .await
+                        {
+                            apply_partial_agent_message_delta(active, &event);
+                        }
                     } else {
                         let event = AgentMessageContentDeltaEvent {
                             thread_id: sess.thread_id.to_string(),
@@ -5861,9 +6085,16 @@ async fn try_run_sampling_request(
                 if uses_sequential_cutoff_reasoning_summaries {
                     continue;
                 }
-                if let Some(active) = active_item.as_ref() {
+                if let Some(active) = active_item.as_mut() {
                     if !active_item_is_streaming_to_client {
                         continue;
+                    }
+                    if let TurnItem::Reasoning(reasoning) = active {
+                        append_partial_reasoning_text(
+                            &mut reasoning.summary_text,
+                            summary_index,
+                            &delta,
+                        );
                     }
                     let event = ReasoningContentDeltaEvent {
                         thread_id: sess.thread_id.to_string(),
@@ -5904,7 +6135,7 @@ async fn try_run_sampling_request(
                 if !uses_sequential_cutoff_reasoning_summaries {
                     continue;
                 }
-                let Some(active) = active_item.as_ref() else {
+                let Some(active) = active_item.as_mut() else {
                     continue;
                 };
                 if !active_item_is_streaming_to_client || active.id() != item_id {
@@ -5920,6 +6151,13 @@ async fn try_run_sampling_request(
                     )
                     .await;
                 }
+                if let TurnItem::Reasoning(reasoning) = active {
+                    append_partial_reasoning_text(
+                        &mut reasoning.summary_text,
+                        summary_index,
+                        &text,
+                    );
+                }
                 let event = ReasoningContentDeltaEvent {
                     thread_id: sess.thread_id.to_string(),
                     turn_id: turn_context.sub_id.clone(),
@@ -5934,9 +6172,16 @@ async fn try_run_sampling_request(
                 delta,
                 content_index,
             } => {
-                if let Some(active) = active_item.as_ref() {
+                if let Some(active) = active_item.as_mut() {
                     if !active_item_is_streaming_to_client {
                         continue;
+                    }
+                    if let TurnItem::Reasoning(reasoning) = active {
+                        append_partial_reasoning_text(
+                            &mut reasoning.raw_content,
+                            content_index,
+                            &delta,
+                        );
                     }
                     let event = ReasoningRawContentDeltaEvent {
                         thread_id: sess.thread_id.to_string(),
@@ -5966,13 +6211,31 @@ async fn try_run_sampling_request(
     response_tail.close(tail_outcome);
     drop(sampling_timing_guard);
 
-    flush_assistant_text_segments_all(
+    let remaining_deltas = flush_assistant_text_segments_all(
         &sess,
         &turn_context,
         plan_mode_state.as_mut(),
         &mut assistant_message_stream_parsers,
     )
     .await;
+    if let Some(active) = active_item.as_mut() {
+        for delta in remaining_deltas {
+            if delta.item_id == active.id() {
+                apply_partial_agent_message_delta(active, &delta);
+            }
+        }
+    }
+    // Close only items that were actually streamed. These partial snapshots close
+    // the item stream; the unchanged turn result still reports failure or interruption.
+    if let Some(state) = plan_mode_state.as_mut() {
+        complete_partial_plan_items(&sess, &turn_context, state).await;
+    }
+    if active_item_is_streaming_to_client
+        && let Some(item) = active_item.take()
+        && (plan_mode_state.is_none() || !matches!(item, TurnItem::AgentMessage(_)))
+    {
+        sess.emit_turn_item_completed(&turn_context, item).await;
+    }
     response_item_recorder.flush().await;
 
     let tool_blocking_timing_guard = if in_flight.is_empty() && completed_in_flight.is_empty() {
@@ -5988,7 +6251,7 @@ async fn try_run_sampling_request(
     )
     .await;
     drop(tool_blocking_timing_guard);
-    let generation_workspace_evidence = tool_runtime.flush_workspace_evidence_generation().await;
+    let generation_workspace_evidence = tool_runtime.flush_workspace_evidence_generation().await?;
     let required_tool_terminal = required_tool_terminal?;
 
     let terminal = {

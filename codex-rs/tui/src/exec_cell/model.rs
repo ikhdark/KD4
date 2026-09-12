@@ -11,12 +11,15 @@ use std::time::Instant;
 
 use super::live_output::LiveCommandOutput;
 use codex_app_server_protocol::CommandExecutionSource as ExecCommandSource;
+use codex_app_server_protocol::CommandExecutionStatus;
 use codex_protocol::parse_command::ParsedCommand;
 use itertools::Either;
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct CommandOutput {
     pub(crate) exit_code: i32,
+    /// The terminal protocol status when the command did not report an exit code.
+    status_without_exit_code: Option<CommandExecutionStatus>,
     /// The finalized, interleaved stderr and stdout used by the compact preview.
     pub(crate) aggregated_output: String,
     /// The finalized output of the command, as seen by the model, when it differs from the
@@ -31,6 +34,7 @@ impl CommandOutput {
         let formatted_output = (formatted_output != aggregated_output).then_some(formatted_output);
         Self {
             exit_code,
+            status_without_exit_code: None,
             aggregated_output,
             formatted_output,
             live_output: None,
@@ -41,9 +45,37 @@ impl CommandOutput {
     pub(crate) fn from_shared_output(exit_code: i32, output: String) -> Self {
         Self {
             exit_code,
+            status_without_exit_code: None,
             aggregated_output: output,
             formatted_output: None,
             live_output: None,
+        }
+    }
+
+    pub(crate) fn from_app_server_output(
+        status: CommandExecutionStatus,
+        exit_code: Option<i32>,
+        output: String,
+    ) -> Self {
+        let mut result = Self::from_shared_output(exit_code.unwrap_or_default(), output);
+        result.status_without_exit_code = exit_code.is_none().then_some(status);
+        result
+    }
+
+    pub(super) fn is_success(&self) -> bool {
+        match self.status_without_exit_code.as_ref() {
+            Some(CommandExecutionStatus::Completed) => true,
+            Some(_) => false,
+            None => self.exit_code == 0,
+        }
+    }
+
+    pub(super) fn terminal_failure_label(&self) -> Option<&'static str> {
+        match self.status_without_exit_code.as_ref() {
+            Some(CommandExecutionStatus::Declined) => Some("Declined"),
+            Some(CommandExecutionStatus::Failed) => Some("Failed"),
+            Some(CommandExecutionStatus::InProgress) => Some("Incomplete"),
+            Some(CommandExecutionStatus::Completed) | None => None,
         }
     }
 

@@ -95,21 +95,23 @@ fn test_stdio_server_config(command: &str) -> McpServerConfig {
     }
 }
 
-fn create_codex_apps_tools_cache_context(
+async fn create_codex_apps_tools_cache_context(
     codex_home: PathBuf,
     account_id: Option<&str>,
     chatgpt_user_id: Option<&str>,
 ) -> CodexAppsToolsCacheContext {
-    CodexAppsToolsCache::default().context(
-        codex_home,
-        CodexAppsToolsCacheKey {
-            account_id: account_id.map(ToOwned::to_owned),
-            chatgpt_user_id: chatgpt_user_id.map(ToOwned::to_owned),
-            is_workspace_account: false,
-            chatgpt_base_url: "https://chatgpt.com".to_string(),
-            product_sku: DEFAULT_CODEX_APPS_MCP_PRODUCT_SKU.to_string(),
-        },
-    )
+    CodexAppsToolsCache::default()
+        .context(
+            codex_home,
+            CodexAppsToolsCacheKey {
+                account_id: account_id.map(ToOwned::to_owned),
+                chatgpt_user_id: chatgpt_user_id.map(ToOwned::to_owned),
+                is_workspace_account: false,
+                chatgpt_base_url: "https://chatgpt.com".to_string(),
+                product_sku: DEFAULT_CODEX_APPS_MCP_PRODUCT_SKU.to_string(),
+            },
+        )
+        .await
 }
 
 fn create_test_server_info(title: &str) -> McpServerInfo {
@@ -451,7 +453,7 @@ async fn aggregate_tool_snapshot_is_shared_until_the_catalog_revision_changes() 
     assert!(!Arc::ptr_eq(&first, &refreshed));
 }
 
-fn create_test_manager_with_failed_apps_startup(
+async fn create_test_manager_with_failed_apps_startup(
     cached_tools: Vec<ToolInfo>,
     reconnect_factory: Arc<dyn Fn() -> ManagedClientFuture + Send + Sync>,
 ) -> McpConnectionManager {
@@ -467,7 +469,8 @@ fn create_test_manager_with_failed_apps_startup(
         codex_home.path().to_path_buf(),
         Some("reconnect-test-account"),
         Some("reconnect-test-user"),
-    );
+    )
+    .await;
     cache_context.store_current_tools_for_test(cached_tools);
     let approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
     let permission_profile = Constrained::allow_any(PermissionProfile::default());
@@ -712,6 +715,92 @@ async fn disabled_permissions_do_not_auto_accept_elicitation_with_requested_fiel
             meta: None,
         }
     );
+}
+
+#[tokio::test]
+async fn elicitation_closed_event_channel_returns_error_without_waiting_for_a_response() {
+    let manager = ElicitationRequestManager::new(
+        AskForApproval::OnRequest,
+        PermissionProfile::default(),
+        /*reviewer*/ None,
+        /*lifecycle*/ None,
+        ElicitationRequestRouter::default(),
+    );
+    let (tx_event, rx_event) = async_channel::bounded(1);
+    drop(rx_event);
+    let sender = manager.make_sender("server".to_string(), tx_event);
+    let result = tokio::time::timeout(
+        Duration::from_secs(1),
+        sender(
+            NumberOrString::Number(1),
+            codex_rmcp_client::Elicitation::OpenAiForm {
+                meta: None,
+                message: "Enter a value".to_string(),
+                requested_schema: serde_json::json!({"type": "object"}),
+            },
+        ),
+    )
+    .await
+    .expect("failed event delivery must not wait for a response");
+
+    assert!(
+        result
+            .expect_err("closed event channel must fail the elicitation")
+            .to_string()
+            .contains("failed to deliver elicitation request")
+    );
+}
+
+#[tokio::test]
+async fn elicitation_cancelled_request_removes_its_response_route() {
+    let manager = ElicitationRequestManager::new(
+        AskForApproval::OnRequest,
+        PermissionProfile::default(),
+        /*reviewer*/ None,
+        /*lifecycle*/ None,
+        ElicitationRequestRouter::default(),
+    );
+    let (tx_event, rx_event) = async_channel::bounded(1);
+    let sender = manager.make_sender("server".to_string(), tx_event);
+    let pending = tokio::spawn(sender(
+        NumberOrString::Number(1),
+        codex_rmcp_client::Elicitation::OpenAiForm {
+            meta: None,
+            message: "Enter a value".to_string(),
+            requested_schema: serde_json::json!({"type": "object"}),
+        },
+    ));
+    let event = tokio::time::timeout(Duration::from_secs(1), rx_event.recv())
+        .await
+        .expect("request must be published")
+        .expect("event channel remains open");
+    let EventMsg::ElicitationRequest(request) = event.msg else {
+        panic!("expected elicitation request");
+    };
+    let codex_protocol::mcp::RequestId::String(request_id) = request.id else {
+        panic!("expected Codex-owned string request ID");
+    };
+    pending.abort();
+    assert!(
+        pending
+            .await
+            .expect_err("request task was cancelled")
+            .is_cancelled()
+    );
+
+    let error = manager
+        .resolve(
+            "server".to_string(),
+            NumberOrString::String(request_id.into()),
+            ElicitationResponse {
+                action: ElicitationAction::Decline,
+                content: None,
+                meta: None,
+            },
+        )
+        .await
+        .expect_err("a cancelled elicitation must have no remaining route");
+    assert_eq!(error.to_string(), "elicitation request not found");
 }
 
 #[tokio::test]
@@ -1086,7 +1175,8 @@ async fn list_all_tools_uses_shared_codex_apps_cache_while_client_is_pending() {
         codex_home.path().to_path_buf(),
         Some("account-one"),
         Some("user-one"),
-    );
+    )
+    .await;
     cache_context.store_current_tools_for_test(vec![create_test_tool(
         CODEX_APPS_MCP_SERVER_NAME,
         "calendar_create_event",
@@ -1374,7 +1464,8 @@ async fn list_all_tools_does_not_block_when_shared_codex_apps_cache_is_empty() {
         codex_home.path().to_path_buf(),
         Some("account-one"),
         Some("user-one"),
-    );
+    )
+    .await;
     cache_context.store_current_tools_for_test(Vec::new());
     let pending_client = futures::future::pending::<Result<ManagedClient, StartupOutcomeError>>()
         .boxed()
@@ -1415,7 +1506,8 @@ async fn list_all_tools_uses_shared_codex_apps_cache_when_client_startup_fails()
         codex_home.path().to_path_buf(),
         Some("account-one"),
         Some("user-one"),
-    );
+    )
+    .await;
     cache_context.store_current_tools_for_test(vec![create_test_tool(
         CODEX_APPS_MCP_SERVER_NAME,
         "calendar_create_event",
@@ -1482,26 +1574,42 @@ async fn list_all_tools_reconnects_failed_codex_apps_startup_and_reuses_client()
     .await;
     let attempts = Arc::new(AtomicUsize::new(0));
     let attempts_for_reconnect = Arc::clone(&attempts);
-    let reconnect_finished = Arc::new(tokio::sync::Notify::new());
-    let reconnect_finished_for_factory = Arc::clone(&reconnect_finished);
+    let reconnect_started = Arc::new(tokio::sync::Notify::new());
+    let reconnect_started_for_factory = Arc::clone(&reconnect_started);
+    let allow_reconnect = Arc::new(tokio::sync::Notify::new());
+    let allow_reconnect_for_factory = Arc::clone(&allow_reconnect);
     let reconnect_factory = Arc::new(move || {
         attempts_for_reconnect.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let reconnect_finished = Arc::clone(&reconnect_finished_for_factory);
+        let reconnect_started = Arc::clone(&reconnect_started_for_factory);
+        let allow_reconnect = Arc::clone(&allow_reconnect_for_factory);
         let recovered_client = recovered_client.clone();
         async move {
-            reconnect_finished.notify_one();
+            reconnect_started.notify_one();
+            allow_reconnect.notified().await;
             Ok(recovered_client)
         }
         .boxed()
         .shared()
     });
-    let manager = create_test_manager_with_failed_apps_startup(Vec::new(), reconnect_factory);
+    let manager = create_test_manager_with_failed_apps_startup(Vec::new(), reconnect_factory).await;
 
-    let reconnect_finished_wait = reconnect_finished.notified();
-    let tools = manager.list_all_tools().await;
+    // Hold the external startup pending: an immediately ready reconnect may
+    // legitimately populate the first catalog before list_all_tools returns.
+    let tools = tokio::time::timeout(Duration::from_secs(1), manager.list_all_tools())
+        .await
+        .expect("listing should not wait for the pending reconnect");
     assert!(tools.is_empty());
     assert_eq!(manager.tool_catalog_revision(), 0);
-    reconnect_finished_wait.await;
+    tokio::time::timeout(Duration::from_secs(1), reconnect_started.notified())
+        .await
+        .expect("listing should start the reconnect");
+    let tools = tokio::time::timeout(Duration::from_secs(1), manager.list_all_tools())
+        .await
+        .expect("repeated listing should not wait for the pending reconnect");
+    assert!(tools.is_empty());
+    assert_eq!(manager.tool_catalog_revision(), 0);
+    assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    allow_reconnect.notify_one();
 
     tokio::time::timeout(Duration::from_secs(1), async {
         while manager.tool_catalog_revision() == 0 {
@@ -1571,7 +1679,8 @@ async fn later_tool_list_retries_after_failed_reconnect_and_keeps_cached_tools()
             "cached_drive_search",
         )],
         reconnect_factory,
-    );
+    )
+    .await;
 
     let first_reconnect_finished = reconnect_finished.notified();
     let tools = manager.list_all_tools().await;
@@ -1669,13 +1778,16 @@ async fn tool_lists_do_not_block_and_share_codex_apps_startup_reconnect() {
         .boxed()
         .shared()
     });
-    let manager = Arc::new(create_test_manager_with_failed_apps_startup(
-        vec![create_test_tool(
-            CODEX_APPS_MCP_SERVER_NAME,
-            "cached_drive_search",
-        )],
-        reconnect_factory,
-    ));
+    let manager = Arc::new(
+        create_test_manager_with_failed_apps_startup(
+            vec![create_test_tool(
+                CODEX_APPS_MCP_SERVER_NAME,
+                "cached_drive_search",
+            )],
+            reconnect_factory,
+        )
+        .await,
+    );
     let reconnect_started_wait = reconnect_started.notified();
     let first_tools = tokio::time::timeout(Duration::from_millis(10), manager.list_all_tools())
         .await

@@ -121,11 +121,12 @@ impl CommandExecRequestProcessor {
         &self,
         request_id: ConnectionRequestId,
         params: CommandExecWriteParams,
+        rpc_gate: &ConnectionRpcGate,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
         self.command_exec_manager
-            .write(request_id, params)
+            .write_with_gate(Arc::clone(&self.outgoing), request_id, params, rpc_gate)
             .await
-            .map(|response| Some(response.into()))
+            .map(|()| None)
     }
 
     pub(crate) async fn command_exec_resize(
@@ -373,12 +374,13 @@ impl CommandExecRequestProcessor {
             None => None,
         };
 
-        let exec_request = codex_core::exec::build_exec_request(
+        let exec_request = codex_core::exec::build_exec_request_async(
             exec_params,
             &effective_permission_profile,
             &sandbox_cwd,
             windows_sandbox_workspace_roots.as_slice(),
         )
+        .await
         .map_err(|err| internal_error(format!("exec failed: {err}")))?;
         self.command_exec_manager
             .start_with_gate(

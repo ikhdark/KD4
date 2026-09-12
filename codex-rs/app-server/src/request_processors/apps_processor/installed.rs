@@ -65,7 +65,8 @@ impl AppsRequestProcessor {
             );
             let previous_tools = mcp_manager
                 .codex_apps_tools_cache()
-                .current_tools(config.codex_home.to_path_buf(), cache_key.clone());
+                .current_tools(config.codex_home.to_path_buf(), cache_key.clone())
+                .await;
             let tools = if force_refresh && runtime_enabled {
                 let refresh_result = async {
                     anyhow::ensure!(
@@ -130,6 +131,7 @@ impl AppsRequestProcessor {
                         mcp_manager
                             .codex_apps_tools_cache()
                             .current_tools(config.codex_home.to_path_buf(), cache_key.clone())
+                            .await
                             .ok_or_else(|| {
                                 anyhow::anyhow!(
                                     "hosted connector refresh completed without publishing tools"

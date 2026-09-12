@@ -394,7 +394,22 @@ async fn exec_resume_last_respects_cwd_filter_and_all_flag() -> anyhow::Result<(
 
     let test = test_codex_exec();
     let server = MockServer::start().await;
-    let _response_mock = mount_exec_responses(&server, /*count*/ 5).await;
+    let _response_mock = mount_exec_responses(&server, /*count*/ 6).await;
+    // This peer implements HTTP Responses/SSE, so register that capability via
+    // the same provider configuration read by every normal CLI invocation.
+    std::fs::write(
+        test.home_path().join("config.toml"),
+        format!(
+            "model_provider = \"resume_fixture\"\n\
+             [model_providers.resume_fixture]\n\
+             name = \"Resume HTTP fixture\"\n\
+             base_url = {}\n\
+             wire_api = \"responses\"\n\
+             requires_openai_auth = true\n\
+             supports_websockets = false\n",
+            serde_json::to_string(&format!("{}/v1", server.uri()))?,
+        ),
+    )?;
 
     let dir_a = TempDir::new()?;
     let dir_b = TempDir::new()?;
@@ -420,76 +435,90 @@ async fn exec_resume_last_respects_cwd_filter_and_all_flag() -> anyhow::Result<(
         .success();
 
     let sessions_dir = test.home_path().join("sessions");
-    find_session_file_containing_marker(&sessions_dir, &marker_a)
+    let path_a = find_session_file_containing_marker(&sessions_dir, &marker_a)
         .expect("no session file found for marker_a");
     let path_b = find_session_file_containing_marker(&sessions_dir, &marker_b)
         .expect("no session file found for marker_b");
+    assert_ne!(
+        path_a, path_b,
+        "different initial runs must create different sessions"
+    );
 
-    // `updated_at` is second-granularity, so ensure the touch lands in a later second
-    // than the initial session creation on fast CI (especially Windows).
-    std::thread::sleep(std::time::Duration::from_millis(1100));
-
-    // Make thread B deterministically newest according to rollout metadata.
+    // updated_at has second granularity. Make B strictly newer than A before
+    // testing that the normal cwd filter still chooses A.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
     let session_id_b = extract_conversation_id(&path_b);
     let marker_b_touch = format!("resume-cwd-b-touch-{}", Uuid::new_v4());
-    let prompt_b_touch = format!("echo {marker_b_touch}");
     test.cmd_with_server(&server)
         .arg("--skip-git-repo-check")
         .arg("-C")
         .arg(dir_b.path())
         .arg("resume")
         .arg(&session_id_b)
-        .arg(&prompt_b_touch)
+        .arg(format!("echo {marker_b_touch}"))
         .assert()
         .success();
+    assert_eq!(
+        find_session_file_containing_marker(&sessions_dir, &marker_b_touch),
+        Some(path_b.clone())
+    );
 
-    // `resume --last` sorts by `updated_at`, which is second-granularity. Sleep so
-    // the upcoming `resume --last --all` write lands in a later second and becomes
-    // deterministically newest (instead of tying and falling back to UUID order).
-    std::thread::sleep(std::time::Duration::from_millis(1100));
-
-    let marker_b2 = format!("resume-cwd-b-2-{}", Uuid::new_v4());
-    let prompt_b2 = format!("echo {marker_b2}");
+    // Make the filtered A turn strictly newer than B for the following --all
+    // assertion, independently of UUID tie ordering on fast machines.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let marker_a2 = format!("resume-cwd-a-filtered-{}", Uuid::new_v4());
     test.cmd_with_server(&server)
         .arg("--skip-git-repo-check")
         .arg("-C")
         .arg(dir_a.path())
+        .arg("resume")
+        .arg("--last")
+        .arg(format!("echo {marker_a2}"))
+        .assert()
+        .success();
+    assert_eq!(
+        find_session_file_containing_marker(&sessions_dir, &marker_a2),
+        Some(path_a.clone()),
+        "resume --last must filter out the newer session in another cwd"
+    );
+    assert!(!std::fs::read_to_string(&path_b)?.contains(&marker_a2));
+
+    let marker_all = format!("resume-cwd-all-{}", Uuid::new_v4());
+    test.cmd_with_server(&server)
+        .arg("--skip-git-repo-check")
+        .arg("-C")
+        .arg(dir_b.path())
         .arg("resume")
         .arg("--last")
         .arg("--all")
-        .arg(&prompt_b2)
+        .arg(format!("echo {marker_all}"))
         .assert()
         .success();
-
-    let resumed_path_all = find_session_file_containing_marker(&sessions_dir, &marker_b2)
-        .expect("no resumed session file containing marker_b2");
     assert_eq!(
-        resumed_path_all, path_b,
-        "resume --last --all should pick newest session"
+        find_session_file_containing_marker(&sessions_dir, &marker_all),
+        Some(path_a.clone()),
+        "resume --last --all must choose the newest session even in another cwd"
     );
+    assert!(!std::fs::read_to_string(&path_b)?.contains(&marker_all));
 
-    let marker_a2 = format!("resume-cwd-a-2-{}", Uuid::new_v4());
-    let prompt_a2 = format!("echo {marker_a2}");
+    // Resuming A from B records B as A's latest turn cwd, so filtered lookup
+    // from B must now discover A rather than only considering its initial cwd.
+    let marker_latest_cwd = format!("resume-latest-cwd-{}", Uuid::new_v4());
     test.cmd_with_server(&server)
         .arg("--skip-git-repo-check")
         .arg("-C")
-        .arg(dir_a.path())
+        .arg(dir_b.path())
         .arg("resume")
         .arg("--last")
-        .arg(&prompt_a2)
+        .arg(format!("echo {marker_latest_cwd}"))
         .assert()
         .success();
-
-    let resumed_path_cwd = find_session_file_containing_marker(&sessions_dir, &marker_a2)
-        .expect("no resumed session file containing marker_a2");
-    // The `--all` resume above appends a new turn to `path_b` while running from `dir_a`, so the
-    // session's latest cwd now matches `dir_a`. A subsequent `resume --last` should therefore pick
-    // the newest matching session (`path_b`).
     assert_eq!(
-        resumed_path_cwd, path_b,
-        "resume --last should prefer sessions whose latest turn context matches the current cwd"
+        find_session_file_containing_marker(&sessions_dir, &marker_latest_cwd),
+        Some(path_a),
+        "cwd filtering must use the latest recorded turn context"
     );
-
+    assert!(!std::fs::read_to_string(&path_b)?.contains(&marker_latest_cwd));
     Ok(())
 }
 

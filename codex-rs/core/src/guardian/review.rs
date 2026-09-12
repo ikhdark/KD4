@@ -50,6 +50,7 @@ use super::prompt::parse_guardian_assessment;
 use super::review_session::GuardianReviewSessionOutcome;
 use super::review_session::GuardianReviewSessionParams;
 use super::review_session::build_guardian_review_session_config;
+use super::review_session::run_before_review_deadline;
 
 const GUARDIAN_REJECTION_INSTRUCTIONS: &str = concat!(
     "The agent must not attempt to achieve the same outcome via workaround, ",
@@ -808,12 +809,12 @@ pub(crate) fn spawn_approval_request_review_with_runtime_error_for_test(
 
 pub(super) struct GuardianReviewSessionConfig {
     pub(super) spawn_config: crate::config::Config,
-    model: String,
-    reasoning_effort: Option<codex_protocol::openai_models::ReasoningEffort>,
-    default_review_model_id: String,
-    catalog_contains_auto_review: bool,
-    model_overridden: bool,
-    model_override: Option<String>,
+    pub(super) model: String,
+    pub(super) reasoning_effort: Option<codex_protocol::openai_models::ReasoningEffort>,
+    pub(super) default_review_model_id: String,
+    pub(super) catalog_contains_auto_review: bool,
+    pub(super) model_overridden: bool,
+    pub(super) model_override: Option<String>,
 }
 
 pub(super) async fn guardian_review_session_config(
@@ -918,39 +919,47 @@ async fn run_guardian_review_session_before_deadline(
     external_cancel: Option<CancellationToken>,
     deadline: Instant,
 ) -> (GuardianReviewOutcome, GuardianReviewAnalyticsResult) {
-    let session_config = match guardian_review_session_config(session.as_ref(), turn.as_ref()).await
+    let (session_outcome, session_analytics_result) = match run_before_review_deadline(
+        deadline,
+        external_cancel.as_ref(),
+        guardian_review_session_config(session.as_ref(), turn.as_ref()),
+    )
+    .await
     {
-        Ok(session_config) => session_config,
-        Err(err) => {
+        Ok(Ok(session_config)) => {
+            Box::pin(
+                session
+                    .guardian_review_session
+                    .run_review(GuardianReviewSessionParams {
+                        parent_session: Arc::clone(&session),
+                        parent_turn: turn.clone(),
+                        spawn_config: session_config.spawn_config,
+                        request,
+                        retry_reason,
+                        schema,
+                        model: session_config.model,
+                        reasoning_effort: session_config.reasoning_effort,
+                        guardian_default_review_model_id: session_config.default_review_model_id,
+                        guardian_catalog_contains_auto_review: session_config
+                            .catalog_contains_auto_review,
+                        guardian_review_model_overridden: session_config.model_overridden,
+                        guardian_review_model_override: session_config.model_override,
+                        reasoning_summary: turn.reasoning_summary,
+                        personality: turn.personality,
+                        external_cancel,
+                        deadline,
+                    }),
+            )
+            .await
+        }
+        Ok(Err(err)) => {
             return (
                 GuardianReviewOutcome::Error(GuardianReviewError::prompt_build(err)),
                 GuardianReviewAnalyticsResult::without_session(),
             );
         }
+        Err(outcome) => (outcome, GuardianReviewAnalyticsResult::without_session()),
     };
-    let (session_outcome, session_analytics_result) = Box::pin(
-        session
-            .guardian_review_session
-            .run_review(GuardianReviewSessionParams {
-                parent_session: Arc::clone(&session),
-                parent_turn: turn.clone(),
-                spawn_config: session_config.spawn_config,
-                request,
-                retry_reason,
-                schema,
-                model: session_config.model,
-                reasoning_effort: session_config.reasoning_effort,
-                guardian_default_review_model_id: session_config.default_review_model_id,
-                guardian_catalog_contains_auto_review: session_config.catalog_contains_auto_review,
-                guardian_review_model_overridden: session_config.model_overridden,
-                guardian_review_model_override: session_config.model_override,
-                reasoning_summary: turn.reasoning_summary,
-                personality: turn.personality,
-                external_cancel,
-                deadline,
-            }),
-    )
-    .await;
 
     match session_outcome {
         GuardianReviewSessionOutcome::Completed(Ok(last_agent_message)) => match last_agent_message

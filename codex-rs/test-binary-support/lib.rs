@@ -60,9 +60,11 @@ where
             };
             match previous_codex_home.as_ref() {
                 Some(value) => unsafe {
+                    // SAFETY: the test ctor is still running before test threads start.
                     std::env::set_var("CODEX_HOME", value);
                 },
                 None => unsafe {
+                    // SAFETY: the test ctor is still running before test threads start.
                     std::env::remove_var("CODEX_HOME");
                 },
             }

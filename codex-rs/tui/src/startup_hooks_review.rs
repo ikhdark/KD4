@@ -88,6 +88,23 @@ async fn run_startup_hooks_review_app(
 ) -> Result<StartupHooksReviewOutcome> {
     let keymap = RuntimeKeymap::from_config(&config.tui_keymap)
         .map_err(|err| color_eyre::eyre::eyre!(err))?;
+    run_startup_hooks_review_loop(
+        app_server.request_handle(),
+        &keymap,
+        entry,
+        tui.event_stream(),
+        |view| draw_view(tui, view),
+    )
+    .await
+}
+
+async fn run_startup_hooks_review_loop(
+    request_handle: AppServerRequestHandle,
+    keymap: &RuntimeKeymap,
+    entry: HooksListEntry,
+    mut tui_events: std::pin::Pin<Box<dyn tokio_stream::Stream<Item = TuiEvent> + Send>>,
+    mut draw: impl FnMut(&ListSelectionView) -> Result<()>,
+) -> Result<StartupHooksReviewOutcome> {
     let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
     let app_event_tx = AppEventSender::new(tx_raw);
     let mut trust_all_error = None;
@@ -96,12 +113,9 @@ async fn run_startup_hooks_review_app(
         trust_all_error.as_deref(),
         /*trusting_all*/ false,
         app_event_tx.clone(),
-        &keymap,
+        keymap,
     );
-    draw_view(tui, &view)?;
-
-    let tui_events = tui.event_stream();
-    tokio::pin!(tui_events);
+    draw(&view)?;
 
     loop {
         let Some(event) = tui_events.next().await else {
@@ -113,7 +127,7 @@ async fn run_startup_hooks_review_app(
                     view.handle_key_event(key_event);
                 }
                 let Some(selection) = selected_choice(&mut view) else {
-                    draw_view(tui, &view)?;
+                    draw(&view)?;
                     continue;
                 };
                 match selection {
@@ -129,11 +143,11 @@ async fn run_startup_hooks_review_app(
                             trust_all_error.as_deref(),
                             /*trusting_all*/ true,
                             app_event_tx.clone(),
-                            &keymap,
+                            keymap,
                         );
-                        draw_view(tui, &view)?;
-                        let result = write_hook_trusts(
-                            app_server.request_handle(),
+                        draw(&view)?;
+                        let write = write_hook_trusts(
+                            request_handle.clone(),
                             entry
                                 .hooks
                                 .iter()
@@ -143,8 +157,20 @@ async fn run_startup_hooks_review_app(
                                     current_hash: hook.current_hash.clone(),
                                 })
                                 .collect(),
-                        )
-                        .await
+                        );
+                        tokio::pin!(write);
+                        let mut events_open = true;
+                        let result = loop {
+                            tokio::select! {
+                                result = &mut write => break result,
+                                event = tui_events.next(), if events_open => match event {
+                                    Some(TuiEvent::Draw | TuiEvent::Resize) => draw(&view)?,
+                                    // Trusting disables actions until the admitted write settles.
+                                    Some(TuiEvent::Key(_) | TuiEvent::Paste(_)) => {},
+                                    None => events_open = false,
+                                }
+                            }
+                        }
                         .map(|_| ())
                         .map_err(|err| {
                             format!("Failed to trust hooks: {}", format_config_error(&err))
@@ -158,16 +184,16 @@ async fn run_startup_hooks_review_app(
                                     trust_all_error.as_deref(),
                                     /*trusting_all*/ false,
                                     app_event_tx.clone(),
-                                    &keymap,
+                                    keymap,
                                 );
-                                draw_view(tui, &view)?;
+                                draw(&view)?;
                             }
                         }
                     }
                 }
             }
             TuiEvent::Paste(_) => {}
-            TuiEvent::Draw | TuiEvent::Resize => draw_view(tui, &view)?,
+            TuiEvent::Draw | TuiEvent::Resize => draw(&view)?,
         }
     }
 }
@@ -300,6 +326,127 @@ mod tests {
     use ratatui::buffer::Buffer;
     use ratatui::layout::Rect;
     use tokio::sync::mpsc::unbounded_channel;
+
+    #[tokio::test]
+    async fn pending_trust_write_redraws_and_preserves_error_then_retry() {
+        use crate::tui::TuiEvent;
+        use codex_app_server_client::AppServerRequestHandle;
+        use codex_app_server_client::RemoteAppServerClient;
+        use codex_app_server_client::RemoteAppServerConnectArgs;
+        use codex_app_server_client::RemoteAppServerEndpoint;
+        use crossterm::event::KeyCode;
+        use crossterm::event::KeyEvent;
+        use crossterm::event::KeyModifiers;
+        use futures::SinkExt;
+        use futures::StreamExt;
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicU16;
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+        use tokio::sync::mpsc;
+        use tokio_tungstenite::tungstenite::Message;
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+            let (arrived_tx, mut arrived_rx) = mpsc::channel(2);
+            let (release_tx, mut release_rx) = mpsc::channel(2);
+            let written_path = test_path_buf("/tmp/config.toml");
+            let peer = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                let init = socket.next().await.unwrap().unwrap();
+                let init: serde_json::Value = serde_json::from_str(init.to_text().unwrap()).unwrap();
+                assert_eq!(init["method"], "initialize");
+                socket.send(Message::Text(serde_json::json!({"id":init["id"],"result":{}}).to_string().into())).await.unwrap();
+                let initialized = socket.next().await.unwrap().unwrap();
+                let initialized: serde_json::Value = serde_json::from_str(initialized.to_text().unwrap()).unwrap();
+                assert_eq!(initialized["method"], "initialized");
+                for attempt in 0..2 {
+                    let request = socket.next().await.unwrap().unwrap();
+                    let request: serde_json::Value = serde_json::from_str(request.to_text().unwrap()).unwrap();
+                    assert_eq!(request["method"], "config/batchWrite");
+                    assert_eq!(request["params"]["reloadUserConfig"], true);
+                    assert_eq!(request["params"]["edits"], serde_json::json!([{
+                        "keyPath":"hooks.state", "mergeStrategy":"upsert", "value":{
+                            "path:new":{"trusted_hash":"sha256:path:new"},
+                            "path:changed":{"trusted_hash":"sha256:path:changed"}
+                        }
+                    }]));
+                    arrived_tx.send(()).await.unwrap();
+                    release_rx.recv().await.unwrap();
+                    let response = if attempt == 0 {
+                        serde_json::json!({"id":request["id"],"error":{"code":-32000,"message":"trust rejected"}})
+                    } else {
+                        serde_json::json!({"id":request["id"],"result":{"status":"ok","version":"1","filePath":written_path,"overriddenMetadata":null}})
+                    };
+                    socket.send(Message::Text(response.to_string().into())).await.unwrap();
+                }
+                let _ = release_rx.recv().await;
+            });
+            let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+                endpoint: RemoteAppServerEndpoint::WebSocket { websocket_url: endpoint, auth_token: None },
+                client_name: "codex-tui-test".to_string(), client_version: "0.0.0-test".to_string(),
+                experimental_api: true, mcp_server_openai_form_elicitation: false,
+                opt_out_notification_methods: Vec::new(), channel_capacity: 8,
+            }).await.unwrap();
+            let (events_tx, events_rx) = mpsc::channel(16);
+            let (paint_tx, mut paint_rx) = mpsc::unbounded_channel();
+            let width = Arc::new(AtomicU16::new(80));
+            let draw_width = width.clone();
+            let keymap = RuntimeKeymap::defaults();
+            let review = super::run_startup_hooks_review_loop(
+                AppServerRequestHandle::Remote(client.request_handle()), &keymap, entry(),
+                Box::pin(tokio_stream::wrappers::ReceiverStream::new(events_rx)),
+                move |view| {
+                    let width = draw_width.load(Ordering::Relaxed);
+                    paint_tx.send((width, render_lines(view, width))).unwrap();
+                    Ok(())
+                },
+            );
+            tokio::pin!(review);
+            let driver = async {
+                assert!(paint_rx.recv().await.unwrap().1.contains("Hooks need review"));
+                let key = |code| TuiEvent::Key(KeyEvent::new(code, KeyModifiers::NONE));
+                events_tx.send(key(KeyCode::Down)).await.unwrap();
+                paint_rx.recv().await.unwrap();
+                events_tx.send(key(KeyCode::Enter)).await.unwrap();
+                assert!(paint_rx.recv().await.unwrap().1.contains("Trusting hooks..."));
+                arrived_rx.recv().await.unwrap();
+
+                // Escape/Enter cannot bypass the admitted write. Resize still repaints.
+                events_tx.send(key(KeyCode::Esc)).await.unwrap();
+                events_tx.send(key(KeyCode::Enter)).await.unwrap();
+                width.store(37, Ordering::Relaxed);
+                events_tx.send(TuiEvent::Resize).await.unwrap();
+                let (actual_width, rendered) = paint_rx.recv().await.unwrap();
+                assert_eq!(actual_width, 37);
+                assert!(rendered.contains("Trusting hooks..."));
+                events_tx.send(TuiEvent::Draw).await.unwrap();
+                assert!(paint_rx.recv().await.unwrap().1.contains("Trusting hooks..."));
+                release_tx.send(()).await.unwrap();
+                let error = paint_rx.recv().await.unwrap().1;
+                let error = error.split_whitespace().collect::<Vec<_>>().join(" ");
+                assert!(error.contains("Failed to trust hooks"));
+                assert!(error.contains("trust rejected"));
+
+                // Retry through the same selection loop and actual typed RPC.
+                events_tx.send(key(KeyCode::Down)).await.unwrap();
+                paint_rx.recv().await.unwrap();
+                events_tx.send(key(KeyCode::Enter)).await.unwrap();
+                paint_rx.recv().await.unwrap();
+                arrived_rx.recv().await.unwrap();
+                release_tx.send(()).await.unwrap();
+                // Keep event and backend lifetimes until the real outcome is observed.
+                (events_tx, release_tx)
+            };
+            let (outcome, (events_tx, release_tx)) = tokio::join!(&mut review, driver);
+            assert!(matches!(outcome.unwrap(), super::StartupHooksReviewOutcome::Continue));
+            drop(events_tx);
+            drop(release_tx);
+            peer.await.unwrap();
+        }).await.expect("held trust reply must not freeze terminal event processing");
+    }
 
     fn hook(key: &str, trust_status: HookTrustStatus) -> HookMetadata {
         HookMetadata {

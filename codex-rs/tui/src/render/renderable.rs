@@ -120,7 +120,7 @@ impl<'a> Renderable for Paragraph<'a> {
         self.render_ref(area, buf);
     }
     fn desired_height(&self, width: u16) -> u16 {
-        self.line_count(width) as u16
+        self.line_count(width).min(usize::from(u16::MAX)) as u16
     }
 }
 
@@ -188,7 +188,7 @@ impl Renderable for ColumnRenderable<'_> {
         self.children
             .iter()
             .map(|child| child.desired_height(width))
-            .sum()
+            .fold(0, u16::saturating_add)
     }
 
     /// Returns the cursor position of the first child that has a cursor position, offset by the
@@ -282,7 +282,7 @@ impl<'a> FlexRenderable<'a> {
         let max_size = area.height;
         for (i, FlexChild { flex, child }) in self.children.iter().enumerate() {
             if *flex > 0 {
-                flex_children.push((i, *flex as u16, child.desired_height(area.width)));
+                flex_children.push((i, *flex as u128, child.desired_height(area.width)));
             } else {
                 child_sizes[i] = child
                     .desired_height(area.width)
@@ -295,11 +295,10 @@ impl<'a> FlexRenderable<'a> {
         // space can be redistributed instead of leaving blank rows.
         let mut remaining_space = free_space;
         while !flex_children.is_empty() {
-            let total_flex = flex_children.iter().map(|(_, flex, _)| *flex).sum::<u16>();
+            let total_flex = flex_children.iter().map(|(_, flex, _)| *flex).sum::<u128>();
             let mut satisfied_any = false;
             flex_children.retain(|(i, flex, desired_height)| {
-                let proportional_share =
-                    (u32::from(remaining_space) * u32::from(*flex) / u32::from(total_flex)) as u16;
+                let proportional_share = (u128::from(remaining_space) * *flex / total_flex) as u16;
                 if *desired_height <= proportional_share {
                     child_sizes[*i] = *desired_height;
                     remaining_space = remaining_space.saturating_sub(*desired_height);
@@ -314,14 +313,14 @@ impl<'a> FlexRenderable<'a> {
             }
         }
         // 3. Divide the remaining space proportionally. The final child absorbs rounding slack.
-        let total_flex = flex_children.iter().map(|(_, flex, _)| *flex).sum::<u16>();
+        let total_flex = flex_children.iter().map(|(_, flex, _)| *flex).sum::<u128>();
         let mut allocated_flex_space = 0;
         let last_flex_child_idx = flex_children.last().map(|(i, _, _)| *i);
         for (i, flex, desired_height) in flex_children {
             let max_child_extent = if Some(i) == last_flex_child_idx {
                 remaining_space.saturating_sub(allocated_flex_space)
             } else {
-                (u32::from(remaining_space) * u32::from(flex) / u32::from(total_flex)) as u16
+                (u128::from(remaining_space) * flex / total_flex) as u16
             };
             let child_size = desired_height.min(max_child_extent);
             child_sizes[i] = child_size;
@@ -461,9 +460,13 @@ impl<'a> Renderable for InsetRenderable<'a> {
     }
     fn desired_height(&self, width: u16) -> u16 {
         self.child
-            .desired_height(width - self.insets.left - self.insets.right)
-            + self.insets.top
-            + self.insets.bottom
+            .desired_height(
+                width
+                    .saturating_sub(self.insets.left)
+                    .saturating_sub(self.insets.right),
+            )
+            .saturating_add(self.insets.top)
+            .saturating_add(self.insets.bottom)
     }
     fn cursor_pos(&self, area: Rect) -> Option<(u16, u16)> {
         self.child.cursor_pos(area.inset(self.insets))

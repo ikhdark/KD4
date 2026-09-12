@@ -328,7 +328,15 @@ impl HostState {
                     );
                     return;
                 };
-                let result = session.execute(request).await;
+                // Admission can wait for another cell to finish. No cell is
+                // registered until the final, synchronous part of execute.
+                let result = tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => {
+                        Err("code-mode request cancelled".to_string())
+                    }
+                    result = session.execute(request) => result,
+                };
                 match result {
                     Ok(started) => {
                         let cell_id = started.cell_id.clone();

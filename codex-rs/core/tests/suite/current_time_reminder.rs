@@ -520,3 +520,121 @@ async fn sleep_tool_uses_configured_time_provider() -> Result<()> {
 
     Ok(())
 }
+
+/// The clock is the external dependency; both real registered handlers must enter it
+/// before either read is released, proving that dispatch actually honors parallelism.
+struct ConcurrentToolTimeProvider {
+    calls: std::sync::atomic::AtomicUsize,
+    tool_reads_entered: std::sync::atomic::AtomicUsize,
+    release_tool_reads: tokio::sync::Semaphore,
+}
+
+impl TimeProvider for ConcurrentToolTimeProvider {
+    fn current_time(&self, _thread_id: ThreadId) -> TimeFuture<'_> {
+        Box::pin(async move {
+            let index = self.calls.fetch_add(1, Ordering::SeqCst);
+            // The first provider call supplies the initial normal reminder. The next
+            // two come from the model's two clock tool invocations in the same response.
+            if index == 1 || index == 2 {
+                self.tool_reads_entered.fetch_add(1, Ordering::SeqCst);
+                self.release_tool_reads
+                    .acquire()
+                    .await
+                    .expect("test clock remains open")
+                    .forget();
+            }
+            Ok(DateTime::<Utc>::from_timestamp(
+                FIRST_TIME_UNIX_SECONDS
+                    + i64::try_from(index).expect("bounded test clock index") * 60,
+                0,
+            )
+            .expect("controlled external clock timestamp"))
+        })
+    }
+
+    fn sleep(&self, _thread_id: ThreadId, _duration: Duration) -> SleepFuture<'_> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn current_time_tool_calls_execute_concurrently_through_registration() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = start_mock_server().await;
+    let responses = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("parallel-clock-1"),
+                ev_function_call_with_namespace("clock-one", "clock", "curr_time", "{}"),
+                ev_function_call_with_namespace("clock-two", "clock", "curr_time", "{}"),
+                ev_completed("parallel-clock-1"),
+            ]),
+            sse(vec![
+                ev_response_created("parallel-clock-2"),
+                ev_completed("parallel-clock-2"),
+            ]),
+        ],
+    )
+    .await;
+    let clock = Arc::new(ConcurrentToolTimeProvider {
+        calls: std::sync::atomic::AtomicUsize::new(0),
+        tool_reads_entered: std::sync::atomic::AtomicUsize::new(0),
+        release_tool_reads: tokio::sync::Semaphore::new(0),
+    });
+    let test = test_codex()
+        .with_config(|config| {
+            enable_current_time_reminder(config, 3_000, CurrentTimeSource::External)
+        })
+        .with_external_time_provider(clock.clone())
+        .build(&server)
+        .await?;
+    test.codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "read both clocks".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await?;
+    let both_entered = tokio::time::timeout(Duration::from_secs(5), async {
+        while clock.tool_reads_entered.load(Ordering::SeqCst) < 2 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await;
+    let entered_before_release = clock.tool_reads_entered.load(Ordering::SeqCst);
+    let requests_before_release = responses.requests().len();
+    // Always release on the failed regression path as well; the prior observation
+    // remains the oracle and cleanup must not leave a clock waiter behind.
+    clock.release_tool_reads.add_permits(2);
+    both_entered.expect("both registered clock handlers must enter before either read completes");
+    assert_eq!(entered_before_release, 2);
+    assert_eq!(
+        requests_before_release, 1,
+        "inference must wait for both actual tool results"
+    );
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+    let requests = responses.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].tool_by_name("clock", "curr_time").is_some());
+    let mut outputs = ["clock-one", "clock-two"].map(|call_id| {
+        requests[1]
+            .function_call_output_text(call_id)
+            .expect("each registered clock call has a model-visible result")
+    });
+    outputs.sort();
+    assert_eq!(
+        outputs,
+        [SECOND_REMINDER.to_string(), THIRD_REMINDER.to_string()],
+        "both independent current-time reads must reach the corresponding model results"
+    );
+    Ok(())
+}

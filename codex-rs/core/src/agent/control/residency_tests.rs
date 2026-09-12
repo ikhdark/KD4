@@ -12,7 +12,10 @@ use codex_login::CodexAuth;
 use codex_protocol::AgentPath;
 use codex_protocol::ThreadId;
 use codex_protocol::error::CodexErr;
+use codex_protocol::protocol::AgentMessageEvent;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::RolloutItem;
+use codex_protocol::protocol::RolloutLine;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::ThreadSource;
@@ -111,6 +114,122 @@ async fn residency_slot_reservation_unloads_oldest_idle_v2_agent() {
 
     assert!(manager.get_thread(root.thread_id).await.is_ok());
     assert!(manager.get_thread(second.thread_id).await.is_ok());
+}
+
+#[tokio::test]
+async fn residency_materialization_failure_preserves_running_agent_and_buffered_history() {
+    let mut config = test_config().await;
+    let _ = config.features.enable(Feature::MultiAgentV2);
+    config.multi_agent_v2.max_concurrent_threads_per_session = 2;
+    let temp_home = tempfile::tempdir().expect("create temp home");
+    config.codex_home = temp_home.path().to_path_buf().try_into().unwrap();
+    config.cwd = temp_home.path().to_path_buf().try_into().unwrap();
+    let manager = ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+    );
+    let root = manager
+        .start_thread(config.clone())
+        .await
+        .expect("start root thread");
+    let control = manager.agent_control();
+    let state = control.upgrade().expect("thread manager should be live");
+    let slot = control
+        .reserve_v2_residency_slot(&state, &config, /*protected_thread_id*/ None)
+        .await
+        .expect("first resident slot");
+    let first = spawn_v2_subagent(
+        &control,
+        &state,
+        config.clone(),
+        root.thread_id,
+        "persistence-worker",
+    )
+    .await;
+    slot.commit(first.thread_id);
+    let rollout_path = first
+        .thread
+        .codex
+        .session
+        .current_rollout_path()
+        .await
+        .expect("resolve rollout path")
+        .expect("local rollout path");
+    assert!(!rollout_path.exists(), "new rollout must still be deferred");
+    first
+        .thread
+        .codex
+        .session
+        .live_thread()
+        .expect("live thread store")
+        .append_items_ordered(&[RolloutItem::EventMsg(EventMsg::AgentMessage(
+            AgentMessageEvent {
+                message: "history-before-failed-eviction".to_string(),
+                phase: None,
+                memory_citation: None,
+            },
+        ))])
+        .await
+        .expect("queue history before eviction");
+    mark_thread_completed(first.thread.as_ref()).await;
+
+    // A directory at the deferred file path makes the real store's persist fail.
+    std::fs::create_dir_all(&rollout_path).expect("block rollout file creation");
+    match control
+        .reserve_v2_residency_slot(&state, &config, /*protected_thread_id*/ None)
+        .await
+    {
+        Err(CodexErr::AgentLimitReached { max_threads }) => assert_eq!(max_threads, 1),
+        Err(err) => panic!("expected retained residency capacity, got {err:?}"),
+        Ok(_) => panic!("failed persistence must not free the resident slot"),
+    }
+    let retained = manager
+        .get_thread(first.thread_id)
+        .await
+        .expect("failed persistence must retain the runtime");
+    assert!(Arc::ptr_eq(&retained, &first.thread));
+    assert!(first.thread.is_running(), "shutdown must not be submitted");
+    let mut terminated = Box::pin(first.thread.wait_until_terminated());
+    assert!(futures::poll!(terminated.as_mut()).is_pending());
+    drop(terminated);
+    {
+        let residency = control
+            .v2_residency
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(residency.residents.contains(&first.thread_id));
+        assert!(!residency.evicting.contains_key(&first.thread_id));
+        assert_eq!(residency.pending_slots, 0);
+    }
+
+    std::fs::remove_dir(&rollout_path).expect("remove storage fault");
+    let recovered_slot = control
+        .reserve_v2_residency_slot(&state, &config, /*protected_thread_id*/ None)
+        .await
+        .expect("successful persistence must allow eviction after recovery");
+    match manager.get_thread(first.thread_id).await {
+        Err(CodexErr::ThreadNotFound(thread_id)) => assert_eq!(thread_id, first.thread_id),
+        Err(err) => panic!("expected recovered eviction, got {err:?}"),
+        Ok(_) => panic!("successfully persisted resident must be evicted"),
+    }
+    assert!(!first.thread.is_running());
+    let history = std::fs::read_to_string(&rollout_path).expect("read persisted history");
+    let buffered_messages = history
+        .lines()
+        .map(|line| serde_json::from_str::<RolloutLine>(line).expect("valid rollout line"))
+        .filter(|line| {
+            matches!(&line.item, RolloutItem::EventMsg(EventMsg::AgentMessage(message))
+                if message.message == "history-before-failed-eviction")
+        })
+        .count();
+    assert_eq!(
+        buffered_messages, 1,
+        "failed eviction must preserve queued history exactly once"
+    );
+    drop(recovered_slot);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

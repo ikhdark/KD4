@@ -1355,7 +1355,9 @@ fn parse_project_roots_glob_pattern(pattern: &str) -> Option<&Path> {
 }
 
 fn resolve_project_roots_glob_pattern(subpath: &Path, root: &AbsolutePathBuf) -> String {
-    AbsolutePathBuf::resolve_path_against_base(subpath, root.as_path())
+    // The root is a literal directory; only the caller's subpath is glob syntax.
+    let literal_root = globset::escape(&root.to_string_lossy());
+    AbsolutePathBuf::resolve_path_against_base(subpath, literal_root)
         .to_string_lossy()
         .into_owned()
 }
@@ -2471,10 +2473,11 @@ mod tests {
     #[test]
     fn materialize_project_roots_with_workspace_roots_expands_exact_and_glob_entries() {
         let temp_dir = TempDir::new().expect("tempdir");
-        let first = AbsolutePathBuf::from_absolute_path(temp_dir.path().join("first"))
+        let first = AbsolutePathBuf::from_absolute_path(temp_dir.path().join("workspace[1]"))
             .expect("resolve first root");
-        let second = AbsolutePathBuf::from_absolute_path(temp_dir.path().join("second"))
-            .expect("resolve second root");
+        let second =
+            AbsolutePathBuf::from_absolute_path(temp_dir.path().join("workspace{two,three}"))
+                .expect("resolve second root");
         let policy = FileSystemSandboxPolicy::restricted(vec![
             FileSystemSandboxEntry {
                 path: FileSystemPath::Special {
@@ -2530,7 +2533,7 @@ mod tests {
                     path: FileSystemPath::GlobPattern {
                         pattern: AbsolutePathBuf::resolve_path_against_base(
                             "**/*.env",
-                            first.as_path(),
+                            temp_dir.path().join("workspace[[]1[]]"),
                         )
                         .to_string_lossy()
                         .into_owned(),
@@ -2541,7 +2544,7 @@ mod tests {
                     path: FileSystemPath::GlobPattern {
                         pattern: AbsolutePathBuf::resolve_path_against_base(
                             "**/*.env",
-                            second.as_path(),
+                            temp_dir.path().join("workspace[{]two,three[}]"),
                         )
                         .to_string_lossy()
                         .into_owned(),
@@ -2550,11 +2553,32 @@ mod tests {
                 },
             ])
         );
+
+        let denied_first = first.join("nested/secret.env");
+        let denied_second = second.join("secret.env");
+        let readable = first.join("nested/public.txt");
+        let sibling = temp_dir.path().join("workspace1/nested/secret.env");
+        for path in [
+            denied_first.as_path(),
+            denied_second.as_path(),
+            readable.as_path(),
+            sibling.as_path(),
+        ] {
+            std::fs::create_dir_all(path.parent().expect("file parent")).expect("create parent");
+            std::fs::write(path, "content").expect("write file");
+        }
+        let matcher = ReadDenyMatcher::new(&actual, temp_dir.path()).expect("deny matcher");
+        assert!(matcher.is_read_denied(denied_first.as_path()));
+        assert!(matcher.is_read_denied(denied_second.as_path()));
+        assert!(!matcher.is_read_denied(readable.as_path()));
+        assert!(!matcher.is_read_denied(&sibling));
     }
 
     #[test]
     fn materialize_project_roots_with_cwd_expands_symbolic_glob_entries() {
-        let cwd = TempDir::new().expect("tempdir");
+        let temp_dir = TempDir::new().expect("tempdir");
+        let cwd = temp_dir.path().join("workspace[1]");
+        std::fs::create_dir(&cwd).expect("create workspace");
         let policy = FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry {
             path: FileSystemPath::GlobPattern {
                 pattern: project_roots_glob_pattern(Path::new("**/*.env")),
@@ -2562,19 +2586,34 @@ mod tests {
             access: FileSystemAccessMode::Deny,
         }]);
 
-        let actual = policy.materialize_project_roots_with_cwd(cwd.path());
+        let actual = policy.materialize_project_roots_with_cwd(&cwd);
 
         assert_eq!(
             actual,
             FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry {
                 path: FileSystemPath::GlobPattern {
-                    pattern: AbsolutePathBuf::resolve_path_against_base("**/*.env", cwd.path())
-                        .to_string_lossy()
-                        .into_owned(),
+                    pattern: AbsolutePathBuf::resolve_path_against_base(
+                        "**/*.env",
+                        temp_dir.path().join("workspace[[]1[]]"),
+                    )
+                    .to_string_lossy()
+                    .into_owned(),
                 },
                 access: FileSystemAccessMode::Deny,
             }])
         );
+
+        let denied = cwd.join("nested/secret.env");
+        let readable = cwd.join("nested/public.txt");
+        let sibling = temp_dir.path().join("workspace1/nested/secret.env");
+        for path in [&denied, &readable, &sibling] {
+            std::fs::create_dir_all(path.parent().expect("file parent")).expect("create parent");
+            std::fs::write(path, "content").expect("write file");
+        }
+        let matcher = ReadDenyMatcher::new(&actual, &cwd).expect("deny matcher");
+        assert!(matcher.is_read_denied(&denied));
+        assert!(!matcher.is_read_denied(&readable));
+        assert!(!matcher.is_read_denied(&sibling));
     }
 
     #[test]

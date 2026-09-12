@@ -83,6 +83,9 @@ impl RawOutputArtifactTask {
     }
 
     fn write_chunk(&mut self, output: &[u8]) {
+        if output.is_empty() {
+            return;
+        }
         let queue_limit = MAX_RAW_OUTPUT_ARTIFACT_BYTES.saturating_add(1);
         let remaining = queue_limit.saturating_sub(self.accepted_bytes);
         if remaining == 0 {
@@ -190,14 +193,22 @@ pub(crate) struct OutputHandles {
 
 /// Transport-specific process handle used by unified exec.
 enum ProcessHandle {
-    Local(Box<ExecCommandSession>),
+    Local(Arc<ExecCommandSession>),
     ExecServer(Arc<dyn ExecProcess>),
+}
+
+#[derive(Clone)]
+pub(super) struct ProcessTerminationOwner {
+    pub(super) tasks: tokio_util::task::TaskTracker,
+    pub(super) runtime: tokio::runtime::Handle,
 }
 
 /// Unified wrapper over directly spawned PTY sessions and exec-server-backed
 /// processes.
 pub(crate) struct UnifiedExecProcess {
+    validation: std::sync::OnceLock<codex_protocol::validation::ValidationCommandContext>,
     process_handle: ProcessHandle,
+    termination_owner: std::sync::OnceLock<ProcessTerminationOwner>,
     output_tx: broadcast::Sender<ProcessOutputChunk>,
     initial_output_rx: StdMutex<Option<broadcast::Receiver<ProcessOutputChunk>>>,
     output_buffer: OutputBuffer,
@@ -214,7 +225,9 @@ pub(crate) struct UnifiedExecProcess {
     interaction_lock: Arc<Mutex<()>>,
     state_tx: watch::Sender<ProcessState>,
     state_rx: watch::Receiver<ProcessState>,
+    terminal_completion: StdMutex<Option<watch::Receiver<Option<Result<(), String>>>>>,
     output_task: Option<JoinHandle<()>>,
+    output_shutdown: CancellationToken,
     raw_output_artifact: Option<Arc<Mutex<RawOutputArtifact>>>,
     sandbox_type: SandboxType,
     _spawn_lifecycle: Option<SpawnLifecycleHandle>,
@@ -231,6 +244,32 @@ impl std::fmt::Debug for UnifiedExecProcess {
 }
 
 impl UnifiedExecProcess {
+    #[cfg(test)]
+    pub(super) fn hold_termination_for_test(&self) -> tokio::sync::SemaphorePermit<'_> {
+        self.termination_lock
+            .try_acquire()
+            .expect("uncontended termination fixture")
+    }
+
+    pub(super) fn set_termination_owner(&self, owner: ProcessTerminationOwner) {
+        let _ = self.termination_owner.set(owner);
+    }
+
+    pub(super) fn set_validation(
+        &self,
+        context: Option<codex_protocol::validation::ValidationCommandContext>,
+    ) {
+        if let Some(context) = context {
+            let _ = self.validation.set(context);
+        }
+    }
+
+    pub(super) fn validation(
+        &self,
+    ) -> Option<codex_protocol::validation::ValidationCommandContext> {
+        self.validation.get().cloned()
+    }
+
     fn new(
         process_handle: ProcessHandle,
         sandbox_type: SandboxType,
@@ -250,7 +289,9 @@ impl UnifiedExecProcess {
         let (state_tx, state_rx) = watch::channel(ProcessState::default());
 
         Self {
+            validation: std::sync::OnceLock::new(),
             process_handle,
+            termination_owner: std::sync::OnceLock::new(),
             output_tx,
             initial_output_rx: StdMutex::new(Some(output_rx)),
             output_buffer,
@@ -267,11 +308,42 @@ impl UnifiedExecProcess {
             interaction_lock: Arc::new(Mutex::new(())),
             state_tx,
             state_rx,
+            terminal_completion: StdMutex::new(None),
             output_task: None,
+            output_shutdown: CancellationToken::new(),
             raw_output_artifact: raw_output_artifact.map(|artifact| Arc::new(Mutex::new(artifact))),
             sandbox_type,
             _spawn_lifecycle: spawn_lifecycle,
         }
+    }
+
+    pub(super) fn register_terminal_completion(&self) -> watch::Sender<Option<Result<(), String>>> {
+        let (sender, receiver) = watch::channel(None);
+        let previous = self
+            .terminal_completion
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .replace(receiver);
+        assert!(previous.is_none(), "a process has only one exit watcher");
+        sender
+    }
+
+    pub(super) async fn wait_for_terminal_completion(&self) -> Result<(), String> {
+        let receiver = self
+            .terminal_completion
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let Some(mut receiver) = receiver else {
+            // A short-lived process is finalized directly by process_manager.
+            return Ok(());
+        };
+        let result = receiver.wait_for(Option::is_some).await.map_err(|_| {
+            "unified exec exit watcher closed before terminal finalization".to_string()
+        })?;
+        result
+            .clone()
+            .ok_or_else(|| "unified exec terminal completion is missing".to_string())?
     }
 
     pub(super) async fn write(&self, data: &[u8]) -> Result<(), UnifiedExecError> {
@@ -415,11 +487,9 @@ impl UnifiedExecProcess {
                 process_handle.finish();
             }
             ProcessHandle::ExecServer(_) => {
-                if let Some(output_task) = &self.output_task {
-                    output_task.abort();
-                }
-                self.output_closed.store(true, Ordering::Release);
-                self.output_closed_notify.notify_waiters();
+                // The output worker owns artifact finalization and publishes
+                // output closure only after the retained bytes are durable.
+                self.output_shutdown.cancel();
             }
         }
         self.cancellation_token.cancel();
@@ -435,9 +505,19 @@ impl UnifiedExecProcess {
             }
             ProcessHandle::ExecServer(process_handle) => {
                 let process_handle = Arc::clone(process_handle);
-                tokio::spawn(async move {
-                    let _ = process_handle.terminate().await;
-                });
+                let termination = async move {
+                    if let Err(error) = process_handle.terminate().await {
+                        tracing::warn!(%error, "failed to terminate remote unified-exec process");
+                    }
+                };
+                if let Some(owner) = self.termination_owner.get() {
+                    owner.tasks.spawn_on(termination, &owner.runtime);
+                } else if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                    // Standalone test processes have no session cleanup owner.
+                    runtime.spawn(termination);
+                } else {
+                    tracing::warn!("remote process termination has no runtime owner");
+                }
             }
         }
         self.finish_termination();
@@ -467,8 +547,14 @@ impl UnifiedExecProcess {
         }
         match &self.process_handle {
             ProcessHandle::Local(process_handle) => {
-                process_handle
-                    .request_terminate()
+                let process_handle = Arc::clone(process_handle);
+                tokio::task::spawn_blocking(move || process_handle.request_terminate())
+                    .await
+                    .map_err(|err| {
+                        UnifiedExecError::process_failed(format!(
+                            "process termination worker failed: {err}"
+                        ))
+                    })?
                     .map_err(|err| UnifiedExecError::process_failed(err.to_string()))?;
 
                 let mut state_rx = self.state_rx.clone();
@@ -496,9 +582,19 @@ impl UnifiedExecProcess {
     pub(super) async fn interrupt(&self) -> Result<(), UnifiedExecError> {
         self.termination_requested.store(true, Ordering::Release);
         match &self.process_handle {
-            ProcessHandle::Local(process_handle) => process_handle
-                .signal(PtyProcessSignal::Interrupt)
-                .map_err(|err| UnifiedExecError::process_failed(err.to_string())),
+            ProcessHandle::Local(process_handle) => {
+                let process_handle = Arc::clone(process_handle);
+                tokio::task::spawn_blocking(move || {
+                    process_handle.signal(PtyProcessSignal::Interrupt)
+                })
+                .await
+                .map_err(|err| {
+                    UnifiedExecError::process_failed(format!(
+                        "process interrupt worker failed: {err}"
+                    ))
+                })?
+                .map_err(|err| UnifiedExecError::process_failed(err.to_string()))
+            }
             ProcessHandle::ExecServer(process_handle) => process_handle
                 .signal(ExecServerProcessSignal::Interrupt)
                 .await
@@ -606,7 +702,7 @@ impl UnifiedExecProcess {
             mut exit_rx,
         } = spawned;
         let mut managed = Self::new(
-            ProcessHandle::Local(Box::new(process_handle)),
+            ProcessHandle::Local(Arc::new(process_handle)),
             sandbox_type,
             Some(spawn_lifecycle),
             raw_output_artifact,
@@ -644,7 +740,21 @@ impl UnifiedExecProcess {
             let managed = Arc::clone(&managed);
             async move {
                 match exit_rx.await {
-                    Ok(exit_code) => managed.signal_exit(Some(exit_code)),
+                    Ok(exit_code) => {
+                        managed.signal_exit(Some(exit_code));
+                        // ConPTY retains its output pipe until the pseudoconsole
+                        // is released. Keep the reader alive to drain final bytes.
+                        #[cfg(windows)]
+                        if let Err(error) = tokio::task::spawn_blocking(move || {
+                            if let ProcessHandle::Local(process_handle) = &managed.process_handle {
+                                process_handle.release_pty_after_exit();
+                            }
+                        })
+                        .await
+                        {
+                            tracing::warn!(%error, "failed to release exited local pseudoconsole");
+                        }
+                    }
                     Err(_) => {
                         managed.signal_exit_failure(MISSING_LOCAL_EXIT_STATUS_MESSAGE.to_string())
                     }
@@ -699,6 +809,7 @@ impl UnifiedExecProcess {
             managed.output_tx.clone(),
             managed.state_tx.clone(),
             managed.raw_output_artifact.clone(),
+            managed.output_shutdown.clone(),
         ));
         let managed = Arc::new(managed);
         pending_spawns.register(Arc::clone(&managed));
@@ -717,6 +828,7 @@ impl UnifiedExecProcess {
         output_tx: broadcast::Sender<ProcessOutputChunk>,
         state_tx: watch::Sender<ProcessState>,
         raw_output_artifact: Option<Arc<Mutex<RawOutputArtifact>>>,
+        output_shutdown: CancellationToken,
     ) -> JoinHandle<()> {
         let OutputHandles {
             output_buffer,
@@ -734,7 +846,12 @@ impl UnifiedExecProcess {
             let mut artifact_task = RawOutputArtifactTask::spawn(raw_output_artifact);
             let mut last_seq: u64 = 0;
             loop {
-                let event = match events.recv().await {
+                let received = tokio::select! {
+                    biased;
+                    _ = output_shutdown.cancelled() => break,
+                    received = events.recv() => received,
+                };
+                let event = match received {
                     Ok(event) => Some(event),
                     Err(broadcast::error::RecvError::Lagged(_)) => None,
                     Err(broadcast::error::RecvError::Closed) => {
@@ -763,14 +880,16 @@ impl UnifiedExecProcess {
                     || event_seq.is_some_and(|seq| seq > last_seq.saturating_add(1))
                     || missing_sandbox_denial
                 {
-                    let response = match process
-                        .read(
+                    let response = tokio::select! {
+                        biased;
+                        _ = output_shutdown.cancelled() => break,
+                        response = process.read(
                             Some(last_seq),
                             /*max_bytes*/ None,
                             /*wait_ms*/ Some(0),
-                        )
-                        .await
-                    {
+                        ) => response,
+                    };
+                    let response = match response {
                         Ok(response) => response,
                         Err(err) => {
                             let state = state_tx.borrow().clone();
@@ -992,5 +1111,40 @@ impl Drop for UnifiedExecProcess {
         if !self.has_exited() {
             self.terminate();
         }
+    }
+}
+
+#[cfg(test)]
+mod raw_artifact_queue_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn empty_artifact_chunks_do_not_queue_messages_or_consume_byte_capacity() {
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let mut artifact = RawOutputArtifactTask {
+            sender: Some(sender),
+            task: tokio::spawn(async {}),
+            state: Arc::new(Mutex::new(RawOutputArtifact::unavailable("test sink"))),
+            accepted_bytes: 0,
+        };
+        for _ in 0..100 {
+            artifact.write_chunk(b"");
+        }
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert_eq!(artifact.accepted_bytes, 0);
+        artifact.write_chunk(b"retained output");
+        assert_eq!(
+            receiver.try_recv().expect("nonempty output queued"),
+            b"retained output"
+        );
+        assert_eq!(artifact.accepted_bytes, 15);
+        artifact.finish().await;
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected)
+        ));
     }
 }

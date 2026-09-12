@@ -693,10 +693,17 @@ async fn execute_mcp_tool_call(
     )
     .await
     .map_err(|e| format!("failed to build MCP tool request metadata: {e:#}"))?;
-    let mcp_call_trace = sess
-        .services
-        .rollout_thread_trace
-        .start_mcp_call_trace(call_id);
+    let mcp_call_trace = if sess.services.rollout_thread_trace.is_enabled() {
+        let thread_trace = sess.services.rollout_thread_trace.clone();
+        let call_id = call_id.to_string();
+        crate::tools::tool_dispatch_trace::run_trace_recording(&sess.terminal_tasks, move || {
+            thread_trace.start_mcp_call_trace(call_id)
+        })
+        .await
+        .unwrap_or_else(codex_rollout_trace::McpCallTraceContext::disabled)
+    } else {
+        codex_rollout_trace::McpCallTraceContext::disabled()
+    };
     let request_meta = mcp_call_trace.add_request_meta(request_meta);
     let request_meta =
         with_tool_call_progress_token_meta(request_meta, turn_context.sub_id.as_str(), call_id);

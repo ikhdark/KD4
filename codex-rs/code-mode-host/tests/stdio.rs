@@ -352,6 +352,63 @@ text(result.value);
 }
 
 #[tokio::test]
+async fn dropping_session_outside_runtime_closes_cells_and_preserves_shared_host() {
+    let provider = ProcessOwnedCodeModeSessionProvider::with_host_program(
+        codex_utils_cargo_bin::cargo_bin("codex-code-mode-host").expect("host binary"),
+    );
+    let (delegate, mut events_rx) = CancellationDelegate::new();
+    let session = provider
+        .create_session(delegate)
+        .await
+        .expect("create session to drop");
+    let survivor = provider
+        .create_session(Arc::new(RecordingDelegate::default()))
+        .await
+        .expect("create surviving session");
+    assert_eq!(
+        execute(&survivor, execute_request(r#"store("key", "preserved");"#)).await,
+        RuntimeResponse::Result {
+            cell_id: cell_id("1"),
+            content_items: Vec::new(),
+            error_text: None,
+        }
+    );
+
+    let mut request = execute_request("await new Promise(() => {});");
+    request.yield_time_ms = Some(1);
+    let started = session.execute(request).await.expect("start pending cell");
+    let running_cell_id = started.cell_id.clone();
+    assert_eq!(
+        started.initial_response().await.expect("initial response"),
+        RuntimeResponse::Yielded {
+            cell_id: running_cell_id.clone(),
+            content_items: Vec::new(),
+        }
+    );
+    std::thread::spawn(move || drop(session))
+        .join()
+        .expect("drop session on a plain thread");
+    assert_eq!(
+        next_callback_event(&mut events_rx).await,
+        CallbackEvent::CellClosed(running_cell_id)
+    );
+    assert_eq!(
+        execute(&survivor, execute_request(r#"text(load("key"));"#)).await,
+        RuntimeResponse::Result {
+            cell_id: cell_id("2"),
+            content_items: vec![FunctionCallOutputContentItem::InputText {
+                text: "preserved".to_string(),
+            }],
+            error_text: None,
+        }
+    );
+    survivor
+        .shutdown()
+        .await
+        .expect("shutdown surviving session");
+}
+
+#[tokio::test]
 async fn dropping_long_wait_releases_observer_before_next_wait() {
     let provider = ProcessOwnedCodeModeSessionProvider::with_host_program(
         codex_utils_cargo_bin::cargo_bin("codex-code-mode-host").expect("host binary"),

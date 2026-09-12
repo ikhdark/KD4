@@ -896,6 +896,8 @@ async fn plugin_share_checkout_cleans_up_path_when_marketplace_update_fails() ->
         }))?,
     )?;
 
+    let original_marketplace = std::fs::read(&marketplace_path)?;
+
     let bundle_url = mount_remote_plugin_bundle(
         &server,
         "demo-plugin",
@@ -946,6 +948,7 @@ async fn plugin_share_checkout_cleans_up_path_when_marketplace_update_fails() ->
             .message
             .contains("marketplace already contains plugin `demo-plugin`")
     );
+    assert_eq!(std::fs::read(&marketplace_path)?, original_marketplace);
     assert!(!home.path().join("plugins/demo-plugin").exists());
     assert!(
         !codex_home

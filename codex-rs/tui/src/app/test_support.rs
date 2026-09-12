@@ -17,6 +17,7 @@ pub(super) async fn make_test_app() -> App {
     let session_telemetry = test_session_telemetry(&config, model.as_str());
 
     App {
+        desktop_thread_open_command_for_test: None,
         model_catalog: chat_widget.model_catalog(),
         session_telemetry,
         app_event_tx,

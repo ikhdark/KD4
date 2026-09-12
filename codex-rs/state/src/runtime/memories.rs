@@ -742,7 +742,7 @@ WHERE id = ? AND memory_mode != 'polluted'
     ) -> anyhow::Result<Stage1JobClaimOutcome> {
         let now = Utc::now().timestamp();
         let lease_until = now.saturating_add(lease_seconds.max(0));
-        let max_running_jobs = max_running_jobs as i64;
+        let max_running_jobs = i64::try_from(max_running_jobs).unwrap_or(i64::MAX);
         let ownership_token = Uuid::new_v4().to_string();
         let thread_id = thread_id.to_string();
         let worker_id = worker_id.to_string();
@@ -1814,8 +1814,11 @@ mod tests {
 
         let claim = runtime
             .try_claim_stage1_job(
-                thread_id, owner_a, /*source_updated_at*/ 100, /*lease_seconds*/ 3600,
-                /*max_running_jobs*/ 64,
+                thread_id,
+                owner_a,
+                /*source_updated_at*/ 100,
+                /*lease_seconds*/ 3600,
+                /*max_running_jobs*/ usize::MAX,
             )
             .await
             .expect("claim stage1 job");

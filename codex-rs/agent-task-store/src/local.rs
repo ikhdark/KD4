@@ -95,9 +95,10 @@ use crate::WorkspaceStrategy;
 use crate::WorkspaceTaskStatus;
 use crate::scope::RepositoryIdentity;
 use crate::scope::absolute_repo_path;
-use crate::scope::normalize_repo_path;
+use crate::scope::normalize_repo_path_async;
 use crate::scope::normalize_repo_scopes;
 use crate::scope::repository_identity;
+use crate::scope::repository_identity_async;
 
 const COORDINATION_DIR: &str = "agent-task-coordination";
 const COLD_REVIEW_REASON_PREFIX: &str = "cold review required: ";
@@ -466,8 +467,14 @@ impl LocalAgentTaskStore {
         selective: bool,
         isolated_integrator_available: bool,
     ) -> StoreResult<AdmittedAssignment> {
-        let repository = repository_identity(repo_root)?;
-        let mut assignment = draft.normalize(repo_root)?;
+        let root = repo_root.to_path_buf();
+        let (repository, mut assignment) = tokio::task::spawn_blocking(move || {
+            Ok::<_, StoreError>((repository_identity(&root)?, draft.normalize(&root)?))
+        })
+        .await
+        .map_err(|error| {
+            StoreError::CorruptData(format!("assignment normalization task failed: {error}"))
+        })??;
         if selective {
             assignment.validate_selective_role_contract()?;
         }
@@ -2716,8 +2723,8 @@ LIMIT 1
         path: String,
         confidence: AttributionConfidence,
     ) -> StoreResult<MutationEventId> {
-        let normalized = normalize_repo_path(repo_root, &path)?;
-        let repository = repository_identity(repo_root)?;
+        let normalized = normalize_repo_path_async(repo_root, &path).await?;
+        let repository = repository_identity_async(repo_root).await?;
         let mut snapshot_candidate = None;
         let result: StoreResult<MutationEventId> = async {
             let mut transaction = self.pool.begin().await?;
@@ -2821,7 +2828,7 @@ LIMIT 1
         repo_root: &Path,
         path: String,
     ) -> StoreResult<MutationEvidence> {
-        let normalized = normalize_repo_path(repo_root, &path)?;
+        let normalized = normalize_repo_path_async(repo_root, &path).await?;
         self.finalize_mutations_atomically_impl(attempt_id, repo_root, Some(vec![normalized]))
             .await?
             .into_iter()
@@ -2835,7 +2842,7 @@ LIMIT 1
         repo_root: &Path,
         requested_paths: Option<Vec<String>>,
     ) -> StoreResult<Vec<MutationEvidence>> {
-        let repository = repository_identity(repo_root)?;
+        let repository = repository_identity_async(repo_root).await?;
         let mut snapshots: Vec<(String, PathBuf)> = Vec::new();
         let mut requested_paths = requested_paths;
         let result: StoreResult<Vec<MutationEvidence>> = async {
@@ -4446,7 +4453,7 @@ async fn upgrade_legacy_repository_bindings(pool: &SqlitePool) -> StoreResult<()
         let legacy_repository_id = row.get::<String, _>("repository_id");
         let workspace_id = row.get::<String, _>("workspace_id");
         let canonical_root = row.get::<String, _>("canonical_root");
-        let repository = match repository_identity(Path::new(&canonical_root)) {
+        let repository = match repository_identity_async(Path::new(&canonical_root)).await {
             Ok(repository) => repository,
             Err(StoreError::InvalidScope(_)) => continue,
             Err(error) => return Err(error),
@@ -4745,7 +4752,8 @@ async fn seal_architecture_contract_for_receipt_tx(
     .bind(assignment.assignment_id.to_string())
     .fetch_one(&mut **transaction)
     .await?;
-    let contract = canonicalize_architecture_contract(Path::new(&canonical_root), contract)?;
+    let contract =
+        canonicalize_architecture_contract_async(Path::new(&canonical_root), contract).await?;
     let contract_sha256 = format!("{:x}", Sha256::digest(serde_json::to_vec(&contract)?));
     Ok(Some(SealedArchitectureContractV1 {
         contract,
@@ -4825,7 +4833,8 @@ async fn validate_architecture_contract_reference_tx(
             "architecture contract version or hash does not match the sealed receipt".to_string(),
         ));
     }
-    let sealed_contract = canonicalize_architecture_contract(repo_root, sealed.contract)?;
+    let sealed_contract =
+        canonicalize_architecture_contract_async(repo_root, sealed.contract).await?;
     let sealed_hash = format!(
         "{:x}",
         Sha256::digest(serde_json::to_vec(&sealed_contract)?)
@@ -4835,7 +4844,7 @@ async fn validate_architecture_contract_reference_tx(
             "sealed architecture contract is not canonical for the worker repository".to_string(),
         ));
     }
-    let worker_projection = canonicalize_architecture_contract(
+    let worker_projection = canonicalize_architecture_contract_async(
         repo_root,
         ArchitectureContractV1 {
             schema_version: ARCHITECTURE_CONTRACT_V1_SCHEMA_VERSION,
@@ -4849,7 +4858,8 @@ async fn validate_architecture_contract_reference_tx(
             prohibited_changes: worker.prohibited_changes.clone(),
             contract_claims: worker.contract_claims.clone(),
         },
-    )?;
+    )
+    .await?;
     if worker_projection != sealed_contract {
         return Err(StoreError::InvalidAssignment(
             "worker scope or claims are incompatible with the authoritative architecture contract"
@@ -4857,6 +4867,18 @@ async fn validate_architecture_contract_reference_tx(
         ));
     }
     Ok(())
+}
+
+async fn canonicalize_architecture_contract_async(
+    repo_root: &Path,
+    contract: ArchitectureContractV1,
+) -> StoreResult<ArchitectureContractV1> {
+    let repo_root = repo_root.to_path_buf();
+    tokio::task::spawn_blocking(move || canonicalize_architecture_contract(&repo_root, contract))
+        .await
+        .map_err(|error| {
+            StoreError::CorruptData(format!("contract normalization task failed: {error}"))
+        })?
 }
 
 fn canonicalize_architecture_contract(
@@ -5227,7 +5249,7 @@ async fn validate_completed_mutation_evidence_tx(
                 "declared change summary cannot be empty".to_string(),
             ));
         }
-        change.path = normalize_repo_path(repo_root, &change.path)?;
+        change.path = normalize_repo_path_async(repo_root, &change.path).await?;
         if !declared.insert(change.path.clone()) {
             return Err(StoreError::InvalidAssignment(format!(
                 "duplicate declared change {}",
@@ -5243,7 +5265,8 @@ async fn validate_completed_mutation_evidence_tx(
     .await?;
     let mut finalized = BTreeSet::new();
     for row in rows {
-        let path = normalize_repo_path(repo_root, row.get::<String, _>("path").as_str())?;
+        let path =
+            normalize_repo_path_async(repo_root, row.get::<String, _>("path").as_str()).await?;
         if row.get::<Option<String>, _>("finalized_at").is_none() {
             return Err(StoreError::MutationNotFinalized { attempt_id, path });
         }
@@ -5686,13 +5709,19 @@ async fn planned_claim_supersessions_tx(
         let existing_repository_id = row.get::<Option<String>, _>("repository_id");
         let mut scopes: Vec<RepoScope> = decode(row.get::<String, _>("scopes_json").as_str())?;
         if let Some(canonical_root) = row.get::<Option<String>, _>("canonical_root") {
-            scopes = scopes
-                .into_iter()
-                .map(|scope| {
-                    normalize_repo_scopes(Path::new(&canonical_root), std::slice::from_ref(&scope))
-                        .map(|mut scopes| scopes.remove(0))
-                })
-                .collect::<StoreResult<Vec<_>>>()?;
+            scopes = tokio::task::spawn_blocking(move || {
+                scopes
+                    .into_iter()
+                    .map(|scope| {
+                        normalize_repo_scopes(Path::new(&canonical_root), std::slice::from_ref(&scope))
+                            .map(|mut scopes| scopes.remove(0))
+                    })
+                    .collect::<StoreResult<Vec<_>>>()
+            })
+            .await
+            .map_err(|error| {
+                StoreError::CorruptData(format!("claim scope normalization task failed: {error}"))
+            })??;
         }
         let fully_covered = scopes.iter().all(|existing_scope| {
             assignment

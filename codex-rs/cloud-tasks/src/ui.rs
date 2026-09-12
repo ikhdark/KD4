@@ -463,7 +463,10 @@ fn draw_diff_overlay(frame: &mut Frame, area: Rect, app: &mut App) {
             .as_ref()
             .map(|o| o.sd.state.scroll)
             .unwrap_or(0);
-        let content = Paragraph::new(Text::from(styled_lines)).scroll((scroll, 0));
+        // Paragraph's scroll offset is u16; select the rows first so large diffs
+        // can reach their final line without narrowing the logical scroll position.
+        let visible_lines: Vec<_> = styled_lines.into_iter().skip(scroll).collect();
+        let content = Paragraph::new(Text::from(visible_lines));
         frame.render_widget(content, content_area);
     }
 }
@@ -916,20 +919,26 @@ pub fn draw_env_modal(frame: &mut Frame, area: Rect, app: &mut App) {
         return;
     }
 
+    // Keep cached choices available while making refresh failures visible.
+    let error = app.env_error.as_deref();
     // Layout: subheader + search + results list
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // subheader
-            Constraint::Length(1), // search
-            Constraint::Min(1),    // list
+            Constraint::Length(if error.is_some() { 2 } else { 1 }), // subheader
+            Constraint::Length(1),                                   // search
+            Constraint::Min(1),                                      // list
         ])
         .split(content);
 
     // Subheader with usage hints (dim cyan)
-    let subheader = Paragraph::new(Line::from(
-        "Type to search, Enter select, Esc cancel".cyan().dim(),
-    ))
+    let subheader = match error {
+        Some(error) => Paragraph::new(format!("Failed to load environments: {error}"))
+            .style(Style::default().fg(Color::Red)),
+        None => Paragraph::new(Line::from(
+            "Type to search, Enter select, Esc cancel".cyan().dim(),
+        )),
+    }
     .wrap(Wrap { trim: true });
     frame.render_widget(subheader, rows[0]);
 
@@ -1066,5 +1075,100 @@ mod tests {
             .collect::<String>();
 
         assert!(text.contains("Codex Cloud • All  • 0%"));
+    }
+
+    #[test]
+    fn environment_load_failure_is_visible_and_recovery_replaces_cached_choices() {
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).expect("terminal");
+        let mut app = App::new();
+        app.env_modal = Some(crate::app::EnvModalState {
+            query: String::new(),
+            selected: 0,
+        });
+        let environment = |id: &str, label: &str| crate::app::EnvironmentRow {
+            id: id.to_string(),
+            label: Some(label.to_string()),
+            is_pinned: false,
+            repo_hints: None,
+        };
+        app.apply_environments_loaded(Ok(vec![environment("cached", "Cached environment")]));
+        app.env_loading = true;
+        app.apply_environments_loaded(Err(anyhow::anyhow!("network unavailable")));
+        assert!(!app.env_loading);
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("failure draw");
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(rendered.contains("Failed to load environments: network unavailable"));
+        assert!(rendered.contains("Cached environment"));
+        assert!(!rendered.contains("Loading environments"));
+
+        app.apply_environments_loaded(Ok(vec![environment("fresh", "Fresh environment")]));
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("recovery draw");
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(rendered.contains("Fresh environment"));
+        assert!(!rendered.contains("Cached environment"));
+        assert!(!rendered.contains("Failed to load environments"));
+        assert!(app.env_error.is_none());
+    }
+
+    #[test]
+    fn draw_renders_final_line_of_diff_larger_than_u16() {
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).expect("terminal");
+        let mut app = App::new();
+        let mut overlay = crate::app::DiffOverlay::new(
+            codex_cloud_tasks_client::TaskId("large-diff".to_string()),
+            "Large diff".to_string(),
+            None,
+        );
+        let mut lines = vec!["ordinary row".to_string(); 65_536];
+        lines.push("+FINAL DIFF ROW".to_string());
+        overlay.base_attempt_mut().diff_lines = lines;
+        overlay.set_view(crate::app::DetailView::Diff);
+        app.diff_overlay = Some(overlay);
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("initial draw");
+        app.diff_overlay
+            .as_mut()
+            .expect("overlay")
+            .sd
+            .scroll_to_bottom();
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("scrolled draw");
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(
+            text.contains("+FINAL DIFF ROW"),
+            "final diff row missing: {text}"
+        );
+        assert_eq!(
+            app.diff_overlay
+                .as_ref()
+                .expect("overlay")
+                .sd
+                .percent_scrolled(),
+            Some(100)
+        );
     }
 }

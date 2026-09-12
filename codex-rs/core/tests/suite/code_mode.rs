@@ -622,6 +622,120 @@ async fn run_code_mode_turn_with_rmcp_config(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn code_mode_persistence_failure_blocks_next_provider_request() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = responses::start_mock_server().await;
+    let test = test_codex()
+        .with_model("test-gpt-5.1-codex")
+        .with_config(|config| {
+            config
+                .features
+                .enable(Feature::CodeMode)
+                .expect("register real code-mode exec");
+            config.completed_tool_history_projection = true;
+        })
+        .build(&server)
+        .await?;
+
+    // Initialization has completed. Preserve its empty snapshot, if present,
+    // and obstruct only subsequent tool-history writes in this isolated home.
+    let history_path = test.codex_home_path().join("tool-history");
+    if history_path.exists() {
+        fs::rename(
+            &history_path,
+            test.codex_home_path().join("tool-history-before-failure"),
+        )?;
+    }
+    fs::write(&history_path, b"filesystem obstruction")?;
+
+    let first_request = responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("response-before-persistence-failure"),
+            ev_custom_tool_call(
+                "queued-non-workspace-call",
+                "exec",
+                "text('real code-mode output before durability failure');",
+            ),
+            ev_completed("response-before-persistence-failure"),
+        ]),
+    )
+    .await;
+    let forbidden_follow_up = responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_assistant_message("forbidden-follow-up", "must not dispatch this generation"),
+            ev_completed("forbidden-follow-up-response"),
+        ]),
+    )
+    .await;
+
+    let completion = tokio::time::timeout(
+        Duration::from_secs(30),
+        test.submit_turn_and_capture_completion("Produce the requested text using exec."),
+    )
+    .await
+    .expect("a failed persistence barrier must terminate the turn")?;
+    let error = completion
+        .error
+        .expect("the failed queued write must be reported in the terminal turn result");
+    assert!(
+        error
+            .message
+            .contains("failed to create tool-history ledger directory"),
+        "the terminal error must preserve the actual persistence cause: {}",
+        error.message,
+    );
+    assert_eq!(first_request.requests().len(), 1);
+    assert!(
+        forbidden_follow_up.requests().is_empty(),
+        "the model must receive no follow-up request after its tool-history barrier fails",
+    );
+    let model_request_count = server
+        .received_requests()
+        .await
+        .expect("recorded HTTP requests")
+        .iter()
+        .filter(|request| request.url.path().contains("responses"))
+        .count();
+    assert_eq!(model_request_count, 1);
+    assert_eq!(fs::read(&history_path)?, b"filesystem obstruction");
+
+    // Repair and use the real shutdown checkpoint to prove the failed queue
+    // retained the registration produced by the actual code-mode tool runtime.
+    fs::remove_file(&history_path)?;
+    test.codex.submit(Op::Shutdown).await?;
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let event = test.codex.next_event().await.expect("shutdown event");
+            match event.msg {
+                EventMsg::ShutdownComplete => break,
+                EventMsg::Error(error) => {
+                    panic!(
+                        "repaired shutdown must flush the queued mutation: {}",
+                        error.message
+                    );
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("repaired shutdown must finish");
+    let ledger: Value = serde_json::from_slice(&fs::read(
+        history_path.join(format!("{}.json", test.session_configured.thread_id)),
+    )?)?;
+    assert_eq!(
+        ledger["state"]["non_workspace_code_mode_calls"],
+        serde_json::json!(["queued-non-workspace-call"]),
+        "the real code-mode registration must survive its failed persistence cycle",
+    );
+    assert!(forbidden_follow_up.requests().is_empty());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_preserves_read_history_until_its_source_changes() -> Result<()> {
     skip_if_no_network!(Ok(()));
     let server = responses::start_mock_server().await;
@@ -710,6 +824,90 @@ text(result.result?.selected_text ?? result.output);"#
         fs::read_to_string(test.cwd_path().join("contract.txt"))?
             .ends_with("Accept non-ASCII input.\n")
     );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn code_mode_tool_history_has_a_hard_aggregate_budget() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = responses::start_mock_server().await;
+    let test = test_codex()
+        .with_config(|config| {
+            let _ = config.features.enable(Feature::CodeMode);
+            config.completed_tool_history_projection = true;
+            config.model_auto_compact_token_limit = Some(1_000_000);
+        })
+        .build(&server)
+        .await?;
+    let mut events = vec![ev_response_created("many-results")];
+    events.push(ev_custom_tool_call(
+        "budget-output",
+        "exec",
+        "text('evidence '.repeat(3500));",
+    ));
+    // Failed dispatches have no artifact candidate, but must share the same budget.
+    for index in 0..800 {
+        events.push(ev_custom_tool_call(
+            &format!("budget-{index:03}"),
+            "unknown_budget_tool",
+            "invalid",
+        ));
+    }
+    events.push(ev_completed("many-results"));
+    let first = responses::mount_sse_once(&server, sse(events)).await;
+    let final_request = responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_assistant_message("done", "done"),
+            ev_completed("final"),
+        ]),
+    )
+    .await;
+    test.submit_turn("Collect the requested results.").await?;
+
+    assert_eq!(first.requests().len(), 1);
+    let request = final_request.single_request();
+    let body = request.body_json();
+    let input = body["input"].as_array().unwrap();
+    let outputs = input
+        .iter()
+        .filter(|item| item["type"] == "custom_tool_call_output")
+        .collect::<Vec<_>>();
+    assert!(!outputs.is_empty());
+    assert!(
+        outputs.len() < 801,
+        "dispatch failures must also be bounded under pressure"
+    );
+    let total = outputs
+        .iter()
+        .map(|item| {
+            let text = match &item["output"] {
+                Value::String(text) => text.clone(),
+                Value::Array(content) => content
+                    .iter()
+                    .filter_map(|item| item["text"].as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                value => panic!("unexpected tool output: {value:?}"),
+            };
+            codex_utils_output_truncation::approx_token_count(&text)
+        })
+        .sum::<usize>();
+    assert!(
+        total <= 10_000,
+        "actual provider-visible results consumed {total} tokens"
+    );
+    for call in input
+        .iter()
+        .filter(|item| item["type"] == "custom_tool_call")
+    {
+        assert!(
+            outputs
+                .iter()
+                .any(|output| output["call_id"] == call["call_id"]),
+            "eviction must not leave a dangling call"
+        );
+    }
     Ok(())
 }
 

@@ -9,29 +9,45 @@ impl ThreadRequestProcessor {
         request_id: ConnectionRequestId,
         params: ThreadDeleteParams,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
-        let mut deleted_thread_ids = Vec::new();
-        let result = {
-            let _thread_list_state_permit = self.acquire_thread_list_state_permit().await?;
-            self.thread_delete_response(params, &mut deleted_thread_ids)
-                .await
-        };
-        match result {
-            Ok(response) => {
-                self.outgoing
-                    .send_response(request_id.clone(), response)
-                    .await;
-                self.send_thread_deleted_notifications(deleted_thread_ids)
-                    .await;
-                Ok(None)
-            }
-            Err(error) if !deleted_thread_ids.is_empty() => {
-                self.outgoing.send_error(request_id, error).await;
-                self.send_thread_deleted_notifications(deleted_thread_ids)
-                    .await;
-                Ok(None)
-            }
-            Err(error) => Err(error),
-        }
+        let processor = self.clone();
+        // A committed deletion must finish live cleanup and publish all completed
+        // deletions even if its originating RPC is cancelled after the commit.
+        self.background_tasks
+            .spawn(
+                async move {
+                    let mut deleted_thread_ids = Vec::new();
+                    let result = {
+                        let _thread_list_state_permit =
+                            processor.acquire_thread_list_state_permit().await?;
+                        processor
+                            .thread_delete_response(params, &mut deleted_thread_ids)
+                            .await
+                    };
+                    match result {
+                        Ok(response) => {
+                            processor
+                                .outgoing
+                                .send_response(request_id.clone(), response)
+                                .await;
+                            processor
+                                .send_thread_deleted_notifications(deleted_thread_ids)
+                                .await;
+                            Ok(None)
+                        }
+                        Err(error) if !deleted_thread_ids.is_empty() => {
+                            processor.outgoing.send_error(request_id, error).await;
+                            processor
+                                .send_thread_deleted_notifications(deleted_thread_ids)
+                                .await;
+                            Ok(None)
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+                .instrument(tracing::Span::current()),
+            )
+            .await
+            .map_err(|error| internal_error(format!("delete task failed: {error}")))?
     }
 
     async fn thread_delete_response(

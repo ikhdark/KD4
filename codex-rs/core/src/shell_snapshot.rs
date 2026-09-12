@@ -789,6 +789,10 @@ async fn run_script_with_timeout_with_args(
     environment_variables: &HashMap<String, String>,
 ) -> Result<String> {
     let timeout_deadline = tokio::time::Instant::now() + snapshot_timeout;
+    #[cfg(test)]
+    let spawn_observer = tests::take_snapshot_process_observer();
+    #[cfg(test)]
+    let spawn_gate = tests::take_snapshot_spawn_gate();
     let args = shell.derive_exec_args(script, use_login_shell)?;
     let args = clean_snapshot_shell_args(shell.shell_type, args, use_login_shell);
     let shell_name = shell.name();
@@ -815,17 +819,57 @@ async fn run_script_with_timeout_with_args(
     let managed = timeout_at(timeout_deadline, ManagedRootProcess::reserve_with_reclaim())
         .await
         .map_err(|_| anyhow!("Snapshot command timed out for {shell_name}"))??;
+    #[cfg(test)]
+    tests::wait_for_snapshot_spawn_gate(spawn_gate).await;
+    if tokio::time::Instant::now() >= timeout_deadline {
+        return Err(anyhow!("Snapshot command timed out for {shell_name}"));
+    }
     let spawn_timeout = timeout_deadline.saturating_duration_since(tokio::time::Instant::now());
-    let mut child = run_windows_process_operation(spawn_timeout, move || handler.spawn())
+    #[cfg(test)]
+    tests::record_snapshot_process_event(&spawn_observer, tests::SnapshotProcessEvent::Queued);
+    #[cfg(test)]
+    let worker_spawn_observer = spawn_observer.clone();
+    let spawn = run_windows_process_operation(spawn_timeout, move || {
+        // A timed-out JoinHandle does not cancel a queued blocking operation.
+        // Check the original budget at native admission, not just at enqueue.
+        if tokio::time::Instant::now() >= timeout_deadline {
+            return Err(std::io::Error::new(
+                ErrorKind::TimedOut,
+                "snapshot deadline expired before native process creation",
+            ));
+        }
+        let child = handler.spawn()?;
+        #[cfg(test)]
+        tests::record_snapshot_process_event(
+            &worker_spawn_observer,
+            tests::SnapshotProcessEvent::Spawned(child.id()),
+        );
+        Ok(child)
+    });
+    let mut child = timeout_at(timeout_deadline, spawn)
         .await
+        .map_err(|_| anyhow!("Snapshot command timed out for {shell_name}"))?
         .with_context(|| format!("Failed to execute {shell_name}"))?;
     let process_id = child.id().context("Snapshot command had no process id")?;
+    if tokio::time::Instant::now() >= timeout_deadline {
+        // Creation may finish just before expiry while its waiter is not polled.
+        // This helper creates the cleanup owner before returning its wait future.
+        // Detach only that acknowledgement: cleanup keeps the child/admission,
+        // while an expired caller must not wait for a new five-second budget.
+        drop(managed.cleanup_after_failed_attach(child));
+        return Err(anyhow!("Snapshot command timed out for {shell_name}"));
+    }
     if let Err(err) = managed.attach_and_resume(process_id) {
-        let _ = managed.terminate();
-        let _ = child.start_kill();
-        let _ = child.wait().await;
+        if let Err(cleanup_error) = managed.cleanup_after_failed_attach(child).await {
+            tracing::warn!("Failed to clean up uncontained snapshot child: {cleanup_error}");
+        }
         return Err(err).context("Failed to contain snapshot command");
     }
+    #[cfg(test)]
+    tests::record_snapshot_process_event(
+        &spawn_observer,
+        tests::SnapshotProcessEvent::Resumed(process_id),
+    );
     let mut stdout = child
         .stdout
         .take()
@@ -957,65 +1001,83 @@ async fn run_remote_snapshot_process_before(
     deadline: tokio::time::Instant,
     shell_name: &str,
 ) -> Result<String> {
-    let started = timeout_at(deadline, exec_backend.start(params))
-        .await
-        .map_err(|_| anyhow!("Snapshot command timed out for {shell_name}"))??;
-    let process = started.process;
-    let collect = async {
-        let mut after_seq = None;
-        let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
-        let mut exit_code = None;
-        loop {
-            let response = process
-                .read(
-                    after_seq,
-                    Some(SNAPSHOT_OUTPUT_LIMIT_BYTES.saturating_add(1)),
-                    Some(1_000),
-                )
-                .await
-                .context("Failed to read remote snapshot command output")?;
-            if let Some(failure) = response.failure {
-                bail!("Remote snapshot command failed: {failure}");
-            }
-            for chunk in response.chunks {
-                after_seq = Some(chunk.seq);
-                let bytes = chunk.chunk.into_inner();
-                let retained = match chunk.stream {
-                    ExecOutputStream::Stdout | ExecOutputStream::Pty => &mut stdout,
-                    ExecOutputStream::Stderr => &mut stderr,
-                };
-                if retained.len().saturating_add(bytes.len()) > SNAPSHOT_OUTPUT_LIMIT_BYTES {
-                    bail!(
-                        "Snapshot command output exceeded the {SNAPSHOT_OUTPUT_LIMIT_BYTES} byte per-stream limit"
-                    );
+    // Keep the accepted remote process transaction alive after its caller is
+    // dropped. Cancellation stops collection, then the same owner awaits cleanup.
+    // Start keeps the original absolute deadline until its process handle is known.
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let _cancel_on_drop = cancellation.clone().drop_guard();
+    let shell_name = shell_name.to_string();
+    tokio::spawn(async move {
+        let started = timeout_at(deadline, exec_backend.start(params))
+            .await
+            .map_err(|_| anyhow!("Snapshot command timed out for {shell_name}"))??;
+        let process = started.process;
+        let collect = async {
+            let mut after_seq = None;
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            let mut exit_code = None;
+            loop {
+                let response = process
+                    .read(
+                        after_seq,
+                        Some(SNAPSHOT_OUTPUT_LIMIT_BYTES.saturating_add(1)),
+                        Some(1_000),
+                    )
+                    .await
+                    .context("Failed to read remote snapshot command output")?;
+                if let Some(failure) = response.failure {
+                    bail!("Remote snapshot command failed: {failure}");
                 }
-                retained.extend_from_slice(&bytes);
+                for chunk in response.chunks {
+                    after_seq = Some(chunk.seq);
+                    let bytes = chunk.chunk.into_inner();
+                    let retained = match chunk.stream {
+                        ExecOutputStream::Stdout | ExecOutputStream::Pty => &mut stdout,
+                        ExecOutputStream::Stderr => &mut stderr,
+                    };
+                    if retained.len().saturating_add(bytes.len()) > SNAPSHOT_OUTPUT_LIMIT_BYTES {
+                        bail!(
+                            "Snapshot command output exceeded the {SNAPSHOT_OUTPUT_LIMIT_BYTES} byte per-stream limit"
+                        );
+                    }
+                    retained.extend_from_slice(&bytes);
+                }
+                after_seq = response.next_seq.checked_sub(1).or(after_seq);
+                exit_code = response.exit_code.or(exit_code);
+                if response.closed {
+                    break;
+                }
             }
-            after_seq = response.next_seq.checked_sub(1).or(after_seq);
-            exit_code = response.exit_code.or(exit_code);
-            if response.closed {
-                break;
+            let exit_code = exit_code.unwrap_or(-1);
+            if exit_code != 0 {
+                bail!(
+                    "Snapshot command exited with status {exit_code}: {}",
+                    String::from_utf8_lossy(&stderr)
+                );
             }
+            Ok::<_, anyhow::Error>(String::from_utf8_lossy(&stdout).into_owned())
+        };
+        let output = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => Err(anyhow!("Snapshot command cancelled for {shell_name}")),
+            output = timeout_at(deadline, collect) => match output {
+                Ok(output) => output,
+                Err(_) => Err(anyhow!("Snapshot command timed out for {shell_name}")),
+            },
+        };
+        // Cancellation, a read failure, or an output limit can stop collection while the shell is
+        // still running. Release the remote process before returning any failure,
+        // just as we do when the total snapshot deadline expires.
+        if output.is_err()
+            && let Err(err) = process.terminate().await
+        {
+            tracing::warn!("Failed to terminate failed remote snapshot shell: {err:?}");
         }
-        let exit_code = exit_code.unwrap_or(-1);
-        if exit_code != 0 {
-            bail!(
-                "Snapshot command exited with status {exit_code}: {}",
-                String::from_utf8_lossy(&stderr)
-            );
-        }
-        Ok::<_, anyhow::Error>(String::from_utf8_lossy(&stdout).into_owned())
-    };
-    match timeout_at(deadline, collect).await {
-        Ok(output) => output,
-        Err(_) => {
-            if let Err(err) = process.terminate().await {
-                tracing::warn!("Failed to terminate timed-out remote snapshot shell: {err:?}");
-            }
-            Err(anyhow!("Snapshot command timed out for {shell_name}"))
-        }
-    }
+        output
+    })
+    .await
+    .context("Remote snapshot capture task failed")?
 }
 
 const SNAPSHOT_OUTPUT_LIMIT_BYTES: usize = 8 * 1024 * 1024;

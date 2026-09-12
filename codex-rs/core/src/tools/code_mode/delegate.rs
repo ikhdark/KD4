@@ -179,10 +179,11 @@ impl CodeModeDispatchBroker {
                             .await;
                             let response = if ready {
                                 tokio::select! {
-                                    response = host.notify(call_id, cell_id.clone(), text) => response,
+                                    biased;
                                     _ = cancellation_token.cancelled() => {
                                         Err("code mode notification cancelled".to_string())
                                     }
+                                    response = host.notify(call_id, cell_id.clone(), text) => response,
                                 }
                             } else {
                                 close_cell(&cells, &cell_id);
@@ -510,10 +511,10 @@ impl CoreTurnHost {
                     output: FunctionCallOutputPayload::from_text(text),
                     internal_chat_message_metadata_passthrough: None,
                 }],
-                Some(self.exec.turn.as_ref()),
+                Some(&self.exec.turn),
             )
-            .await;
-        Ok(())
+            .await
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -660,5 +661,220 @@ mod tests {
         assert!(broker.has_waitable_cells());
         assert!(broker.continuation_snapshot(&first).is_empty());
         assert_eq!(broker.continuation_snapshot(&second).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn broker_notify_cancellation_preserves_physical_live_and_model_history()
+    -> anyhow::Result<()> {
+        use codex_protocol::protocol::{EventMsg, RolloutItem};
+        use std::time::Duration;
+
+        fn outputs(items: &[ResponseItem], call: &str) -> Vec<ResponseItem> {
+            items
+                .iter()
+                .filter(|item| {
+                    matches!(item,
+                ResponseItem::CustomToolCallOutput { call_id, .. } if call_id == call)
+                })
+                .cloned()
+                .collect()
+        }
+        async fn physical(path: &std::path::Path) -> anyhow::Result<Vec<ResponseItem>> {
+            let history =
+                crate::rollout::recorder::RolloutRecorder::get_rollout_history(path).await?;
+            Ok(history
+                .get_rollout_items()
+                .iter()
+                .filter_map(|item| match item {
+                    RolloutItem::ResponseItem(item) => Some(item.clone()),
+                    _ => None,
+                })
+                .collect())
+        }
+        const CALL: &str = "broker-notify-parent";
+        const TEXT: &str = "accepted notification evidence: 7 * 6 = 42";
+        let home = tempfile::tempdir()?;
+        let (mut session, turn, events) =
+            crate::session::tests::make_session_and_context_with_auth_config_home_and_rx(
+                codex_login::CodexAuth::from_api_key("test"),
+                Vec::new(),
+                home.path(),
+                |_| {},
+            )
+            .await;
+        let rollout = crate::session::tests::attach_thread_persistence(
+            Arc::get_mut(&mut session).expect("unique fixture session"),
+        )
+        .await;
+        let call = ResponseItem::CustomToolCall {
+            id: None,
+            status: None,
+            call_id: CALL.to_string(),
+            name: PUBLIC_TOOL_NAME.to_string(),
+            namespace: None,
+            input: "notify('accepted notification evidence: 7 * 6 = 42')".to_string(),
+            internal_chat_message_metadata_passthrough: None,
+        };
+        session
+            .record_conversation_items_ordered(&turn, &[call])
+            .await?;
+        session.flush_rollout_after_ordered_commits(&turn).await?;
+        session.request_raw_response_items();
+        assert!(
+            session.active_turn.lock().await.is_none(),
+            "exercise idle fallback without starting a turn"
+        );
+
+        let broker = Arc::new(CodeModeDispatchBroker::new());
+        let cell = CellId::new("normal-broker-notify-cell".to_string());
+        broker.mark_cell_ready_for_dispatch(&cell);
+        let worker = broker.start_turn_worker(
+            ExecContext {
+                session: Arc::clone(&session),
+                turn: Arc::clone(&turn),
+            },
+            StepContext::for_test(Arc::clone(&turn)),
+            Arc::new(tokio::sync::Mutex::new(
+                crate::turn_diff_tracker::TurnDiffTracker::new(),
+            )),
+            Default::default(),
+        );
+        let canceled = CancellationToken::new();
+        canceled.cancel();
+        assert!(
+            broker
+                .notify(
+                    "before-admission".to_string(),
+                    cell.clone(),
+                    "forbidden".to_string(),
+                    canceled
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            broker.dispatch_rx.is_empty(),
+            "already-cancelled notification never enters broker queue"
+        );
+
+        // Hold the real live-history mutex while the normal broker worker appends
+        // the notification through the real LocalThreadStore/physical rollout.
+        let state = session.lock_history_state_for_test().await;
+        let cancel = CancellationToken::new();
+        let notify = {
+            let broker = Arc::clone(&broker);
+            let cell = cell.clone();
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                broker
+                    .notify(CALL.to_string(), cell, TEXT.to_string(), cancel)
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                session.flush_rollout().await?;
+                if outputs(&physical(&rollout).await?, CALL).len() == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+        .await??;
+        assert!(
+            outputs(&state.clone_history().into_raw_items(), CALL).is_empty(),
+            "physical acceptance precedes blocked live history"
+        );
+        cancel.cancel();
+        let error = tokio::time::timeout(Duration::from_secs(5), notify)
+            .await??
+            .expect_err("delegate reports cancelled waiter");
+        assert_eq!(error, "code mode notification cancelled");
+        drop(state);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            session.flush_rollout_after_ordered_commits(&turn),
+        )
+        .await??;
+
+        let saved = outputs(&physical(&rollout).await?, CALL);
+        let live = outputs(&session.clone_history().await.into_raw_items(), CALL);
+        assert_eq!(
+            saved.len(),
+            1,
+            "accepted output appears exactly once physically"
+        );
+        assert_eq!(
+            live, saved,
+            "cancelled waiter cannot split physical and live history"
+        );
+        let model = outputs(
+            &session
+                .clone_history()
+                .await
+                .for_prompt(&turn.model_info.input_modalities),
+            CALL,
+        );
+        assert_eq!(
+            model, saved,
+            "normal next-prompt projection retains the accepted output"
+        );
+        let ResponseItem::CustomToolCallOutput { output, .. } = &saved[0] else {
+            unreachable!()
+        };
+        assert_eq!(output, &FunctionCallOutputPayload::from_text(TEXT.to_string()));
+
+        // A new emission with identical text is not a retry of the cancelled wait.
+        broker
+            .notify(
+                CALL.to_string(),
+                cell.clone(),
+                TEXT.to_string(),
+                CancellationToken::new(),
+            )
+            .await
+            .map_err(anyhow::Error::msg)?;
+        session.flush_rollout_after_ordered_commits(&turn).await?;
+        let repeated = outputs(&physical(&rollout).await?, CALL);
+        assert_eq!(
+            repeated.len(),
+            2,
+            "intentional repeated notifications remain distinct"
+        );
+        assert_ne!(repeated[0].id(), repeated[1].id());
+        assert_eq!(
+            outputs(&session.clone_history().await.into_raw_items(), CALL),
+            repeated
+        );
+        assert!(outputs(&physical(&rollout).await?, "before-admission").is_empty());
+        assert!(
+            session.active_turn.lock().await.is_none(),
+            "notification never starts a turn"
+        );
+        assert!(
+            !session
+                .input_queue
+                .has_pending_input(&session.active_turn)
+                .await,
+            "internal notification never becomes user steering"
+        );
+        let mut published = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            match event.msg {
+                EventMsg::RawResponseItem(event) => published.push(event.item),
+                EventMsg::TurnStarted(_) => panic!("notification started a model turn"),
+                _ => {}
+            }
+        }
+        assert_eq!(
+            outputs(&published, CALL),
+            repeated,
+            "raw subscribers receive both committed outputs exactly once"
+        );
+        assert!(outputs(&published, "before-admission").is_empty());
+        broker.close_cell(&cell);
+        drop(worker);
+        Ok(())
     }
 }

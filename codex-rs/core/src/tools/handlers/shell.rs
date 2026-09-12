@@ -29,6 +29,7 @@ use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
 use crate::tools::events::ToolEmitter;
 use crate::tools::events::ToolEventCtx;
+use crate::tools::handlers::allows_inline_sandbox_approval;
 use crate::tools::handlers::apply_granted_turn_permissions;
 use crate::tools::handlers::apply_patch::intercept_apply_patch;
 use crate::tools::handlers::command_shape::CommandInvocation;
@@ -95,6 +96,7 @@ fn parse_shell_command_hook_invocation(
 }
 
 pub(super) struct RunExecLikeArgs {
+    pub(super) validation: Option<codex_protocol::validation::ValidationCommandContext>,
     pub(super) tool_name: ToolName,
     pub(super) exec_params: ExecParams,
     pub(super) stall_timeout_ms: Option<u64>,
@@ -230,6 +232,7 @@ pub(super) fn validation_structured_output(value: serde_json::Value) -> Function
 }
 
 pub(super) struct LegacyShellToolOutput {
+    pub(super) validation: Option<codex_protocol::validation::ValidationCommandContext>,
     pub(super) inner: FunctionToolOutput,
     pub(super) canonical_output: Option<Vec<u8>>,
     pub(super) exit_code: Option<i32>,
@@ -301,6 +304,10 @@ impl ToolOutput for LegacyShellToolOutput {
         }
         metadata.essential_inline["exit_code"] = serde_json::json!(self.exit_code);
         metadata.essential_inline["call_id"] = serde_json::json!(&self.call_id);
+        if let Some(validation) = self.validation.as_ref() {
+            metadata.essential_inline["validation"] =
+                crate::tools::context::declared_validation_metadata(validation);
+        }
         if self.validation_failure
             && let Some(canonical_output) = self.canonical_output.as_deref()
             && let Ok(diagnostics) = std::str::from_utf8(canonical_output)
@@ -337,7 +344,15 @@ impl ToolOutput for LegacyShellToolOutput {
     }
 
     fn code_mode_result(&self, payload: &ToolPayload) -> JsonValue {
-        self.inner.code_mode_result(payload)
+        let mut result = self.inner.code_mode_result(payload);
+        if let (Some(validation), Some(object)) = (self.validation.as_ref(), result.as_object_mut())
+        {
+            object.insert(
+                "validation".to_string(),
+                crate::tools::context::declared_validation_metadata(validation),
+            );
+        }
+        result
     }
 }
 
@@ -345,11 +360,21 @@ pub(super) async fn run_exec_like(
     args: RunExecLikeArgs,
 ) -> Result<LegacyShellToolOutput, FunctionCallError> {
     let call_id = args.call_id.clone();
+    let validation = args.validation.clone();
     let validation_output_owned = args.validation_launch.is_some();
-    let result = run_exec_like_with_exit_code(args).await?;
+    let mut result = run_exec_like_with_exit_code(args).await?;
+    if let Some(validation) = validation.as_ref() {
+        let metadata = crate::tools::context::declared_validation_metadata(validation);
+        result.output.body.push(
+            codex_protocol::models::FunctionCallOutputContentItem::InputText {
+                text: format!("Declared validation attribution (coverage unverified): {metadata}"),
+            },
+        );
+    }
     let validation_failure = validation_output_owned
         && result.validation_execution_outcome == ValidationExecutionOutcome::ExecutedFailure;
     Ok(LegacyShellToolOutput {
+        validation,
         inner: result.output,
         canonical_output: result.canonical_output,
         exit_code: result.exit_code,
@@ -385,7 +410,13 @@ pub(super) async fn run_exec_like_with_exit_code(
     args: RunExecLikeArgs,
 ) -> Result<RunExecLikeResult, FunctionCallError> {
     let session_source = args.turn.session_source.clone();
-    let inspection_command = is_known_safe_command(&args.safety_command);
+    let safety_command = args.safety_command.clone();
+    let inspection_command =
+        crate::tools::run_blocking_command_analysis(move || is_known_safe_command(&safety_command))
+            .await
+            .map_err(|error| {
+                FunctionCallError::RespondToModel(format!("command safety worker failed: {error}"))
+            })?;
     validate_independent_review_shell(
         &session_source,
         inspection_command,
@@ -399,10 +430,7 @@ pub(super) async fn run_exec_like_with_exit_code(
         .exec_params
         .sandbox_permissions
         .requests_sandbox_override()
-        && !matches!(
-            args.turn.approval_policy.value(),
-            codex_protocol::protocol::AskForApproval::OnRequest
-        )
+        && !allows_inline_sandbox_approval(args.turn.approval_policy.value())
     {
         let effective_permissions = apply_granted_turn_permissions(
             args.session.as_ref(),
@@ -531,6 +559,7 @@ async fn run_exec_like_with_exit_code_inner(
     repository_root: std::path::PathBuf,
 ) -> Result<RunExecLikeResult, FunctionCallError> {
     let RunExecLikeArgs {
+        validation: _,
         tool_name,
         exec_params,
         stall_timeout_ms,
@@ -654,17 +683,14 @@ async fn run_exec_like_with_exit_code_inner(
         .as_ref()
         .is_some_and(known_delta_store::PreparedKnownDelta::is_hit);
 
-    // Approval policy guard for explicit escalation in non-OnRequest modes.
+    // Fresh inline overrides require a policy that allows sandbox approval.
     // Sticky turn permissions have already been approved, so they should
     // continue through the normal exec approval flow for the command.
     if effective_additional_permissions
         .sandbox_permissions
         .requests_sandbox_override()
         && !effective_additional_permissions.permissions_preapproved
-        && !matches!(
-            turn.approval_policy.value(),
-            codex_protocol::protocol::AskForApproval::OnRequest
-        )
+        && !allows_inline_sandbox_approval(turn.approval_policy.value())
     {
         let approval_policy = turn.approval_policy.value();
         return Err(FunctionCallError::RespondToModel(format!(
@@ -694,6 +720,7 @@ async fn run_exec_like_with_exit_code_inner(
         Some(&tracker),
         &call_id,
         tool_name.name.as_str(),
+        cancellation_token.clone(),
     )
     .await;
     let observed_mutation_revision = tracker.lock().await.current_mutation_revision();
@@ -1006,7 +1033,7 @@ async fn run_exec_like_with_exit_code_inner(
             &raw_output_artifact.render_for_model_with_source_truncation(source_capture_truncated),
         );
         if model_projection.is_some_and(|projection| projection.reduced)
-            && let Some(notice) = raw_output_artifact.reduction_notice()
+            && let Some(notice) = raw_output_artifact.reduction_notice().await
         {
             content.push('\n');
             content.push_str(&notice);

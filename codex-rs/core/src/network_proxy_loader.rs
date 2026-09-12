@@ -1,4 +1,4 @@
-use crate::config::find_codex_home;
+use crate::config::find_codex_home_async;
 use crate::config::is_builtin_permission_profile_name;
 use crate::config::reject_unknown_builtin_permission_profile;
 use crate::config::resolve_permission_profile;
@@ -44,7 +44,9 @@ pub async fn build_network_proxy_state() -> Result<NetworkProxyState> {
 
 pub async fn build_network_proxy_state_and_reloader() -> Result<(ConfigState, MtimeConfigReloader)>
 {
-    let codex_home = find_codex_home().context("failed to resolve CODEX_HOME")?;
+    let codex_home = find_codex_home_async()
+        .await
+        .context("failed to resolve CODEX_HOME")?;
     let (state, layer_mtimes) = build_config_state_with_mtimes(&codex_home).await?;
     Ok((state, MtimeConfigReloader::new(layer_mtimes, codex_home)))
 }
@@ -65,7 +67,7 @@ async fn build_config_state_with_mtimes(
     .await
     .context("failed to load Codex config")?;
 
-    let layer_mtimes = collect_layer_mtimes(&config_layer_stack);
+    let layer_mtimes = collect_layer_mtimes(&config_layer_stack).await?;
     let state = build_config_state_from_layers(&config_layer_stack, codex_home).await?;
     Ok((state, layer_mtimes))
 }
@@ -85,11 +87,16 @@ async fn build_config_state_from_layers(
     let config = config_from_layers(config_layer_stack, &exec_policy)?;
 
     let constraints = enforce_trusted_constraints(config_layer_stack, &config)?;
-    build_config_state_with_codex_home(config, constraints, codex_home)
+    let codex_home = codex_home.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        build_config_state_with_codex_home(config, constraints, &codex_home)
+    })
+    .await
+    .context("network proxy state construction task failed")?
 }
 
-fn collect_layer_mtimes(stack: &ConfigLayerStack) -> Vec<LayerMtime> {
-    stack
+async fn collect_layer_mtimes(stack: &ConfigLayerStack) -> Result<Vec<LayerMtime>> {
+    let paths = stack
         .get_layers(
             ConfigLayerStackOrdering::LowestPrecedenceFirst,
             /*include_disabled*/ false,
@@ -105,9 +112,12 @@ fn collect_layer_mtimes(stack: &ConfigLayerStack) -> Vec<LayerMtime> {
                 ConfigLayerSource::LegacyManagedConfigTomlFromFile { file } => Some(file.clone()),
                 _ => None,
             };
-            path.map(LayerMtime::new)
+            path
         })
-        .collect()
+        .collect::<Vec<_>>();
+    run_blocking_config_probe(move || paths.into_iter().map(LayerMtime::new).collect())
+        .await
+        .context("network config metadata capture task failed")
 }
 
 fn enforce_trusted_constraints(

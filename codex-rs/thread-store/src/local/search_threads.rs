@@ -149,7 +149,11 @@ pub(super) async fn search_threads(
         None
     }
     .as_ref()
-    .and_then(|cursor| serde_json::to_value(cursor).ok())
+    .map(serde_json::to_value)
+    .transpose()
+    .map_err(|err| ThreadStoreError::Internal {
+        message: format!("failed to serialize thread search cursor: {err}"),
+    })?
     .and_then(|value| value.as_str().map(str::to_owned));
 
     let (names, resolved_title_ids) =

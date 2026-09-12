@@ -107,6 +107,10 @@ impl OutgoingMessageSender {
             .is_some()
     }
 
+    pub(crate) async fn cancel_all_requests(&self) {
+        self.request_id_to_callback.lock().await.clear();
+    }
+
     pub(crate) async fn notify_client_response(&self, id: RequestId, result: Value) {
         let entry = {
             let mut request_id_to_callback = self.request_id_to_callback.lock().await;
@@ -550,5 +554,20 @@ mod tests {
         assert!(outgoing.cancel_request(&pending.id).await);
         assert!(outgoing.request_id_to_callback.lock().await.is_empty());
         assert!(pending.receiver.await.is_err());
+    }
+
+    #[tokio::test]
+    async fn cancelling_all_requests_closes_every_pending_receiver() {
+        let (outgoing_tx, _outgoing_rx) = mpsc::channel::<OutgoingMessage>(2);
+        let outgoing = OutgoingMessageSender::new(outgoing_tx);
+        let first = outgoing.send_request("elicitation/create", None).await;
+        let second = outgoing.send_request("elicitation/create", None).await;
+
+        outgoing.cancel_all_requests().await;
+
+        assert!(first.receiver.await.is_err());
+        assert!(second.receiver.await.is_err());
+        assert!(!outgoing.cancel_request(&first.id).await);
+        assert!(!outgoing.cancel_request(&second.id).await);
     }
 }

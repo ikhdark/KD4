@@ -6,9 +6,11 @@ use serde::Serialize;
 use serde::de::Error as SerdeError;
 use std::borrow::Cow;
 use std::cell::RefCell;
+use std::marker::PhantomData;
 use std::path::Display;
 use std::path::Path;
 use std::path::PathBuf;
+use std::rc::Rc;
 use ts_rs::TS;
 
 mod absolutize;
@@ -335,21 +337,26 @@ thread_local! {
 /// provide a base path for resolving relative paths. Because this relies on
 /// thread-local storage, the deserialization must be single-threaded and
 /// occur on the same thread that created the guard.
-pub struct AbsolutePathBufGuard;
+pub struct AbsolutePathBufGuard {
+    previous_base: Option<PathBuf>,
+    _same_thread: PhantomData<Rc<()>>,
+}
 
 impl AbsolutePathBufGuard {
     pub fn new(base_path: &Path) -> Self {
-        ABSOLUTE_PATH_BASE.with(|cell| {
-            *cell.borrow_mut() = Some(base_path.to_path_buf());
-        });
-        Self
+        let previous_base =
+            ABSOLUTE_PATH_BASE.with(|cell| cell.replace(Some(base_path.to_path_buf())));
+        Self {
+            previous_base,
+            _same_thread: PhantomData,
+        }
     }
 }
 
 impl Drop for AbsolutePathBufGuard {
     fn drop(&mut self) {
         ABSOLUTE_PATH_BASE.with(|cell| {
-            *cell.borrow_mut() = None;
+            *cell.borrow_mut() = self.previous_base.take();
         });
     }
 }
@@ -537,6 +544,34 @@ mod tests {
             abs_path_buf.as_path(),
             base_dir.join(relative_path).as_path()
         );
+    }
+
+    #[test]
+    fn nested_guards_restore_deserialization_base() {
+        let outer_dir = tempdir().expect("outer base");
+        let inner_dir = tempdir().expect("inner base");
+        let input = r#""relative.txt""#;
+        let deserialize = || serde_json::from_str::<AbsolutePathBuf>(input);
+        assert!(deserialize().is_err());
+        {
+            let _outer = AbsolutePathBufGuard::new(outer_dir.path());
+            assert_eq!(
+                deserialize().expect("outer path").as_path(),
+                outer_dir.path().join("relative.txt")
+            );
+            {
+                let _inner = AbsolutePathBufGuard::new(inner_dir.path());
+                assert_eq!(
+                    deserialize().expect("inner path").as_path(),
+                    inner_dir.path().join("relative.txt")
+                );
+            }
+            assert_eq!(
+                deserialize().expect("restored outer path").as_path(),
+                outer_dir.path().join("relative.txt")
+            );
+        }
+        assert!(deserialize().is_err());
     }
 
     #[test]

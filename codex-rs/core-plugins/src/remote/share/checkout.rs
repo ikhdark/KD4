@@ -62,25 +62,46 @@ pub async fn checkout_remote_plugin_share(
         });
     }
 
-    let home = crate::marketplace::home_dir().ok_or_else(|| {
-        RemotePluginCatalogError::UnexpectedResponse(
-            "could not determine home directory for personal plugin marketplace".to_string(),
-        )
-    })?;
-    let home = AbsolutePathBuf::try_from(home).map_err(|err| {
-        RemotePluginCatalogError::UnexpectedResponse(format!(
-            "failed to resolve home directory for personal plugin marketplace: {err}"
-        ))
-    })?;
+    let codex_home = codex_home.to_path_buf();
+    let remote_plugin_id = remote_plugin_id.to_string();
+    let checkout_inputs = (
+        codex_home.clone(),
+        plugin_name.clone(),
+        remote_plugin_id.clone(),
+    );
+    let (home, local_plugin_path, already_checked_out) = tokio::task::spawn_blocking(move || {
+        let (codex_home, plugin_name, remote_plugin_id) = checkout_inputs;
+        let home = crate::marketplace::home_dir().ok_or_else(|| {
+            RemotePluginCatalogError::UnexpectedResponse(
+                "could not determine home directory for personal plugin marketplace".to_string(),
+            )
+        })?;
+        let home = AbsolutePathBuf::try_from(home).map_err(|err| {
+            RemotePluginCatalogError::UnexpectedResponse(format!(
+                "failed to resolve home directory for personal plugin marketplace: {err}"
+            ))
+        })?;
 
-    let local_paths = load_share_local_paths_for_checkout(codex_home)?;
-    let (local_plugin_path, already_checked_out) =
-        editable_plugin_path_for_checkout(&home, &plugin_name, remote_plugin_id, &local_paths)?;
+        let local_paths = load_share_local_paths_for_checkout(&codex_home)?;
+        let (local_plugin_path, already_checked_out) = editable_plugin_path_for_checkout(
+            &home,
+            &plugin_name,
+            &remote_plugin_id,
+            &local_paths,
+        )?;
+        Ok::<_, RemotePluginCatalogError>((home, local_plugin_path, already_checked_out))
+    })
+    .await
+    .map_err(|err| {
+        RemotePluginCatalogError::UnexpectedResponse(format!(
+            "failed to join plugin share checkout preparation task: {err}"
+        ))
+    })??;
 
     let mut created_checkout_path = false;
     if !already_checked_out {
         let bundle = crate::remote_bundle::validate_remote_plugin_bundle(
-            remote_plugin_id,
+            &remote_plugin_id,
             &detail.marketplace_name,
             &plugin_name,
             detail.release_version.as_deref(),
@@ -106,60 +127,68 @@ pub async fn checkout_remote_plugin_share(
         created_checkout_path = true;
     }
 
-    let marketplace = match update_personal_marketplace(
-        &home,
-        &plugin_name,
-        &local_plugin_path,
-        detail.summary.install_policy,
-        detail.summary.auth_policy,
-        detail
-            .summary
-            .interface
-            .as_ref()
-            .and_then(|interface| interface.category.clone()),
-    ) {
-        Ok(marketplace) => marketplace,
-        Err(err) => {
+    tokio::task::spawn_blocking(move || {
+        let marketplace = match update_personal_marketplace(
+            &home,
+            &plugin_name,
+            &local_plugin_path,
+            detail.summary.install_policy,
+            detail.summary.auth_policy,
+            detail
+                .summary
+                .interface
+                .as_ref()
+                .and_then(|interface| interface.category.clone()),
+        ) {
+            Ok(marketplace) => marketplace,
+            Err(err) => {
+                return Err(clean_up_created_checkout_path(
+                    created_checkout_path,
+                    &local_plugin_path,
+                    err,
+                ));
+            }
+        };
+
+        if let Err(err) = local_paths::record_plugin_share_local_path(
+            &codex_home,
+            &remote_plugin_id,
+            local_plugin_path.clone(),
+        ) {
+            let err = RemotePluginCatalogError::UnexpectedResponse(format!(
+                "failed to record plugin share local path mapping: {err}"
+            ));
             return Err(clean_up_created_checkout_path(
                 created_checkout_path,
                 &local_plugin_path,
                 err,
             ));
         }
-    };
 
-    if let Err(err) = local_paths::record_plugin_share_local_path(
-        codex_home,
-        remote_plugin_id,
-        local_plugin_path.clone(),
-    ) {
-        let err = RemotePluginCatalogError::UnexpectedResponse(format!(
-            "failed to record plugin share local path mapping: {err}"
-        ));
-        return Err(clean_up_created_checkout_path(
-            created_checkout_path,
-            &local_plugin_path,
-            err,
-        ));
-    }
+        let plugin_id = PluginId::new(plugin_name.clone(), marketplace.name.clone())
+            .map_err(|err| {
+                RemotePluginCatalogError::UnexpectedResponse(format!(
+                    "failed to build checked out plugin id: {err}"
+                ))
+            })?
+            .as_key();
 
-    let plugin_id = PluginId::new(plugin_name.clone(), marketplace.name.clone())
-        .map_err(|err| {
-            RemotePluginCatalogError::UnexpectedResponse(format!(
-                "failed to build checked out plugin id: {err}"
-            ))
-        })?
-        .as_key();
-
-    Ok(RemotePluginShareCheckoutResult {
-        remote_plugin_id: remote_plugin_id.to_string(),
-        plugin_id,
-        plugin_name,
-        plugin_path: local_plugin_path,
-        marketplace_name: marketplace.name,
-        marketplace_path: marketplace.path,
-        remote_version,
+        Ok(RemotePluginShareCheckoutResult {
+            remote_plugin_id,
+            plugin_id,
+            plugin_name,
+            plugin_path: local_plugin_path,
+            marketplace_name: marketplace.name,
+            marketplace_path: marketplace.path,
+            remote_version,
+        })
     })
+    .await
+    .map_err(|err| {
+        RemotePluginCatalogError::UnexpectedResponse(format!(
+            "failed to join plugin share checkout finalization task: {err}"
+        ))
+    })?
 }
 
 fn is_checkout_supported_share_marketplace(marketplace_name: &str) -> bool {

@@ -26,6 +26,11 @@ fn restored_input_mode(mode: u32, original: VirtualTerminalInput) -> u32 {
 static ORIGINAL_VT_INPUT: std::sync::Mutex<Vec<InputModeSnapshot>> =
     std::sync::Mutex::new(Vec::new());
 
+#[cfg(test)]
+pub(super) fn lock_input_modes_for_test() -> impl Drop {
+    ORIGINAL_VT_INPUT.lock().expect("test input mode state")
+}
+
 fn current_input_mode() -> std::io::Result<Option<(windows_sys::Win32::Foundation::HANDLE, u32)>> {
     use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
     use windows_sys::Win32::System::Console::GetConsoleMode;

@@ -124,10 +124,10 @@ fn render_prompt_context(context: &IdeContext) -> Option<String> {
             }
             for range in selected_ranges {
                 // Render ranges as 1-based positions for the prompt.
-                let start_line = range.start.line + 1;
-                let start_column = range.start.character + 1;
-                let end_line = range.end.line + 1;
-                let end_column = range.end.character + 1;
+                let start_line = u64::from(range.start.line) + 1;
+                let start_column = u64::from(range.start.character) + 1;
+                let end_line = u64::from(range.end.line) + 1;
+                let end_column = u64::from(range.end.character) + 1;
                 ide_context_section.push_str(&format!(
                     "- {}: line {start_line}, column {start_column} to line {end_line}, column {end_column}\n",
                     active_file.descriptor.path
@@ -244,6 +244,38 @@ mod tests {
         };
 
         assert_eq!(render_prompt_context(&context), None);
+    }
+
+    #[test]
+    fn maximum_ide_coordinates_remain_exact_in_submitted_prompt() {
+        let context: IdeContext = serde_json::from_value(serde_json::json!({
+            "activeFile": {
+                "label": "lib.rs",
+                "path": "src/lib.rs",
+                "selection": {
+                    "start": { "line": 4294967295_u32, "character": 4294967294_u32 },
+                    "end": { "line": 4294967295_u32, "character": 4294967295_u32 },
+                },
+            },
+        }))
+        .expect("valid IDE context coordinates");
+        let mut items = vec![UserInput::Text {
+            text: "Explain this range".to_string(),
+            text_elements: Vec::new(),
+        }];
+        assert!(apply_ide_context_to_user_input(&context, &mut items));
+        assert_eq!(
+            items,
+            vec![UserInput::Text {
+                text: concat!(
+                    "# Context from my IDE setup:\n\n## Active file: src/lib.rs\n",
+                    "\n## Active selection range:\n",
+                    "- src/lib.rs: line 4294967296, column 4294967295 to line 4294967296, column 4294967296\n",
+                    "\n## My request for Codex:\nExplain this range",
+                ).to_string(),
+                text_elements: Vec::new(),
+            }],
+        );
     }
 
     #[test]

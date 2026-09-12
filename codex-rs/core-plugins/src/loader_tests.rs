@@ -498,3 +498,129 @@ fn materialize_git_subdir_uses_sparse_checkout() {
     assert!(!checkout_root.join("root.txt").exists());
     assert!(!checkout_root.join("plugins/other/marker.txt").exists());
 }
+
+#[test]
+fn capability_loaders_yield_for_filesystem_discovery_and_preserve_invalid_manifest() {
+    use std::future::Future;
+    use std::task::Context;
+    use std::task::Poll;
+    use std::task::Waker;
+    use std::time::Duration;
+
+    let fixture = TempDir::new().expect("fixture");
+    let root = AbsolutePathBuf::try_from(fixture.path().join("sample")).expect("plugin root");
+    let manifest_path = root.join(".codex-plugin/plugin.json");
+    write_file(manifest_path.as_path(), "{");
+    let plugin_id = PluginId::parse("sample@company").expect("plugin id");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .expect("runtime");
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let worker = runtime.spawn_blocking(move || {
+        started_tx.send(()).expect("started receiver");
+        let _ = release_rx.recv();
+    });
+    started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("filesystem worker occupied");
+
+    runtime.block_on(async {
+        let mut apps = Box::pin(load_plugin_apps(root.as_path()));
+        let mut mcp = Box::pin(load_plugin_mcp_servers(
+            root.as_path(),
+            Some(AuthMode::ApiKey),
+        ));
+        let mut summary = Box::pin(plugin_capability_summary_from_root(&plugin_id, &root));
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(
+            matches!(apps.as_mut().poll(&mut context), Poll::Pending),
+            "app discovery must yield when filesystem workers are occupied"
+        );
+        assert!(
+            matches!(mcp.as_mut().poll(&mut context), Poll::Pending),
+            "MCP discovery must yield when filesystem workers are occupied"
+        );
+        assert!(
+            matches!(summary.as_mut().poll(&mut context), Poll::Pending),
+            "capability discovery must yield when filesystem workers are occupied"
+        );
+        release_tx.send(()).expect("release filesystem worker");
+        worker.await.expect("occupied worker completes");
+        assert!(apps.await.is_empty());
+        assert!(mcp.await.is_empty());
+        assert!(summary.await.is_none());
+        assert_eq!(
+            std::fs::read_to_string(manifest_path.as_path()).unwrap(),
+            "{"
+        );
+
+        write_file(manifest_path.as_path(), r#"{"name":"sample"}"#);
+        let app_path = root.join(".app.json");
+        let app_contents = r#"{"apps":{"sample-mcp":{"id":"connector_sample"}}}"#;
+        write_file(app_path.as_path(), app_contents);
+        let mcp_path = root.join(".mcp.json");
+        let mcp_contents = r#"{"mcpServers":{"sample-mcp":{"command":"sample-command"}}}"#;
+        write_file(mcp_path.as_path(), mcp_contents);
+        assert_eq!(
+            app_connector_ids_from_declarations(&load_plugin_apps(root.as_path()).await),
+            vec![codex_plugin::AppConnectorId("connector_sample".to_string())]
+        );
+        let servers = load_plugin_mcp_servers(root.as_path(), Some(AuthMode::ApiKey)).await;
+        assert_eq!(servers.len(), 1);
+        match &servers
+            .get("sample-mcp")
+            .expect("declared MCP server")
+            .transport
+        {
+            codex_config::types::McpServerTransportConfig::Stdio { command, .. } => {
+                assert_eq!(command, "sample-command");
+            }
+            _ => panic!("declared stdio server must keep its transport"),
+        }
+        assert_eq!(
+            plugin_capability_summary_from_root(&plugin_id, &root).await,
+            Some(PluginCapabilitySummary {
+                config_name: "sample@company".to_string(),
+                display_name: "sample".to_string(),
+                description: None,
+                has_skills: false,
+                mcp_server_names: vec!["sample-mcp".to_string()],
+                app_connector_ids: vec![codex_plugin::AppConnectorId(
+                    "connector_sample".to_string()
+                )],
+            })
+        );
+
+        write_file(manifest_path.as_path(), "{");
+        assert_eq!(
+            app_connector_ids_from_declarations(&load_plugin_apps(root.as_path()).await),
+            vec![codex_plugin::AppConnectorId("connector_sample".to_string())],
+            "apps retain the documented default-path fallback"
+        );
+        assert!(
+            load_plugin_mcp_servers(root.as_path(), Some(AuthMode::ApiKey))
+                .await
+                .is_empty()
+        );
+        assert!(
+            plugin_capability_summary_from_root(&plugin_id, &root)
+                .await
+                .is_none()
+        );
+        assert_eq!(
+            std::fs::read_to_string(manifest_path.as_path()).unwrap(),
+            "{"
+        );
+        assert_eq!(
+            std::fs::read_to_string(app_path.as_path()).unwrap(),
+            app_contents
+        );
+        assert_eq!(
+            std::fs::read_to_string(mcp_path.as_path()).unwrap(),
+            mcp_contents
+        );
+    });
+}

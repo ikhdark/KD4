@@ -134,21 +134,31 @@ impl MetricsClientInner {
         inc: i64,
         attributes: &[KeyValue],
     ) {
-        let mut counters = self
-            .counters
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let key = InstrumentKey {
             name: name.to_string(),
             unit: None,
             description: description.map(str::to_string),
         };
-        let counter = counters.entry(key).or_insert_with(|| {
+        let cached = self
+            .counters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&key)
+            .cloned();
+        let counter = cached.unwrap_or_else(|| {
+            // SDK instrument resolution can call configured views. Keep that work
+            // outside the shared cache so existing counters remain independent.
             let builder = self.meter.u64_counter(name.to_string());
-            match description {
+            let created = match description {
                 Some(description) => builder.with_description(description.to_string()).build(),
                 None => builder.build(),
-            }
+            };
+            self.counters
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entry(key)
+                .or_insert(created)
+                .clone()
         });
         counter.add(inc as u64, attributes);
     }
@@ -621,5 +631,105 @@ fn build_otlp_metric_exporter(
                 .build()
                 .map_err(|source| MetricsError::ExporterBuild { source })
         }
+    }
+}
+
+#[cfg(test)]
+mod counter_cache_tests {
+    use super::*;
+    use opentelemetry_sdk::metrics::Instrument;
+    use opentelemetry_sdk::metrics::data::AggregatedMetrics;
+    use opentelemetry_sdk::metrics::data::MetricData;
+
+    #[test]
+    fn cached_counter_progresses_during_sdk_registration_and_collects_all_values() {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let reader = Arc::new(ManualReader::builder().build());
+        let provider = SdkMeterProvider::builder()
+            .with_reader(SharedManualReader::new(Arc::clone(&reader)))
+            .with_view(move |instrument: &Instrument| {
+                if instrument.name() == "codex.cold" {
+                    entered_tx.send(()).unwrap();
+                    release_rx
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(5))
+                        .unwrap();
+                }
+                None
+            })
+            .build();
+        let metrics = MetricsClient(Arc::new(MetricsClientInner {
+            meter: provider.meter(METER_NAME),
+            meter_provider: provider,
+            counters: Mutex::new(HashMap::new()),
+            gauges: Mutex::new(HashMap::new()),
+            histograms: Mutex::new(HashMap::new()),
+            duration_histograms: Mutex::new(HashMap::new()),
+            runtime_reader: Some(reader),
+            default_tags: BTreeMap::new(),
+        }));
+        metrics
+            .counter("codex.warm", 2, &[("status", "upserted")])
+            .unwrap();
+        let cold = metrics.clone();
+        let cold_task =
+            std::thread::spawn(move || cold.counter("codex.cold", 5, &[("status", "failed")]));
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+        let warm = metrics.clone();
+        let warm_task = std::thread::spawn(move || {
+            let result = warm.counter("codex.warm", 3, &[("status", "upserted")]);
+            completed_tx.send(result).unwrap();
+        });
+        let during_registration = completed_rx.recv_timeout(Duration::from_secs(1));
+        release_tx.send(()).unwrap();
+        cold_task.join().unwrap().unwrap();
+        warm_task.join().unwrap();
+        during_registration
+            .expect("cached counter must complete while unrelated SDK view is blocked")
+            .unwrap();
+
+        let snapshot = metrics.snapshot().unwrap();
+        let mut observed = BTreeMap::new();
+        for scope in snapshot.scope_metrics() {
+            for metric in scope.metrics() {
+                if let AggregatedMetrics::U64(MetricData::Sum(sum)) = metric.data() {
+                    let points: Vec<_> = sum.data_points().collect();
+                    assert_eq!(points.len(), 1);
+                    observed.insert(
+                        metric.name().to_string(),
+                        (
+                            points[0].value(),
+                            points[0]
+                                .attributes()
+                                .map(|value| {
+                                    (
+                                        value.key.as_str().to_string(),
+                                        value.value.as_str().to_string(),
+                                    )
+                                })
+                                .collect::<Vec<_>>(),
+                        ),
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            observed,
+            BTreeMap::from([
+                (
+                    "codex.cold".to_string(),
+                    (5, vec![("status".to_string(), "failed".to_string())])
+                ),
+                (
+                    "codex.warm".to_string(),
+                    (5, vec![("status".to_string(), "upserted".to_string())])
+                ),
+            ])
+        );
+        metrics.shutdown().unwrap();
     }
 }

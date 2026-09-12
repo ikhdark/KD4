@@ -155,8 +155,8 @@ async fn mcp_startup_aggregate_completion_finishes_incomplete_status_round() {
         warning_text,
         concat!(
             "⚠ MCP client for `beta` failed to start: handshake failed\n",
-            "⚠ MCP startup interrupted. The following servers were not initialized: gamma\n",
-            "⚠ MCP startup incomplete (failed: beta)\n",
+            "\n⚠ MCP startup interrupted. The following servers were not initialized: gamma\n",
+            "\n⚠ MCP startup incomplete (failed: beta)\n",
         )
     );
 }

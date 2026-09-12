@@ -104,14 +104,6 @@ fn exec_command_boundary_reports_branch_field_and_bound_errors() {
     assert!(invalid_bound.contains("250..=30000"), "{invalid_bound}");
 }
 
-#[test]
-fn exec_command_runtime_declares_confirmed_cancellation_cleanup() {
-    let handler = ExecCommandHandler::default();
-
-    assert!(handler.waits_for_runtime_cancellation());
-    assert!(handler.owns_unified_exec_processes());
-}
-
 #[tokio::test]
 async fn exec_command_cancellation_waits_for_confirmed_process_cleanup() {
     let python = which::which("python")
@@ -123,12 +115,18 @@ async fn exec_command_cancellation_waits_for_confirmed_process_cleanup() {
     let started_literal = serde_json::to_string(&started_path.to_string_lossy()).unwrap();
     let finished_literal = serde_json::to_string(&finished_path.to_string_lossy()).unwrap();
     let script = format!(
-        "import pathlib,time; pathlib.Path({started_literal}).write_text('started'); time.sleep(30); pathlib.Path({finished_literal}).write_text('finished')"
+        "import pathlib,socket,time; listener=socket.socket(); listener.bind(('127.0.0.1',0)); listener.listen(1); pathlib.Path({started_literal}).write_text(str(listener.getsockname()[1])); time.sleep(30); pathlib.Path({finished_literal}).write_text('finished')"
     );
     let program = python.to_string_lossy().into_owned();
     let command = vec![program.clone(), "-c".to_string(), script.clone()];
     let (session, mut turn) = make_session_and_context().await;
     turn.permission_profile = PermissionProfile::Disabled;
+    let mut config = (*turn.config).clone();
+    config
+        .features
+        .enable(codex_features::Feature::UnifiedExec)
+        .expect("enable the normal registered exec tool");
+    turn.config = Arc::new(config);
     tokio::fs::create_dir_all(turn.config.codex_home.as_path())
         .await
         .expect("create test codex home");
@@ -157,31 +155,79 @@ async fn exec_command_cancellation_waits_for_confirmed_process_cleanup() {
                 "kind": "argv",
                 "program": program,
                 "args": ["-c", script],
+                "validation": {"covered_paths": ["cancelled-scope"]},
                 "yield_time_ms": 20_000
             })
             .to_string(),
         },
     };
-    let task = tokio::spawn(async move { ExecCommandHandler::default().handle(invocation).await });
+    let router = Arc::new(crate::tools::router::ToolRouter::from_context(
+        invocation.step_context.as_ref(),
+        crate::tools::router::ToolRouterParams {
+            tool_suggest_candidates: None,
+            deferred_mcp_tools: None,
+            mcp_tools: None,
+            extension_tool_executors: Vec::new(),
+            dynamic_tools: &[],
+            exposure_identity: Default::default(),
+        },
+        &Default::default(),
+    ));
+    assert!(invocation.step_context.set_tool_router(router).is_ok());
+    let runtime = crate::tools::parallel::ToolCallRuntime::new(
+        invocation.session,
+        invocation.step_context,
+        invocation.tracker,
+    );
+    let task = tokio::spawn(runtime.handle_tool_call(
+        crate::tools::router::ToolCall {
+            tool_name: invocation.tool_name,
+            call_id: invocation.call_id,
+            payload: invocation.payload,
+        },
+        invocation.cancellation_token,
+    ));
 
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        while tokio::fs::metadata(&started_path).await.is_err() {
+    let port = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if let Ok(value) = tokio::fs::read_to_string(&started_path).await
+                && let Ok(port) = value.parse::<u16>()
+            {
+                break port;
+            }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     })
     .await
-    .expect("test process should start");
+    .expect("test process should publish its bound listener port");
+    assert!(
+        std::net::TcpListener::bind(("127.0.0.1", port)).is_err(),
+        "the started child must still own its live listener"
+    );
     cancellation_token.cancel();
 
     let result = tokio::time::timeout(std::time::Duration::from_secs(5), task)
         .await
         .expect("cancellation cleanup should be bounded")
         .expect("handler task should join");
-    let error = match result {
-        Ok(_) => panic!("cancelled exec_command should not publish ordinary output"),
-        Err(error) => error,
+    let response = result.expect("registered cancellation returns a terminal function result");
+    let codex_protocol::models::ResponseInputItem::FunctionCallOutput { call_id, output } =
+        response
+    else {
+        panic!("registered exec must return function output");
     };
-    assert!(error.to_string().contains("unified exec cancelled"));
+    assert_eq!(call_id, "cancel-confirmed-cleanup");
+    let codex_protocol::models::FunctionCallOutputBody::Text(text) = output.body else {
+        panic!("cancelled exec output must be text");
+    };
+    assert!(text.contains("aborted by user"), "{text}");
+    assert!(
+        !text.contains("\"coverage_status\":\"succeeded\""),
+        "{text}"
+    );
+    let released_listener = std::net::TcpListener::bind(("127.0.0.1", port))
+        .expect("the child-owned listener must close before registered cancellation returns");
+    drop(released_listener);
     assert!(
         tokio::fs::metadata(&finished_path).await.is_err(),
         "the child must be terminated before cancellation returns"
@@ -354,6 +400,7 @@ fn terminal_powershell_failure_keeps_recovery_advisory_out_of_raw_output() {
     let raw_output = b"ParserError: Unexpected token 'foo'".to_vec();
     let existing_repair_notice = "Preflight repaired the command.";
     let mut output = ExecCommandToolOutput {
+        validation: None,
         event_call_id: "call-parser-failure".to_string(),
         chunk_id: "chunk-parser-failure".to_string(),
         wall_time: std::time::Duration::from_millis(10),
@@ -366,6 +413,7 @@ fn terminal_powershell_failure_keeps_recovery_advisory_out_of_raw_output() {
         original_token_count: None,
         hook_command: Some("broken command".to_string()),
         raw_output_artifact: None,
+        raw_output_reduction_notice: None,
         repair_notice: Some(existing_repair_notice.to_string()),
     };
 
@@ -1716,6 +1764,19 @@ async fn foreground_output_artifact_retains_bytes_beyond_transcript_cap() {
     let model_output = code_mode["output"].as_str().expect("model output");
     assert!(model_output.len() < segment_bytes);
     assert!(!model_output.contains("MIDDLE_MARKER"));
+    assert!(model_output.contains(
+        "[command output reduced; recover the full retained output with read_tool_output"
+    ));
+    let response = output.to_response_item(
+        "full-output-artifact",
+        &ToolPayload::Function {
+            arguments: "{}".to_string(),
+        },
+    );
+    let rendered = serde_json::to_string(&response).expect("model response");
+    assert!(rendered.contains(
+        "[command output reduced; recover the full retained output with read_tool_output"
+    ));
 }
 
 #[test]
@@ -1989,6 +2050,7 @@ async fn exec_command_post_tool_use_payload_uses_output_for_noninteractive_one_s
         arguments: serde_json::json!({ "cmd": "echo three", "tty": false }).to_string(),
     };
     let output = ExecCommandToolOutput {
+        validation: None,
         event_call_id: "call-43".to_string(),
         chunk_id: "chunk-1".to_string(),
         wall_time: std::time::Duration::from_millis(498),
@@ -2001,6 +2063,7 @@ async fn exec_command_post_tool_use_payload_uses_output_for_noninteractive_one_s
         original_token_count: None,
         hook_command: Some("echo three".to_string()),
         raw_output_artifact: None,
+        raw_output_reduction_notice: None,
         repair_notice: None,
     };
     let invocation = invocation_for_payload("exec_command", "call-43", payload).await;
@@ -2022,6 +2085,7 @@ async fn exec_command_post_tool_use_payload_uses_output_for_interactive_completi
         arguments: serde_json::json!({ "cmd": "echo three", "tty": true }).to_string(),
     };
     let output = ExecCommandToolOutput {
+        validation: None,
         event_call_id: "call-44".to_string(),
         chunk_id: "chunk-1".to_string(),
         wall_time: std::time::Duration::from_millis(498),
@@ -2034,6 +2098,7 @@ async fn exec_command_post_tool_use_payload_uses_output_for_interactive_completi
         original_token_count: None,
         hook_command: Some("echo three".to_string()),
         raw_output_artifact: None,
+        raw_output_reduction_notice: None,
         repair_notice: None,
     };
     let invocation = invocation_for_payload("exec_command", "call-44", payload).await;
@@ -2056,6 +2121,7 @@ async fn exec_command_post_tool_use_payload_skips_running_sessions() {
         arguments: serde_json::json!({ "cmd": "echo three", "tty": false }).to_string(),
     };
     let output = ExecCommandToolOutput {
+        validation: None,
         event_call_id: "event-45".to_string(),
         chunk_id: "chunk-1".to_string(),
         wall_time: std::time::Duration::from_millis(498),
@@ -2068,6 +2134,7 @@ async fn exec_command_post_tool_use_payload_skips_running_sessions() {
         original_token_count: None,
         hook_command: Some("echo three".to_string()),
         raw_output_artifact: None,
+        raw_output_reduction_notice: None,
         repair_notice: None,
     };
     let invocation = invocation_for_payload("exec_command", "call-45", payload).await;
@@ -2085,6 +2152,7 @@ async fn write_stdin_post_tool_use_payload_uses_original_exec_call_id_and_comman
         .to_string(),
     };
     let output = ExecCommandToolOutput {
+        validation: None,
         event_call_id: "exec-call-45".to_string(),
         chunk_id: "chunk-2".to_string(),
         wall_time: std::time::Duration::from_millis(498),
@@ -2097,6 +2165,7 @@ async fn write_stdin_post_tool_use_payload_uses_original_exec_call_id_and_comman
         original_token_count: None,
         hook_command: Some("sleep 1; echo finished".to_string()),
         raw_output_artifact: None,
+        raw_output_reduction_notice: None,
         repair_notice: None,
     };
     let invocation = invocation_for_payload("write_stdin", "write-stdin-call", payload).await;
@@ -2149,6 +2218,7 @@ async fn write_stdin_post_tool_use_payload_keeps_parallel_session_metadata_separ
         arguments: serde_json::json!({ "session_id": 45, "chars": "" }).to_string(),
     };
     let output_a = ExecCommandToolOutput {
+        validation: None,
         event_call_id: "exec-call-a".to_string(),
         chunk_id: "chunk-a".to_string(),
         wall_time: std::time::Duration::from_millis(498),
@@ -2161,9 +2231,11 @@ async fn write_stdin_post_tool_use_payload_keeps_parallel_session_metadata_separ
         original_token_count: None,
         hook_command: Some("sleep 2; echo alpha".to_string()),
         raw_output_artifact: None,
+        raw_output_reduction_notice: None,
         repair_notice: None,
     };
     let output_b = ExecCommandToolOutput {
+        validation: None,
         event_call_id: "exec-call-b".to_string(),
         chunk_id: "chunk-b".to_string(),
         wall_time: std::time::Duration::from_millis(498),
@@ -2176,6 +2248,7 @@ async fn write_stdin_post_tool_use_payload_keeps_parallel_session_metadata_separ
         original_token_count: None,
         hook_command: Some("sleep 1; echo beta".to_string()),
         raw_output_artifact: None,
+        raw_output_reduction_notice: None,
         repair_notice: None,
     };
     let invocation_b = invocation_for_payload("write_stdin", "write-call-b", payload.clone()).await;
@@ -2204,4 +2277,984 @@ async fn write_stdin_post_tool_use_payload_keeps_parallel_session_metadata_separ
             }),
         ]
     );
+}
+
+async fn assert_completed_exec_reports_tool_history_failure(background: bool) {
+    use codex_protocol::items::CommandExecutionStatus;
+    use codex_protocol::items::TurnItem;
+    use codex_protocol::models::FunctionCallOutputPayload;
+    use codex_protocol::models::ResponseItem;
+    use codex_protocol::protocol::EventMsg;
+    use std::time::Duration;
+
+    let python = which::which("python")
+        .or_else(|_| which::which("python3"))
+        .expect("Python is required by the unified-exec behavior test");
+    let workspace = tempfile::tempdir().expect("temporary command workspace");
+    let changed_path = workspace.path().join("changed.txt");
+    let path_literal = serde_json::to_string(&changed_path.to_string_lossy()).unwrap();
+    let wait_for_stdin = if background {
+        "line = sys.stdin.readline(); assert line == 'finish\\n', repr(line); "
+    } else {
+        ""
+    };
+    let script = format!(
+        "import sys,pathlib; {wait_for_stdin}pathlib.Path({path_literal}).write_text('after'); print('MUTATION_FINISHED', flush=True)"
+    );
+    let program = python.to_string_lossy().into_owned();
+    let (session, mut turn, rx_event) = make_session_and_context_with_rx().await;
+    Arc::get_mut(&mut turn)
+        .expect("single turn")
+        .permission_profile = PermissionProfile::Disabled;
+    let codex_home = &turn.config.codex_home;
+    tokio::fs::create_dir_all(codex_home)
+        .await
+        .expect("create test home");
+    session
+        .services
+        .exec_policy
+        .append_amendment_and_update(
+            codex_home,
+            &codex_protocol::protocol::ExecPolicyAmendment::new(vec![
+                program.clone(),
+                "-c".to_string(),
+                script.clone(),
+            ]),
+        )
+        .await
+        .expect("allow exact bounded test command");
+    let observation = crate::tool_history::WorkspaceEvidenceObservation::from_response_item(
+        None,
+        &ResponseItem::FunctionCallOutput {
+            id: None,
+            call_id: "prior-workspace-read".to_string(),
+            output: FunctionCallOutputPayload::from_text("before mutation".to_string()),
+            internal_chat_message_metadata_passthrough: None,
+        },
+        Default::default(),
+    )
+    .expect("workspace observation");
+    session
+        .register_workspace_evidence(codex_home, observation, ())
+        .await;
+    session
+        .flush_tool_history_persistence()
+        .await
+        .expect("initial evidence is durable");
+    let directory = codex_home.join("tool-history");
+    let saved = codex_home.join("saved-tool-history");
+    tokio::fs::rename(&directory, &saved)
+        .await
+        .expect("save baseline");
+    tokio::fs::write(&directory, "blocks journal and checkpoint writes")
+        .await
+        .expect("real failure fixture");
+
+    let tracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
+    let payload = ToolPayload::Function {
+        arguments: serde_json::json!({
+            "kind": "argv", "program": program, "args": ["-c", script],
+            "workdir": workspace.path(), "yield_time_ms": if background { 250 } else { 20_000 },
+            "tty": background
+        })
+        .to_string(),
+    };
+    let invocation = ToolInvocation {
+        session: Arc::clone(&session),
+        step_context: StepContext::for_test(Arc::clone(&turn)),
+        cancellation_token: tokio_util::sync::CancellationToken::new(),
+        tracker: Arc::clone(&tracker),
+        call_id: "durability-command".to_string(),
+        tool_name: codex_tools::ToolName::plain("exec_command"),
+        source: ToolCallSource::Direct,
+        payload: payload.clone(),
+    };
+    let initial_result = tokio::time::timeout(
+        Duration::from_secs(15),
+        ExecCommandHandler::default().handle(invocation),
+    )
+    .await
+    .expect("foreground completion or live background yield is bounded");
+    let result = if background {
+        let output =
+            initial_result.expect("a still-running process must not wait for terminal durability");
+        let process_id = output.code_mode_result(&payload)["session_id"]
+            .as_u64()
+            .and_then(|id| u32::try_from(id).ok())
+            .expect("live process id");
+        assert!(
+            !changed_path.exists(),
+            "the command must still be waiting for stdin"
+        );
+        assert!(
+            session
+                .services
+                .command_execution
+                .running_process(process_id)
+                .await
+                .is_some(),
+            "the initial yield must retain a live command before stdin releases it"
+        );
+        tokio::time::timeout(Duration::from_secs(15), WriteStdinHandler.handle(ToolInvocation {
+            session: Arc::clone(&session),
+            step_context: StepContext::for_test(Arc::clone(&turn)),
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
+            tracker: Arc::clone(&tracker),
+            call_id: "durability-stdin".to_string(),
+            tool_name: codex_tools::ToolName::plain("write_stdin"),
+            source: ToolCallSource::Direct,
+            payload: ToolPayload::Function {
+                arguments: serde_json::json!({"session_id": process_id, "chars": "finish\n", "yield_time_ms": 1000}).to_string(),
+            },
+        })).await.expect("exited process must finish terminal persistence and cleanup")
+    } else {
+        initial_result
+    };
+    let error = match result {
+        Ok(_) => panic!("completed mutation must return fatal persistence failure"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, crate::FunctionCallError::Fatal(_)));
+    assert_eq!(
+        tokio::fs::read_to_string(&changed_path).await.unwrap(),
+        "after"
+    );
+    assert_eq!(tracker.lock().await.current_mutation_revision(), 1);
+
+    let events: Vec<_> = std::iter::from_fn(|| rx_event.try_recv().ok()).collect();
+    let (completed_index, completed) = events
+        .iter()
+        .enumerate()
+        .find_map(|(index, event)| match &event.msg {
+            EventMsg::ItemCompleted(event) => match &event.item {
+                TurnItem::CommandExecution(item) if item.id == "durability-command" => {
+                    Some((index, item))
+                }
+                _ => None,
+            },
+            _ => None,
+        })
+        .expect("the actual command retains its completed event");
+    assert_eq!(completed.status, CommandExecutionStatus::Completed);
+    assert_eq!(completed.exit_code, Some(0));
+    assert!(
+        completed
+            .aggregated_output
+            .as_deref()
+            .unwrap_or_default()
+            .contains("MUTATION_FINISHED")
+    );
+    let process_id = completed
+        .process_id
+        .as_deref()
+        .and_then(|id| id.parse::<u32>().ok())
+        .expect("normal command process id");
+    assert!(
+        session
+            .services
+            .command_execution
+            .running_process(process_id)
+            .await
+            .is_none(),
+        "fatal persistence failure must not skip process retirement"
+    );
+    let next_id = session
+        .services
+        .unified_exec_manager
+        .allocate_process_id()
+        .await;
+    assert_eq!(
+        next_id, process_id,
+        "completed command must release the reserved process slot"
+    );
+    session
+        .services
+        .unified_exec_manager
+        .release_process_id(next_id)
+        .await;
+    if background {
+        let error_index = events
+            .iter()
+            .position(|event| matches!(event.msg, EventMsg::Error(_)))
+            .expect("background durability failure is also notified");
+        assert!(completed_index < error_index);
+        assert!(events.iter().any(|event| matches!(&event.msg,
+            EventMsg::TerminalInteraction(interaction) if interaction.call_id == "durability-command" && interaction.stdin == "finish\n")),
+            "stdin was delivered even though completion durability failed");
+    }
+    let history = session.clone_history().await;
+    let live = serde_json::to_value(history.tool_history_state()).unwrap();
+    assert_eq!(
+        live["workspace_evidence"]["prior-workspace-read"]["source_dependencies_current"],
+        false
+    );
+    tokio::fs::remove_file(&directory)
+        .await
+        .expect("remove failure fixture");
+    tokio::fs::rename(&saved, &directory)
+        .await
+        .expect("restore baseline");
+    session
+        .flush_tool_history_persistence()
+        .await
+        .expect("recover after repairing storage");
+}
+
+#[tokio::test]
+async fn completed_exec_returns_fatal_after_tool_history_failure_and_process_cleanup() {
+    assert_completed_exec_reports_tool_history_failure(false).await;
+}
+
+#[tokio::test]
+async fn background_stdin_completion_returns_fatal_after_tool_history_failure_and_process_cleanup()
+{
+    assert_completed_exec_reports_tool_history_failure(true).await;
+}
+
+#[tokio::test]
+async fn stdin_completion_prepares_recovery_notice_for_both_output_consumers() {
+    let python = which::which("python")
+        .or_else(|_| which::which("python3"))
+        .expect("Python is required by the KD4 test environment");
+    let program = python.to_string_lossy().into_owned();
+    let script = "import sys; line = sys.stdin.readline(); assert line == 'go\\n', repr(line); sys.stdout.write(''.join('stdin-notice-%04d retained producer bytes\\n' % i for i in range(256))); sys.stdout.flush()";
+    let expected = (0..256)
+        .map(|i| format!("stdin-notice-{i:04} retained producer bytes\n"))
+        .collect::<String>();
+    let (session, turn) = make_session_and_context().await;
+    tokio::fs::create_dir_all(&turn.config.codex_home)
+        .await
+        .expect("codex home");
+    session
+        .services
+        .exec_policy
+        .append_amendment_and_update(
+            &turn.config.codex_home,
+            &codex_protocol::protocol::ExecPolicyAmendment::new(vec![
+                program.clone(),
+                "-u".to_string(),
+                "-c".to_string(),
+                script.to_string(),
+            ]),
+        )
+        .await
+        .expect("allow exact test producer");
+    let home = turn.config.codex_home.clone();
+    let thread_id = session.thread_id.to_string();
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let invoke = |tool: &str, arguments: serde_json::Value| ToolInvocation {
+        session: Arc::clone(&session),
+        step_context: StepContext::for_test(Arc::clone(&turn)),
+        cancellation_token: tokio_util::sync::CancellationToken::new(),
+        tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+        call_id: format!("notice-{tool}"),
+        tool_name: codex_tools::ToolName::plain(tool),
+        source: ToolCallSource::Direct,
+        payload: ToolPayload::Function {
+            arguments: arguments.to_string(),
+        },
+    };
+    let payload = ToolPayload::Function {
+        arguments: "{}".to_string(),
+    };
+    let started = ExecCommandHandler::default()
+        .handle(invoke(
+            "exec_command",
+            serde_json::json!({
+                "kind": "argv", "program": program, "args": ["-u", "-c", script],
+                "yield_time_ms": 1000, "max_output_tokens": 100, "tty": true
+            }),
+        ))
+        .await
+        .expect("normal stdin-waiting process");
+    let start_json = started.code_mode_result(&payload);
+    let session_id = start_json["session_id"]
+        .as_u64()
+        .expect("process waits for input");
+    let completed = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        let mut chars = "go\n";
+        loop {
+            let output = WriteStdinHandler
+                .handle(invoke(
+                    "write_stdin",
+                    serde_json::json!({
+                        "session_id": session_id, "chars": chars,
+                        "yield_time_ms": 1000, "max_output_tokens": 100
+                    }),
+                ))
+                .await
+                .expect("normal write_stdin completion");
+            if output
+                .code_mode_result(&payload)
+                .get("session_id")
+                .is_none()
+            {
+                break output;
+            }
+            chars = "";
+        }
+    })
+    .await
+    .expect("producer completes");
+    let code_mode = completed.code_mode_result(&payload);
+    assert_eq!(code_mode["exit_code"], 0);
+    let text = code_mode["output"].as_str().expect("code-mode output");
+    assert!(
+        text.contains(
+            "[command output reduced; recover the full retained output with read_tool_output"
+        ),
+        "{text}"
+    );
+    assert!(!text.contains("stdin-notice-0128"));
+    let response =
+        serde_json::to_string(&completed.to_response_item("notice-write_stdin", &payload))
+            .expect("model response");
+    assert!(response.contains(
+        "[command output reduced; recover the full retained output with read_tool_output"
+    ));
+    let id = code_mode["raw_output_artifact_id"]
+        .as_str()
+        .expect("advertised artifact");
+    assert!(
+        response.contains(id),
+        "model recovery notice must retain its artifact ID"
+    );
+    let retained = crate::tools::command_output_artifact::read_exact_tool_output_artifact(
+        &home, &thread_id, id,
+    )
+    .await
+    .expect("normal exact recovery");
+    let retained = String::from_utf8(retained).expect("UTF-8 terminal output");
+    // A PTY may include input echo, CRLFs and terminal control sequences.
+    // Require every independently authored producer record exactly once and in
+    // order from the advertised artifact, including the omitted middle records.
+    let record = regex_lite::Regex::new(r"stdin-notice-[0-9]{4} retained producer bytes")
+        .expect("producer record pattern");
+    let recovered_records = record
+        .find_iter(&retained)
+        .map(|matched| format!("{}\n", matched.as_str()))
+        .collect::<String>();
+    assert_eq!(recovered_records, expected);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn registered_exec_preserves_foreign_grant_with_explicit_network_request() {
+    use codex_protocol::models::FileSystemPermissions;
+    use codex_protocol::models::ManagedFileSystemPermissions;
+    use codex_protocol::permissions::NetworkSandboxPolicy;
+    use codex_protocol::protocol::AskForApproval;
+    use codex_protocol::protocol::EventMsg;
+    use codex_protocol::protocol::ReviewDecision;
+    use codex_protocol::request_permissions::UriAdditionalPermissionProfile;
+    use codex_utils_path_uri::PathUri;
+    use futures::SinkExt;
+    use futures::StreamExt;
+    use serde_json::json;
+    use std::time::Duration;
+    use tokio_tungstenite::tungstenite::Message;
+
+    // The stored grant belongs to the opposite path convention from this host.
+    let grant_root = PathUri::parse(if cfg!(windows) {
+        "file:///srv/remote-output"
+    } else {
+        "file:///C:/remote-output"
+    })
+    .unwrap();
+    let granted = UriAdditionalPermissionProfile {
+        file_system: Some(FileSystemPermissions::from_read_write_roots(
+            None,
+            Some(vec![grant_root]),
+        )),
+        network: None,
+    };
+    assert!(
+        codex_protocol::models::AdditionalPermissionProfile::try_from(granted.clone()).is_err()
+    );
+    for tool_name in ["exec_command", "shell_command"] {
+        for (feature_enabled, policy, rejection) in [
+            (true, AskForApproval::OnRequest, None),
+            (
+                false,
+                AskForApproval::OnRequest,
+                Some("additional permissions are disabled"),
+            ),
+            (true, AskForApproval::Never, Some("approval policy")),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("ws://{}", listener.local_addr().unwrap());
+            let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel();
+            let (read_release, read_release_rx) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(async move {
+                let accepted = tokio::select! {
+                    accepted = listener.accept() => accepted.unwrap(),
+                    _ = &mut stop_rx => return Vec::new(),
+                };
+                let mut socket = tokio_tungstenite::accept_async(accepted.0).await.unwrap();
+                let mut starts = Vec::new();
+                let mut read_release_rx = Some(read_release_rx);
+                loop {
+                    let frame = tokio::select! {
+                        frame = socket.next() => frame,
+                        _ = &mut stop_rx => break,
+                    };
+                    let Some(Ok(frame)) = frame else { break };
+                    let message: serde_json::Value = match frame {
+                        Message::Text(text) => serde_json::from_str(text.as_ref()).unwrap(),
+                        Message::Binary(bytes) => serde_json::from_slice(bytes.as_ref()).unwrap(),
+                        Message::Ping(_) | Message::Pong(_) => continue,
+                        Message::Close(_) => break,
+                        other => panic!("unexpected executor frame: {other:?}"),
+                    };
+                    let result = match message["method"].as_str().unwrap() {
+                        "initialize" => json!({"sessionId": "uri-permission-session"}),
+                        "initialized" => continue,
+                        "environment/info" => json!({
+                            "operatingSystem": "windows",
+                            "shell": {"name": "cmd", "path": "cmd.exe"},
+                            "cwd": "file:///C:/remote-output"
+                        }),
+                        "process/start" => {
+                            starts.push(message["params"].clone());
+                            json!({"processId": message["params"]["processId"]})
+                        }
+                        "process/read" => json!({
+                            "chunks": [{"stream": "stdout", "chunk": "cmVtb3RlLXVyaS1wcm9vZgo=", "seq": 1}],
+                            "nextSeq": 4, "exited": true, "exitCode": 7,
+                            "closed": true, "failure": null, "sandboxDenied": false
+                        }),
+                        "process/terminate" => json!({}),
+                        method => panic!("unexpected executor operation {method}: {message}"),
+                    };
+                    socket
+                        .send(Message::Text(
+                            json!({"id": message["id"], "result": result})
+                                .to_string()
+                                .into(),
+                        ))
+                        .await
+                        .unwrap();
+                    if message["method"] == "process/start" {
+                        read_release_rx
+                            .take()
+                            .expect("one remote process")
+                            .await
+                            .expect("test releases remote output after the real yielded result");
+                        // Normal live exec-server output uses notifications. process/read
+                        // is recovery, so a read-only peer would never settle a live process.
+                        let process_id = &message["params"]["processId"];
+                        for notification in [
+                            json!({"method": "process/output", "params": {"processId": process_id, "seq": 1, "stream": "stdout", "chunk": "cmVtb3RlLXVyaS1wcm9vZgo="}}),
+                            json!({"method": "process/exited", "params": {"processId": process_id, "seq": 2, "exitCode": 7, "sandboxDenied": false}}),
+                            json!({"method": "process/closed", "params": {"processId": process_id, "seq": 3}}),
+                        ] {
+                            socket
+                                .send(Message::Text(notification.to_string().into()))
+                                .await
+                                .unwrap();
+                        }
+                    }
+                }
+                starts
+            });
+            let home = tempfile::tempdir().unwrap();
+            let (session, mut turn, events) =
+                crate::session::tests::make_session_and_context_with_auth_config_home_and_rx(
+                    codex_login::CodexAuth::from_api_key("Test API Key"),
+                    Vec::new(),
+                    home.path(),
+                    |config| {
+                        config
+                            .features
+                            .enable(codex_features::Feature::UnifiedExec)
+                            .unwrap();
+                        config
+                            .features
+                            .set_enabled(
+                                codex_features::Feature::ExecPermissionApprovals,
+                                feature_enabled,
+                            )
+                            .unwrap();
+                        if tool_name == "shell_command" {
+                            config
+                                .features
+                                .set_enabled(codex_features::Feature::UnifiedExec, false)
+                                .unwrap();
+                        }
+                        config.permissions.approval_policy =
+                            crate::config::Constrained::allow_any(policy);
+                        config
+                            .permissions
+                            .set_permission_profile(PermissionProfile::Managed {
+                                file_system: ManagedFileSystemPermissions::Restricted {
+                                    entries: vec![],
+                                    glob_scan_max_depth: None,
+                                },
+                                network: NetworkSandboxPolicy::Restricted,
+                            })
+                            .unwrap();
+                    },
+                )
+                .await;
+            let environment = Arc::new(Environment::create_for_tests(Some(url)).unwrap());
+            let scope = environment.approval_scope_id().to_string();
+            let turn_mut =
+                Arc::get_mut(&mut turn).expect("fixture owns the turn before registration");
+            let cwd = if tool_name == "shell_command" {
+                turn_mut.model_info.shell_type =
+                    codex_protocol::openai_models::ConfigShellToolType::ShellCommand;
+                PathUri::parse(if cfg!(windows) {
+                    "file:///srv/remote-output"
+                } else {
+                    "file:///C:/remote-output"
+                })
+                .unwrap()
+            } else {
+                turn_mut.cwd_uri()
+            };
+            turn_mut.environments.turn_environments =
+                vec![crate::session::turn_context::TurnEnvironment::new(
+                    "grant-remote".into(),
+                    environment,
+                    cwd.clone(),
+                    None,
+                )];
+            let active = crate::state::ActiveTurn::default();
+            active
+                .turn_state
+                .lock()
+                .await
+                .record_granted_permissions(&scope, granted.clone());
+            *session.active_turn.lock().await = Some(active);
+            assert_eq!(
+                session.granted_turn_permissions(&scope).await,
+                Some(granted.clone())
+            );
+            let step = StepContext::for_test(turn);
+            let router = Arc::new(crate::tools::router::ToolRouter::from_context(
+                step.as_ref(),
+                crate::tools::router::ToolRouterParams {
+                    tool_suggest_candidates: None,
+                    deferred_mcp_tools: None,
+                    mcp_tools: None,
+                    extension_tool_executors: Vec::new(),
+                    dynamic_tools: &[],
+                    exposure_identity: Default::default(),
+                },
+                &Default::default(),
+            ));
+            assert!(step.set_tool_router(router).is_ok());
+            let runtime = crate::tools::parallel::ToolCallRuntime::new(
+                session.clone(),
+                step,
+                Arc::new(Mutex::new(TurnDiffTracker::new())),
+            );
+            let call = runtime.clone().handle_tool_call(
+            crate::tools::router::ToolCall {
+                tool_name: codex_tools::ToolName::plain(tool_name),
+                call_id: "uri-grant-exec".into(),
+                payload: ToolPayload::Function {
+                    arguments: {
+                        let mut args = json!({
+                            "kind": "argv", "program": "uri-proof-command", "args": ["two words"],
+                            "sandbox_permissions": "with_additional_permissions",
+                            "additional_permissions": {"network": {"enabled": true}},
+                            "validation": {"covered_paths": ["remote-declared-scope"]},
+                        });
+                        if tool_name == "exec_command" { args["yield_time_ms"] = json!(1000); }
+                        args.to_string()
+                    },
+                },
+            },
+            tokio_util::sync::CancellationToken::new(),
+        );
+            tokio::pin!(call);
+            let response = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                tokio::select! {
+                    result = &mut call => break result.unwrap(),
+                    event = events.recv() => {
+                        if let EventMsg::ExecApprovalRequest(request) = event.unwrap().msg {
+                            assert!(rejection.is_none(), "rejected request must not prompt for execution");
+                            session.notify_approval(request.approval_id.as_deref().unwrap_or(&request.call_id), ReviewDecision::Approved).await;
+                        }
+                    }
+                }
+            }
+        }).await.expect("registered execution must complete");
+            let codex_protocol::models::ResponseInputItem::FunctionCallOutput { output, .. } =
+                response
+            else {
+                panic!("registered exec must return a function output");
+            };
+            let mut text = output.body.to_text().unwrap();
+            if rejection.is_none() {
+                assert!(
+                    text.contains("Process running with session ID "),
+                    "remote output is intentionally pending: {text}"
+                );
+                read_release
+                    .send(())
+                    .expect("remote output consumer remains owned");
+                text = tokio::time::timeout(Duration::from_secs(15), async {
+                    while let Some((_, status)) = text.split_once("Process running with session ID ") {
+                        assert!(text.contains("remote-declared-scope") && text.contains("unverified"), "running result retains attribution: {text}");
+                        let id = status.split(';').next().unwrap().parse::<u32>().unwrap();
+                        let response = runtime.clone().handle_tool_call(
+                            crate::tools::router::ToolCall {
+                                tool_name: codex_tools::ToolName::plain("write_stdin"),
+                                call_id: "uri-grant-poll".into(),
+                                payload: ToolPayload::Function {
+                                    arguments: json!({"session_id": id, "chars": "", "yield_time_ms": 1000}).to_string(),
+                                },
+                            },
+                            tokio_util::sync::CancellationToken::new(),
+                        ).await.unwrap();
+                        let codex_protocol::models::ResponseInputItem::FunctionCallOutput { output, .. } = response else { panic!("registered remote poll output") };
+                        text = output.body.to_text().unwrap();
+                    }
+                    text
+                }).await.expect("remote process must settle through normal registered polling");
+            }
+            // The client may already have closed the external socket after settlement.
+            let _ = stop_tx.send(());
+            let starts = tokio::time::timeout(Duration::from_secs(5), server)
+                .await
+                .unwrap()
+                .unwrap();
+            if let Some(rejection) = rejection {
+                assert_eq!(output.success, Some(false));
+                assert!(text.contains(rejection), "{text}");
+                assert!(
+                    !text.contains("\"coverage_status\":\"succeeded\""),
+                    "{text}"
+                );
+                assert!(
+                    starts.is_empty(),
+                    "rejected permissions must never launch remotely"
+                );
+            } else {
+                assert!(text.contains("Process exited with code 7"), "{text}");
+                assert!(text.contains("remote-uri-proof"), "{text}");
+                assert!(text.contains("remote-declared-scope"), "{text}");
+                assert!(text.contains("unverified"), "{text}");
+                assert_eq!(starts.len(), 1, "exactly one remote launch");
+                assert_eq!(starts[0]["argv"], json!(["uri-proof-command", "two words"]));
+                assert_eq!(starts[0]["cwd"], json!(cwd));
+                let expected = PermissionProfile::Managed {
+                    file_system: ManagedFileSystemPermissions::Restricted {
+                        entries: granted.file_system.as_ref().unwrap().entries.clone(),
+                        glob_scan_max_depth: None,
+                    },
+                    network: NetworkSandboxPolicy::Enabled,
+                };
+                assert_eq!(
+                    starts[0]["sandbox"]["permissions"],
+                    serde_json::to_value(expected).unwrap(),
+                    "remote sandbox must retain the entire foreign grant and explicit network permission"
+                );
+            }
+            assert_eq!(
+                session.granted_turn_permissions(&scope).await,
+                Some(granted.clone()),
+                "a per-command network request must not overwrite or widen stored grants"
+            );
+        }
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn registered_shell_analysis_yields_and_preserves_search_results() {
+    use std::time::Duration;
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .expect("single-worker tool runtime");
+    runtime.block_on(async {
+        for tool_name in ["shell_command", "exec_command"] {
+            for scenario in ["original", "repaired", "denied", "mutating", "script_typo"] {
+                let repaired = scenario == "repaired";
+                let denied = scenario == "denied";
+                let mutating = scenario == "mutating";
+                let script_typo = scenario == "script_typo";
+                let workspace = tempfile::tempdir().expect("selected command cwd");
+                std::fs::write(
+                    workspace.path().join("input.txt"),
+                    "unrelated\nneedle-worker-proof\n",
+                )
+                .expect("independent search fixture");
+                let (session, mut turn, events) = make_session_and_context_with_rx().await;
+                let turn_mut = Arc::get_mut(&mut turn).expect("unshared setup turn");
+                turn_mut.permission_profile = PermissionProfile::Disabled;
+                turn_mut.session_source = if mutating {
+                    codex_protocol::protocol::SessionSource::Cli
+                } else {
+                    codex_protocol::protocol::SessionSource::SubAgent(
+                        codex_protocol::protocol::SubAgentSource::Review,
+                    )
+                };
+                let mut config = (*turn_mut.config).clone();
+                config.features.enable(codex_features::Feature::UnifiedExec).unwrap();
+                config.features.disable(codex_features::Feature::DirectRuntime).unwrap();
+                config.permissions.allow_login_shell = false;
+                config.permissions.approval_policy = crate::config::Constrained::allow_any(
+                    codex_protocol::protocol::AskForApproval::Never,
+                );
+                turn_mut.config = Arc::new(config);
+                let selected = turn_mut.environments.turn_environments.first_mut().unwrap();
+                // Explicit PowerShell input must discover PowerShell instead of running in Cmd.
+                selected.shell = Some(crate::shell::Shell {
+                    shell_type: ShellType::Cmd,
+                    shell_path: PathBuf::from("cmd.exe"),
+                });
+                let step = StepContext::for_test(Arc::clone(&turn));
+                let router = Arc::new(crate::tools::router::ToolRouter::from_context(
+                    step.as_ref(),
+                    crate::tools::router::ToolRouterParams {
+                        tool_suggest_candidates: None,
+                        deferred_mcp_tools: None,
+                        mcp_tools: None,
+                        extension_tool_executors: Vec::new(),
+                        dynamic_tools: &[],
+                        exposure_identity: Default::default(),
+                    },
+                    &Default::default(),
+                ));
+                assert!(step.set_tool_router(router).is_ok());
+                let tracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
+                let tool_runtime = crate::tools::parallel::ToolCallRuntime::new(
+                    session,
+                    step,
+                    Arc::clone(&tracker),
+                );
+                let call_id = format!("worker-search-{tool_name}-{scenario}");
+                let script = if denied {
+                    "Set-Content -LiteralPath forbidden.txt -Value launched".to_string()
+                } else if mutating {
+                    "Set-Content -LiteralPath mutation.txt -NoNewline -Value 'mutation-worker-proof'; Get-Content -LiteralPath mutation.txt".to_string()
+                } else if script_typo {
+                    "rg --ignorecase --color never -n needle input.txt; Set-Content -LiteralPath forbidden.txt -Value launched".to_string()
+                } else {
+                    "rg --ignore-case --color never -n needle input.txt".to_string()
+                };
+                // Only direct argv has the execution-safe equivalent repair contract.
+                let arguments = if repaired {
+                    serde_json::json!({
+                        "kind": "argv", "program": "rg",
+                        "args": ["--ignorecase", "--color", "never", "-n", "needle", "input.txt"],
+                        "workdir": workspace.path(), "login": false,
+                    })
+                } else {
+                    serde_json::json!({
+                        "kind": "powershell_script", "script_body": script,
+                        "workdir": workspace.path(), "login": false,
+                    })
+                };
+                let payload = ToolPayload::Function { arguments: arguments.to_string() };
+                let (occupied_tx, occupied_rx) = tokio::sync::oneshot::channel();
+                let (release_tx, release_rx) = std::sync::mpsc::channel();
+                let blocker = tokio::task::spawn_blocking(move || {
+                    occupied_tx.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(10)).is_ok()
+                });
+                occupied_rx.await.unwrap();
+                let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+                let request_call_id = call_id.clone();
+                let request = tokio::spawn(async move {
+                    entered_tx.send(()).unwrap();
+                    tool_runtime.handle_tool_call(
+                        crate::tools::router::ToolCall {
+                            tool_name: codex_tools::ToolName::plain(tool_name),
+                            call_id: request_call_id,
+                            payload,
+                        },
+                        tokio_util::sync::CancellationToken::new(),
+                    ).await
+                });
+                entered_rx.await.unwrap();
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                assert!(!blocker.is_finished(), "timer progresses while the worker is occupied");
+                assert!(!request.is_finished(), "registered tool awaits analysis before execution");
+                while let Ok(event) = events.try_recv() {
+                    assert!(
+                        !matches!(event.msg, codex_protocol::protocol::EventMsg::ExecCommandBegin(ref event) if event.call_id == call_id),
+                        "queued analysis must not publish command execution",
+                    );
+                }
+                release_tx.send(()).unwrap();
+                assert!(blocker.await.unwrap());
+                let response = tokio::time::timeout(Duration::from_secs(30), request)
+                    .await.expect("normal PowerShell search finishes")
+                    .expect("tool task").expect("registered tool response");
+                let codex_protocol::models::ResponseInputItem::FunctionCallOutput { output, .. } = response else {
+                    panic!("registered shell tool must return a function result");
+                };
+                let text = output.body.to_text().expect("command output");
+                if denied || script_typo {
+                    assert_eq!(output.success, Some(false));
+                    let expected_error = if script_typo {
+                        "known_flag_typo"
+                    } else {
+                        "independent reviewers may run only shell commands proven read-only"
+                    };
+                    assert!(text.contains(expected_error), "{text}");
+                    assert!(!workspace.path().join("forbidden.txt").exists(), "rejected mutation must not execute");
+                    while let Ok(event) = events.try_recv() {
+                        assert!(
+                            !matches!(event.msg, codex_protocol::protocol::EventMsg::ExecCommandBegin(ref event) if event.call_id == call_id),
+                            "rejected mutation must not publish command execution",
+                        );
+                    }
+                } else {
+                    if mutating {
+                        assert!(text.contains("mutation-worker-proof"), "{text}");
+                        assert_eq!(std::fs::read_to_string(workspace.path().join("mutation.txt")).unwrap(), "mutation-worker-proof");
+                    } else {
+                        assert!(text.contains("2:needle-worker-proof"), "{text}");
+                    }
+                    let expected_exit = if tool_name == "shell_command" { "Exit code: 0" } else { "Process exited with code 0" };
+                    assert!(text.contains(expected_exit), "{text}");
+                    if repaired {
+                        assert!(text.contains("known_flag_typo"), "{text}");
+                    }
+                }
+                assert_eq!(tracker.lock().await.current_mutation_revision(), u64::from(mutating), "only an executed mutation advances the turn revision");
+                assert_eq!(
+                    std::fs::read_to_string(workspace.path().join("input.txt")).unwrap(),
+                    "unrelated\nneedle-worker-proof\n",
+                    "read-only search preserves its selected input",
+                );
+            }
+        }
+    });
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn registered_exec_declared_validation_survives_yield_and_stdin_completion() {
+    use serde_json::json;
+    use std::time::Duration;
+    let python = which::which("python")
+        .or_else(|_| which::which("python3"))
+        .unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let release = workspace.path().join("release");
+    let release_literal = serde_json::to_string(&release.to_string_lossy()).unwrap();
+    let script = format!(
+        "import pathlib,time; print('CHILD_STARTED',flush=True); p=pathlib.Path({release_literal}); exec('while not p.exists(): time.sleep(0.01)'); print('CHILD_FINISHED',flush=True)"
+    );
+    let (session, mut turn) = make_session_and_context().await;
+    turn.permission_profile = PermissionProfile::Disabled;
+    let mut config = (*turn.config).clone();
+    config
+        .features
+        .enable(codex_features::Feature::UnifiedExec)
+        .unwrap();
+    config.permissions.approval_policy =
+        crate::config::Constrained::allow_any(codex_protocol::protocol::AskForApproval::Never);
+    turn.config = Arc::new(config);
+    let session = Arc::new(session);
+    let step = StepContext::for_test(Arc::new(turn));
+    let router = Arc::new(crate::tools::router::ToolRouter::from_context(
+        step.as_ref(),
+        crate::tools::router::ToolRouterParams {
+            tool_suggest_candidates: None,
+            deferred_mcp_tools: None,
+            mcp_tools: None,
+            extension_tool_executors: Vec::new(),
+            dynamic_tools: &[],
+            exposure_identity: Default::default(),
+        },
+        &Default::default(),
+    ));
+    assert!(step.set_tool_router(router).is_ok());
+    let runtime = crate::tools::parallel::ToolCallRuntime::new(
+        session.clone(),
+        step,
+        Arc::new(Mutex::new(TurnDiffTracker::new())),
+    );
+    let initial = runtime.clone().handle_tool_call(crate::tools::router::ToolCall {
+        tool_name: codex_tools::ToolName::plain("exec_command"), call_id: "declared-validation-child".into(),
+        payload: ToolPayload::Function { arguments: json!({
+            "kind": "argv", "program": python, "args": ["-c", script], "yield_time_ms": 1000,
+            "validation": {"covered_paths": ["src/declared-only.rs", "tests/declared-only.rs"]}
+        }).to_string() },
+    }, tokio_util::sync::CancellationToken::new()).await.unwrap();
+    let codex_protocol::models::ResponseInputItem::FunctionCallOutput { output, .. } = initial
+    else {
+        panic!("normal exec output")
+    };
+    let text = output.body.to_text().unwrap();
+    assert!(text.contains("CHILD_STARTED"), "{text}");
+    assert!(
+        text.contains("src/declared-only.rs") && text.contains("tests/declared-only.rs"),
+        "{text}"
+    );
+    assert!(text.contains("unverified"), "{text}");
+    let id = text
+        .split_once("Process running with session ID ")
+        .expect("child must yield")
+        .1
+        .split(';')
+        .next()
+        .unwrap()
+        .parse::<u32>()
+        .unwrap();
+    tokio::fs::write(&release, b"finish").await.unwrap();
+    let settled = tokio::time::timeout(
+        Duration::from_secs(15),
+        runtime.clone().handle_tool_call(
+            crate::tools::router::ToolCall {
+                tool_name: codex_tools::ToolName::plain("write_stdin"),
+                call_id: "declared-validation-poll".into(),
+                payload: ToolPayload::Function {
+                    arguments: json!({"session_id": id, "chars": "", "yield_time_ms": 10000})
+                        .to_string(),
+                },
+            },
+            tokio_util::sync::CancellationToken::new(),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let codex_protocol::models::ResponseInputItem::FunctionCallOutput { output, .. } = settled
+    else {
+        panic!("normal stdin output")
+    };
+    let text = output.body.to_text().unwrap();
+    assert!(text.contains("CHILD_FINISHED"), "{text}");
+    assert!(text.contains("Process exited with code 0"), "{text}");
+    assert!(
+        text.contains("src/declared-only.rs") && text.contains("tests/declared-only.rs"),
+        "{text}"
+    );
+    assert!(
+        text.contains("unverified"),
+        "successful execution must not claim proved coverage: {text}"
+    );
+    // Untagged commands preserve their existing result and do not inherit the prior process annotation.
+    let plain = runtime.handle_tool_call(crate::tools::router::ToolCall {
+        tool_name: codex_tools::ToolName::plain("exec_command"), call_id: "untagged-child".into(),
+        payload: ToolPayload::Function { arguments: json!({"kind": "argv", "program": python, "args": ["-c", "print('PLAIN_CHILD')"], "yield_time_ms": 10000}).to_string() },
+    }, tokio_util::sync::CancellationToken::new()).await.unwrap();
+    let codex_protocol::models::ResponseInputItem::FunctionCallOutput { output, .. } = plain else {
+        panic!("normal plain output")
+    };
+    let text = output.body.to_text().unwrap();
+    assert!(
+        text.contains("PLAIN_CHILD") && text.contains("Process exited with code 0"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("declared-only") && !text.contains("coverage_status"),
+        "{text}"
+    );
+    session
+        .services
+        .unified_exec_manager
+        .terminate_all_processes()
+        .await;
 }

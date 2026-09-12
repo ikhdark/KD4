@@ -317,6 +317,10 @@ pub async fn register_agent_task(
     agent_identity_authapi_base_url: &str,
     key: AgentIdentityKey<'_>,
 ) -> Result<String> {
+    anyhow::ensure!(
+        !matches!(key.agent_runtime_id, "." | ".."),
+        "agent runtime id must not be a URL dot segment"
+    );
     let timestamp = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
     let request = RegisterTaskRequest {
         signature: sign_task_registration_payload(key, &timestamp)?,
@@ -460,6 +464,12 @@ pub fn agent_task_registration_url(
     agent_identity_authapi_base_url: &str,
     agent_runtime_id: &str,
 ) -> String {
+    const PATH_SEGMENT: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+        .remove(b'-')
+        .remove(b'.')
+        .remove(b'_')
+        .remove(b'~');
+    let agent_runtime_id = percent_encoding::utf8_percent_encode(agent_runtime_id, PATH_SEGMENT);
     agent_identity_authapi_url(
         agent_identity_authapi_base_url,
         &format!("/v1/agent/{agent_runtime_id}/task/register"),
@@ -919,6 +929,96 @@ J1bwkqKZTB5dHolX9A58e/xXnfZ5P8f3Z83+Izap3FwqQulk7b1WO1MQcHuVg2NN
         assert_eq!(
             agent_task_registration_url("http://localhost:8080", "agent-runtime-id"),
             "http://localhost:8080/v1/agent/agent-runtime-id/task/register"
+        );
+    }
+
+    #[tokio::test]
+    async fn register_agent_task_encodes_runtime_id_and_signs_original_value() {
+        use wiremock::Mock;
+        use wiremock::MockServer;
+        use wiremock::ResponseTemplate;
+        use wiremock::matchers::method;
+        use wiremock::matchers::path;
+
+        let server = MockServer::start().await;
+        let client = codex_http_client::HttpClientBuilder::new()
+            .build_direct()
+            .expect("HTTP client");
+        let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+        let private_key = signing_key.to_pkcs8_der().expect("test private key");
+        let private_key_base64 = BASE64_STANDARD.encode(private_key.as_bytes());
+        for (runtime_id, encoded_id) in [
+            ("agent-name_1.~", "agent-name_1.~"),
+            ("agent/name?# %", "agent%2Fname%3F%23%20%25"),
+        ] {
+            Mock::given(method("POST"))
+                .and(path(format!(
+                    "/accounts/v1/agent/{encoded_id}/task/register"
+                )))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({ "task_id": "registered-task" })),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            let task_id = register_agent_task(
+                &client,
+                &format!("{}/accounts/", server.uri()),
+                AgentIdentityKey {
+                    agent_runtime_id: runtime_id,
+                    private_key_pkcs8_base64: &private_key_base64,
+                },
+            )
+            .await
+            .expect("register task");
+            assert_eq!(task_id, "registered-task");
+        }
+        let requests = server.received_requests().await.expect("recorded requests");
+        assert_eq!(requests.len(), 2);
+        for (request, runtime_id) in requests.iter().zip(["agent-name_1.~", "agent/name?# %"]) {
+            assert_eq!(request.url.query(), None);
+            assert_eq!(request.url.fragment(), None);
+            let body: serde_json::Value = request.body_json().expect("request JSON");
+            let timestamp = body["timestamp"].as_str().expect("timestamp");
+            let bytes = BASE64_STANDARD
+                .decode(body["signature"].as_str().expect("signature"))
+                .expect("base64 signature");
+            signing_key
+                .verifying_key()
+                .verify(
+                    format!("{runtime_id}:{timestamp}").as_bytes(),
+                    &Signature::from_slice(&bytes).expect("signature bytes"),
+                )
+                .expect("registration signs the original runtime ID");
+        }
+    }
+
+    #[tokio::test]
+    async fn register_agent_task_rejects_dot_ids_without_requests() {
+        let server = wiremock::MockServer::start().await;
+        let client = codex_http_client::HttpClientBuilder::new()
+            .build_direct()
+            .expect("HTTP client");
+        for runtime_id in [".", ".."] {
+            let error = register_agent_task(
+                &client,
+                &server.uri(),
+                AgentIdentityKey {
+                    agent_runtime_id: runtime_id,
+                    private_key_pkcs8_base64: "unused: rejected before signing",
+                },
+            )
+            .await
+            .expect_err("dot segment must be rejected");
+            assert!(error.to_string().contains("URL dot segment"));
+        }
+        assert!(
+            server
+                .received_requests()
+                .await
+                .expect("recorded requests")
+                .is_empty()
         );
     }
 

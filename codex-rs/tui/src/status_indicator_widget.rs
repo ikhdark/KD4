@@ -21,8 +21,8 @@ use unicode_width::UnicodeWidthStr;
 use crate::app_event_sender::AppEventSender;
 use crate::key_hint;
 use crate::key_hint::KeyBinding;
-use crate::line_truncation::truncate_line_with_ellipsis_if_overflow;
 use crate::line_truncation::truncate_line_to_width;
+use crate::line_truncation::truncate_line_with_ellipsis_if_overflow;
 use crate::motion::MotionMode;
 use crate::motion::ReducedMotionIndicator;
 use crate::motion::activity_indicator;
@@ -488,7 +488,10 @@ mod tests {
     fn renders_unicode_details_with_visible_overflow_marker() {
         for (details, expected_cells) in [
             ("界界界界界", ["界", " ", "…", " "]),
-            ("e\u{301}e\u{301}e\u{301}e\u{301}e\u{301}", ["e\u{301}", "e\u{301}", "e\u{301}", "…"]),
+            (
+                "e\u{301}e\u{301}e\u{301}e\u{301}e\u{301}",
+                ["e\u{301}", "e\u{301}", "e\u{301}", "…"],
+            ),
         ] {
             let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
             let mut widget = StatusIndicatorWidget::new(

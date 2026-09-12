@@ -178,10 +178,43 @@ pub async fn request_device_code(opts: &ServerOptions) -> std::io::Result<Device
     })
 }
 
+/// Exchanged device-code credentials that have not yet changed the auth store.
+pub struct PendingDeviceCodeLogin {
+    opts: ServerOptions,
+    tokens: crate::server::ExchangedTokens,
+}
+
+impl PendingDeviceCodeLogin {
+    /// Commit the exchanged credentials after the caller admits persistence.
+    pub async fn persist(self) -> std::io::Result<()> {
+        crate::server::persist_tokens_async(
+            &self.opts.codex_home,
+            /*api_key*/ None,
+            self.tokens.id_token,
+            self.tokens.access_token,
+            self.tokens.refresh_token,
+            self.opts.cli_auth_credentials_store_mode,
+            self.opts.auth_keyring_backend_kind,
+        )
+        .await
+    }
+}
+
 pub async fn complete_device_code_login(
     opts: ServerOptions,
     device_code: DeviceCode,
 ) -> std::io::Result<()> {
+    prepare_device_code_login(opts, device_code)
+        .await?
+        .persist()
+        .await
+}
+
+/// Poll and exchange credentials without writing local authentication state.
+pub async fn prepare_device_code_login(
+    opts: ServerOptions,
+    device_code: DeviceCode,
+) -> std::io::Result<PendingDeviceCodeLogin> {
     let base_url = opts.issuer.trim_end_matches('/');
     let client = create_raw_auth_client(base_url, &opts.auth_route_config)?;
     let api_base_url = format!("{base_url}/api/accounts");
@@ -219,16 +252,7 @@ pub async fn complete_device_code_login(
         return Err(io::Error::new(io::ErrorKind::PermissionDenied, message));
     }
 
-    crate::server::persist_tokens_async(
-        &opts.codex_home,
-        /*api_key*/ None,
-        tokens.id_token,
-        tokens.access_token,
-        tokens.refresh_token,
-        opts.cli_auth_credentials_store_mode,
-        opts.auth_keyring_backend_kind,
-    )
-    .await
+    Ok(PendingDeviceCodeLogin { opts, tokens })
 }
 
 pub async fn run_device_code_login(opts: ServerOptions) -> std::io::Result<()> {

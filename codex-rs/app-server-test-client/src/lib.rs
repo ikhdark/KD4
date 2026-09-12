@@ -5,7 +5,6 @@ use std::fs::OpenOptions;
 use std::io::BufRead;
 use std::io::BufReader;
 use std::io::Write;
-use std::net::TcpListener;
 use std::net::TcpStream;
 use std::path::Path;
 use std::path::PathBuf;
@@ -14,6 +13,7 @@ use std::process::ChildStdin;
 use std::process::ChildStdout;
 use std::process::Command;
 use std::process::Stdio;
+use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
@@ -111,6 +111,7 @@ const NOTIFICATIONS_TO_OPT_OUT: &[&str] = &[
     "item/reasoning/textDelta",
 ];
 const APP_SERVER_GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+const APP_SERVER_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const APP_SERVER_GRACEFUL_SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const DEFAULT_ANALYTICS_ENABLED: bool = true;
 const OTEL_SERVICE_NAME: &str = "codex-app-server-test-client";
@@ -557,29 +558,58 @@ fn resolve_shared_websocket_url(
 }
 
 impl BackgroundAppServer {
-    fn spawn(codex_bin: &Path, config_overrides: &[String]) -> Result<Self> {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .context("failed to reserve a local port for websocket app-server")?;
-        let addr = listener.local_addr()?;
-        drop(listener);
-
-        let url = format!("ws://{addr}");
+    fn command(codex_bin: &Path, config_overrides: &[String]) -> Result<Command> {
         let mut cmd = Command::new(codex_bin);
         add_codex_parent_to_path(&mut cmd, codex_bin)?;
         for override_kv in config_overrides {
             cmd.arg("--config").arg(override_kv);
         }
-        let process = cmd
-            .arg("app-server")
+        cmd.arg("app-server")
             .arg("--listen")
-            .arg(&url)
+            .arg("ws://127.0.0.1:0")
+            .env("NO_COLOR", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .with_context(|| format!("failed to start `{}` app-server", codex_bin.display()))?;
+            .stderr(Stdio::piped());
+        Ok(cmd)
+    }
 
-        Ok(Self { process, url })
+    fn spawn(mut cmd: Command) -> Result<Self> {
+        let process = cmd
+            .spawn()
+            .context("failed to start websocket app-server")?;
+
+        // Own the child before waiting so every startup error kills and reaps it.
+        let mut server = Self {
+            process,
+            url: String::new(),
+        };
+        let stderr = server
+            .process
+            .stderr
+            .take()
+            .context("missing app-server stderr")?;
+        let (ready_tx, ready_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let mut ready_tx = Some(ready_tx);
+            for line in BufReader::new(stderr).lines() {
+                let Ok(line) = line else { break };
+                // Keep draining and forwarding diagnostics after startup too.
+                let _ = writeln!(std::io::stderr(), "{line}");
+                if let Some(url) = line.trim().strip_prefix("listening on: ")
+                    && let Some(ready_tx) = ready_tx.take()
+                {
+                    let _ = ready_tx.send(url.to_owned());
+                }
+            }
+        });
+        server.url = ready_rx
+            .recv_timeout(APP_SERVER_STARTUP_TIMEOUT)
+            .context("app-server did not report its websocket listening address")?;
+        if let Some(status) = server.process.try_wait()? {
+            bail!("app-server exited during startup: {status}");
+        }
+        Ok(server)
     }
 }
 
@@ -1170,7 +1200,10 @@ fn live_elicitation_timeout_pause(
     let websocket_url = match (codex_bin, url) {
         (Some(_), Some(_)) => bail!("--codex-bin and --url are mutually exclusive"),
         (Some(codex_bin), None) => {
-            let server = BackgroundAppServer::spawn(&codex_bin, config_overrides)?;
+            let server = BackgroundAppServer::spawn(BackgroundAppServer::command(
+                &codex_bin,
+                config_overrides,
+            )?)?;
             let websocket_url = server.url.clone();
             _background_server = Some(server);
             websocket_url
@@ -1335,7 +1368,7 @@ fn parse_dynamic_tools_arg(dynamic_tools: &Option<String>) -> Result<Option<Vec<
 
 enum ClientTransport {
     Stdio {
-        child: Child,
+        child: std::sync::Arc<std::sync::Mutex<Child>>,
         stdin: Option<ChildStdin>,
         stdout: BufReader<ChildStdout>,
     },
@@ -1347,6 +1380,7 @@ enum ClientTransport {
 
 struct CodexClient {
     transport: ClientTransport,
+    operation_deadline: Option<Instant>,
     pending_notifications: VecDeque<JSONRPCNotification>,
     command_approval_behavior: CommandApprovalBehavior,
     command_approval_count: usize,
@@ -1424,10 +1458,11 @@ impl CodexClient {
 
         Ok(Self {
             transport: ClientTransport::Stdio {
-                child: codex_app_server,
+                child: std::sync::Arc::new(std::sync::Mutex::new(codex_app_server)),
                 stdin: Some(stdin),
                 stdout: BufReader::new(stdout),
             },
+            operation_deadline: None,
             pending_notifications: VecDeque::new(),
             command_approval_behavior: CommandApprovalBehavior::AlwaysAccept,
             command_approval_count: 0,
@@ -1467,6 +1502,7 @@ impl CodexClient {
                 url: url.to_string(),
                 socket: Box::new(socket),
             },
+            operation_deadline: None,
             pending_notifications: VecDeque::new(),
             command_approval_behavior: CommandApprovalBehavior::AlwaysAccept,
             command_approval_count: 0,
@@ -1481,6 +1517,67 @@ impl CodexClient {
             last_turn_status: None,
             last_turn_error_message: None,
         })
+    }
+
+    /// Bounds a smoke polling operation, including its synchronous child RPC/turn IO.
+    /// Expiry terminates this owned stdio server; callers must not treat its remote state as known.
+    fn with_stdio_deadline<T>(
+        &mut self,
+        deadline: Instant,
+        operation: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        let deadline = self
+            .operation_deadline
+            .map_or(deadline, |prior| prior.min(deadline));
+        deadline
+            .checked_duration_since(Instant::now())
+            .context("smoke operation deadline expired before starting IO")?;
+        let ClientTransport::Stdio { child, .. } = &self.transport else {
+            bail!("smoke operation deadline requires its owned stdio server");
+        };
+        let child = std::sync::Arc::clone(child);
+        let previous = self.operation_deadline.replace(deadline);
+        let result = thread::scope(|scope| {
+            let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+            let watchdog = scope.spawn(move || -> Result<()> {
+                if matches!(
+                    stop_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                ) {
+                    let mut child = child
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if child.try_wait()?.is_none() {
+                        child
+                            .kill()
+                            .context("terminate timed-out smoke app-server")?;
+                    }
+                    child.wait().context("reap timed-out smoke app-server")?;
+                }
+                Ok(())
+            });
+            let result = operation(self);
+            let _ = stop_tx.send(());
+            watchdog
+                .join()
+                .map_err(|_| anyhow::anyhow!("smoke deadline watchdog panicked"))??;
+            if Instant::now() >= deadline {
+                bail!("smoke operation deadline expired; app-server state may be unknown");
+            }
+            result
+        });
+        self.operation_deadline = previous;
+        result
+    }
+
+    fn check_operation_deadline(&self) -> Result<()> {
+        if self
+            .operation_deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            bail!("smoke operation deadline expired before further IO");
+        }
+        Ok(())
     }
 
     fn note_helper_output(&mut self, output: &str) {
@@ -1840,6 +1937,7 @@ impl CodexClient {
     }
 
     fn next_notification(&mut self) -> Result<JSONRPCNotification> {
+        self.check_operation_deadline()?;
         if let Some(notification) = self.pending_notifications.pop_front() {
             return Ok(notification);
         }
@@ -2032,6 +2130,7 @@ impl CodexClient {
     }
 
     fn write_payload(&mut self, payload: &str) -> Result<()> {
+        self.check_operation_deadline()?;
         match &mut self.transport {
             ClientTransport::Stdio { stdin, .. } => {
                 if let Some(stdin) = stdin.as_mut() {
@@ -2053,6 +2152,7 @@ impl CodexClient {
     }
 
     fn read_payload(&mut self) -> Result<String> {
+        self.check_operation_deadline()?;
         match &mut self.transport {
             ClientTransport::Stdio { stdout, .. } => {
                 let mut response_line = String::new();
@@ -2173,6 +2273,9 @@ impl Drop for CodexClient {
         };
 
         let _ = stdin.take();
+        let mut child = child
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         if let Ok(Some(status)) = child.try_wait() {
             println!("[codex app-server exited: {status}]");
@@ -2201,6 +2304,63 @@ impl Drop for CodexClient {
 #[cfg(test)]
 mod tests {
     use super::NOTIFICATIONS_TO_OPT_OUT;
+
+    #[test]
+    fn background_app_server_reports_bound_port_and_accepts_initialization() {
+        use super::*;
+
+        let codex_bin = codex_utils_cargo_bin::cargo_bin("codex").expect("built codex binary");
+        let codex_home = tempfile::tempdir().expect("isolated codex home");
+        let mut command =
+            BackgroundAppServer::command(&codex_bin, &["analytics.enabled=false".to_owned()])
+                .expect("build app-server command");
+        command.env("CODEX_HOME", codex_home.path());
+        let server = BackgroundAppServer::spawn(command).expect("start real websocket app-server");
+        let url = Url::parse(&server.url).expect("reported websocket URL");
+        assert_eq!(url.scheme(), "ws");
+        assert_eq!(url.host_str(), Some("127.0.0.1"));
+        assert!(url.port().is_some_and(|port| port != 0));
+        let mut client = CodexClient::connect(&Endpoint::ConnectWs(server.url.clone()), &[])
+            .expect("connect to the address actually bound by the child");
+        let response = client.initialize().expect("initialize the spawned server");
+        assert_eq!(
+            response
+                .codex_home
+                .as_path()
+                .canonicalize()
+                .expect("server home"),
+            codex_home
+                .path()
+                .canonicalize()
+                .expect("expected child home"),
+            "the reported port must reach this spawned server"
+        );
+    }
+
+    #[test]
+    fn background_app_server_rejects_child_exit_before_listening() {
+        use super::*;
+
+        let codex_bin = codex_utils_cargo_bin::cargo_bin("codex").expect("built codex binary");
+        let codex_home = tempfile::tempdir().expect("isolated codex home");
+        let mut command = BackgroundAppServer::command(&codex_bin, &["missing-equals".to_owned()])
+            .expect("build app-server command");
+        command.env("CODEX_HOME", codex_home.path());
+        let started = Instant::now();
+        let error = BackgroundAppServer::spawn(command)
+            .err()
+            .expect("invalid child arguments must not return a usable server URL");
+        assert!(
+            error
+                .to_string()
+                .contains("did not report its websocket listening address"),
+            "unexpected startup error: {error:#}"
+        );
+        assert!(
+            started.elapsed() < APP_SERVER_STARTUP_TIMEOUT,
+            "child exit must fail immediately instead of waiting for the startup deadline"
+        );
+    }
 
     #[test]
     fn client_shutdown_reaps_cooperative_and_unresponsive_processes() {
@@ -2232,10 +2392,11 @@ mod tests {
             assert_eq!(ready.trim(), "ready");
             let client = CodexClient {
                 transport: ClientTransport::Stdio {
-                    child,
+                    child: std::sync::Arc::new(std::sync::Mutex::new(child)),
                     stdin,
                     stdout,
                 },
+                operation_deadline: None,
                 pending_notifications: VecDeque::new(),
                 command_approval_behavior: CommandApprovalBehavior::AlwaysAccept,
                 command_approval_count: 0,
@@ -2281,5 +2442,78 @@ mod tests {
     #[test]
     fn retired_file_change_output_delta_is_not_requested() {
         assert!(!NOTIFICATIONS_TO_OPT_OUT.contains(&"item/fileChange/outputDelta"));
+    }
+    /// Real stdio peer; the production deadline owns/terminates it just like its app-server child.
+    pub(super) fn smoke_deadline_client(log: &std::path::Path, body: &str) -> super::CodexClient {
+        use super::*;
+        use std::os::windows::process::CommandExt;
+        let log_path = log.to_string_lossy().replace('\'', "''");
+        let script = format!(
+            "$log = '{log_path}'; [Console]::WriteLine('ready'); while ($null -ne ($line = [Console]::In.ReadLine())) {{ [System.IO.File]::AppendAllText($log, $line + [Environment]::NewLine); $request = $line | ConvertFrom-Json; {body} }}"
+        );
+        let mut child = Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .creation_flags(0x08000000)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("start real stdio deadline peer");
+        let stdin = child.stdin.take();
+        let mut stdout = BufReader::new(child.stdout.take().expect("peer stdout"));
+        let mut ready = String::new();
+        stdout.read_line(&mut ready).expect("peer ready");
+        assert_eq!(ready.trim(), "ready");
+        CodexClient {
+            transport: ClientTransport::Stdio {
+                child: std::sync::Arc::new(std::sync::Mutex::new(child)),
+                stdin,
+                stdout,
+            },
+            operation_deadline: None,
+            pending_notifications: VecDeque::new(),
+            command_approval_behavior: CommandApprovalBehavior::AlwaysAccept,
+            command_approval_count: 0,
+            command_approval_item_ids: Vec::new(),
+            command_execution_statuses: Vec::new(),
+            command_execution_outputs: Vec::new(),
+            command_output_stream: String::new(),
+            command_item_started: false,
+            helper_done_seen: false,
+            turn_completed_before_helper_done: false,
+            unexpected_items_before_helper_done: Vec::new(),
+            last_turn_status: None,
+            last_turn_error_message: None,
+        }
+    }
+
+    #[test]
+    fn smoke_deadline_success_disarms_watchdog_and_keeps_rpc_usable() {
+        use super::*;
+        let temp = tempfile::tempdir().expect("peer log root");
+        let log = temp.path().join("requests.jsonl");
+        let mut client = smoke_deadline_client(
+            &log,
+            "$response = @{jsonrpc='2.0'; id=$request.id; result=@{data=@(); nextCursor=$null}}; [Console]::WriteLine(($response | ConvertTo-Json -Depth 10 -Compress))",
+        );
+        client
+            .with_stdio_deadline(Instant::now() + Duration::from_secs(1), |client| {
+                let response = client.model_list(ModelListParams::default())?;
+                assert!(response.data.is_empty());
+                assert_eq!(response.next_cursor, None);
+                Ok(())
+            })
+            .expect("successful RPC finishes inside the total budget");
+        assert!(client.operation_deadline.is_none());
+        let response = client
+            .model_list(ModelListParams::default())
+            .expect("deadline watchdog was disarmed without killing healthy peer");
+        assert!(response.data.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(log)
+                .expect("actual requests")
+                .lines()
+                .count(),
+            2
+        );
     }
 }

@@ -366,9 +366,18 @@ fn append_file(output: &mut String, path: &Path, label: &str, max_bytes: usize) 
 fn read_head_and_tail(path: &Path, max_bytes: usize) -> std::io::Result<(Vec<u8>, Vec<u8>, u64)> {
     let mut file = fs::File::open(path)?;
     let original_bytes = file.metadata()?.len();
+    read_head_and_tail_from(&mut file, original_bytes, max_bytes)
+}
+
+fn read_head_and_tail_from(
+    file: &mut (impl Read + Seek),
+    original_bytes: u64,
+    max_bytes: usize,
+) -> std::io::Result<(Vec<u8>, Vec<u8>, u64)> {
     if original_bytes <= max_bytes as u64 {
         let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)?;
+        // The file can grow after metadata is read, and virtual files may report zero.
+        file.take(max_bytes as u64).read_to_end(&mut bytes)?;
         return Ok((bytes, Vec::new(), original_bytes));
     }
 
@@ -422,6 +431,17 @@ mod tests {
     }
 
     #[test]
+    fn selected_file_read_is_bounded_when_metadata_understates_length() {
+        let mut file = std::io::Cursor::new(b"first123unbounded tail".to_vec());
+
+        let (head, tail, _) = read_head_and_tail_from(&mut file, 0, 8).expect("read file");
+
+        assert_eq!(head, b"first123");
+        assert!(tail.is_empty());
+        assert_eq!(file.position(), 8);
+    }
+
+    #[test]
     fn over_truncation_selected_file_keeps_tail_failure_and_recovery() {
         let temp = tempfile::tempdir().expect("tempdir");
         let selected = temp.path().join("large.log");
@@ -444,6 +464,7 @@ mod tests {
         assert!(content.contains("omitted_bytes="));
         assert!(content.contains("recovery=\"read the original path"));
         assert!(content.contains("do not infer missing content"));
+        assert!(content.len() <= MAX_FILE_BYTES + 1024);
     }
 
     #[test]

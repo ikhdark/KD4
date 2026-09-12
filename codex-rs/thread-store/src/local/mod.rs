@@ -122,6 +122,14 @@ impl LocalThreadStore {
         self.state_db.clone()
     }
 
+    /// Remove all local persistence for a newly created thread that failed to start.
+    ///
+    /// This owns the staged rollout deletion and SQLite commit together, including
+    /// after its caller stops waiting. Missing or lazily created rollouts are valid.
+    pub async fn rollback_created_thread(&self, thread_id: ThreadId) -> ThreadStoreResult<()> {
+        delete_thread::rollback_created_thread(self, thread_id).await
+    }
+
     /// Stage local rollout files for deletion while a caller commits related state.
     pub async fn stage_thread_deletes(
         &self,

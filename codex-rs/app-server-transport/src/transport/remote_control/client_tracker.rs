@@ -45,7 +45,7 @@ struct ClientState {
 pub(crate) struct ClientTracker {
     clients: HashMap<(ClientId, StreamId), ClientState>,
     legacy_stream_ids: HashMap<ClientId, StreamId>,
-    join_set: JoinSet<(ClientId, StreamId)>,
+    join_set: JoinSet<(ClientId, StreamId, ConnectionId)>,
     server_event_tx: mpsc::Sender<QueuedServerEnvelope>,
     transport_event_tx: mpsc::Sender<TransportEvent>,
     shutdown_token: CancellationToken,
@@ -69,10 +69,18 @@ impl ClientTracker {
 
     pub(crate) async fn bookkeep_join_set(&mut self) -> Option<(ClientId, StreamId)> {
         while let Some(join_result) = self.join_set.join_next().await {
-            let Ok(client_key) = join_result else {
+            let Ok((client_id, stream_id, connection_id)) = join_result else {
                 continue;
             };
-            return Some(client_key);
+            let client_key = (client_id, stream_id);
+            // Reinitialization may replace the same stream before its old writer exits.
+            if self
+                .clients
+                .get(&client_key)
+                .is_some_and(|client| client.connection_id == connection_id)
+            {
+                return Some(client_key);
+            }
         }
         futures::future::pending().await
     }
@@ -85,6 +93,18 @@ impl ClientTracker {
         }
 
         self.drain_join_set().await;
+    }
+
+    pub(super) fn contains_client_stream(
+        &self,
+        client_id: &ClientId,
+        stream_id: Option<&StreamId>,
+    ) -> bool {
+        let Some(stream_id) = stream_id.or_else(|| self.legacy_stream_ids.get(client_id)) else {
+            return false;
+        };
+        self.clients
+            .contains_key(&(client_id.clone(), stream_id.clone()))
     }
 
     async fn drain_join_set(&mut self) {
@@ -177,6 +197,7 @@ impl ClientTracker {
                 self.join_set.spawn(Self::run_client_outbound(
                     client_id.clone(),
                     stream_id.clone(),
+                    connection_id,
                     self.server_event_tx.clone(),
                     writer_rx,
                     status_rx,
@@ -244,11 +265,12 @@ impl ClientTracker {
     async fn run_client_outbound(
         client_id: ClientId,
         stream_id: StreamId,
+        connection_id: ConnectionId,
         server_event_tx: mpsc::Sender<QueuedServerEnvelope>,
         mut writer_rx: mpsc::Receiver<QueuedOutgoingMessage>,
         mut status_rx: watch::Receiver<PongStatus>,
         disconnect_token: CancellationToken,
-    ) -> (ClientId, StreamId) {
+    ) -> (ClientId, StreamId, ConnectionId) {
         loop {
             let (event, write_complete_tx) = tokio::select! {
                 _ = disconnect_token.cancelled() => {
@@ -286,7 +308,7 @@ impl ClientTracker {
                 break;
             }
         }
-        (client_id, stream_id)
+        (client_id, stream_id, connection_id)
     }
 
     pub(crate) async fn close_expired_clients(
@@ -933,6 +955,88 @@ mod tests {
                 ..
             } => assert_eq!(incoming_connection_id, connection_id),
             other => panic!("expected incoming message, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn reinitialize_keeps_replacement_alive_after_previous_writer_finishes() {
+        for stream_id in [None, Some("stream-1")] {
+            let (server_event_tx, _server_event_rx) = mpsc::channel(CHANNEL_CAPACITY);
+            let (transport_event_tx, mut transport_event_rx) = mpsc::channel(CHANNEL_CAPACITY);
+            let shutdown = CancellationToken::new();
+            let mut tracker = ClientTracker::new(server_event_tx, transport_event_tx, &shutdown);
+            tracker
+                .handle_message(initialize_envelope_with_stream_id("client", stream_id))
+                .await
+                .expect("first initialize");
+            let (old_id, old_writer) = match transport_event_rx.recv().await.expect("first open") {
+                TransportEvent::ConnectionOpened {
+                    connection_id,
+                    writer,
+                    ..
+                } => (connection_id, writer),
+                other => panic!("expected first open, got {other:?}"),
+            };
+            assert!(matches!(
+                transport_event_rx.recv().await,
+                Some(TransportEvent::IncomingMessage { .. })
+            ));
+            tracker
+                .handle_message(initialize_envelope_with_stream_id("client", stream_id))
+                .await
+                .expect("replacement initialize");
+            match transport_event_rx.recv().await.expect("old close") {
+                TransportEvent::ConnectionClosed { connection_id } => {
+                    assert_eq!(connection_id, old_id)
+                }
+                other => panic!("expected old close, got {other:?}"),
+            }
+            let (new_id, _new_writer) =
+                match transport_event_rx.recv().await.expect("replacement open") {
+                    TransportEvent::ConnectionOpened {
+                        connection_id,
+                        writer,
+                        ..
+                    } => (connection_id, writer),
+                    other => panic!("expected replacement open, got {other:?}"),
+                };
+            assert_ne!(old_id, new_id);
+            assert!(matches!(
+                transport_event_rx.recv().await,
+                Some(TransportEvent::IncomingMessage { .. })
+            ));
+            timeout(Duration::from_secs(1), old_writer.closed())
+                .await
+                .expect("old writer exits");
+            assert!(
+                timeout(Duration::from_millis(20), tracker.bookkeep_join_set())
+                    .await
+                    .is_err(),
+                "old writer completion must not close the replacement stream"
+            );
+            tracker
+                .handle_message(ClientEnvelope {
+                    event: ClientEvent::ClientMessage {
+                        message: initialized_notification(),
+                    },
+                    client_id: ClientId("client".to_string()),
+                    stream_id: stream_id.map(|id| StreamId(id.to_string())),
+                    seq_id: Some(1),
+                    cursor: None,
+                })
+                .await
+                .expect("replacement followup");
+            match transport_event_rx.recv().await.expect("forwarded followup") {
+                TransportEvent::IncomingMessage {
+                    connection_id,
+                    message,
+                } => {
+                    assert_eq!(connection_id, new_id);
+                    assert_eq!(message, initialized_notification());
+                }
+                other => panic!("expected replacement followup, got {other:?}"),
+            }
+            tracker.shutdown().await;
         }
     }
 }

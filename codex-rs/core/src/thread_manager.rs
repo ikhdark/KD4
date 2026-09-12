@@ -378,21 +378,13 @@ pub(crate) async fn rollback_created_thread_persistence(
     thread_id: ThreadId,
 ) -> bool {
     if let Some(local_store) = thread_store.as_any().downcast_ref::<LocalThreadStore>() {
-        let staged_delete = match local_store.stage_thread_deletes(&[thread_id]).await {
-            Ok(staged_delete) => staged_delete,
+        return match local_store.rollback_created_thread(thread_id).await {
+            Ok(()) => true,
             Err(err) => {
-                warn!("failed to stage persistence for rolled-back thread {thread_id}: {err}");
-                return false;
+                warn!("failed to remove local persistence for rolled-back thread {thread_id}: {err}");
+                false
             }
         };
-        if let Some(state_db) = local_store.state_db().await
-            && let Err(err) = state_db.delete_thread(thread_id).await
-        {
-            warn!("failed to remove state DB rows for rolled-back thread {thread_id}: {err}");
-            return false;
-        }
-        staged_delete.commit().await;
-        return true;
     }
 
     match thread_store
@@ -411,6 +403,23 @@ fn invalid_reconstructed_setting(error: impl std::fmt::Display) -> CodexErr {
     CodexErr::InvalidRequest(format!(
         "persisted thread settings are no longer allowed by the active configuration: {error}"
     ))
+}
+
+async fn apply_reconstructed_settings_to_config_async(
+    mut config: Config,
+    settings: &PersistedThreadSettings,
+) -> CodexResult<Config> {
+    let settings = settings.clone();
+    // Legacy permissions resolve worktree metadata from disk. Keep that complete
+    // read-only reconstruction off the runtime before publishing a resumed thread.
+    tokio::task::spawn_blocking(move || {
+        apply_reconstructed_settings_to_config(&mut config, &settings)?;
+        Ok(config)
+    })
+    .await
+    .map_err(|error| {
+        CodexErr::Fatal(format!("thread settings projection worker failed: {error}"))
+    })?
 }
 
 fn apply_reconstructed_settings_to_config(
@@ -1262,7 +1271,7 @@ impl ThreadManager {
             &mut persisted_settings,
             &reconstruction.explicit_overrides,
         )?;
-        apply_reconstructed_settings_to_config(&mut config, &persisted_settings)?;
+        config = apply_reconstructed_settings_to_config_async(config, &persisted_settings).await?;
         let environments = persisted_settings
             .environments
             .as_ref()
@@ -1648,7 +1657,7 @@ impl ThreadManager {
             &mut persisted_settings,
             &reconstruction.explicit_overrides,
         )?;
-        apply_reconstructed_settings_to_config(&mut config, &persisted_settings)?;
+        config = apply_reconstructed_settings_to_config_async(config, &persisted_settings).await?;
         let environments = persisted_settings
             .environments
             .as_ref()

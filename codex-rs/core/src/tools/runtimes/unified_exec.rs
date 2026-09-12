@@ -384,7 +384,7 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecLaunch> for UnifiedExecRunti
                 call_id: ctx.call_id.clone(),
                 tool_name: flat_tool_name(&ctx.tool_name).into_owned(),
                 command: req.command.clone(),
-                cwd: req.cwd.to_abs_path().ok()?,
+                cwd: req.cwd.clone(),
                 sandbox_permissions: req.sandbox_permissions,
                 additional_permissions: req.additional_permissions.clone(),
                 justification: req.justification.clone(),
@@ -410,12 +410,14 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecLaunch> for UnifiedExecRunti
             return Ok(UnifiedExecLaunch::KnownDelta(hit.clone()));
         }
         let native_cwd = req.cwd.to_abs_path().ok();
-        let mutation = crate::turn_diff_tracker::command_mutation(
+        let mutation = crate::tools::events::command_mutation_for_exec(
             &req.command_for_approval,
             native_cwd
                 .as_ref()
                 .map(codex_utils_absolute_path::AbsolutePathBuf::as_path),
-        );
+        )
+        .await
+        .map_err(ToolError::Codex)?;
         crate::tools::events::begin_exec_mutation_evidence(
             crate::tools::events::ToolEventCtx::new(
                 ctx.session.as_ref(),
@@ -450,10 +452,11 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecLaunch> for UnifiedExecRunti
         let (mut env, managed_network_context) = match managed_network {
             Some(network) => {
                 let prepared = network
-                    .prepare_for_optional_environment(
+                    .prepare_for_optional_environment_async(
                         env,
                         Some(&req.turn_environment.environment_id),
                     )
+                    .await
                     .map_err(|err| {
                         ToolError::Codex(CodexErr::Io(io::Error::other(format!(
                             "failed to prepare network proxy for environment `{}`: {err}",
@@ -569,8 +572,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn guardian_review_request_preserves_foreign_cwd() {
+    #[tokio::test]
+    async fn guardian_review_request_preserves_foreign_cwd() {
         let foreign_cwd =
             PathUri::parse("file:///tmp/remote-workspace").expect("POSIX remote workspace URI");
         let mut request = test_request(

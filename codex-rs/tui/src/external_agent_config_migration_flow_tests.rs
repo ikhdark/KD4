@@ -257,3 +257,218 @@ fn external_agent_config_migration_status_lines_use_semantic_colors() {
         ]
     );
 }
+
+/// Replaces terminal I/O only. The real migration flow, prompt state machine,
+/// renderer, configuration detector and embedded app server all remain active.
+struct MigrationTestTerminal {
+    terminal: crate::custom_terminal::Terminal<crate::test_backend::VT100Backend>,
+    events: Vec<crate::tui::TuiEvent>,
+    events_polled: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    draw_calls: usize,
+    fail_draw: Option<usize>,
+}
+
+impl MigrationTestTerminal {
+    fn new(events: Vec<crate::tui::TuiEvent>, fail_draw: Option<usize>) -> Self {
+        let mut terminal =
+            crate::custom_terminal::Terminal::with_screen_size_and_cursor_position_for_test(
+                crate::test_backend::VT100Backend::new(80, 24),
+                ratatui::layout::Size {
+                    width: 80,
+                    height: 24,
+                },
+                ratatui::layout::Position { x: 0, y: 0 },
+            );
+        terminal.set_viewport_area(ratatui::layout::Rect::new(0, 0, 80, 24));
+        Self {
+            terminal,
+            events,
+            events_polled: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            draw_calls: 0,
+            fail_draw,
+        }
+    }
+}
+
+impl ExternalAgentConfigMigrationTerminal for MigrationTestTerminal {
+    fn frame_requester(&self) -> crate::tui::FrameRequester {
+        crate::tui::FrameRequester::test_dummy()
+    }
+
+    fn event_stream(
+        &mut self,
+    ) -> std::pin::Pin<Box<dyn tokio_stream::Stream<Item = crate::tui::TuiEvent> + Send + 'static>>
+    {
+        use tokio_stream::StreamExt;
+        let events_polled = self.events_polled.clone();
+        Box::pin(
+            tokio_stream::iter(std::mem::take(&mut self.events)).map(move |event| {
+                events_polled.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                event
+            }),
+        )
+    }
+
+    fn draw(
+        &mut self,
+        _height: u16,
+        draw_fn: impl FnOnce(&mut crate::custom_terminal::Frame<'_>),
+    ) -> std::io::Result<()> {
+        self.draw_calls += 1;
+        if self.fail_draw == Some(self.draw_calls) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "migration terminal disconnected",
+            ));
+        }
+        self.terminal.draw(draw_fn)
+    }
+}
+
+#[tokio::test]
+async fn migration_flow_draw_errors_stop_before_import() -> color_eyre::Result<()> {
+    use crate::legacy_core::config::ConfigBuilder;
+    use crate::legacy_core::config::ConfigOverrides;
+    use crate::tui::TuiEvent;
+    use crossterm::event::KeyCode;
+    use crossterm::event::KeyEvent;
+    use crossterm::event::KeyModifiers;
+    use std::sync::atomic::Ordering;
+
+    let temp = tempfile::TempDir::new()?;
+    let project = temp.path().join("project");
+    let codex_home = temp.path().join("codex-home");
+    std::fs::create_dir_all(project.join(".git"))?;
+    std::fs::create_dir_all(project.join(".claude"))?;
+    std::fs::create_dir_all(project.join(".codex"))?;
+    std::fs::create_dir_all(&codex_home)?;
+    let source_path = project.join(".claude/settings.json");
+    let target_path = project.join(".codex/config.toml");
+    let source_bytes = br#"{"env":{"MIGRATION_DRAW_TEST":"must-not-be-imported"}}"#;
+    let target_bytes = b"# Existing project configuration must be preserved.\n";
+    std::fs::write(&source_path, source_bytes)?;
+    std::fs::write(&target_path, target_bytes)?;
+    let mut config = ConfigBuilder::default()
+        .codex_home(codex_home.clone())
+        .harness_overrides(ConfigOverrides {
+            cwd: Some(project.clone()),
+            ..Default::default()
+        })
+        .build()
+        .await?;
+    config.sqlite_home = temp.path().join("sqlite");
+    let mut app_server = crate::start_embedded_app_server_for_picker(&config).await?;
+    let detected = app_server
+        .external_agent_config_detect(ExternalAgentConfigDetectParams {
+            include_home: false,
+            cwds: Some(vec![project.clone()]),
+        })
+        .await?;
+    assert!(
+        detected.items.iter().any(|item| item.item_type
+            == ExternalAgentConfigMigrationItemType::Config
+            && item.cwd.as_deref() == Some(project.as_path())),
+        "fixture must expose a real project configuration import"
+    );
+
+    for (fail_draw, redraw_event) in [
+        (Some(1), None),
+        (Some(2), Some(TuiEvent::Draw)),
+        (Some(2), Some(TuiEvent::Resize)),
+        (None, Some(TuiEvent::Draw)),
+    ] {
+        let mut events = Vec::new();
+        if let Some(event) = redraw_event {
+            events.push(event);
+        }
+        // Keep a regression safe even when home detection finds real items:
+        // ignored draw errors consume Escape, never an import confirmation.
+        events.push(TuiEvent::Key(KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        )));
+        let mut terminal = MigrationTestTerminal::new(events, fail_draw);
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            handle_external_agent_config_migration_prompt(&mut terminal, &mut app_server, &config),
+        )
+        .await
+        .expect("migration flow must terminate");
+        if let Some(failed_draw) = fail_draw {
+            let message = match outcome {
+                Err(message) => message,
+                Ok(_) => panic!("failed terminal must return an error, not a migration outcome"),
+            };
+            assert_eq!(
+                message,
+                "Could not display the Claude Code import prompt: migration terminal disconnected"
+            );
+            assert_eq!(terminal.draw_calls, failed_draw);
+            assert_eq!(
+                terminal.events_polled.load(Ordering::SeqCst),
+                failed_draw - 1,
+                "draw failure must return before consuming the following Escape"
+            );
+        } else {
+            assert!(matches!(
+                outcome,
+                Ok(ExternalAgentConfigMigrationFlowOutcome::Cancelled)
+            ));
+            assert_eq!(terminal.draw_calls, 2);
+            assert_eq!(terminal.events_polled.load(Ordering::SeqCst), 2);
+        }
+        if terminal.draw_calls > 1 {
+            assert!(
+                terminal
+                    .terminal
+                    .backend()
+                    .to_string()
+                    .contains("Bring over your setup"),
+                "successful frames must render the actual migration screen"
+            );
+        }
+        assert!(
+            !app_server.external_agent_config_import_in_progress(),
+            "failure/cancellation must never start an import"
+        );
+        assert_eq!(std::fs::read(&target_path)?, target_bytes);
+        assert_eq!(std::fs::read(&source_path)?, source_bytes);
+    }
+    app_server.shutdown().await?;
+    assert_eq!(
+        std::fs::read(&target_path)?,
+        target_bytes,
+        "no delayed import may change the target during shutdown"
+    );
+    assert_eq!(std::fs::read(&source_path)?, source_bytes);
+    Ok(())
+}
+
+#[tokio::test]
+async fn migration_prompt_successful_draw_can_confirm_selected_items() {
+    use crate::tui::TuiEvent;
+    use crossterm::event::KeyCode;
+    use crossterm::event::KeyEvent;
+    use crossterm::event::KeyModifiers;
+
+    let items = selected_items();
+    let mut terminal = MigrationTestTerminal::new(
+        vec![TuiEvent::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        ))],
+        None,
+    );
+    let outcome = run_external_agent_config_migration_prompt(&mut terminal, &items, &items, None)
+        .await
+        .expect("working terminal must permit confirmation");
+    assert_eq!(outcome, ExternalAgentConfigMigrationOutcome::Proceed(items));
+    assert_eq!(terminal.draw_calls, 1);
+    assert!(
+        terminal
+            .terminal
+            .backend()
+            .to_string()
+            .contains("Bring over your setup")
+    );
+}

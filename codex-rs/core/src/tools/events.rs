@@ -11,6 +11,7 @@ use codex_agent_task_store::AttributionConfidence;
 use codex_apply_patch::AppliedPatchDelta;
 use codex_git_utils::get_git_repo_root;
 use codex_protocol::error::CodexErr;
+use codex_protocol::error::Result as CodexResult;
 use codex_protocol::error::SandboxErr;
 use codex_protocol::exec_output::ExecToolCallOutput;
 use codex_protocol::items::CommandExecutionItem;
@@ -288,7 +289,7 @@ impl ToolEmitter {
         self
     }
 
-    pub async fn emit(&self, ctx: ToolEventCtx<'_>, stage: ToolEventStage<'_>) {
+    pub async fn emit(&self, ctx: ToolEventCtx<'_>, stage: ToolEventStage<'_>) -> CodexResult<()> {
         match (self, stage) {
             (
                 Self::Shell {
@@ -314,7 +315,7 @@ impl ToolEmitter {
                     ),
                     stage,
                 )
-                .await;
+                .await?;
             }
 
             (
@@ -367,7 +368,7 @@ impl ToolEmitter {
                     status,
                     tracker_update,
                 )
-                .await;
+                .await?;
             }
             (
                 Self::ApplyPatch { changes, .. },
@@ -385,7 +386,7 @@ impl ToolEmitter {
                     },
                     TurnDiffTrackerUpdate::Invalidate,
                 )
-                .await;
+                .await?;
             }
             (
                 Self::ApplyPatch { changes, .. },
@@ -399,7 +400,7 @@ impl ToolEmitter {
                     PatchApplyStatus::Failed,
                     TurnDiffTrackerUpdate::None,
                 )
-                .await;
+                .await?;
             }
             (
                 Self::ApplyPatch {
@@ -424,7 +425,7 @@ impl ToolEmitter {
                         })
                         .unwrap_or(TurnDiffTrackerUpdate::None),
                 )
-                .await;
+                .await?;
             }
             (Self::ApplyPatch { .. }, ToolEventStage::Skipped(_)) => {}
             (
@@ -452,13 +453,16 @@ impl ToolEmitter {
                     ),
                     stage,
                 )
-                .await;
+                .await?;
             }
         }
+        Ok(())
     }
 
     pub async fn begin(&self, ctx: ToolEventCtx<'_>) {
-        self.emit(ctx, ToolEventStage::Begin).await;
+        self.emit(ctx, ToolEventStage::Begin)
+            .await
+            .expect("begin events do not invalidate tool history");
     }
 
     fn format_exec_output_for_model(
@@ -588,7 +592,9 @@ impl ToolEmitter {
                 (event, result)
             }
         };
-        self.emit(ctx, event).await;
+        self.emit(ctx, event)
+            .await
+            .map_err(|error| FunctionCallError::Fatal(error.to_string()))?;
         result
     }
 }
@@ -636,18 +642,34 @@ struct ExecCommandResult {
     timed_out: bool,
 }
 
+// Safety classification can invoke the native PowerShell parser. Keep its process
+// and filesystem work off the executor for runtime admission and execution events.
+pub(crate) async fn command_mutation_for_exec(
+    command: &[String],
+    cwd: Option<&std::path::Path>,
+) -> CodexResult<crate::turn_diff_tracker::CommandMutation> {
+    let command = command.to_vec();
+    let cwd = cwd.map(std::path::Path::to_path_buf);
+    super::run_blocking_command_analysis(move || {
+        crate::turn_diff_tracker::command_mutation(&command, cwd.as_deref())
+    })
+    .await
+    .map_err(|error| CodexErr::Fatal(format!("command mutation analysis failed: {error}")))
+}
+
 async fn emit_exec_stage(
     ctx: ToolEventCtx<'_>,
     exec_input: ExecCommandInput<'_>,
     stage: ToolEventStage<'_>,
-) {
+) -> CodexResult<()> {
     match stage {
         ToolEventStage::Begin => {
             let native_cwd = exec_input.cwd.to_abs_path().ok();
-            let mutation = crate::turn_diff_tracker::command_mutation(
+            let mutation = command_mutation_for_exec(
                 exec_input.command,
                 native_cwd.as_ref().map(AbsolutePathBuf::as_path),
-            );
+            )
+            .await?;
             if matches!(
                 mutation,
                 crate::turn_diff_tracker::CommandMutation::Uncertain
@@ -704,7 +726,7 @@ async fn emit_exec_stage(
                 },
                 timed_out: output.timed_out,
             };
-            emit_exec_end(ctx, exec_input, exec_result).await;
+            emit_exec_end(ctx, exec_input, exec_result).await?;
         }
         ToolEventStage::Failure(ToolEventFailure::Message(message)) => {
             let text = message.to_string();
@@ -718,7 +740,7 @@ async fn emit_exec_stage(
                 status: ExecCommandStatus::Failed,
                 timed_out: false,
             };
-            emit_exec_end(ctx, exec_input, exec_result).await;
+            emit_exec_end(ctx, exec_input, exec_result).await?;
         }
         ToolEventStage::Failure(ToolEventFailure::Denied { message, .. }) => {
             let text = message.to_string();
@@ -732,7 +754,7 @@ async fn emit_exec_stage(
                 status: ExecCommandStatus::Declined,
                 timed_out: false,
             };
-            emit_exec_end(ctx, exec_input, exec_result).await;
+            emit_exec_end(ctx, exec_input, exec_result).await?;
         }
         ToolEventStage::Skipped(output) => {
             tracing::info!(%output, "exec tool completed with a skipped outcome");
@@ -747,9 +769,10 @@ async fn emit_exec_stage(
                 status: ExecCommandStatus::Declined,
                 timed_out: false,
             };
-            emit_exec_end(ctx, exec_input, exec_result).await;
+            emit_exec_end(ctx, exec_input, exec_result).await?;
         }
     }
+    Ok(())
 }
 
 pub(crate) async fn begin_exec_mutation_evidence(
@@ -877,12 +900,14 @@ async fn emit_exec_end(
     ctx: ToolEventCtx<'_>,
     exec_input: ExecCommandInput<'_>,
     exec_result: ExecCommandResult,
-) {
+) -> CodexResult<()> {
+    let mut persistence_result = Ok(());
     let native_cwd = exec_input.cwd.to_abs_path().ok();
-    let mut mutation = crate::turn_diff_tracker::command_mutation(
+    let mut mutation = command_mutation_for_exec(
         exec_input.command,
         native_cwd.as_ref().map(AbsolutePathBuf::as_path),
-    );
+    )
+    .await?;
     let mut observed_workspace_identity = None;
     if matches!(
         mutation,
@@ -965,7 +990,8 @@ async fn emit_exec_end(
                         .as_ref()
                         .map_or_else(|| std::path::Path::new("."), AbsolutePathBuf::as_path),
                     &paths,
-                );
+                )
+                .await;
         } else {
             ctx.session
                 .services
@@ -973,7 +999,8 @@ async fn emit_exec_end(
                 .note_host_workspace_mutation();
         }
         if !defer_workspace_identity {
-            ctx.session
+            persistence_result = ctx
+                .session
                 .invalidate_tool_history_source_dependencies(
                     ctx.turn.config.codex_home.as_path(),
                     mutation_paths,
@@ -1010,7 +1037,8 @@ async fn emit_exec_end(
         )
     });
     if defer_workspace_identity && !mutation_deferred {
-        ctx.session
+        persistence_result = ctx
+            .session
             .invalidate_tool_history_source_dependencies(
                 ctx.turn.config.codex_home.as_path(),
                 mutation_paths,
@@ -1055,6 +1083,9 @@ async fn emit_exec_end(
             }),
         )
         .await;
+    // The external command already ran. Publish its terminal item and account for
+    // its mutation before propagating the durability barrier failure.
+    persistence_result
 }
 
 fn observed_workspace_identity_changed(
@@ -1078,7 +1109,8 @@ async fn emit_patch_end(
     stderr: String,
     status: PatchApplyStatus,
     tracker_update: TurnDiffTrackerUpdate<'_>,
-) {
+) -> CodexResult<()> {
+    let mut persistence_result = Ok(());
     let evidence_cwd = match &tracker_update {
         TurnDiffTrackerUpdate::Track { environment_id, .. } => {
             apply_patch_local_cwd(ctx, environment_id.as_deref())
@@ -1129,7 +1161,8 @@ async fn emit_patch_end(
             None
         };
         if !mutation_deferred {
-            ctx.session
+            persistence_result = ctx
+                .session
                 .invalidate_tool_history_source_dependencies(
                     ctx.turn.config.codex_home.as_path(),
                     affected_paths.as_ref(),
@@ -1203,6 +1236,9 @@ async fn emit_patch_end(
                 .await;
         }
     }
+    // Preserve the committed delta and completion event even when its evidence
+    // invalidation could not be made durable.
+    persistence_result
 }
 
 #[cfg(test)]
@@ -1231,6 +1267,176 @@ mod tests {
     use tempfile::tempdir;
     use tokio::sync::Mutex;
     use tokio::time::Instant;
+
+    #[test]
+    fn execution_events_wait_for_command_analysis_without_blocking_the_executor() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .expect("current-thread runtime");
+        runtime.block_on(async {
+            let (session, turn, rx_event) =
+                make_session_and_context_with_dynamic_tools_and_rx(Vec::new()).await;
+            let workspace = tempdir().expect("workspace");
+            let cwd = AbsolutePathBuf::from_absolute_path(workspace.path()).expect("absolute cwd");
+            #[cfg(windows)]
+            let command = vec![
+                "powershell.exe".to_string(),
+                "-NoProfile".to_string(),
+                "-Command".to_string(),
+                "Write-Output 'classification-ok'".to_string(),
+            ];
+            #[cfg(not(windows))]
+            let command = vec!["echo".to_string(), "classification-ok".to_string()];
+            let emitter = ToolEmitter::shell(
+                command.clone(),
+                cwd.clone(),
+                ExecCommandSource::Agent,
+                codex_exec_server::LOCAL_ENVIRONMENT_ID.to_string(),
+            );
+            let tracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
+            let ctx = ToolEventCtx::new(
+                session.as_ref(),
+                turn.as_ref(),
+                "analysis-call",
+                Some(&tracker),
+            );
+
+            for begin in [true, false] {
+                let (release_tx, release_rx) = std::sync::mpsc::channel();
+                let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+                let occupied_worker = tokio::task::spawn_blocking(move || {
+                    let _ = entered_tx.send(());
+                    release_rx
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("release occupied worker");
+                });
+                entered_rx.await.expect("worker is occupied");
+                let stage = if begin {
+                    ToolEventStage::Begin
+                } else {
+                    ToolEventStage::Success {
+                        output: ExecToolCallOutput {
+                            exit_code: 0,
+                            stdout: StreamOutput::new("classification-ok\n".to_string()),
+                            stderr: StreamOutput::new(String::new()),
+                            aggregated_output: StreamOutput::new("classification-ok\n".to_string()),
+                            duration: Duration::from_millis(7),
+                            timed_out: false,
+                        },
+                        applied_patch_delta: None,
+                        formatted_output: Some("classification-ok\n".to_string()),
+                    }
+                };
+                let mut operation = Box::pin(emitter.emit(ctx, stage));
+                // The ordinary in-memory Session fixture has no rollout writer or trace
+                // worker. A read-only command has no Git evidence work. Thus the old
+                // inline classifier publishes its event here instead of waiting.
+                assert!(futures::poll!(operation.as_mut()).is_pending());
+                assert!(
+                    rx_event.try_recv().is_err(),
+                    "classification must precede publication"
+                );
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                assert!(futures::poll!(operation.as_mut()).is_pending());
+                release_tx.send(()).expect("release classification worker");
+                occupied_worker.await.expect("occupied worker finished");
+                tokio::time::timeout(Duration::from_secs(15), operation)
+                    .await
+                    .expect("classification and publication complete")
+                    .expect("event emission succeeds");
+
+                let events = std::iter::from_fn(|| rx_event.try_recv().ok()).collect::<Vec<_>>();
+                let modern = events
+                    .iter()
+                    .filter_map(|event| match &event.msg {
+                        EventMsg::ItemStarted(event) if begin => Some(&event.item),
+                        EventMsg::ItemCompleted(event) if !begin => Some(&event.item),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(modern.len(), 1, "one normal event for this execution stage");
+                let TurnItem::CommandExecution(item) = modern[0] else {
+                    panic!("expected command execution item");
+                };
+                assert_eq!(item.id, "analysis-call");
+                assert_eq!(item.command, command);
+                assert_eq!(
+                    item.status,
+                    if begin {
+                        CommandExecutionStatus::InProgress
+                    } else {
+                        CommandExecutionStatus::Completed
+                    }
+                );
+                if !begin {
+                    assert_eq!(item.exit_code, Some(0));
+                    assert_eq!(item.stdout.as_deref(), Some("classification-ok\n"));
+                    assert_eq!(
+                        item.formatted_output.as_deref(),
+                        Some("classification-ok\n")
+                    );
+                }
+                assert_eq!(tracker.lock().await.current_mutation_revision(), 0);
+                if begin {
+                    assert!(
+                        session
+                            .services
+                            .command_execution
+                            .take_uncertain_command_baseline("analysis-call")
+                            .await
+                            .is_none(),
+                        "read-only parsing must not fall back to uncertain Git evidence work"
+                    );
+                }
+            }
+
+            // Reject a worker integration that always returns ReadOnly: the ordinary
+            // completed mutating command must still invalidate the mutation tracker.
+            tokio::fs::write(workspace.path().join("removed.txt"), "before")
+                .await
+                .expect("fixture file");
+            let mutating = ToolEmitter::shell(
+                vec!["rm".to_string(), "removed.txt".to_string()],
+                cwd,
+                ExecCommandSource::Agent,
+                codex_exec_server::LOCAL_ENVIRONMENT_ID.to_string(),
+            );
+            let mutation_ctx = ToolEventCtx::new(
+                session.as_ref(),
+                turn.as_ref(),
+                "mutation-control",
+                Some(&tracker),
+            );
+            mutating
+                .emit(mutation_ctx, ToolEventStage::Begin)
+                .await
+                .expect("mutation begin");
+            tokio::fs::remove_file(workspace.path().join("removed.txt"))
+                .await
+                .expect("external command effect");
+            mutating
+                .emit(
+                    mutation_ctx,
+                    ToolEventStage::Success {
+                        output: ExecToolCallOutput::default(),
+                        applied_patch_delta: None,
+                        formatted_output: Some(String::new()),
+                    },
+                )
+                .await
+                .expect("mutation completion");
+            assert_eq!(tracker.lock().await.current_mutation_revision(), 1);
+            assert!(!workspace.path().join("removed.txt").exists());
+            assert!(std::iter::from_fn(|| rx_event.try_recv().ok()).any(
+                |event| matches!(event.msg,
+                EventMsg::ItemCompleted(event) if matches!(&event.item,
+                    TurnItem::CommandExecution(item) if item.id == "mutation-control"
+                        && item.status == CommandExecutionStatus::Completed))
+            ));
+        });
+    }
 
     #[test]
     fn authoritative_non_git_uncertain_command_identity_is_unchanged() {
@@ -1925,16 +2131,39 @@ mod tests {
 
     #[tokio::test]
     async fn net_zero_patch_emits_empty_turn_diff() {
-        let (session, turn, rx_event) =
+        let (session, mut turn, rx_event) =
             make_session_and_context_with_dynamic_tools_and_rx(Vec::new()).await;
         let tracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
         let dir = tempdir().expect("tempdir");
+        set_turn_environments(
+            &mut turn,
+            &[(codex_exec_server::LOCAL_ENVIRONMENT_ID, dir.path())],
+        );
         let cwd = PathUri::from_host_native_path(dir.path()).expect("absolute cwd");
 
-        for patch in [
-            "*** Begin Patch\n*** Add File: a.txt\n+one\n*** End Patch",
-            "*** Begin Patch\n*** Delete File: a.txt\n*** End Patch",
+        for (call_id, patch, change) in [
+            (
+                "add-file",
+                "*** Begin Patch\n*** Add File: a.txt\n+one\n*** End Patch",
+                FileChange::Add {
+                    content: "one\n".to_string(),
+                },
+            ),
+            (
+                "delete-file",
+                "*** Begin Patch\n*** Delete File: a.txt\n*** End Patch",
+                FileChange::Delete {
+                    content: "one\n".to_string(),
+                },
+            ),
         ] {
+            let emitter = ToolEmitter::apply_patch_for_environment(
+                HashMap::from([(dir.path().join("a.txt"), change)]),
+                true,
+                codex_exec_server::LOCAL_ENVIRONMENT_ID.to_string(),
+            );
+            let ctx = ToolEventCtx::new(session.as_ref(), turn.as_ref(), call_id, Some(&tracker));
+            emitter.begin(ctx).await;
             let mut stdout = Vec::new();
             let mut stderr = Vec::new();
             let delta = codex_apply_patch::apply_patch(
@@ -1943,81 +2172,331 @@ mod tests {
                 &mut stdout,
                 &mut stderr,
                 LOCAL_FS.as_ref(),
-                /*sandbox*/ None,
+                None,
             )
             .await
-            .expect("apply patch");
-
-            emit_patch_end(
-                ToolEventCtx::new(session.as_ref(), turn.as_ref(), "call-id", Some(&tracker)),
-                HashMap::new(),
-                String::new(),
-                String::new(),
-                PatchApplyStatus::Completed,
-                TurnDiffTrackerUpdate::Track {
-                    environment_id: None,
-                    delta: &delta,
-                },
-            )
-            .await;
-
-            rx_event.recv().await.expect("item completed event");
-            let unified_diff = loop {
-                let event = rx_event.recv().await.expect("turn diff event");
-                if let EventMsg::TurnDiff(TurnDiffEvent { unified_diff }) = event.msg {
-                    break unified_diff;
-                }
-            };
-            if patch.contains("Delete File") {
-                assert_eq!(unified_diff, "");
+            .expect("actual patch commits");
+            emitter
+                .finish(ctx, Ok(ExecToolCallOutput::default()), Some(&delta))
+                .await
+                .expect("patch result is model-visible");
+            let events = std::iter::from_fn(|| rx_event.try_recv().ok()).collect::<Vec<_>>();
+            assert_eq!(events.iter().filter(|event| matches!(&event.msg,
+                EventMsg::ItemStarted(event) if matches!(&event.item, TurnItem::FileChange(item) if item.id == call_id)
+            )).count(), 1);
+            assert_eq!(events.iter().filter(|event| matches!(&event.msg,
+                EventMsg::ItemCompleted(event) if matches!(&event.item, TurnItem::FileChange(item) if item.id == call_id && item.status == Some(PatchApplyStatus::Completed))
+            )).count(), 1);
+            let diffs = events
+                .iter()
+                .filter_map(|event| match &event.msg {
+                    EventMsg::TurnDiff(event) => Some(event.unified_diff.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                diffs.len(),
+                1,
+                "one visible diff update per committed patch"
+            );
+            if call_id == "delete-file" {
+                assert_eq!(diffs[0], "");
+                assert!(!dir.path().join("a.txt").exists());
             } else {
-                assert!(unified_diff.contains("+one"));
+                assert!(diffs[0].contains("+one"));
+                assert_eq!(
+                    std::fs::read(dir.path().join("a.txt")).expect("actual added file"),
+                    b"one\n"
+                );
             }
         }
     }
 
     #[tokio::test]
     async fn invalidation_emits_empty_turn_diff() {
-        let (session, turn, rx_event) =
+        let (session, mut turn, rx_event) =
             make_session_and_context_with_dynamic_tools_and_rx(Vec::new()).await;
         let tracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
         let dir = tempdir().expect("tempdir");
+        set_turn_environments(
+            &mut turn,
+            &[(codex_exec_server::LOCAL_ENVIRONMENT_ID, dir.path())],
+        );
         let cwd = PathUri::from_host_native_path(dir.path()).expect("absolute cwd");
-        let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
+        let emitter = ToolEmitter::apply_patch_for_environment(
+            HashMap::from([(
+                dir.path().join("a.txt"),
+                FileChange::Add {
+                    content: "one\n".to_string(),
+                },
+            )]),
+            true,
+            codex_exec_server::LOCAL_ENVIRONMENT_ID.to_string(),
+        );
+        let ctx = ToolEventCtx::new(
+            session.as_ref(),
+            turn.as_ref(),
+            "known-patch",
+            Some(&tracker),
+        );
+        emitter.begin(ctx).await;
         let delta = codex_apply_patch::apply_patch(
             "*** Begin Patch\n*** Add File: a.txt\n+one\n*** End Patch",
             &cwd,
-            &mut stdout,
-            &mut stderr,
+            &mut Vec::new(),
+            &mut Vec::new(),
             LOCAL_FS.as_ref(),
-            /*sandbox*/ None,
+            None,
         )
         .await
-        .expect("apply patch");
-        {
-            let mut tracker = tracker.lock().await;
-            tracker.track_delta("", &delta);
-            assert!(tracker.take_unified_diff_if_changed().is_some());
-        }
+        .expect("actual initial patch");
+        emitter
+            .finish(ctx, Ok(ExecToolCallOutput::default()), Some(&delta))
+            .await
+            .expect("known patch completes");
+        let initial_events = std::iter::from_fn(|| rx_event.try_recv().ok()).collect::<Vec<_>>();
+        assert!(initial_events.iter().any(|event| matches!(&event.msg,
+            EventMsg::TurnDiff(event) if event.unified_diff.contains("+one"))));
 
-        emit_patch_end(
-            ToolEventCtx::new(session.as_ref(), turn.as_ref(), "call-id", Some(&tracker)),
+        let unknown = ToolEmitter::apply_patch_for_environment(
             HashMap::new(),
-            String::new(),
-            String::new(),
-            PatchApplyStatus::Completed,
-            TurnDiffTrackerUpdate::Invalidate,
+            true,
+            codex_exec_server::LOCAL_ENVIRONMENT_ID.to_string(),
+        );
+        let ctx = ToolEventCtx::new(
+            session.as_ref(),
+            turn.as_ref(),
+            "unknown-patch",
+            Some(&tracker),
+        );
+        unknown.begin(ctx).await;
+        unknown
+            .finish(ctx, Ok(ExecToolCallOutput::default()), None)
+            .await
+            .expect("missing external delta still completes and invalidates");
+        let events = std::iter::from_fn(|| rx_event.try_recv().ok()).collect::<Vec<_>>();
+        assert_eq!(events.iter().filter(|event| matches!(&event.msg,
+            EventMsg::ItemCompleted(event) if matches!(&event.item, TurnItem::FileChange(item) if item.id == "unknown-patch" && item.status == Some(PatchApplyStatus::Completed))
+        )).count(), 1);
+        let diffs = events
+            .iter()
+            .filter_map(|event| match &event.msg {
+                EventMsg::TurnDiff(event) => Some(event.unified_diff.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            diffs,
+            vec![""],
+            "the consumer must stop displaying the now-unknown prior diff"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("a.txt"))
+                .expect("invalidation preserves the actual file"),
+            b"one\n"
+        );
+    }
+    async fn assert_tool_history_failure_preserves_mutation_completion(apply_patch: bool) {
+        let (session, mut turn, rx_event) =
+            make_session_and_context_with_dynamic_tools_and_rx(Vec::new()).await;
+        let workspace = tempdir().expect("workspace");
+        set_turn_environments(
+            &mut turn,
+            &[(codex_exec_server::LOCAL_ENVIRONMENT_ID, workspace.path())],
+        );
+        let codex_home = &turn.config.codex_home;
+        let observation = crate::tool_history::WorkspaceEvidenceObservation::from_response_item(
+            None,
+            &codex_protocol::models::ResponseItem::FunctionCallOutput {
+                id: None,
+                call_id: "earlier-read".to_string(),
+                output: codex_protocol::models::FunctionCallOutputPayload::from_text(
+                    "before mutation".to_string(),
+                ),
+                internal_chat_message_metadata_passthrough: None,
+            },
+            BTreeSet::new(),
         )
-        .await;
+        .expect("workspace observation");
+        session
+            .register_workspace_evidence(codex_home, observation, ())
+            .await;
+        session
+            .flush_tool_history_persistence()
+            .await
+            .expect("initial evidence is durable");
+        let history_directory = codex_home.join("tool-history");
+        let saved_history = codex_home.join("saved-tool-history");
+        tokio::fs::rename(&history_directory, &saved_history)
+            .await
+            .expect("retain durable baseline");
+        tokio::fs::write(
+            &history_directory,
+            "blocks both journal and snapshot writes",
+        )
+        .await
+        .expect("install real filesystem failure");
 
-        rx_event.recv().await.expect("item completed event");
-        loop {
-            let event = rx_event.recv().await.expect("turn diff event");
-            if let EventMsg::TurnDiff(TurnDiffEvent { unified_diff }) = event.msg {
-                assert_eq!(unified_diff, "");
-                break;
-            }
+        let tracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
+        let cwd = AbsolutePathBuf::from_absolute_path(workspace.path()).expect("absolute cwd");
+        let ctx = ToolEventCtx::new(session.as_ref(), turn.as_ref(), "mutation", Some(&tracker));
+        let (emitter, delta) = if apply_patch {
+            let delta = codex_apply_patch::apply_patch(
+                "*** Begin Patch\n*** Add File: changed.txt\n+after\n*** End Patch",
+                &PathUri::from_abs_path(&cwd),
+                &mut Vec::new(),
+                &mut Vec::new(),
+                LOCAL_FS.as_ref(),
+                None,
+            )
+            .await
+            .expect("actual patch commits before the durability failure");
+            (
+                ToolEmitter::apply_patch_for_environment(
+                    HashMap::from([(
+                        workspace.path().join("changed.txt"),
+                        FileChange::Add {
+                            content: "after\n".to_string(),
+                        },
+                    )]),
+                    true,
+                    codex_exec_server::LOCAL_ENVIRONMENT_ID.to_string(),
+                ),
+                Some(delta),
+            )
+        } else {
+            tokio::fs::write(workspace.path().join("changed.txt"), "after\n")
+                .await
+                .expect("command mutation is already committed");
+            (
+                ToolEmitter::shell(
+                    vec!["touch".to_string(), "changed.txt".to_string()],
+                    cwd,
+                    ExecCommandSource::Agent,
+                    codex_exec_server::LOCAL_ENVIRONMENT_ID.to_string(),
+                ),
+                None,
+            )
+        };
+        emitter.begin(ctx).await;
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            emitter.finish(ctx, Ok(ExecToolCallOutput::default()), delta.as_ref()),
+        )
+        .await
+        .expect("permanent persistence failure must finish promptly")
+        .expect_err("a successful external mutation must not hide failed durability");
+        assert!(matches!(error, FunctionCallError::Fatal(_)));
+        assert_eq!(
+            tokio::fs::read_to_string(workspace.path().join("changed.txt"))
+                .await
+                .unwrap(),
+            "after\n",
+            "persistence failure must not pretend to roll back the external mutation",
+        );
+        // Normal dispatch emits each typed item followed by its legacy alias.
+        // Completion has already returned, so a missing terminal event must fail
+        // immediately rather than wait for an event that will never arrive.
+        let mut events = std::iter::from_fn(|| rx_event.try_recv().ok());
+        let started = events.next().expect("started item");
+        match started.msg {
+            EventMsg::ItemStarted(event) => match event.item {
+                TurnItem::FileChange(item) if apply_patch => assert_eq!(item.id, "mutation"),
+                TurnItem::CommandExecution(item) if !apply_patch => {
+                    assert_eq!(item.id, "mutation");
+                    assert_eq!(item.status, CommandExecutionStatus::InProgress);
+                }
+                item => panic!("unexpected started item: {item:?}"),
+            },
+            event => panic!("expected started item, got {event:?}"),
         }
+        match events.next().expect("legacy begin event").msg {
+            EventMsg::PatchApplyBegin(event) if apply_patch => {
+                assert_eq!(event.call_id, "mutation");
+            }
+            EventMsg::ExecCommandBegin(event) if !apply_patch => {
+                assert_eq!(event.call_id, "mutation");
+            }
+            event => panic!("unexpected legacy begin event: {event:?}"),
+        }
+        match events.next().expect("completed item").msg {
+            EventMsg::ItemCompleted(event) => match event.item {
+                TurnItem::FileChange(item) if apply_patch => {
+                    assert_eq!(item.id, "mutation");
+                    assert_eq!(item.status, Some(PatchApplyStatus::Completed));
+                }
+                TurnItem::CommandExecution(item) if !apply_patch => {
+                    assert_eq!(item.id, "mutation");
+                    assert_eq!(item.status, CommandExecutionStatus::Completed);
+                    assert_eq!(item.exit_code, Some(0));
+                }
+                item => panic!("unexpected terminal item: {item:?}"),
+            },
+            event => panic!("expected terminal item, got {event:?}"),
+        }
+        match events.next().expect("legacy completion event").msg {
+            EventMsg::PatchApplyEnd(event) if apply_patch => {
+                assert_eq!(event.call_id, "mutation");
+                assert!(event.success);
+                assert_eq!(event.status, PatchApplyStatus::Completed);
+            }
+            EventMsg::ExecCommandEnd(event) if !apply_patch => {
+                assert_eq!(event.call_id, "mutation");
+                assert_eq!(event.status, ExecCommandStatus::Completed);
+                assert_eq!(event.exit_code, 0);
+            }
+            event => panic!("unexpected legacy completion event: {event:?}"),
+        }
+        assert_eq!(tracker.lock().await.current_mutation_revision(), 1);
+        if apply_patch {
+            let diff = events.next().expect("committed patch diff");
+            assert!(
+                matches!(diff.msg, EventMsg::TurnDiff(TurnDiffEvent { unified_diff })
+                if unified_diff.contains("changed.txt") && unified_diff.contains("+after"))
+            );
+        }
+        assert!(
+            events.next().is_none(),
+            "completion must be emitted exactly once"
+        );
+        let history = session.clone_history().await;
+        let live = serde_json::to_value(history.tool_history_state()).unwrap();
+        assert_eq!(
+            live["workspace_evidence"]["earlier-read"]["source_dependencies_current"],
+            false
+        );
+
+        tokio::fs::remove_file(&history_directory)
+            .await
+            .expect("remove failure fixture");
+        tokio::fs::rename(&saved_history, &history_directory)
+            .await
+            .expect("restore baseline");
+        session
+            .flush_tool_history_persistence()
+            .await
+            .expect("explicit checkpoint recovers");
+        let (reloaded, warning) = crate::tool_history::load_tool_history_state(
+            codex_home,
+            &session.thread_id.to_string(),
+        )
+        .await
+        .into_state_and_warning();
+        assert_eq!(warning, None);
+        let reloaded = serde_json::to_value(reloaded).unwrap();
+        assert_eq!(
+            reloaded["workspace_evidence"]["earlier-read"]["source_dependencies_current"],
+            false
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_history_failure_returns_fatal_after_shell_mutation_completion() {
+        assert_tool_history_failure_preserves_mutation_completion(false).await;
+    }
+
+    #[tokio::test]
+    async fn tool_history_failure_returns_fatal_after_committed_patch_diff() {
+        assert_tool_history_failure_preserves_mutation_completion(true).await;
     }
 }

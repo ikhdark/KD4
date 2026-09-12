@@ -119,6 +119,17 @@ impl McpProcess {
         self.send_request("ping", None).await
     }
 
+    pub async fn cancel_tool_call(&mut self, request_id: i64) -> anyhow::Result<()> {
+        self.send_jsonrpc_message(JsonRpcMessage::Notification(JsonRpcNotification {
+            jsonrpc: JsonRpcVersion2_0,
+            notification: CustomNotification::new(
+                "notifications/cancelled",
+                Some(json!({ "requestId": request_id })),
+            ),
+        }))
+        .await
+    }
+
     pub async fn wait_for_exit(&mut self) -> std::io::Result<ExitStatus> {
         self.process.wait().await
     }
@@ -241,6 +252,19 @@ impl McpProcess {
             jsonrpc: JsonRpcVersion2_0,
             id,
             result,
+        }))
+        .await
+    }
+
+    pub async fn send_error(
+        &mut self,
+        id: RequestId,
+        error: rmcp::model::ErrorData,
+    ) -> anyhow::Result<()> {
+        self.send_jsonrpc_message(JsonRpcMessage::Error(rmcp::model::JsonRpcError {
+            jsonrpc: JsonRpcVersion2_0,
+            id: Some(id),
+            error,
         }))
         .await
     }

@@ -121,230 +121,264 @@ impl Handler {
             )
             .await;
 
-        let explicit_cursor = args.cursor.is_some();
-        let parsed_cursor = args
-            .cursor
-            .as_deref()
-            .map(WakeEventId::parse)
-            .transpose()
-            .map_err(|error| {
-                FunctionCallError::RespondToModel(format!(
-                    "wait_agent cursor is invalid or no longer retained: {error}"
-                ))
-            })?;
-        let coordinator = session.services.agent_control.task_coordinator();
-        // Already-pending input does not need durable task-store state. Avoid
-        // delaying immediate mailbox or steering delivery on store startup.
-        if pending_activity.is_none() && coordinator.store().is_none() {
-            coordinator
-                .initialize_for_workspace_coordination(
-                    session.services.state_db.clone(),
-                    turn.config.sqlite_home.clone(),
-                    turn.config.model_provider_id.clone(),
-                    session.services.agent_control.session_id().to_string(),
-                )
-                .await
+        // Close the published item on ordinary validation, store and cancellation errors.
+        let result = async {
+            let explicit_cursor = args.cursor.is_some();
+            let parsed_cursor = args
+                .cursor
+                .as_deref()
+                .map(WakeEventId::parse)
+                .transpose()
                 .map_err(|error| {
                     FunctionCallError::RespondToModel(format!(
-                        "wait_agent could not initialize durable typed-task progress: {error}"
+                        "wait_agent cursor is invalid or no longer retained: {error}"
                     ))
                 })?;
-        }
-        let store = coordinator.store();
-        let root_session_id = coordinator.root_session_id();
-        let consuming_agent_path = turn
-            .session_source
-            .get_agent_path()
-            .unwrap_or_else(AgentPath::root)
-            .to_string();
-        let mut cursor = match (explicit_cursor, store.as_ref(), root_session_id.as_deref()) {
-            (false, Some(store), Some(root_session_id)) => store
-                .automatic_wake_cursor(root_session_id.to_string(), consuming_agent_path.clone())
-                .await
-                .map_err(|error| {
-                    FunctionCallError::RespondToModel(format!(
-                        "wait_agent could not initialize its automatic cursor: {error}"
-                    ))
-                })?,
-            _ => parsed_cursor,
-        };
-        let wait_started = Instant::now();
-        let deadline = explicit_timeout_ms
-            .map(|timeout_ms| wait_started + Duration::from_millis(timeout_ms as u64));
-        let mut maintenance_deadline = Some(wait_started + maintenance_interval);
-        let mut pending_activity = pending_activity;
-        let mut activity_open = true;
-        let mut unchanged_store_polls = 0_u32;
-        let mut drained_event_pages = 0_u32;
-        let mut nudged_assignment_ids = Vec::new();
-        let (outcome, wake_read, hydrated_assignments) = 'wait_owner: loop {
-            if pending_activity.is_none() {
-                let current = read_wake_events(store.as_ref(), root_session_id.as_deref(), cursor)
+            let coordinator = session.services.agent_control.task_coordinator();
+            // Already-pending input does not need durable task-store state. Avoid
+            // delaying immediate mailbox or steering delivery on store startup.
+            if pending_activity.is_none() && coordinator.store().is_none() {
+                coordinator
+                    .initialize_for_workspace_coordination(
+                        session.services.state_db.clone(),
+                        turn.config.sqlite_home.clone(),
+                        turn.config.model_provider_id.clone(),
+                        session.services.agent_control.session_id().to_string(),
+                    )
                     .await
                     .map_err(|error| {
                         FunctionCallError::RespondToModel(format!(
-                            "wait_agent could not inspect durable progress before waiting: {error}"
+                            "wait_agent could not initialize durable typed-task progress: {error}"
                         ))
                     })?;
-                if current.updated_agents.is_empty() {
-                    let owners = hydrate_wait_owner_assignments(
-                        coordinator,
-                        store.as_ref(),
-                        root_session_id.as_deref(),
-                        &consuming_agent_path,
-                    )
+            }
+            let store = coordinator.store();
+            let root_session_id = coordinator.root_session_id();
+            let consuming_agent_path = turn
+                .session_source
+                .get_agent_path()
+                .unwrap_or_else(AgentPath::root)
+                .to_string();
+            let mut cursor = match (explicit_cursor, store.as_ref(), root_session_id.as_deref()) {
+                (false, Some(store), Some(root_session_id)) => store
+                    .automatic_wake_cursor(root_session_id.to_string(), consuming_agent_path.clone())
                     .await
-                    .map_err(FunctionCallError::RespondToModel)?;
-                    if wait_owner_is_settled(&owners) {
-                        break 'wait_owner (WaitOutcome::MaintenanceActivity, current, owners);
+                    .map_err(|error| {
+                        FunctionCallError::RespondToModel(format!(
+                            "wait_agent could not initialize its automatic cursor: {error}"
+                        ))
+                    })?,
+                _ => parsed_cursor,
+            };
+            let wait_started = Instant::now();
+            let deadline = explicit_timeout_ms
+                .map(|timeout_ms| wait_started + Duration::from_millis(timeout_ms as u64));
+            let mut maintenance_deadline = Some(wait_started + maintenance_interval);
+            let mut pending_activity = pending_activity;
+            let mut activity_open = true;
+            let mut unchanged_store_polls = 0_u32;
+            let mut drained_event_pages = 0_u32;
+            let mut nudged_assignment_ids = Vec::new();
+            let (outcome, wake_read, hydrated_assignments) = 'wait_owner: loop {
+                if pending_activity.is_none() {
+                    let current = read_wake_events(store.as_ref(), root_session_id.as_deref(), cursor)
+                        .await
+                        .map_err(|error| {
+                            FunctionCallError::RespondToModel(format!(
+                                "wait_agent could not inspect durable progress before waiting: {error}"
+                            ))
+                        })?;
+                    if current.updated_agents.is_empty() {
+                        let owners = hydrate_wait_owner_assignments(
+                            coordinator,
+                            store.as_ref(),
+                            root_session_id.as_deref(),
+                            &consuming_agent_path,
+                        )
+                        .await
+                        .map_err(FunctionCallError::RespondToModel)?;
+                        if wait_owner_is_settled(&owners) {
+                            break 'wait_owner (WaitOutcome::MaintenanceActivity, current, owners);
+                        }
                     }
                 }
-            }
-            let boundary_deadline = earliest_deadline(deadline, maintenance_deadline);
-            let wait = wait_for_activity(
-                &mut activity_rx,
-                &mut activity_open,
-                pending_activity.take(),
-                boundary_deadline,
-                store.as_ref(),
-                root_session_id.as_deref(),
-                cursor,
-            );
-            let (mut outcome, mut wake_read) = tokio::select! {
-                biased;
-                _ = cancellation_token.cancelled() => {
+                let boundary_deadline = earliest_deadline(deadline, maintenance_deadline);
+                let wait = wait_for_activity(
+                    &mut activity_rx,
+                    &mut activity_open,
+                    pending_activity.take(),
+                    boundary_deadline,
+                    store.as_ref(),
+                    root_session_id.as_deref(),
+                    cursor,
+                );
+                let (mut outcome, mut wake_read) = tokio::select! {
+                    biased;
+                    _ = cancellation_token.cancelled() => {
+                        turn.turn_timing_state
+                            .record_internally_drained_waits(drained_event_pages);
+                        return Err(FunctionCallError::RespondToModel(
+                            "wait_agent cancelled".to_string(),
+                        ));
+                    }
+                    result = wait => result,
+                }
+                .map_err(|error| {
                     turn.turn_timing_state
                         .record_internally_drained_waits(drained_event_pages);
+                    FunctionCallError::RespondToModel(format!(
+                        "wait_agent could not read durable typed-task progress: {error}"
+                    ))
+                })?;
+
+                if outcome == WaitOutcome::BoundaryElapsed {
+                    let now = Instant::now();
+                    let maintenance_due = maintenance_deadline.is_some_and(|value| now >= value);
+                    let explicit_deadline_due = deadline.is_some_and(|value| now >= value);
+                    if maintenance_due && !explicit_deadline_due {
+                        let maintenance = async {
+                            let nudged = if !turn.session_source.is_non_root_agent() {
+                                nudge_stalled_assignments(
+                                    session.as_ref(),
+                                    turn.as_ref(),
+                                    store.as_ref(),
+                                    root_session_id.as_deref(),
+                                )
+                                .await
+                            } else {
+                                Vec::new()
+                            };
+                            let read = read_wake_events(
+                                store.as_ref(),
+                                root_session_id.as_deref(),
+                                cursor,
+                            )
+                            .await;
+                            (nudged, read)
+                        };
+                        let completed = tokio::select! {
+                            biased;
+                            _ = cancellation_token.cancelled() => {
+                                turn.turn_timing_state.record_internally_drained_waits(drained_event_pages);
+                                return Err(FunctionCallError::RespondToModel("wait_agent cancelled".to_string()));
+                            }
+                            _ = async {
+                                match deadline {
+                                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                                    None => std::future::pending::<()>().await,
+                                }
+                            } => None,
+                            completed = maintenance => Some(completed),
+                        };
+                        if let Some((nudged, read)) = completed {
+                            nudged_assignment_ids = nudged;
+                            maintenance_deadline = if maintenance_interval.is_zero() {
+                                None
+                            } else {
+                                Some(now + maintenance_interval)
+                            };
+                            wake_read = read.map_err(|error| {
+                                turn.turn_timing_state.record_internally_drained_waits(drained_event_pages);
+                                FunctionCallError::RespondToModel(format!(
+                                    "wait_agent could not reread durable typed-task progress after maintenance: {error}"
+                                ))
+                            })?;
+                            if wake_read.updated_agents.is_empty() {
+                                unchanged_store_polls = unchanged_store_polls.saturating_add(1);
+                            } else {
+                                outcome = WaitOutcome::DurableActivity;
+                            }
+                            if outcome == WaitOutcome::BoundaryElapsed && !nudged_assignment_ids.is_empty() {
+                                outcome = WaitOutcome::MaintenanceActivity;
+                            }
+                        } else {
+                            outcome = WaitOutcome::TimedOut;
+                            wake_read.timed_out = true;
+                        }
+                    }
+                    if outcome == WaitOutcome::BoundaryElapsed && explicit_deadline_due {
+                        outcome = WaitOutcome::TimedOut;
+                        wake_read.timed_out = true;
+                    }
+                    if outcome == WaitOutcome::BoundaryElapsed {
+                        continue;
+                    }
+                }
+
+                if !wake_read.updated_agents.is_empty() {
+                    prove_durable_forward_progress(cursor, &wake_read).map_err(|message| {
+                        turn.turn_timing_state
+                            .record_internally_drained_waits(drained_event_pages);
+                        FunctionCallError::RespondToModel(message)
+                    })?;
+                }
+
+                if wake_read.updated_agents.is_empty() {
+                    break (outcome, wake_read, HydratedAssignments::default());
+                }
+                let (Some(store), Some(root_session_id)) = (store.as_ref(), root_session_id.as_deref())
+                else {
+                    break (outcome, wake_read, HydratedAssignments::default());
+                };
+
+                if cancellation_token.is_cancelled() {
                     return Err(FunctionCallError::RespondToModel(
                         "wait_agent cancelled".to_string(),
                     ));
                 }
-                result = wait => result,
-            }
-            .map_err(|error| {
-                turn.turn_timing_state
-                    .record_internally_drained_waits(drained_event_pages);
-                FunctionCallError::RespondToModel(format!(
-                    "wait_agent could not read durable typed-task progress: {error}"
-                ))
-            })?;
-
-            if outcome == WaitOutcome::BoundaryElapsed {
-                let now = Instant::now();
-                let maintenance_due = maintenance_deadline.is_some_and(|value| now >= value);
-                let explicit_deadline_due = deadline.is_some_and(|value| now >= value);
-                if maintenance_due {
-                    if !turn.session_source.is_non_root_agent() {
-                        nudged_assignment_ids = nudge_stalled_assignments(
-                            session.as_ref(),
-                            turn.as_ref(),
-                            store.as_ref(),
-                            root_session_id.as_deref(),
-                        )
-                        .await;
-                    }
-                    maintenance_deadline = if maintenance_interval.is_zero() {
-                        None
-                    } else {
-                        Some(now + maintenance_interval)
-                    };
-                    wake_read = read_wake_events(
-                        store.as_ref(),
-                        root_session_id.as_deref(),
-                        cursor,
-                    )
+                let first_page = wake_read;
+                let first_assignment_ids = wake_assignment_ids(&first_page);
+                let first_hydration = hydrate_assignments(coordinator, &first_assignment_ids)
                     .await
                     .map_err(|error| {
-                        turn.turn_timing_state
-                            .record_internally_drained_waits(drained_event_pages);
                         FunctionCallError::RespondToModel(format!(
-                            "wait_agent could not reread durable typed-task progress after maintenance: {error}"
+                            "wait_agent could not hydrate its first durable event page: {error}"
                         ))
                     })?;
-                    if wake_read.updated_agents.is_empty() {
-                        unchanged_store_polls = unchanged_store_polls.saturating_add(1);
-                    } else {
-                        outcome = WaitOutcome::DurableActivity;
-                    }
-                    if outcome == WaitOutcome::BoundaryElapsed && !nudged_assignment_ids.is_empty()
-                    {
-                        outcome = WaitOutcome::MaintenanceActivity;
-                    }
-                }
-                if outcome == WaitOutcome::BoundaryElapsed && explicit_deadline_due {
-                    outcome = WaitOutcome::TimedOut;
-                    wake_read.timed_out = true;
-                }
-                if outcome == WaitOutcome::BoundaryElapsed {
-                    continue;
-                }
-            }
+                let mut drain = WakeEventDrain::new(cursor, first_page.clone(), first_hydration)
+                    .map_err(FunctionCallError::RespondToModel)?;
+                let mut drain_outcome = outcome;
+                let mut fail_open = false;
 
-            if !wake_read.updated_agents.is_empty() {
-                prove_durable_forward_progress(cursor, &wake_read).map_err(|message| {
-                    turn.turn_timing_state
-                        .record_internally_drained_waits(drained_event_pages);
-                    FunctionCallError::RespondToModel(message)
-                })?;
-            }
-
-            if wake_read.updated_agents.is_empty() {
-                break (outcome, wake_read, HydratedAssignments::default());
-            }
-            let (Some(store), Some(root_session_id)) = (store.as_ref(), root_session_id.as_deref())
-            else {
-                break (outcome, wake_read, HydratedAssignments::default());
-            };
-
-            if cancellation_token.is_cancelled() {
-                return Err(FunctionCallError::RespondToModel(
-                    "wait_agent cancelled".to_string(),
-                ));
-            }
-            let first_page = wake_read;
-            let first_assignment_ids = wake_assignment_ids(&first_page);
-            let first_hydration = hydrate_assignments(coordinator, &first_assignment_ids)
-                .await
-                .map_err(|error| {
-                    FunctionCallError::RespondToModel(format!(
-                        "wait_agent could not hydrate its first durable event page: {error}"
-                    ))
-                })?;
-            let mut drain = WakeEventDrain::new(cursor, first_page.clone(), first_hydration)
-                .map_err(FunctionCallError::RespondToModel)?;
-            let mut drain_outcome = outcome;
-            let mut fail_open = false;
-
-            while drain.should_continue() {
-                let Some(next_cursor) = drain.cursor() else {
-                    fail_open = true;
-                    break;
-                };
-                let next_page = match read_next_wake_page(
-                    store,
-                    root_session_id,
-                    next_cursor,
-                    &mut activity_rx,
-                    &mut activity_open,
-                    &cancellation_token,
-                )
-                .await
-                {
-                    BacklogPageRead::Page(Ok(page)) => page,
-                    BacklogPageRead::Page(Err(error)) => {
-                        tracing::debug!(
-                            %error,
-                            cursor = %next_cursor,
-                            "wait_agent backlog drain failed open after a durable page read error"
-                        );
+                while drain.should_continue() {
+                    let Some(next_cursor) = drain.cursor() else {
                         fail_open = true;
                         break;
-                    }
-                    BacklogPageRead::Activity(activity) => {
-                        drain_outcome = activity;
-                        break;
-                    }
-                    BacklogPageRead::Cancelled => {
+                    };
+                    let next_page = match read_next_wake_page(
+                        store,
+                        root_session_id,
+                        next_cursor,
+                        &mut activity_rx,
+                        &mut activity_open,
+                        &cancellation_token,
+                    )
+                    .await
+                    {
+                        BacklogPageRead::Page(Ok(page)) => page,
+                        BacklogPageRead::Page(Err(error)) => {
+                            tracing::debug!(
+                                %error,
+                                cursor = %next_cursor,
+                                "wait_agent backlog drain failed open after a durable page read error"
+                            );
+                            fail_open = true;
+                            break;
+                        }
+                        BacklogPageRead::Activity(activity) => {
+                            drain_outcome = activity;
+                            break;
+                        }
+                        BacklogPageRead::Cancelled => {
+                            turn.turn_timing_state.record_internally_drained_waits(
+                                u32::try_from(drain.internally_drained_pages()).unwrap_or(u32::MAX),
+                            );
+                            return Err(FunctionCallError::RespondToModel(
+                                "wait_agent cancelled".to_string(),
+                            ));
+                        }
+                    };
+                    if cancellation_token.is_cancelled() {
                         turn.turn_timing_state.record_internally_drained_waits(
                             u32::try_from(drain.internally_drained_pages()).unwrap_or(u32::MAX),
                         );
@@ -352,278 +386,273 @@ impl Handler {
                             "wait_agent cancelled".to_string(),
                         ));
                     }
-                };
-                if cancellation_token.is_cancelled() {
-                    turn.turn_timing_state.record_internally_drained_waits(
-                        u32::try_from(drain.internally_drained_pages()).unwrap_or(u32::MAX),
-                    );
-                    return Err(FunctionCallError::RespondToModel(
-                        "wait_agent cancelled".to_string(),
-                    ));
-                }
-                if let Some(activity) = take_pending_activity(&mut activity_rx, &mut activity_open)
-                {
-                    drain_outcome = activity;
-                    break;
-                }
-
-                let assignment_ids = wake_assignment_ids(&next_page);
-                let hydration = match hydrate_assignments(coordinator, &assignment_ids).await {
-                    Ok(hydration) => hydration,
-                    Err(error) => {
-                        tracing::debug!(
-                            %error,
-                            cursor = %next_cursor,
-                            "wait_agent backlog drain failed open after assignment hydration failed"
-                        );
-                        fail_open = true;
+                    if let Some(activity) = take_pending_activity(&mut activity_rx, &mut activity_open)
+                    {
+                        drain_outcome = activity;
                         break;
                     }
-                };
-                if cancellation_token.is_cancelled() {
-                    turn.turn_timing_state.record_internally_drained_waits(
-                        u32::try_from(drain.internally_drained_pages()).unwrap_or(u32::MAX),
-                    );
-                    return Err(FunctionCallError::RespondToModel(
-                        "wait_agent cancelled".to_string(),
-                    ));
-                }
-                if let Some(activity) = take_pending_activity(&mut activity_rx, &mut activity_open)
-                {
-                    drain_outcome = activity;
-                    break;
-                }
-                match drain.push(next_page, hydration) {
-                    WakePageAcceptance::Accepted => {}
-                    WakePageAcceptance::AggregateBoundReached => break,
-                    WakePageAcceptance::FailOpen(message) => {
-                        tracing::debug!(
-                            reason = message,
-                            cursor = %next_cursor,
-                            "wait_agent backlog drain could not prove a safe continuation"
+
+                    let assignment_ids = wake_assignment_ids(&next_page);
+                    let hydration = match hydrate_assignments(coordinator, &assignment_ids).await {
+                        Ok(hydration) => hydration,
+                        Err(error) => {
+                            tracing::debug!(
+                                %error,
+                                cursor = %next_cursor,
+                                "wait_agent backlog drain failed open after assignment hydration failed"
+                            );
+                            fail_open = true;
+                            break;
+                        }
+                    };
+                    if cancellation_token.is_cancelled() {
+                        turn.turn_timing_state.record_internally_drained_waits(
+                            u32::try_from(drain.internally_drained_pages()).unwrap_or(u32::MAX),
                         );
-                        fail_open = true;
+                        return Err(FunctionCallError::RespondToModel(
+                            "wait_agent cancelled".to_string(),
+                        ));
+                    }
+                    if let Some(activity) = take_pending_activity(&mut activity_rx, &mut activity_open)
+                    {
+                        drain_outcome = activity;
                         break;
                     }
+                    match drain.push(next_page, hydration) {
+                        WakePageAcceptance::Accepted => {}
+                        WakePageAcceptance::AggregateBoundReached => break,
+                        WakePageAcceptance::FailOpen(message) => {
+                            tracing::debug!(
+                                reason = message,
+                                cursor = %next_cursor,
+                                "wait_agent backlog drain could not prove a safe continuation"
+                            );
+                            fail_open = true;
+                            break;
+                        }
+                    }
                 }
-            }
 
-            if !fail_open && drain_outcome == WaitOutcome::DurableActivity {
-                if cancellation_token.is_cancelled() {
-                    turn.turn_timing_state.record_internally_drained_waits(
-                        u32::try_from(drain.internally_drained_pages()).unwrap_or(u32::MAX),
-                    );
-                    return Err(FunctionCallError::RespondToModel(
-                        "wait_agent cancelled".to_string(),
-                    ));
-                }
-                if let Some(activity) = take_pending_activity(&mut activity_rx, &mut activity_open)
-                {
-                    drain_outcome = activity;
-                } else if drain.internally_drained_pages() > 0 {
-                    let assignment_ids = drain.assignment_ids();
-                    match hydrate_assignments(coordinator, &assignment_ids).await {
-                        Ok(hydration) => {
-                            if let Err(message) = drain.replace_if_same_revisions(hydration) {
+                if !fail_open && drain_outcome == WaitOutcome::DurableActivity {
+                    if cancellation_token.is_cancelled() {
+                        turn.turn_timing_state.record_internally_drained_waits(
+                            u32::try_from(drain.internally_drained_pages()).unwrap_or(u32::MAX),
+                        );
+                        return Err(FunctionCallError::RespondToModel(
+                            "wait_agent cancelled".to_string(),
+                        ));
+                    }
+                    if let Some(activity) = take_pending_activity(&mut activity_rx, &mut activity_open)
+                    {
+                        drain_outcome = activity;
+                    } else if drain.internally_drained_pages() > 0 {
+                        let assignment_ids = drain.assignment_ids();
+                        match hydrate_assignments(coordinator, &assignment_ids).await {
+                            Ok(hydration) => {
+                                if let Err(message) = drain.replace_if_same_revisions(hydration) {
+                                    tracing::debug!(
+                                        reason = message,
+                                        "wait_agent backlog drain failed open at its final task revision fence"
+                                    );
+                                    fail_open = true;
+                                }
+                            }
+                            Err(error) => {
                                 tracing::debug!(
-                                    reason = message,
-                                    "wait_agent backlog drain failed open at its final task revision fence"
+                                    %error,
+                                    "wait_agent backlog drain failed open at its final task hydration fence"
                                 );
                                 fail_open = true;
                             }
                         }
-                        Err(error) => {
-                            tracing::debug!(
-                                %error,
-                                "wait_agent backlog drain failed open at its final task hydration fence"
-                            );
-                            fail_open = true;
-                        }
                     }
                 }
-            }
 
-            if fail_open {
-                let hydration = hydrate_assignments(coordinator, &first_assignment_ids)
-                    .await
-                    .map_err(|error| {
-                        FunctionCallError::RespondToModel(format!(
-                            "wait_agent could not fail open to its first durable event page: {error}"
-                        ))
-                    })?;
-                drain = WakeEventDrain::new(cursor, first_page, hydration)
-                    .map_err(FunctionCallError::RespondToModel)?;
-            }
+                if fail_open {
+                    let hydration = hydrate_assignments(coordinator, &first_assignment_ids)
+                        .await
+                        .map_err(|error| {
+                            FunctionCallError::RespondToModel(format!(
+                                "wait_agent could not fail open to its first durable event page: {error}"
+                            ))
+                        })?;
+                    drain = WakeEventDrain::new(cursor, first_page, hydration)
+                        .map_err(FunctionCallError::RespondToModel)?;
+                }
 
-            let next_cursor = drain.cursor().ok_or_else(|| {
-                FunctionCallError::RespondToModel(
-                    "wait_agent durable wake omitted its cursor revision".to_string(),
-                )
-            })?;
-            if !explicit_cursor {
-                let advanced = store
-                    .compare_and_swap_automatic_wake_cursor(
-                        root_session_id.to_string(),
-                        consuming_agent_path.clone(),
-                        cursor,
-                        next_cursor,
+                let next_cursor = drain.cursor().ok_or_else(|| {
+                    FunctionCallError::RespondToModel(
+                        "wait_agent durable wake omitted its cursor revision".to_string(),
                     )
-                    .await
-                    .map_err(|error| {
-                        FunctionCallError::RespondToModel(format!(
-                            "wait_agent could not advance its automatic cursor: {error}"
-                        ))
-                    })?;
-                if !advanced {
-                    cursor = store
-                        .automatic_wake_cursor(
+                })?;
+                if !explicit_cursor {
+                    let advanced = store
+                        .compare_and_swap_automatic_wake_cursor(
                             root_session_id.to_string(),
                             consuming_agent_path.clone(),
+                            cursor,
+                            next_cursor,
                         )
                         .await
                         .map_err(|error| {
                             FunctionCallError::RespondToModel(format!(
-                                "wait_agent could not reread its automatic cursor: {error}"
+                                "wait_agent could not advance its automatic cursor: {error}"
                             ))
                         })?;
-                    continue 'wait_owner;
+                    if !advanced {
+                        cursor = store
+                            .automatic_wake_cursor(
+                                root_session_id.to_string(),
+                                consuming_agent_path.clone(),
+                            )
+                            .await
+                            .map_err(|error| {
+                                FunctionCallError::RespondToModel(format!(
+                                    "wait_agent could not reread its automatic cursor: {error}"
+                                ))
+                            })?;
+                        continue 'wait_owner;
+                    }
                 }
-            }
-            drained_event_pages =
-                u32::try_from(drain.internally_drained_pages()).unwrap_or(u32::MAX);
-            let (wake_read, hydrated_assignments) = drain.finish();
-            break (drain_outcome, wake_read, hydrated_assignments);
-        };
-        turn.turn_timing_state
-            .record_internally_drained_waits(drained_event_pages);
-        let mut typed_deltas = Vec::with_capacity(wake_read.updated_agents.len());
-        let owner_assignments = hydrate_wait_owner_assignments(
-            coordinator,
-            store.as_ref(),
-            root_session_id.as_deref(),
-            &consuming_agent_path,
-        )
-        .await
-        .map_err(FunctionCallError::RespondToModel)?;
-        let owner_states = authoritative_wait_states(&owner_assignments).ok_or_else(|| {
-            FunctionCallError::RespondToModel(
-                "wait_agent could not bind its authoritative wait to exact task revisions"
-                    .to_string(),
+                drained_event_pages =
+                    u32::try_from(drain.internally_drained_pages()).unwrap_or(u32::MAX);
+                let (wake_read, hydrated_assignments) = drain.finish();
+                break (drain_outcome, wake_read, hydrated_assignments);
+            };
+            turn.turn_timing_state
+                .record_internally_drained_waits(drained_event_pages);
+            let mut typed_deltas = Vec::with_capacity(wake_read.updated_agents.len());
+            let owner_assignments = hydrate_wait_owner_assignments(
+                coordinator,
+                store.as_ref(),
+                root_session_id.as_deref(),
+                &consuming_agent_path,
             )
-        })?;
-        for event in &wake_read.updated_agents {
-            let task = &hydrated_assignments
-                .tasks
-                .get(&event.assignment_id)
-                .ok_or_else(|| {
-                    FunctionCallError::RespondToModel(format!(
-                        "wait_agent lost hydrated assignment {}",
-                        event.assignment_id
-                    ))
-                })?;
-            coordinator.record_first_meaningful_progress_once(
-                event.attempt_id,
-                event.reason,
-                &task.assignment.created_at,
-                &event.created_at,
-                &turn.session_telemetry,
-            );
-            if task.receipt.is_some() {
-                coordinator
-                    .record_root_receipt_hydration_once(event.attempt_id, &turn.session_telemetry);
-            }
-            typed_deltas.push(json!({
-                "event_id": event.event_id,
-                "assignment_id": event.assignment_id,
-                "attempt_id": event.attempt_id,
-                "reason": event.reason,
-                "summary": event.summary,
-                "created_at": event.created_at,
-                "epoch": task.workspace_status.epoch,
-                "gates": task.gates,
-                "receipt": durable_receipt_pointer(
-                    event.assignment_id.to_string(),
-                    task.receipt.is_some(),
-                ),
-                "last_progress_at": task.workspace_status.last_progress_at,
-                "lease_state": task.workspace_status.lease_state,
-                "stale_reason": task.workspace_status.stale_reason,
-                "next_required_action": task.workspace_status.next_required_action,
-                "nudge_sent_at": task.workspace_status.nudge_sent_at,
-            }));
-        }
-        let mut result = WaitAgentResult::from_outcome(
-            outcome,
-            wake_read
-                .latest_event_id
-                .map(|event_id| event_id.to_string()),
-            typed_deltas,
-            wake_read.truncated_count,
-            nudged_assignment_ids,
-        );
-        result.authoritative_wait_signal = authoritative_wait_signal(
-            root_session_id.as_deref(),
-            &consuming_agent_path,
-            &owner_states,
-            Some(&result.message),
-        );
-        if drained_event_pages > 0 {
-            let resource_identity_hash = sha256_text(&format!(
-                "agent-event-wait\0{}\0{}",
-                root_session_id.as_deref().unwrap_or_default(),
-                consuming_agent_path,
-            ));
-            let state_revision = sha256_text(
-                &json!({
-                    "cursor": &result.cursor,
-                    "typed_deltas": &result.typed_deltas,
-                    "truncated_count": result.truncated_count,
-                    "nudged_assignment_ids": &result.nudged_assignment_ids,
-                    "timed_out": result.timed_out,
-                })
-                .to_string(),
-            );
-            result.deterministic_continuation_receipts.push(
-                TurnTimingDeterministicContinuationReceipt {
-                    class: DeterministicContinuationClass::AgentEventWait,
-                    wire_identity: String::new(),
-                    resource_identity_hash,
-                    state_revision,
-                    host_action: DeterministicContinuationHostAction::AwaitStateChange,
-                    action_bounds_hash: sha256_text(
-                        &json!({
-                            "cursor": &result.cursor,
-                            "internally_drained_event_pages": drained_event_pages,
-                            "max_event_pages": MAX_WAKE_EVENT_DRAIN_PAGES,
-                            "max_events": MAX_WAKE_EVENTS_PER_ROOT,
-                            "termination": "backlog-exhausted-or-revision-change-or-input-or-terminal-or-error-or-aggregate-bound-or-cancellation",
-                        })
+            .await
+            .map_err(FunctionCallError::RespondToModel)?;
+            let owner_states = authoritative_wait_states(&owner_assignments).ok_or_else(|| {
+                FunctionCallError::RespondToModel(
+                    "wait_agent could not bind its authoritative wait to exact task revisions"
                         .to_string(),
+                )
+            })?;
+            for event in &wake_read.updated_agents {
+                let task = &hydrated_assignments
+                    .tasks
+                    .get(&event.assignment_id)
+                    .ok_or_else(|| {
+                        FunctionCallError::RespondToModel(format!(
+                            "wait_agent lost hydrated assignment {}",
+                            event.assignment_id
+                        ))
+                    })?;
+                coordinator.record_first_meaningful_progress_once(
+                    event.attempt_id,
+                    event.reason,
+                    &task.assignment.created_at,
+                    &event.created_at,
+                    &turn.session_telemetry,
+                );
+                if task.receipt.is_some() {
+                    coordinator
+                        .record_root_receipt_hydration_once(event.attempt_id, &turn.session_telemetry);
+                }
+                typed_deltas.push(json!({
+                    "event_id": event.event_id,
+                    "assignment_id": event.assignment_id,
+                    "attempt_id": event.attempt_id,
+                    "reason": event.reason,
+                    "summary": event.summary,
+                    "created_at": event.created_at,
+                    "epoch": task.workspace_status.epoch,
+                    "gates": task.gates,
+                    "receipt": durable_receipt_pointer(
+                        event.assignment_id.to_string(),
+                        task.receipt.is_some(),
                     ),
-                    suppressed_continuation_count: drained_event_pages,
-                },
+                    "last_progress_at": task.workspace_status.last_progress_at,
+                    "lease_state": task.workspace_status.lease_state,
+                    "stale_reason": task.workspace_status.stale_reason,
+                    "next_required_action": task.workspace_status.next_required_action,
+                    "nudge_sent_at": task.workspace_status.nudge_sent_at,
+                }));
+            }
+            let mut result = WaitAgentResult::from_outcome(
+                outcome,
+                wake_read
+                    .latest_event_id
+                    .map(|event_id| event_id.to_string()),
+                typed_deltas,
+                wake_read.truncated_count,
+                nudged_assignment_ids,
             );
+            result.authoritative_wait_signal = authoritative_wait_signal(
+                root_session_id.as_deref(),
+                &consuming_agent_path,
+                &owner_states,
+                Some(&result.message),
+            );
+            if drained_event_pages > 0 {
+                let resource_identity_hash = sha256_text(&format!(
+                    "agent-event-wait\0{}\0{}",
+                    root_session_id.as_deref().unwrap_or_default(),
+                    consuming_agent_path,
+                ));
+                let state_revision = sha256_text(
+                    &json!({
+                        "cursor": &result.cursor,
+                        "typed_deltas": &result.typed_deltas,
+                        "truncated_count": result.truncated_count,
+                        "nudged_assignment_ids": &result.nudged_assignment_ids,
+                        "timed_out": result.timed_out,
+                    })
+                    .to_string(),
+                );
+                result.deterministic_continuation_receipts.push(
+                    TurnTimingDeterministicContinuationReceipt {
+                        class: DeterministicContinuationClass::AgentEventWait,
+                        wire_identity: String::new(),
+                        resource_identity_hash,
+                        state_revision,
+                        host_action: DeterministicContinuationHostAction::AwaitStateChange,
+                        action_bounds_hash: sha256_text(
+                            &json!({
+                                "cursor": &result.cursor,
+                                "internally_drained_event_pages": drained_event_pages,
+                                "max_event_pages": MAX_WAKE_EVENT_DRAIN_PAGES,
+                                "max_events": MAX_WAKE_EVENTS_PER_ROOT,
+                                "termination": "backlog-exhausted-or-revision-change-or-input-or-terminal-or-error-or-aggregate-bound-or-cancellation",
+                            })
+                            .to_string(),
+                        ),
+                        suppressed_continuation_count: drained_event_pages,
+                    },
+                );
+            }
+            turn.session_telemetry.counter(
+                "codex.multi_agent.root_wait",
+                1,
+                &[(
+                    "outcome",
+                    match outcome {
+                        WaitOutcome::MailboxActivity => "mailbox",
+                        WaitOutcome::DurableActivity => "durable_progress",
+                        WaitOutcome::MaintenanceActivity => "maintenance_activity",
+                        WaitOutcome::Steered => "steered",
+                        WaitOutcome::BoundaryElapsed => "boundary_elapsed",
+                        WaitOutcome::TimedOut => "timed_out",
+                    },
+                )],
+            );
+            turn.session_telemetry.histogram(
+                "codex.multi_agent.root_wait_duration_ms",
+                i64::try_from(wait_started.elapsed().as_millis()).unwrap_or(i64::MAX),
+                &[],
+            );
+
+            Ok(boxed_tool_output(result))
         }
-        turn.session_telemetry.counter(
-            "codex.multi_agent.root_wait",
-            1,
-            &[(
-                "outcome",
-                match outcome {
-                    WaitOutcome::MailboxActivity => "mailbox",
-                    WaitOutcome::DurableActivity => "durable_progress",
-                    WaitOutcome::MaintenanceActivity => "maintenance_activity",
-                    WaitOutcome::Steered => "steered",
-                    WaitOutcome::BoundaryElapsed => "boundary_elapsed",
-                    WaitOutcome::TimedOut => "timed_out",
-                },
-            )],
-        );
-        turn.session_telemetry.histogram(
-            "codex.multi_agent.root_wait_duration_ms",
-            i64::try_from(wait_started.elapsed().as_millis()).unwrap_or(i64::MAX),
-            &[],
-        );
+        .await;
 
         session
             .emit_turn_item_completed(
@@ -631,7 +660,11 @@ impl Handler {
                 TurnItem::CollabAgentToolCall(CollabAgentToolCallItem {
                     id: call_id,
                     tool: CollabAgentTool::Wait,
-                    status: CollabAgentToolCallStatus::Completed,
+                    status: if result.is_ok() {
+                        CollabAgentToolCallStatus::Completed
+                    } else {
+                        CollabAgentToolCallStatus::Failed
+                    },
                     sender_thread_id: session.thread_id,
                     receiver_thread_ids: Vec::new(),
                     receiver_agents: Vec::new(),
@@ -643,7 +676,7 @@ impl Handler {
             )
             .await;
 
-        Ok(boxed_tool_output(result))
+        result
     }
 }
 
@@ -1611,6 +1644,15 @@ mod tests {
 }
 
 impl CoreToolRuntime for Handler {
+    fn waits_for_runtime_cancellation(&self) -> bool {
+        true
+    }
+
+    fn cancellation_requires_commit_barrier(&self) -> bool {
+        // Let cooperative cancellation close the published item before TurnAborted.
+        true
+    }
+
     fn matches_kind(&self, payload: &ToolPayload) -> bool {
         matches!(payload, ToolPayload::Function { .. })
     }

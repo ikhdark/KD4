@@ -306,12 +306,51 @@ impl ExecPolicyManager {
             sandbox_permissions,
             prefix_rule,
         } = req;
+        let command = command.to_vec();
+        let command_for_safety = command_for_safety.map(<[String]>::to_vec);
+        let exec_policy = self.current();
+        // PowerShell parsing can start a host and synchronously wait for its response.
+        // Keep fallback safety parsing and executable resolution in the same worker.
+        spawn_blocking(move || {
+            Self::classify_exec_approval_requirement(
+                exec_policy,
+                ExecApprovalRequest {
+                    command: &command,
+                    command_for_safety: command_for_safety.as_deref(),
+                    approval_policy,
+                    permission_profile,
+                    windows_sandbox_level,
+                    sandbox_permissions,
+                    prefix_rule,
+                },
+                shell_wrapper_is_owned,
+            )
+        })
+        .await
+        .unwrap_or_else(|error| ExecApprovalRequirement::Forbidden {
+            reason: format!("exec approval classification failed: {error}"),
+        })
+    }
+
+    fn classify_exec_approval_requirement(
+        exec_policy: Arc<Policy>,
+        req: ExecApprovalRequest<'_>,
+        shell_wrapper_is_owned: bool,
+    ) -> ExecApprovalRequirement {
+        let ExecApprovalRequest {
+            command,
+            command_for_safety,
+            approval_policy,
+            permission_profile,
+            windows_sandbox_level,
+            sandbox_permissions,
+            prefix_rule,
+        } = req;
         let policy_command = if shell_wrapper_is_owned {
             command_for_safety.unwrap_or(command)
         } else {
             command
         };
-        let exec_policy = self.current();
         let ExecPolicyCommands {
             commands,
             used_complex_parsing,

@@ -118,25 +118,37 @@ impl PendingThreadUnloads {
         }
     }
 
-    async fn admit_resume_connection(
+    async fn admit_resume_connection<'a>(
         &self,
         thread_state_manager: &ThreadStateManager,
         thread_id: ThreadId,
         connection_id: ConnectionId,
-    ) -> ThreadConnectionAdmission<()> {
+        thread_state: &'a Mutex<ThreadState>,
+        listener_generation: u64,
+    ) -> Result<
+        ThreadConnectionAdmission<tokio::sync::MutexGuard<'a, ThreadState>>,
+        JSONRPCErrorError,
+    > {
         let Ok(_admission_permit) = self.admission_gate.acquire().await else {
-            return ThreadConnectionAdmission::ThreadClosing;
+            return Ok(ThreadConnectionAdmission::ThreadClosing);
         };
         if self.state.lock().await.unloading.contains(&thread_id) {
-            return ThreadConnectionAdmission::ThreadClosing;
+            return Ok(ThreadConnectionAdmission::ThreadClosing);
+        }
+        // Match listener admission's gate -> thread-state lock order. Keep the
+        // generation guard through response enqueue, after releasing this gate.
+        let state = thread_state.lock().await;
+        if state.listener_generation != listener_generation || state.listener_command_tx().is_none()
+        {
+            return Err(resume_listener_changed_error(thread_id));
         }
         let added = thread_state_manager
             .try_add_connection_to_thread(thread_id, connection_id)
             .await;
         if added {
-            ThreadConnectionAdmission::Admitted(())
+            Ok(ThreadConnectionAdmission::Admitted(state))
         } else {
-            ThreadConnectionAdmission::ConnectionClosed
+            Ok(ThreadConnectionAdmission::ConnectionClosed)
         }
     }
 
@@ -588,7 +600,7 @@ pub(super) async fn ensure_listener_task_running(
     conversation: Arc<CodexThread>,
     thread_state: Arc<Mutex<ThreadState>>,
 ) -> Result<(), JSONRPCErrorError> {
-    let (cancel_tx, mut cancel_rx) = oneshot::channel();
+    let listener_cancellation = CancellationToken::new();
     let Some(mut unloading_state) = UnloadingState::new(
         &listener_task_context,
         conversation_id,
@@ -625,7 +637,7 @@ pub(super) async fn ensure_listener_task_running(
             return Ok(());
         }
         let (listener_command_rx, listener_generation) = thread_state.set_listener(
-            cancel_tx,
+            listener_cancellation.clone(),
             &conversation,
             watch_registration,
             thread_settings_baseline,
@@ -641,24 +653,25 @@ pub(super) async fn ensure_listener_task_running(
             .register_listener_command_tx(conversation_id, listener_command_tx);
         (listener_command_rx, listener_generation)
     };
-    unloading_state.register_listener(listener_generation).await;
+    let event_context = listener_task_context.clone();
     let ListenerTaskContext {
         outgoing,
         thread_manager,
         thread_state_manager,
         pending_thread_unloads,
         thread_watch_manager,
-        thread_list_state_permit,
-        fallback_model_provider,
         codex_home,
         ..
     } = listener_task_context;
     let outgoing_for_task = Arc::clone(&outgoing);
+    // Publication and spawn must have no intervening await: attachment cancellation
+    // must not leave a registered command sender without its owning listener task.
     tokio::spawn(async move {
+        unloading_state.register_listener(listener_generation).await;
         loop {
             tokio::select! {
                 biased;
-                _ = &mut cancel_rx => {
+                _ = listener_cancellation.cancelled() => {
                     // Listener was superseded or the thread is being torn down.
                     break;
                 }
@@ -688,49 +701,13 @@ pub(super) async fn ensure_listener_task_running(
                         }
                     };
 
-                    let (active_turn_id, raw_events_enabled) = {
-                        let mut state = thread_state.lock().await;
-                        state.track_current_turn_event(&event.id, &event.msg);
-                        (
-                            state.open_turn_id().map(str::to_owned),
-                            state.experimental_raw_events,
-                        )
-                    };
-                    release_turn_start_for_event(
-                        &thread_state_manager,
+                    process_thread_listener_event(
+                        &event_context,
                         conversation_id,
-                        &event.id,
-                        &event.msg,
-                        active_turn_id.as_deref(),
-                    )
-                    .await;
-                    if matches!(&event.msg, EventMsg::RawResponseItem(_)) && !raw_events_enabled {
-                        continue;
-                    }
-                    let (subscribed_connection_ids, experimental_api_connection_ids) =
-                        thread_state_manager
-                            .connection_ids_for_thread(conversation_id)
-                            .await;
-                    let thread_outgoing =
-                        ThreadScopedOutgoingMessageSender::new_with_experimental_api_connections(
-                        outgoing_for_task.clone(),
-                        subscribed_connection_ids,
-                        experimental_api_connection_ids,
-                        conversation_id,
-                    );
-
-                    apply_bespoke_event_handling(
+                        &conversation,
+                        &thread_state,
                         event,
-                        conversation_id,
-                        conversation.clone(),
-                        thread_manager.clone(),
-                        thread_outgoing,
-                        thread_state.clone(),
-                        thread_watch_manager.clone(),
-                        thread_list_state_permit.clone(),
-                        fallback_model_provider.clone(),
-                    )
-                    .await;
+                    ).await;
                 }
                 unloading_trigger = unloading_state.wait_for_unloading_trigger() => {
                     let Some(unloading_trigger) = unloading_trigger else {
@@ -787,6 +764,71 @@ pub(super) async fn wait_for_thread_shutdown(thread: &Arc<CodexThread>) -> Threa
     wait_for_thread_shutdown_with_timeout(thread, THREAD_SHUTDOWN_TIMEOUT).await
 }
 
+/// Processes one core event in the listener subscription order.
+async fn process_thread_listener_event(
+    context: &ListenerTaskContext,
+    conversation_id: ThreadId,
+    conversation: &Arc<CodexThread>,
+    thread_state: &Arc<Mutex<ThreadState>>,
+    event: codex_protocol::protocol::Event,
+) {
+    let (active_turn_id, raw_events_enabled, reconciled_wait_items) = {
+        let mut state = thread_state.lock().await;
+        let reconciled_wait_items =
+            state.track_current_turn_event_with_reconciled_wait_items(&event.id, &event.msg);
+        (
+            state.open_turn_id().map(str::to_owned),
+            state.experimental_raw_events,
+            reconciled_wait_items,
+        )
+    };
+    release_turn_start_for_event(
+        &context.thread_state_manager,
+        conversation_id,
+        &event.id,
+        &event.msg,
+        active_turn_id.as_deref(),
+    )
+    .await;
+    if matches!(&event.msg, EventMsg::RawResponseItem(_)) && !raw_events_enabled {
+        return;
+    }
+    let (subscribed_connection_ids, experimental_api_connection_ids) = context
+        .thread_state_manager
+        .connection_ids_for_thread(conversation_id)
+        .await;
+    let thread_outgoing = ThreadScopedOutgoingMessageSender::new_with_experimental_api_connections(
+        Arc::clone(&context.outgoing),
+        subscribed_connection_ids,
+        experimental_api_connection_ids,
+        conversation_id,
+    );
+    for change in reconciled_wait_items {
+        thread_outgoing
+            .send_server_notification(ServerNotification::ItemCompleted(
+                codex_app_server_protocol::ItemCompletedNotification {
+                    thread_id: conversation_id.to_string(),
+                    turn_id: change.turn_id,
+                    completed_at_ms: chrono::Utc::now().timestamp_millis(),
+                    item: change.item,
+                },
+            ))
+            .await;
+    }
+    apply_bespoke_event_handling(
+        event,
+        conversation_id,
+        Arc::clone(conversation),
+        Arc::clone(&context.thread_manager),
+        thread_outgoing,
+        Arc::clone(thread_state),
+        context.thread_watch_manager.clone(),
+        Arc::clone(&context.thread_list_state_permit),
+        context.fallback_model_provider.clone(),
+    )
+    .await;
+}
+
 async fn wait_for_thread_shutdown_with_timeout(
     thread: &Arc<CodexThread>,
     shutdown_timeout: Duration,
@@ -819,16 +861,31 @@ pub(super) async fn finish_thread_unload(
             .cancel_requests_for_thread(thread_id, /*error*/ None)
             .await;
         thread_state_manager.remove_thread_state(thread_id).await;
-        thread_watch_manager
-            .remove_thread(&thread_id.to_string())
-            .await;
-        if emit_thread_closed {
-            let notification = ThreadClosedNotification {
-                thread_id: thread_id.to_string(),
-            };
-            outgoing
-                .send_server_notification(ServerNotification::ThreadClosed(notification))
+        // Status removal updates local state before publication can suspend. Keep
+        // healthy status/closed ordering, but transport cannot retain unload authority.
+        let notifications = async {
+            thread_watch_manager
+                .remove_thread(&thread_id.to_string())
                 .await;
+            if emit_thread_closed {
+                let notification = ThreadClosedNotification {
+                    thread_id: thread_id.to_string(),
+                };
+                outgoing
+                    .send_server_notification(ServerNotification::ThreadClosed(notification))
+                    .await;
+            }
+        };
+        if tokio::time::timeout(
+            crate::outgoing_message::RESOURCE_DELIVERY_TIMEOUT,
+            notifications,
+        )
+        .await
+        .is_err()
+        {
+            warn!(
+                "timed out publishing final thread state for {thread_id}; releasing unload authority"
+            );
         }
         true
     } else {
@@ -836,9 +893,17 @@ pub(super) async fn finish_thread_unload(
             Err(_) => {
                 info!("thread {thread_id} was already removed before teardown finalized");
                 thread_state_manager.remove_thread_state(thread_id).await;
-                thread_watch_manager
-                    .remove_thread(&thread_id.to_string())
-                    .await;
+                if tokio::time::timeout(
+                    crate::outgoing_message::RESOURCE_DELIVERY_TIMEOUT,
+                    thread_watch_manager.remove_thread(&thread_id.to_string()),
+                )
+                .await
+                .is_err()
+                {
+                    warn!(
+                        "timed out publishing removed thread state for {thread_id}; releasing unload authority"
+                    );
+                }
                 true
             }
             Ok(_) => {
@@ -980,43 +1045,17 @@ async fn shutdown_idle_thread_for_resume_with_timeout(
     if !pending_thread_unloads.begin(thread_id).await {
         return IdleThreadShutdownResult::Closing;
     }
-    match wait_for_thread_shutdown_with_timeout(&thread, shutdown_timeout).await {
-        ThreadShutdownResult::Complete => {
-            if finish_thread_unload(
-                thread_manager,
-                outgoing,
-                pending_thread_unloads,
-                thread_state_manager,
-                thread_watch_manager,
-                thread_id,
-                &thread,
-                /*emit_thread_closed*/ false,
-            )
-            .await
-            {
-                IdleThreadShutdownResult::ReadyForColdResume
-            } else {
-                IdleThreadShutdownResult::Closing
-            }
-        }
-        ThreadShutdownResult::SubmitFailed => {
-            pending_thread_unloads.finish(&thread_id).await;
-            warn!("failed to submit Shutdown to thread {thread_id}");
-            IdleThreadShutdownResult::RejoinLoaded
-        }
-        ThreadShutdownResult::TimedOut => {
-            warn!("thread {thread_id} shutdown timed out; waiting for late termination");
-            outgoing
-                .cancel_requests_for_thread(thread_id, /*error*/ None)
-                .await;
-            let thread_manager = Arc::clone(thread_manager);
-            let outgoing = Arc::clone(outgoing);
-            let pending_thread_unloads = Arc::clone(pending_thread_unloads);
-            let thread_state_manager = thread_state_manager.clone();
-            let thread_watch_manager = thread_watch_manager.clone();
-            tokio::spawn(async move {
-                thread.wait_until_terminated().await;
-                finish_thread_unload(
+    let thread_manager = Arc::clone(thread_manager);
+    let outgoing = Arc::clone(outgoing);
+    let pending_thread_unloads = Arc::clone(pending_thread_unloads);
+    let thread_state_manager = thread_state_manager.clone();
+    let thread_watch_manager = thread_watch_manager.clone();
+    // Once the closing marker is published, shutdown and cleanup must outlive
+    // cancellation of the resume request that initiated them.
+    tokio::spawn(async move {
+        match wait_for_thread_shutdown_with_timeout(&thread, shutdown_timeout).await {
+            ThreadShutdownResult::Complete => {
+                if finish_thread_unload(
                     &thread_manager,
                     &outgoing,
                     &pending_thread_unloads,
@@ -1024,13 +1063,53 @@ async fn shutdown_idle_thread_for_resume_with_timeout(
                     &thread_watch_manager,
                     thread_id,
                     &thread,
-                    /*emit_thread_closed*/ true,
+                    /*emit_thread_closed*/ false,
                 )
-                .await;
-            });
-            IdleThreadShutdownResult::Closing
+                .await
+                {
+                    IdleThreadShutdownResult::ReadyForColdResume
+                } else {
+                    IdleThreadShutdownResult::Closing
+                }
+            }
+            ThreadShutdownResult::SubmitFailed => {
+                pending_thread_unloads.finish(&thread_id).await;
+                warn!("failed to submit Shutdown to thread {thread_id}");
+                IdleThreadShutdownResult::RejoinLoaded
+            }
+            ThreadShutdownResult::TimedOut => {
+                warn!("thread {thread_id} shutdown timed out; waiting for late termination");
+                outgoing
+                    .cancel_requests_for_thread(thread_id, /*error*/ None)
+                    .await;
+                let thread_manager = Arc::clone(&thread_manager);
+                let outgoing = Arc::clone(&outgoing);
+                let pending_thread_unloads = Arc::clone(&pending_thread_unloads);
+                let thread_state_manager = thread_state_manager.clone();
+                let thread_watch_manager = thread_watch_manager.clone();
+                tokio::spawn(async move {
+                    thread.wait_until_terminated().await;
+                    finish_thread_unload(
+                        &thread_manager,
+                        &outgoing,
+                        &pending_thread_unloads,
+                        &thread_state_manager,
+                        &thread_watch_manager,
+                        thread_id,
+                        &thread,
+                        /*emit_thread_closed*/ true,
+                    )
+                    .await;
+                });
+                IdleThreadShutdownResult::Closing
+            }
         }
-    }
+    })
+    .await
+    .unwrap_or_else(|error| {
+        warn!("idle-resume shutdown owner failed for thread {thread_id}: {error}");
+        IdleThreadShutdownResult::Closing
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1111,42 +1190,37 @@ pub(super) async fn handle_pending_thread_resume_request(
     pending_thread_unloads: &Arc<PendingThreadUnloads>,
     pending: crate::thread_state::PendingThreadResumeRequest,
 ) {
-    if let Some(history_items) = pending.history_items.as_deref() {
-        if !thread_state
-            .lock()
-            .await
-            .seed_resume_history_for_listener(history_items, pending.listener_generation)
+    let active_turn = {
+        let mut state = thread_state.lock().await;
+        if state.listener_generation != pending.listener_generation
+            || state.listener_command_tx().is_none()
         {
+            drop(state);
+            outgoing
+                .send_error(
+                    pending.request_id,
+                    resume_listener_changed_error(conversation_id),
+                )
+                .await;
+            return;
+        }
+        if let Some(history_items) = pending.history_items.as_deref() {
+            state.seed_resume_history_for_listener(history_items, pending.listener_generation);
+        } else if !state.resume_history_is_seeded_for_current_listener() {
+            drop(state);
             outgoing
                 .send_error(
                     pending.request_id,
                     internal_error(format!(
-                        "thread {conversation_id} listener changed while composing resume response"
+                        "thread {conversation_id} resume history is not initialized for the active listener"
                     )),
                 )
                 .await;
             return;
         }
-    } else if !thread_state
-        .lock()
-        .await
-        .resume_history_is_seeded_for_current_listener()
-    {
-        outgoing
-            .send_error(
-                pending.request_id,
-                internal_error(format!(
-                    "thread {conversation_id} resume history is not initialized for the active listener"
-                )),
-            )
-            .await;
-        return;
-    }
-    let history_items = pending.history_items.as_deref().unwrap_or(&[]);
-    let active_turn = {
-        let state = thread_state.lock().await;
         state.active_turn_snapshot()
     };
+    let history_items = pending.history_items.as_deref().unwrap_or(&[]);
     tracing::debug!(
         thread_id = %conversation_id,
         request_id = ?pending.request_id,
@@ -1214,32 +1288,6 @@ pub(super) async fn handle_pending_thread_resume_request(
         }
     }
 
-    match pending_thread_unloads
-        .admit_resume_connection(thread_state_manager, conversation_id, connection_id)
-        .await
-    {
-        ThreadConnectionAdmission::Admitted(()) => {}
-        ThreadConnectionAdmission::ThreadClosing => {
-            outgoing
-                .send_error(
-                    request_id,
-                    invalid_request(format!(
-                        "thread {conversation_id} is closing; retry thread/resume after the thread is closed"
-                    )),
-                )
-                .await;
-            return;
-        }
-        ThreadConnectionAdmission::ConnectionClosed => {
-            tracing::debug!(
-                thread_id = %conversation_id,
-                connection_id = ?connection_id,
-                "skipping running thread resume for closed connection"
-            );
-            return;
-        }
-    }
-
     let config_snapshot = pending.config_snapshot;
     let selected_environment =
         super::thread_processor::selected_thread_environment(&config_snapshot);
@@ -1281,9 +1329,36 @@ pub(super) async fn handle_pending_thread_resume_request(
         reasoning_effort,
         initial_turns_page,
     };
-    outgoing
-        .send_response_with_thread_originator(request_id, response, originator)
+    let committed = outgoing
+        .send_resume_response_with_commit(request_id, response, originator, async {
+            match pending_thread_unloads
+                .admit_resume_connection(
+                    thread_state_manager,
+                    conversation_id,
+                    connection_id,
+                    thread_state,
+                    pending.listener_generation,
+                )
+                .await?
+            {
+                ThreadConnectionAdmission::Admitted(guard) => Ok(Some(guard)),
+                ThreadConnectionAdmission::ThreadClosing => Err(invalid_request(format!(
+                    "thread {conversation_id} is closing; retry thread/resume after the thread is closed"
+                ))),
+                ThreadConnectionAdmission::ConnectionClosed => {
+                    tracing::debug!(
+                        thread_id = %conversation_id,
+                        connection_id = ?connection_id,
+                        "skipping running thread resume for closed connection"
+                    );
+                    Ok(None)
+                }
+            }
+        })
         .await;
+    if !committed {
+        return;
+    }
     // Match cold resume: metadata-only resume should attach the listener without
     // paying the cost of turn reconstruction for historical usage replay.
     if let Some(token_usage_turn_id) = token_usage_turn_id {
@@ -1323,6 +1398,12 @@ pub(super) async fn handle_pending_thread_resume_request(
     if pending.emit_thread_goal_update {
         conversation.emit_thread_idle_lifecycle_if_idle().await;
     }
+}
+
+fn resume_listener_changed_error(conversation_id: ThreadId) -> JSONRPCErrorError {
+    internal_error(format!(
+        "thread {conversation_id} listener changed while composing resume response"
+    ))
 }
 
 pub(super) async fn send_thread_goal_snapshot_notification(
@@ -1446,8 +1527,6 @@ mod tests {
     use super::*;
     use crate::outgoing_message::OutgoingEnvelope;
     use crate::outgoing_message::OutgoingMessage;
-    use core_test_support::load_default_config_for_test;
-    use tempfile::TempDir;
 
     #[tokio::test]
     async fn pre_start_error_releases_claim_but_in_turn_error_retains_it() {
@@ -1518,6 +1597,191 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn listener_abort_reconciles_wait_once_before_turn_completion() {
+        use codex_app_server_protocol::CollabAgentToolCallStatus as ApiStatus;
+        use codex_protocol::items::CollabAgentTool;
+        use codex_protocol::items::CollabAgentToolCallItem;
+        use codex_protocol::items::CollabAgentToolCallStatus;
+        use codex_protocol::items::TurnItem;
+        use codex_protocol::protocol::Event;
+        use codex_protocol::protocol::HasLegacyEvent;
+        use codex_protocol::protocol::ItemCompletedEvent;
+        use codex_protocol::protocol::ItemStartedEvent;
+        use codex_protocol::protocol::TurnAbortReason;
+        use codex_protocol::protocol::TurnAbortedEvent;
+        use codex_protocol::protocol::TurnStartedEvent;
+
+        for explicit_status in [
+            None,
+            Some(CollabAgentToolCallStatus::Failed),
+            Some(CollabAgentToolCallStatus::Completed),
+        ] {
+            let mut fixture = LateShutdownFixture::new().await;
+            let config = fixture.thread.config().await;
+            let context = ListenerTaskContext {
+                thread_manager: Arc::clone(&fixture.thread_manager),
+                thread_state_manager: fixture.thread_state_manager.clone(),
+                outgoing: Arc::clone(&fixture.outgoing),
+                pending_thread_unloads: Arc::clone(&fixture.pending_thread_unloads),
+                thread_watch_manager: fixture.thread_watch_manager.clone(),
+                thread_list_state_permit: Arc::new(Semaphore::new(1)),
+                fallback_model_provider: config.model_provider_id.clone(),
+                codex_home: config.codex_home.to_path_buf(),
+                skills_watcher: SkillsWatcher::new(
+                    fixture.thread_manager.skills_service(),
+                    Arc::clone(&fixture.outgoing),
+                ),
+            };
+            let connection_id = ConnectionId(1);
+            fixture
+                .thread_state_manager
+                .connection_initialized(connection_id, ConnectionCapabilities::default())
+                .await;
+            let state = fixture
+                .thread_state_manager
+                .try_ensure_connection_subscribed(fixture.thread_id, connection_id, false)
+                .await
+                .expect("subscribe normal outgoing client");
+            state.lock().await.seed_turn_index_from_history(&[]);
+            let wait_item = CollabAgentToolCallItem {
+                id: "wait-1".to_string(),
+                tool: CollabAgentTool::Wait,
+                status: CollabAgentToolCallStatus::InProgress,
+                sender_thread_id: fixture.thread_id,
+                receiver_thread_ids: vec![ThreadId::new()],
+                receiver_agents: Vec::new(),
+                prompt: None,
+                model: None,
+                reasoning_effort: None,
+                agents_states: HashMap::new(),
+            };
+            let start = ItemStartedEvent {
+                thread_id: fixture.thread_id,
+                turn_id: "turn-1".to_string(),
+                item: TurnItem::CollabAgentToolCall(wait_item.clone()),
+                started_at_ms: 10,
+            };
+            let mut events = vec![
+                EventMsg::TurnStarted(TurnStartedEvent {
+                    turn_id: "turn-1".to_string(),
+                    trace_id: None,
+                    started_at: Some(1),
+                    model_context_window: None,
+                    collaboration_mode_kind: Default::default(),
+                }),
+                EventMsg::ItemStarted(start.clone()),
+            ];
+            events.extend(start.as_legacy_events(false));
+            if let Some(status) = explicit_status {
+                let completion = ItemCompletedEvent {
+                    thread_id: fixture.thread_id,
+                    turn_id: "turn-1".to_string(),
+                    item: TurnItem::CollabAgentToolCall(CollabAgentToolCallItem {
+                        status,
+                        ..wait_item.clone()
+                    }),
+                    completed_at_ms: 20,
+                };
+                events.push(EventMsg::ItemCompleted(completion.clone()));
+                // Real compatibility conversion loses the Failed discriminator;
+                // it must neither replace modern history nor notify v2 twice.
+                events.extend(completion.as_legacy_events(false));
+            }
+            events.push(EventMsg::TurnAborted(TurnAbortedEvent {
+                turn_id: Some("turn-1".to_string()),
+                reason: TurnAbortReason::Interrupted,
+                completed_at: Some(2),
+                duration_ms: Some(1000),
+                timing: None,
+            }));
+            for msg in events {
+                process_thread_listener_event(
+                    &context,
+                    fixture.thread_id,
+                    &fixture.thread,
+                    &state,
+                    Event {
+                        id: "turn-1".to_string(),
+                        msg,
+                    },
+                )
+                .await;
+            }
+            let mut notifications = Vec::new();
+            while let Ok(envelope) = fixture.outgoing_rx.try_recv() {
+                let message = match envelope {
+                    OutgoingEnvelope::Broadcast { message }
+                    | OutgoingEnvelope::ToConnection { message, .. } => message,
+                };
+                if let OutgoingMessage::AppServerNotification(notification) = message {
+                    notifications.push(notification);
+                }
+            }
+            assert_eq!(
+                notifications.len(),
+                4,
+                "one start, one wait start/end and one terminal; explicit={explicit_status:?}"
+            );
+            assert!(
+                matches!(&notifications[0], ServerNotification::TurnStarted(turn) if turn.turn.id == "turn-1")
+            );
+            assert!(
+                matches!(&notifications[1], ServerNotification::ItemStarted(start) if start.item.id() == "wait-1")
+            );
+            let expected_status = if explicit_status == Some(CollabAgentToolCallStatus::Completed) {
+                ApiStatus::Completed
+            } else {
+                ApiStatus::Failed
+            };
+            let ServerNotification::ItemCompleted(completed) = &notifications[2] else {
+                panic!("wait must close before turn terminal");
+            };
+            assert_eq!(completed.thread_id, fixture.thread_id.to_string());
+            assert_eq!(completed.turn_id, "turn-1");
+            assert!(
+                matches!(&completed.item, ThreadItem::CollabAgentToolCall { id, status, receiver_thread_ids, agents_states, .. }
+                if id == "wait-1" && *status == expected_status
+                    && receiver_thread_ids == &wait_item.receiver_thread_ids.iter().map(ToString::to_string).collect::<Vec<_>>()
+                    && agents_states.is_empty())
+            );
+            assert!(
+                matches!(&notifications[3], ServerNotification::TurnCompleted(turn)
+                if turn.turn.id == "turn-1" && turn.turn.status == TurnStatus::Interrupted && turn.turn.error.is_none())
+            );
+            let state = state.lock().await;
+            let page = state
+                .indexed_items_page(
+                    None,
+                    None,
+                    10,
+                    codex_app_server_protocol::SortDirection::Asc,
+                )
+                .expect("valid page")
+                .expect("initialized history index");
+            assert_eq!(
+                page.items.len(),
+                1,
+                "legacy echoes must not create duplicate items"
+            );
+            assert!(
+                matches!(&page.items[0].item, ThreadItem::CollabAgentToolCall { id, status, .. } if id == "wait-1" && *status == expected_status)
+            );
+            drop(state);
+            fixture
+                .release_shutdown
+                .take()
+                .expect("terminal task release")
+                .send(())
+                .expect("release terminal task");
+            fixture
+                .thread
+                .shutdown_and_wait()
+                .await
+                .expect("normal thread cleanup");
+        }
+    }
+
     struct LateShutdownFixture {
         thread_manager: Arc<ThreadManager>,
         outgoing: Arc<OutgoingMessageSender>,
@@ -1529,27 +1793,23 @@ mod tests {
         thread: Arc<CodexThread>,
         original_thread_state: Arc<Mutex<ThreadState>>,
         release_shutdown: Option<oneshot::Sender<()>>,
-        _codex_home: TempDir,
+        _test: core_test_support::test_codex::TestCodex,
+        _server: wiremock::MockServer,
     }
 
     impl LateShutdownFixture {
         async fn new() -> Self {
-            let codex_home = TempDir::new().expect("create temp Codex home");
-            let config = load_default_config_for_test(&codex_home).await;
-            let thread_manager = Arc::new(
-                codex_core::test_support::thread_manager_with_models_provider_and_home(
-                    CodexAuth::create_dummy_chatgpt_auth_for_testing(),
-                    config.model_provider.clone(),
-                    config.codex_home.to_path_buf(),
-                    Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
-                ),
-            );
-            let codex_core::NewThread {
-                thread_id, thread, ..
-            } = thread_manager
-                .start_thread(config)
+            let server = core_test_support::responses::start_mock_server().await;
+            let model_catalog = codex_models_manager::bundled_models_response()
+                .expect("load bundled lifecycle fixture model catalog");
+            let test = core_test_support::test_codex::test_codex()
+                .with_config(move |config| config.model_catalog = Some(model_catalog))
+                .build(&server)
                 .await
-                .expect("start test thread");
+                .expect("start real test thread with local provider and catalog");
+            let thread_id = ThreadId::from(test.session_configured.session_id);
+            let thread = Arc::clone(&test.codex);
+            let thread_manager = Arc::clone(&test.thread_manager);
             let release_shutdown =
                 codex_core::test_support::block_thread_terminal_tasks(thread.as_ref());
             let (outgoing_tx, outgoing_rx) = mpsc::channel(8);
@@ -1579,7 +1839,8 @@ mod tests {
                 thread,
                 original_thread_state,
                 release_shutdown: Some(release_shutdown),
-                _codex_home: codex_home,
+                _test: test,
+                _server: server,
             }
         }
 
@@ -1656,6 +1917,352 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn listener_stop_releases_resolution_waiters_while_notification_delivery_is_blocked() {
+        use crate::thread_state::ResolveServerRequestError;
+        use crate::thread_state::ResolveServerRequestFailure;
+        use crate::thread_state::resolve_server_request_on_thread_listener;
+
+        let mut fixture = LateShutdownFixture::new().await;
+        let config = fixture.thread.config().await;
+        let skills_watcher = SkillsWatcher::new(
+            fixture.thread_manager.skills_service(),
+            Arc::clone(&fixture.outgoing),
+        );
+        let context = ListenerTaskContext {
+            thread_manager: Arc::clone(&fixture.thread_manager),
+            thread_state_manager: fixture.thread_state_manager.clone(),
+            outgoing: Arc::clone(&fixture.outgoing),
+            pending_thread_unloads: Arc::clone(&fixture.pending_thread_unloads),
+            thread_watch_manager: fixture.thread_watch_manager.clone(),
+            thread_list_state_permit: Arc::new(Semaphore::new(1)),
+            fallback_model_provider: config.model_provider_id.clone(),
+            codex_home: config.codex_home.to_path_buf(),
+            skills_watcher,
+        };
+        let connection_id = ConnectionId(1);
+        fixture
+            .thread_state_manager
+            .connection_initialized(connection_id, ConnectionCapabilities::default())
+            .await;
+        assert!(matches!(
+            ensure_conversation_listener(context.clone(), fixture.thread_id, connection_id, false,)
+                .await,
+            Ok(EnsureConversationListenerResult::Attached)
+        ));
+        let (command_tx, old_cancellation) = fixture
+            .original_thread_state
+            .lock()
+            .await
+            .listener_command_route()
+            .expect("registered listener");
+        // Saturate the real transport queue, then make the registered worker wait in
+        // notification delivery. Keep both its completion waiter and a queue waiter.
+        for _ in 0..8 {
+            fixture
+                .outgoing
+                .send_server_notification(ServerNotification::ThreadGoalCleared(
+                    ThreadGoalClearedNotification {
+                        thread_id: fixture.thread_id.to_string(),
+                    },
+                ))
+                .await;
+        }
+        let completion_waiter = resolve_server_request_on_thread_listener(
+            &fixture.original_thread_state,
+            RequestId::Integer(501),
+        );
+        tokio::pin!(completion_waiter);
+        assert!(futures::poll!(&mut completion_waiter).is_pending());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while command_tx.capacity() != command_tx.max_capacity() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("listener consumes first resolution");
+        while command_tx
+            .try_send(ThreadListenerCommand::EmitThreadGoalCleared)
+            .is_ok()
+        {}
+        let queue_waiter = resolve_server_request_on_thread_listener(
+            &fixture.original_thread_state,
+            RequestId::Integer(502),
+        );
+        tokio::pin!(queue_waiter);
+        assert!(futures::poll!(&mut queue_waiter).is_pending());
+        assert!(futures::poll!(&mut completion_waiter).is_pending());
+        fixture.thread_state_manager.clear_all_listeners().await;
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), completion_waiter)
+                .await
+                .expect("owner stop releases completion"),
+            Err(ResolveServerRequestError {
+                request_id: RequestId::Integer(501),
+                failure: ResolveServerRequestFailure::CompletionDropped
+            })
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), queue_waiter)
+                .await
+                .expect("owner stop releases full queue"),
+            Err(ResolveServerRequestError {
+                request_id: RequestId::Integer(502),
+                failure: ResolveServerRequestFailure::ListenerClosed
+            })
+        );
+        assert!(old_cancellation.is_cancelled());
+        // Release delivery and prove the replacement obtained its own live token and
+        // processes a healthy resolution through the normal listener registration.
+        while let Ok(envelope) = fixture.outgoing_rx.try_recv() {
+            let message = match envelope {
+                OutgoingEnvelope::Broadcast { message }
+                | OutgoingEnvelope::ToConnection { message, .. } => message,
+            };
+            assert!(
+                !matches!(message, OutgoingMessage::AppServerNotification(
+                ServerNotification::ServerRequestResolved(notification)
+            ) if notification.request_id == RequestId::Integer(502)),
+                "cancelled queue waiter must not produce a resolution notification"
+            );
+        }
+        tokio::time::timeout(Duration::from_secs(5), command_tx.closed())
+            .await
+            .expect("old worker exits once its in-flight delivery completes");
+        while let Ok(envelope) = fixture.outgoing_rx.try_recv() {
+            let message = match envelope {
+                OutgoingEnvelope::Broadcast { message }
+                | OutgoingEnvelope::ToConnection { message, .. } => message,
+            };
+            assert!(
+                !matches!(message, OutgoingMessage::AppServerNotification(
+                ServerNotification::ServerRequestResolved(notification)
+            ) if notification.request_id == RequestId::Integer(502)),
+                "cancelled queue waiter must not produce a resolution notification"
+            );
+        }
+        assert!(matches!(
+            ensure_conversation_listener(context, fixture.thread_id, connection_id, false,).await,
+            Ok(EnsureConversationListenerResult::Attached)
+        ));
+        let (_, replacement_cancellation) = fixture
+            .original_thread_state
+            .lock()
+            .await
+            .listener_command_route()
+            .expect("replacement listener");
+        assert!(!replacement_cancellation.is_cancelled());
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            resolve_server_request_on_thread_listener(
+                &fixture.original_thread_state,
+                RequestId::Integer(503),
+            ),
+        )
+        .await
+        .expect("healthy resolution completes")
+        .expect("healthy resolution succeeds");
+        let envelope = fixture
+            .outgoing_rx
+            .recv()
+            .await
+            .expect("resolution notification");
+        let message = match envelope {
+            OutgoingEnvelope::Broadcast { message }
+            | OutgoingEnvelope::ToConnection { message, .. } => message,
+        };
+        assert!(matches!(message, OutgoingMessage::AppServerNotification(
+            ServerNotification::ServerRequestResolved(notification)
+        ) if notification.request_id == RequestId::Integer(503)));
+        fixture.thread_state_manager.clear_all_listeners().await;
+        fixture
+            .release_shutdown
+            .take()
+            .expect("shutdown release")
+            .send(())
+            .expect("release terminal task");
+        fixture
+            .thread
+            .shutdown_and_wait()
+            .await
+            .expect("normal thread cleanup");
+    }
+
+    #[tokio::test]
+    // These guards deliberately contend connection admission and eligibility registration.
+    #[allow(clippy::await_holding_invalid_type)]
+    async fn cancelled_listener_attachment_keeps_published_worker_operational_on_retry() {
+        let mut fixture = LateShutdownFixture::new().await;
+        let config = fixture.thread.config().await;
+        let skills_watcher = SkillsWatcher::new(
+            fixture.thread_manager.skills_service(),
+            Arc::clone(&fixture.outgoing),
+        );
+        let context = ListenerTaskContext {
+            thread_manager: Arc::clone(&fixture.thread_manager),
+            thread_state_manager: fixture.thread_state_manager.clone(),
+            outgoing: Arc::clone(&fixture.outgoing),
+            pending_thread_unloads: Arc::clone(&fixture.pending_thread_unloads),
+            thread_watch_manager: fixture.thread_watch_manager.clone(),
+            thread_list_state_permit: Arc::new(Semaphore::new(1)),
+            fallback_model_provider: config.model_provider_id.clone(),
+            codex_home: config.codex_home.to_path_buf(),
+            skills_watcher: Arc::clone(&skills_watcher),
+        };
+        let connection_id = ConnectionId(1);
+        fixture
+            .thread_state_manager
+            .connection_initialized(connection_id, ConnectionCapabilities::default())
+            .await;
+
+        // Stop normal admission after it has checked unload authority and subscribed.
+        let state_guard = fixture.original_thread_state.lock().await;
+        let attach_context = context.clone();
+        let thread_id = fixture.thread_id;
+        let attach = tokio::spawn(async move {
+            ensure_conversation_listener(attach_context, thread_id, connection_id, false).await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !fixture
+                .thread_state_manager
+                .has_subscribers(thread_id)
+                .await
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("normal listener admission should subscribe the connection");
+
+        // Admission passed this mutex; the next acquisition registers listener eligibility.
+        let authority_guard = fixture.pending_thread_unloads.state.lock().await;
+        drop(state_guard);
+        let (command_tx, listener_generation) =
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let state = fixture.original_thread_state.lock().await;
+                    if state.listener_matches(&fixture.thread) {
+                        break (
+                            state
+                                .listener_command_tx()
+                                .expect("published command sender"),
+                            state.listener_generation,
+                        );
+                    }
+                    drop(state);
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("listener publication must not wait for eligibility registration");
+
+        // The fixed request may already have returned; either way dropping its owner must
+        // leave a worker behind the published sender while eligibility is contended.
+        attach.abort();
+        match attach.await {
+            Ok(result) => assert!(matches!(
+                result,
+                Ok(EnsureConversationListenerResult::Attached)
+            )),
+            Err(error) => assert!(error.is_cancelled()),
+        }
+        assert!(
+            fixture
+                .thread_state_manager
+                .current_listener_command_tx(thread_id)
+                .expect("published sender should remain registered")
+                .same_channel(&command_tx)
+        );
+        command_tx
+            .send(ThreadListenerCommand::EmitThreadGoalCleared)
+            .await
+            .expect("cancelling attachment must retain the published listener receiver");
+        drop(authority_guard);
+
+        assert!(matches!(
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                ensure_conversation_listener(context.clone(), thread_id, connection_id, false),
+            )
+            .await
+            .expect("normal attachment retry should finish"),
+            Ok(EnsureConversationListenerResult::Attached)
+        ));
+        let envelope = tokio::time::timeout(Duration::from_secs(5), fixture.outgoing_rx.recv())
+            .await
+            .expect("the surviving listener must execute its queued command")
+            .expect("outgoing channel should remain open");
+        let message = match envelope {
+            OutgoingEnvelope::Broadcast { message }
+            | OutgoingEnvelope::ToConnection { message, .. } => message,
+        };
+        assert!(matches!(
+            message,
+            OutgoingMessage::AppServerNotification(ServerNotification::ThreadGoalCleared(
+                notification
+            )) if notification.thread_id == thread_id.to_string()
+        ));
+        {
+            let state = fixture.original_thread_state.lock().await;
+            assert_eq!(state.listener_generation, listener_generation);
+            assert!(
+                state
+                    .listener_command_tx()
+                    .expect("listener sender")
+                    .same_channel(&command_tx)
+            );
+        }
+        assert_eq!(skills_watcher.thread_config_registration_count(), 1);
+
+        // Exercise owned worker cleanup as well: no stale command route or eligibility
+        // owner may survive cancellation. clear_listener also releases its watch guard.
+        fixture
+            .original_thread_state
+            .lock()
+            .await
+            .listener_cancellation
+            .as_ref()
+            .expect("worker cancellation token")
+            .cancel();
+        tokio::time::timeout(Duration::from_secs(5), command_tx.closed())
+            .await
+            .expect("worker should close its command receiver after cancellation");
+        assert!(
+            fixture
+                .thread_state_manager
+                .current_listener_command_tx(thread_id)
+                .is_none()
+        );
+        assert!(
+            !fixture
+                .original_thread_state
+                .lock()
+                .await
+                .listener_matches(&fixture.thread)
+        );
+        let authority = fixture.pending_thread_unloads.state.lock().await;
+        assert!(!authority.eligibility_owners.contains_key(&thread_id));
+        assert!(!authority.eligible.contains_key(&thread_id));
+        drop(authority);
+        fixture
+            .release_shutdown
+            .take()
+            .expect("terminal task release")
+            .send(())
+            .expect("release terminal task");
+        fixture
+            .thread
+            .request_shutdown()
+            .await
+            .expect("shutdown test thread");
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            fixture.thread.wait_until_terminated(),
+        )
+        .await
+        .expect("test thread should terminate");
+    }
+
+    #[tokio::test]
     async fn existing_listener_skips_thread_skill_registration_and_watcher_is_lazy() {
         let fixture = LateShutdownFixture::new().await;
         let config = fixture.thread.config().await;
@@ -1674,11 +2281,11 @@ mod tests {
             codex_home: config.codex_home.to_path_buf(),
             skills_watcher: Arc::clone(&skills_watcher),
         };
-        let (cancel_tx, _cancel_rx) = oneshot::channel();
+        let listener_cancellation = CancellationToken::new();
         let thread_settings =
             thread_settings_from_config_snapshot(&fixture.thread.config_snapshot().await);
         fixture.original_thread_state.lock().await.set_listener(
-            cancel_tx,
+            listener_cancellation,
             &fixture.thread,
             codex_file_watcher::WatchRegistration::default(),
             thread_settings,
@@ -1808,9 +2415,53 @@ mod tests {
         authority.finish(&thread_id).await;
     }
 
-    #[test]
-    fn inactive_thread_unload_delay_is_five_minutes() {
-        assert_eq!(THREAD_UNLOADING_DELAY, Duration::from_secs(5 * 60));
+    #[tokio::test]
+    async fn inactive_thread_unload_deadline_requires_five_minutes_without_activity_or_subscribers()
+    {
+        let thread_id = ThreadId::new();
+        let thread_watch_manager = ThreadWatchManager::new();
+        thread_watch_manager
+            .note_turn_started(&thread_id.to_string())
+            .await;
+        thread_watch_manager
+            .note_turn_completed(&thread_id.to_string(), false)
+            .await;
+        let (_subscribers_tx, has_subscribers_rx) = tokio::sync::watch::channel(false);
+        let (evict_tx, evict_rx) = mpsc::unbounded_channel();
+        let disconnected_at = Instant::now();
+        let inactive_at = disconnected_at + Duration::from_secs(10);
+        let mut state = UnloadingState {
+            thread_id,
+            authority: Arc::new(PendingThreadUnloads::default()),
+            delay: THREAD_UNLOADING_DELAY,
+            has_subscribers_rx,
+            has_subscribers: (false, disconnected_at),
+            thread_status_rx: thread_watch_manager
+                .subscribe(thread_id)
+                .await
+                .expect("loaded thread should have a status subscription"),
+            is_active: (false, inactive_at),
+            evict_tx,
+            evict_rx,
+            listener_generation: None,
+        };
+
+        assert_eq!(
+            state.unloading_target(),
+            Some(disconnected_at + Duration::from_secs(310)),
+            "the five-minute grace starts when both inactivity conditions hold"
+        );
+        state.has_subscribers = (false, inactive_at + Duration::from_secs(10));
+        assert_eq!(
+            state.unloading_target(),
+            Some(disconnected_at + Duration::from_secs(320)),
+            "a later disconnection restarts the five-minute grace"
+        );
+        state.has_subscribers.0 = true;
+        assert_eq!(state.unloading_target(), None);
+        state.has_subscribers.0 = false;
+        state.is_active.0 = true;
+        assert_eq!(state.unloading_target(), None);
     }
 
     #[tokio::test]
@@ -1924,6 +2575,347 @@ mod tests {
         );
         fixture.assert_late_cleanup_pending().await;
         fixture.release_and_assert_closed().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn late_unload_and_override_resume_release_authority_with_transport_still_full() {
+        for override_resume in [false, true] {
+            let mut fixture = LateShutdownFixture::new().await;
+            fixture.thread_watch_manager =
+                ThreadWatchManager::new_with_outgoing(Arc::clone(&fixture.outgoing));
+            fixture
+                .thread_watch_manager
+                .note_turn_started(&fixture.thread_id.to_string())
+                .await;
+            fixture
+                .thread_watch_manager
+                .note_turn_completed(&fixture.thread_id.to_string(), false)
+                .await;
+            while fixture.outgoing_rx.try_recv().is_ok() {}
+            let local_status = fixture
+                .thread_watch_manager
+                .subscribe(fixture.thread_id)
+                .await
+                .expect("local watcher");
+            assert_eq!(*local_status.borrow(), ThreadStatus::Idle);
+            let connection_id = ConnectionId(91);
+            fixture
+                .thread_state_manager
+                .connection_initialized(connection_id, ConnectionCapabilities::default())
+                .await;
+            for _ in 0..8 {
+                fixture
+                    .outgoing
+                    .send_server_notification(ServerNotification::ThreadGoalCleared(
+                        ThreadGoalClearedNotification {
+                            thread_id: fixture.thread_id.to_string(),
+                        },
+                    ))
+                    .await;
+            }
+            if override_resume {
+                assert_eq!(
+                    shutdown_idle_thread_for_resume_with_timeout(
+                        &fixture.thread_manager,
+                        &fixture.outgoing,
+                        &fixture.pending_thread_unloads,
+                        &fixture.thread_state_manager,
+                        &fixture.thread_watch_manager,
+                        fixture.thread_id,
+                        Arc::clone(&fixture.thread),
+                        Duration::ZERO,
+                    )
+                    .await,
+                    IdleThreadShutdownResult::Closing
+                );
+            } else {
+                assert!(
+                    fixture
+                        .pending_thread_unloads
+                        .begin(fixture.thread_id)
+                        .await
+                );
+                let (result_tx, result_rx) = oneshot::channel();
+                unload_thread_without_subscribers_with_timeout(
+                    Arc::clone(&fixture.thread_manager),
+                    Arc::clone(&fixture.outgoing),
+                    Arc::clone(&fixture.pending_thread_unloads),
+                    fixture.thread_state_manager.clone(),
+                    fixture.thread_watch_manager.clone(),
+                    fixture.thread_id,
+                    Arc::clone(&fixture.thread),
+                    EvictionCompletion(None),
+                    Duration::ZERO,
+                    Some(result_tx),
+                )
+                .await;
+                assert_eq!(
+                    tokio::time::timeout(Duration::from_secs(5), result_rx)
+                        .await
+                        .expect("shutdown outcome")
+                        .expect("shutdown owner"),
+                    ThreadShutdownResult::TimedOut
+                );
+            }
+            fixture.assert_late_cleanup_pending().await;
+            assert!(matches!(
+                fixture
+                    .pending_thread_unloads
+                    .admit_listener_connection(
+                        &fixture.thread_state_manager,
+                        fixture.thread_id,
+                        connection_id,
+                        false,
+                    )
+                    .await,
+                ThreadConnectionAdmission::ThreadClosing
+            ));
+            assert_eq!(fixture.outgoing_rx.capacity(), 0);
+            fixture
+                .release_shutdown
+                .take()
+                .expect("terminal release")
+                .send(())
+                .expect("terminal task still blocked");
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                fixture.thread.wait_until_terminated(),
+            )
+            .await
+            .expect("actual physical termination");
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                fixture
+                    .pending_thread_unloads
+                    .wait_until_finished(&fixture.thread_id),
+            )
+            .await
+            .expect("existing delivery budget must release unload authority");
+            assert!(
+                fixture
+                    .thread_manager
+                    .get_thread(fixture.thread_id)
+                    .await
+                    .is_err()
+            );
+            assert!(!Arc::ptr_eq(
+                &fixture
+                    .thread_state_manager
+                    .thread_state(fixture.thread_id)
+                    .await,
+                &fixture.original_thread_state
+            ));
+            assert_eq!(
+                *local_status.borrow(),
+                ThreadStatus::NotLoaded,
+                "local watcher must update despite blocked status publication"
+            );
+            assert_eq!(
+                fixture
+                    .thread_watch_manager
+                    .loaded_status_for_thread(&fixture.thread_id.to_string())
+                    .await,
+                ThreadStatus::NotLoaded
+            );
+            assert_eq!(
+                fixture.outgoing_rx.capacity(),
+                0,
+                "test must not release transport capacity to unblock cleanup"
+            );
+            assert!(
+                matches!(
+                    fixture
+                        .pending_thread_unloads
+                        .admit_listener_connection(
+                            &fixture.thread_state_manager,
+                            fixture.thread_id,
+                            connection_id,
+                            false,
+                        )
+                        .await,
+                    ThreadConnectionAdmission::Admitted(_)
+                ),
+                "real listener admission must permit a healthy retry"
+            );
+            assert!(
+                fixture
+                    .thread_state_manager
+                    .has_subscribers(fixture.thread_id)
+                    .await
+            );
+            while let Ok(envelope) = fixture.outgoing_rx.try_recv() {
+                let message = match envelope {
+                    OutgoingEnvelope::Broadcast { message }
+                    | OutgoingEnvelope::ToConnection { message, .. } => message,
+                };
+                assert!(
+                    !matches!(
+                        message,
+                        OutgoingMessage::AppServerNotification(ServerNotification::ThreadClosed(_))
+                    ),
+                    "expired teardown delivery must not publish a late close over a new admission"
+                );
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_idle_resume_shutdown_retains_authority_until_cleanup_and_allows_retry() {
+        let mut fixture = LateShutdownFixture::new().await;
+        let connection_id = ConnectionId(1);
+        fixture
+            .thread_state_manager
+            .connection_initialized(connection_id, ConnectionCapabilities::default())
+            .await;
+        // Shutdown closes real elicitation leases before waiting for terminal tasks.
+        // This observable transition locates cancellation inside actual shutdown.
+        assert_eq!(
+            fixture
+                .thread
+                .acquire_out_of_band_elicitation_lease(
+                    codex_core::OutOfBandElicitationLeaseId::new(
+                        1,
+                        "shutdown-observer".to_string()
+                    ),
+                )
+                .expect("thread should accept a lease before shutdown"),
+            1
+        );
+        let thread_manager = Arc::clone(&fixture.thread_manager);
+        let outgoing = Arc::clone(&fixture.outgoing);
+        let pending = Arc::clone(&fixture.pending_thread_unloads);
+        let state_manager = fixture.thread_state_manager.clone();
+        let watch_manager = fixture.thread_watch_manager.clone();
+        let thread_id = fixture.thread_id;
+        let thread = Arc::clone(&fixture.thread);
+        let caller = tokio::spawn(async move {
+            shutdown_idle_thread_for_resume(
+                &thread_manager,
+                &outgoing,
+                &pending,
+                &state_manager,
+                &watch_manager,
+                thread_id,
+                thread,
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while fixture.thread.active_out_of_band_elicitation_lease_count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("normal helper must enter real thread shutdown");
+        fixture.assert_late_cleanup_pending().await;
+        assert!(
+            !caller.is_finished(),
+            "terminal task must still block shutdown completion"
+        );
+        caller.abort();
+        assert!(
+            caller
+                .await
+                .expect_err("request caller should be cancelled")
+                .is_cancelled()
+        );
+
+        fixture.assert_late_cleanup_pending().await;
+        assert_eq!(
+            shutdown_idle_thread_for_resume(
+                &fixture.thread_manager,
+                &fixture.outgoing,
+                &fixture.pending_thread_unloads,
+                &fixture.thread_state_manager,
+                &fixture.thread_watch_manager,
+                thread_id,
+                Arc::clone(&fixture.thread),
+            )
+            .await,
+            IdleThreadShutdownResult::Closing,
+            "a retry must not rejoin a thread whose shutdown is still in flight"
+        );
+        assert!(matches!(
+            fixture
+                .pending_thread_unloads
+                .admit_resume_connection(
+                    &fixture.thread_state_manager,
+                    thread_id,
+                    connection_id,
+                    &fixture.original_thread_state,
+                    0,
+                )
+                .await,
+            Ok(ThreadConnectionAdmission::ThreadClosing)
+        ));
+        assert!(
+            !fixture
+                .thread_state_manager
+                .has_subscribers(thread_id)
+                .await
+        );
+        assert!(matches!(
+            fixture.outgoing_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+
+        fixture
+            .release_shutdown
+            .take()
+            .expect("terminal task release")
+            .send(())
+            .expect("terminal task should still be blocked");
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            fixture.thread.wait_until_terminated(),
+        )
+        .await
+        .expect("released thread must actually terminate");
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            fixture
+                .pending_thread_unloads
+                .wait_until_finished(&thread_id),
+        )
+        .await
+        .expect("owned cleanup must remove the closing marker after caller cancellation");
+        assert!(fixture.thread_manager.get_thread(thread_id).await.is_err());
+        assert!(!Arc::ptr_eq(
+            &fixture.thread_state_manager.thread_state(thread_id).await,
+            &fixture.original_thread_state,
+        ));
+        assert_eq!(
+            fixture
+                .thread_watch_manager
+                .loaded_status_for_thread(&thread_id.to_string())
+                .await,
+            ThreadStatus::NotLoaded
+        );
+        assert!(matches!(
+            fixture
+                .pending_thread_unloads
+                .admit_listener_connection(
+                    &fixture.thread_state_manager,
+                    thread_id,
+                    connection_id,
+                    false,
+                )
+                .await,
+            ThreadConnectionAdmission::Admitted(_)
+        ));
+        assert!(
+            fixture
+                .thread_state_manager
+                .has_subscribers(thread_id)
+                .await
+        );
+        assert!(
+            matches!(
+                fixture.outgoing_rx.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ),
+            "successful idle-resume teardown preserves its existing silent-close behavior"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

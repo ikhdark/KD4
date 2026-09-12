@@ -4694,9 +4694,10 @@ pub enum TruncationPolicy {
 
 impl From<crate::openai_models::TruncationPolicyConfig> for TruncationPolicy {
     fn from(config: crate::openai_models::TruncationPolicyConfig) -> Self {
+        let limit = usize::try_from(config.limit.max(0)).unwrap_or(usize::MAX);
         match config.mode {
-            crate::openai_models::TruncationMode::Bytes => Self::Bytes(config.limit as usize),
-            crate::openai_models::TruncationMode::Tokens => Self::Tokens(config.limit as usize),
+            crate::openai_models::TruncationMode::Bytes => Self::Bytes(limit),
+            crate::openai_models::TruncationMode::Tokens => Self::Tokens(limit),
         }
     }
 }
@@ -5961,6 +5962,50 @@ mod tests {
     use std::path::PathBuf;
     use tempfile::NamedTempFile;
     use tempfile::TempDir;
+
+    #[test]
+    fn truncation_policy_config_clamps_nonpositive_limits_before_truncating() -> Result<()> {
+        for limit in [i64::MIN, -1, 0] {
+            for (mode, expected_policy, expected_text) in [
+                ("bytes", TruncationPolicy::Bytes(0), "…10 chars truncated…"),
+                ("tokens", TruncationPolicy::Tokens(0), ""),
+            ] {
+                let config = serde_json::from_value::<crate::openai_models::TruncationPolicyConfig>(
+                    json!({"mode": mode, "limit": limit}),
+                )?;
+                let policy = TruncationPolicy::from(config);
+                assert_eq!(policy, expected_policy);
+                assert_eq!(policy.token_budget(), 0);
+                assert_eq!(policy.byte_budget(), 0);
+                assert_eq!(policy.truncate_text("abcdefghij"), expected_text);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn truncation_policy_config_preserves_positive_budgets_and_large_limits() -> Result<()> {
+        for (mode, expected_policy) in [
+            ("bytes", TruncationPolicy::Bytes(8)),
+            ("tokens", TruncationPolicy::Tokens(8)),
+        ] {
+            let config = serde_json::from_value::<crate::openai_models::TruncationPolicyConfig>(
+                json!({"mode": mode, "limit": 8}),
+            )?;
+            let policy = TruncationPolicy::from(config);
+            assert_eq!(policy, expected_policy);
+            assert_eq!(policy.truncate_text("abcd"), "abcd");
+
+            for limit in [1_i64 << 32, i64::MAX] {
+                let config = serde_json::from_value::<crate::openai_models::TruncationPolicyConfig>(
+                    json!({"mode": mode, "limit": limit}),
+                )?;
+                let policy = TruncationPolicy::from(config);
+                assert_eq!(policy.truncate_text("abcd"), "abcd");
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn feature_thread_source_serializes_as_its_app_owned_label() -> Result<()> {

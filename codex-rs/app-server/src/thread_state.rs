@@ -5,6 +5,7 @@ use codex_app_server_protocol::SortDirection;
 use codex_app_server_protocol::ThreadGoal;
 use codex_app_server_protocol::ThreadHistoryBuilder;
 use codex_app_server_protocol::ThreadHistoryChangeSet;
+use codex_app_server_protocol::ThreadHistoryItemChange;
 use codex_app_server_protocol::ThreadHistoryTurnChange;
 use codex_app_server_protocol::ThreadSettings;
 use codex_app_server_protocol::Turn;
@@ -31,8 +32,8 @@ use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
 
-type PendingInterruptQueue = Vec<ConnectionRequestId>;
 const MAX_TRACKED_IN_FLIGHT_TASKS: usize = 1_024;
 pub(crate) const THREAD_LISTENER_COMMAND_CAPACITY: usize = 256;
 
@@ -159,6 +160,9 @@ pub(crate) enum ThreadListenerCommand {
         completion_tx: oneshot::Sender<()>,
     },
 }
+
+pub(crate) type ThreadListenerCommandRoute =
+    (mpsc::Sender<ThreadListenerCommand>, CancellationToken);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ResolveServerRequestFailure {
@@ -514,12 +518,22 @@ fn ordered_indexes(
     }
 }
 
+struct PendingInterrupt {
+    request_id: ConnectionRequestId,
+    cancelled: tokio_util::sync::CancellationToken,
+}
+
+struct PendingRollback {
+    request_id: ConnectionRequestId,
+    cancelled: tokio_util::sync::CancellationToken,
+}
+
 #[derive(Default)]
 pub(crate) struct ThreadState {
-    pub(crate) pending_interrupts: PendingInterruptQueue,
-    pub(crate) pending_rollbacks: Option<ConnectionRequestId>,
+    pending_interrupts: Vec<PendingInterrupt>,
+    pending_rollbacks: Option<PendingRollback>,
     pub(crate) turn_summary: TurnSummary,
-    pub(crate) cancel_tx: Option<oneshot::Sender<()>>,
+    pub(crate) listener_cancellation: Option<CancellationToken>,
     pub(crate) experimental_raw_events: bool,
     pub(crate) listener_generation: u64,
     resume_history_seeded_generation: Option<u64>,
@@ -533,9 +547,66 @@ pub(crate) struct ThreadState {
 }
 
 impl ThreadState {
+    pub(crate) fn reserve_interrupt(
+        &mut self,
+        request_id: ConnectionRequestId,
+    ) -> tokio_util::sync::DropGuard {
+        // A dropped request invalidates its entry synchronously, even while the
+        // async ThreadState mutex is held elsewhere. Prune those tombstones on
+        // each admission; terminal draining also removes and filters them.
+        self.pending_interrupts
+            .retain(|pending| !pending.cancelled.is_cancelled());
+        let cancelled = tokio_util::sync::CancellationToken::new();
+        let guard = cancelled.clone().drop_guard();
+        self.pending_interrupts.push(PendingInterrupt {
+            request_id,
+            cancelled,
+        });
+        guard
+    }
+
+    pub(crate) fn take_pending_interrupts(&mut self) -> Vec<ConnectionRequestId> {
+        std::mem::take(&mut self.pending_interrupts)
+            .into_iter()
+            .filter(|pending| !pending.cancelled.is_cancelled())
+            .map(|pending| pending.request_id)
+            .collect()
+    }
+
     #[cfg(test)]
-    fn retained_server_request_resolution_count(&self) -> usize {
-        0
+    pub(crate) fn has_pending_interrupts(&self) -> bool {
+        self.pending_interrupts
+            .iter()
+            .any(|pending| !pending.cancelled.is_cancelled())
+    }
+
+    pub(crate) fn reserve_rollback(
+        &mut self,
+        request_id: ConnectionRequestId,
+    ) -> Option<tokio_util::sync::DropGuard> {
+        if self.has_pending_rollback() {
+            return None;
+        }
+        let cancelled = tokio_util::sync::CancellationToken::new();
+        let guard = cancelled.clone().drop_guard();
+        self.pending_rollbacks = Some(PendingRollback {
+            request_id,
+            cancelled,
+        });
+        Some(guard)
+    }
+
+    pub(crate) fn has_pending_rollback(&self) -> bool {
+        self.pending_rollbacks
+            .as_ref()
+            .is_some_and(|pending| !pending.cancelled.is_cancelled())
+    }
+
+    pub(crate) fn take_pending_rollback(&mut self) -> Option<ConnectionRequestId> {
+        self.pending_rollbacks
+            .take()
+            .filter(|pending| !pending.cancelled.is_cancelled())
+            .map(|pending| pending.request_id)
     }
 
     pub(crate) fn listener_matches(&self, conversation: &Arc<CodexThread>) -> bool {
@@ -547,13 +618,13 @@ impl ThreadState {
 
     pub(crate) fn set_listener(
         &mut self,
-        cancel_tx: oneshot::Sender<()>,
+        cancellation: CancellationToken,
         conversation: &Arc<CodexThread>,
         watch_registration: WatchRegistration,
         thread_settings_baseline: ThreadSettings,
     ) -> (mpsc::Receiver<ThreadListenerCommand>, u64) {
-        if let Some(previous) = self.cancel_tx.replace(cancel_tx) {
-            let _ = previous.send(());
+        if let Some(previous) = self.listener_cancellation.replace(cancellation) {
+            previous.cancel();
         }
         self.listener_generation = self.listener_generation.wrapping_add(1);
         self.last_thread_settings = Some(thread_settings_baseline);
@@ -565,8 +636,8 @@ impl ThreadState {
     }
 
     pub(crate) fn clear_listener(&mut self) {
-        if let Some(cancel_tx) = self.cancel_tx.take() {
-            let _ = cancel_tx.send(());
+        if let Some(cancellation) = self.listener_cancellation.take() {
+            cancellation.cancel();
         }
         self.listener_command_tx = None;
         self.current_turn_history.reset();
@@ -576,6 +647,12 @@ impl ThreadState {
 
     pub(crate) fn listener_command_tx(&self) -> Option<mpsc::Sender<ThreadListenerCommand>> {
         self.listener_command_tx.clone()
+    }
+
+    pub(crate) fn listener_command_route(&self) -> Option<ThreadListenerCommandRoute> {
+        self.listener_command_tx
+            .clone()
+            .zip(self.listener_cancellation.clone())
     }
 
     pub(crate) fn resume_history_is_seeded_for_current_listener(&self) -> bool {
@@ -635,18 +712,49 @@ impl ThreadState {
             .flatten()
     }
 
+    #[cfg(test)]
     pub(crate) fn track_current_turn_event(&mut self, event_turn_id: &str, event: &EventMsg) {
+        let _ = self.track_current_turn_event_with_reconciled_wait_items(event_turn_id, event);
+    }
+
+    pub(crate) fn track_current_turn_event_with_reconciled_wait_items(
+        &mut self,
+        event_turn_id: &str,
+        event: &EventMsg,
+    ) -> Vec<ThreadHistoryItemChange> {
         if let EventMsg::TurnStarted(payload) = event {
             self.turn_summary.started_at = payload.started_at;
             self.turn_summary.origin_connection_id = self.turn_origin_tracker.take(event_turn_id);
         }
         let changes = self.current_turn_history.handle_event_with_changes(event);
+        // Ordinary item events already emit their own notifications. Only abort
+        // reconciliation creates terminal items that have no core ItemCompleted.
+        let reconciled_wait_items = if matches!(event, EventMsg::TurnAborted(_)) {
+            changes
+                .changed_items
+                .iter()
+                .filter(|change| {
+                    matches!(
+                        change.item,
+                        codex_app_server_protocol::ThreadItem::CollabAgentToolCall {
+                            tool: codex_app_server_protocol::CollabAgentTool::Wait,
+                            status: codex_app_server_protocol::CollabAgentToolCallStatus::Failed,
+                            ..
+                        }
+                    )
+                })
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
         self.turn_index.apply_changes(changes);
         if matches!(event, EventMsg::TurnAborted(_) | EventMsg::TurnComplete(_))
             && !self.current_turn_history.has_active_turn()
         {
             self.current_turn_history.reset();
         }
+        reconciled_wait_items
     }
 
     fn seed_current_turn_history(&mut self, items: &[RolloutItem]) {
@@ -697,9 +805,9 @@ pub(crate) async fn resolve_server_request_on_thread_listener(
     let (completion_tx, completion_rx) = oneshot::channel();
     let listener_command_tx = {
         let state = thread_state.lock().await;
-        state.listener_command_tx()
+        state.listener_command_route()
     };
-    let Some(listener_command_tx) = listener_command_tx else {
+    let Some((listener_command_tx, cancellation)) = listener_command_tx else {
         return Err(unresolved(
             request_id,
             ResolveServerRequestFailure::ListenerNotRunning,
@@ -707,21 +815,27 @@ pub(crate) async fn resolve_server_request_on_thread_listener(
     };
 
     let unresolved_request_id = request_id.clone();
-    if listener_command_tx
-        .send(ThreadListenerCommand::ResolveServerRequest {
+    let sent = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => false,
+        result = listener_command_tx.send(ThreadListenerCommand::ResolveServerRequest {
             request_id,
             completion_tx,
-        })
-        .await
-        .is_err()
-    {
+        }) => result.is_ok(),
+    };
+    if !sent {
         return Err(unresolved(
             unresolved_request_id,
             ResolveServerRequestFailure::ListenerClosed,
         ));
     }
 
-    if completion_rx.await.is_err() {
+    let completed = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => false,
+        result = completion_rx => result.is_ok(),
+    };
+    if !completed {
         return Err(unresolved(
             unresolved_request_id,
             ResolveServerRequestFailure::CompletionDropped,
@@ -741,6 +855,36 @@ mod tests {
     use codex_protocol::config_types::Settings;
     use codex_utils_absolute_path::AbsolutePathBuf;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn rollback_reservation_cancellation_and_commit_preserve_single_response_owner() {
+        let mut state = ThreadState::default();
+        let first = ConnectionRequestId {
+            connection_id: ConnectionId(1),
+            request_id: RequestId::Integer(10),
+        };
+        let retry = ConnectionRequestId {
+            connection_id: ConnectionId(2),
+            request_id: RequestId::Integer(20),
+        };
+        let cancelled = state
+            .reserve_rollback(first.clone())
+            .expect("first reservation");
+        assert!(state.reserve_rollback(retry.clone()).is_none());
+        drop(cancelled);
+        assert!(!state.has_pending_rollback());
+        assert_eq!(state.take_pending_rollback(), None);
+        let failed_submission = state.reserve_rollback(first).expect("retry admission");
+        drop(failed_submission);
+        let committed = state
+            .reserve_rollback(retry.clone())
+            .expect("cancelled slot replaced");
+        committed.disarm();
+        assert!(state.reserve_rollback(retry.clone()).is_none());
+        assert_eq!(state.take_pending_rollback(), Some(retry));
+        assert!(!state.has_pending_rollback());
+        assert_eq!(state.take_pending_rollback(), None);
+    }
 
     #[tokio::test]
     async fn connection_ids_for_thread_captures_both_views_together() {
@@ -872,13 +1016,6 @@ mod tests {
                 failure: ResolveServerRequestFailure::ListenerNotRunning,
             })
         );
-        assert_eq!(
-            state
-                .lock()
-                .await
-                .retained_server_request_resolution_count(),
-            0
-        );
     }
 
     #[tokio::test]
@@ -886,7 +1023,11 @@ mod tests {
         let state = Arc::new(Mutex::new(ThreadState::default()));
         let (listener_command_tx, listener_command_rx) = thread_listener_command_channel();
         drop(listener_command_rx);
-        state.lock().await.listener_command_tx = Some(listener_command_tx);
+        {
+            let mut state = state.lock().await;
+            state.listener_command_tx = Some(listener_command_tx);
+            state.listener_cancellation = Some(CancellationToken::new());
+        }
         let request_id = RequestId::Integer(2);
 
         assert_eq!(
@@ -896,20 +1037,17 @@ mod tests {
                 failure: ResolveServerRequestFailure::ListenerClosed,
             })
         );
-        assert_eq!(
-            state
-                .lock()
-                .await
-                .retained_server_request_resolution_count(),
-            0
-        );
     }
 
     #[tokio::test]
     async fn resolving_with_dropped_completion_returns_a_typed_error() {
         let state = Arc::new(Mutex::new(ThreadState::default()));
         let (listener_command_tx, mut listener_command_rx) = thread_listener_command_channel();
-        state.lock().await.listener_command_tx = Some(listener_command_tx);
+        {
+            let mut state = state.lock().await;
+            state.listener_command_tx = Some(listener_command_tx);
+            state.listener_cancellation = Some(CancellationToken::new());
+        }
         let listener = tokio::spawn(async move {
             let Some(ThreadListenerCommand::ResolveServerRequest { completion_tx, .. }) =
                 listener_command_rx.recv().await
@@ -928,13 +1066,6 @@ mod tests {
             })
         );
         listener.await.expect("listener task should complete");
-        assert_eq!(
-            state
-                .lock()
-                .await
-                .retained_server_request_resolution_count(),
-            0
-        );
     }
 
     #[tokio::test]
@@ -1122,6 +1253,13 @@ mod tests {
                     ..Default::default()
                 },
             )));
+            items.push(RolloutItem::EventMsg(EventMsg::AgentMessage(
+                codex_protocol::protocol::AgentMessageEvent {
+                    message: format!("reply to {message}"),
+                    phase: None,
+                    memory_citation: None,
+                },
+            )));
             items.push(RolloutItem::EventMsg(terminal_event(turn_id, message)));
         }
 
@@ -1134,6 +1272,12 @@ mod tests {
             .expect("initialized index");
         assert_eq!(first.items.len(), 2);
         assert!(first.more_items_available);
+        assert!(first.items.iter().all(|entry| entry.turn_id == "turn-1"));
+        assert!(matches!(
+            &first.items[1].item,
+            codex_app_server_protocol::ThreadItem::AgentMessage { text, .. }
+                if text == "reply to first"
+        ));
         let anchor = first.items.last().expect("page anchor");
 
         let second = state
@@ -1148,6 +1292,11 @@ mod tests {
         assert_eq!(second.items.len(), 2);
         assert!(!second.more_items_available);
         assert!(second.items.iter().all(|entry| entry.turn_id == "turn-2"));
+        assert!(matches!(
+            &second.items[1].item,
+            codex_app_server_protocol::ThreadItem::AgentMessage { text, .. }
+                if text == "reply to second"
+        ));
     }
 
     #[test]
@@ -1658,7 +1807,7 @@ impl ThreadStateManager {
             tracing::debug!(
                 thread_id = %thread_id,
                 listener_generation = thread_state.listener_generation,
-                had_listener = thread_state.cancel_tx.is_some(),
+                had_listener = thread_state.listener_cancellation.is_some(),
                 had_active_turn = thread_state.active_turn_snapshot().is_some(),
                 "clearing thread listener during thread-state teardown"
             );
@@ -1682,7 +1831,7 @@ impl ThreadStateManager {
             tracing::debug!(
                 thread_id = %thread_id,
                 listener_generation = thread_state.listener_generation,
-                had_listener = thread_state.cancel_tx.is_some(),
+                had_listener = thread_state.listener_cancellation.is_some(),
                 had_active_turn = thread_state.active_turn_snapshot().is_some(),
                 "clearing thread listener during app-server shutdown"
             );

@@ -320,7 +320,7 @@ async fn derive_review_reason(
         return Ok(None);
     }
 
-    let repo_root = get_git_repo_root(cwd).unwrap_or_else(|| cwd.to_path_buf());
+    let cwd = cwd.to_path_buf();
     let diff = build_attempt_diff(store, task.current_attempt.attempt_id, observed_writes)
         .await
         .map_err(|error| task_store_error(SUBMIT_AGENT_RECEIPT_TOOL, error))?;
@@ -344,25 +344,35 @@ async fn derive_review_reason(
     let drift = observed_writes
         .iter()
         .any(|evidence| evidence.attribution_confidence == AttributionConfidence::DetectionOnly);
-    let derived = derive_risk_policy(
-        &task.assignment,
-        &repo_root,
-        RiskPolicyInput {
-            changed_paths: &diff.changed_paths,
-            configured_high_risk_paths: &risk_hints.high_risk_paths,
-            touched_contracts: &touched_contracts,
-            configured_high_risk_contracts: &risk_hints.contracts,
-            cross_owner_scope: false,
-            named_domains: &risk_hints.domains,
-            non_generated_changed_files: diff.non_generated_changed_files,
-            non_generated_changed_lines: diff.non_generated_changed_lines,
-            focused_validation_succeeded,
-            // Claim overlap is advisory metadata, not an ownership conflict. Detection-only
-            // attribution remains the persisted signal that concurrent drift may exist.
-            ownership_conflict: false,
-            drift,
-        },
-    )
+    let assignment = task.assignment.clone();
+    let derived = tokio::task::spawn_blocking(move || {
+        let repo_root = get_git_repo_root(&cwd).unwrap_or(cwd);
+        derive_risk_policy(
+            &assignment,
+            &repo_root,
+            RiskPolicyInput {
+                changed_paths: &diff.changed_paths,
+                configured_high_risk_paths: &risk_hints.high_risk_paths,
+                touched_contracts: &touched_contracts,
+                configured_high_risk_contracts: &risk_hints.contracts,
+                cross_owner_scope: false,
+                named_domains: &risk_hints.domains,
+                non_generated_changed_files: diff.non_generated_changed_files,
+                non_generated_changed_lines: diff.non_generated_changed_lines,
+                focused_validation_succeeded,
+                // Claim overlap is advisory metadata, not an ownership conflict. Detection-only
+                // attribution remains the persisted signal that concurrent drift may exist.
+                ownership_conflict: false,
+                drift,
+            },
+        )
+    })
+    .await
+    .map_err(|error| {
+        FunctionCallError::RespondToModel(format!(
+            "{SUBMIT_AGENT_RECEIPT_TOOL}: risk evidence worker failed: {error}"
+        ))
+    })?
     .map_err(|error| {
         FunctionCallError::RespondToModel(format!(
             "{SUBMIT_AGENT_RECEIPT_TOOL}: risk evidence is invalid: {error}"
@@ -461,19 +471,28 @@ async fn build_evaluation_context(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
-    let repo_root = get_git_repo_root(cwd).unwrap_or_else(|| cwd.to_path_buf());
-    build_cold_review_context(
-        &repo_root,
-        ColdReviewContextInput {
-            assignment: target.assignment,
-            attempt_id: target.current_attempt.attempt_id,
-            applicable_instructions,
-            attempt_specific_diff: diff.text,
-            observed_writes,
-            relevant_contracts,
-            nearest_tests,
-        },
-    )
+    let cwd = cwd.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let repo_root = get_git_repo_root(&cwd).unwrap_or(cwd);
+        build_cold_review_context(
+            &repo_root,
+            ColdReviewContextInput {
+                assignment: target.assignment,
+                attempt_id: target.current_attempt.attempt_id,
+                applicable_instructions,
+                attempt_specific_diff: diff.text,
+                observed_writes,
+                relevant_contracts,
+                nearest_tests,
+            },
+        )
+    })
+    .await
+    .map_err(|error| {
+        FunctionCallError::RespondToModel(format!(
+            "{GET_AGENT_TASK_TOOL}: cold-review evidence worker failed: {error}"
+        ))
+    })?
     .map(Some)
     .map_err(|error| {
         FunctionCallError::RespondToModel(format!(

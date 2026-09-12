@@ -222,23 +222,43 @@ mod tests {
     use super::*;
     use ratatui::style::Color;
 
-    #[tokio::test]
-    async fn no_commit_until_newline() {
-        let mut c = super::MarkdownStreamCollector::new(/*width*/ None, &super::test_cwd());
-        c.push_delta("Hello, world");
-        let out = c.commit_complete_lines();
-        assert!(out.is_empty(), "should not commit without newline");
-        c.push_delta("!\n");
-        let out2 = c.commit_complete_lines();
-        assert_eq!(out2.len(), 1, "one completed line after newline");
+    #[test]
+    fn no_commit_until_newline() {
+        let mut collector = MarkdownStreamCollector::new(None, &test_cwd());
+        collector.push_delta("Hello, world");
+        assert_eq!(collector.commit_complete_source(), None);
+        collector.push_delta("!\npartial");
+        assert_eq!(
+            collector.commit_complete_source(),
+            Some("Hello, world!\n".to_string())
+        );
+        assert_eq!(collector.commit_complete_source(), None);
+        collector.push_delta(" line\n");
+        assert_eq!(
+            collector.commit_complete_source(),
+            Some("partial line\n".to_string())
+        );
+        assert_eq!(collector.finalize_and_drain_source(), "");
     }
 
-    #[tokio::test]
-    async fn finalize_commits_partial_line() {
-        let mut c = super::MarkdownStreamCollector::new(/*width*/ None, &super::test_cwd());
-        c.push_delta("Line without newline");
-        let out = c.finalize_and_drain();
-        assert_eq!(out.len(), 1);
+    #[test]
+    fn finalize_commits_partial_line() {
+        let mut collector = MarkdownStreamCollector::new(None, &test_cwd());
+        collector.push_delta("committed\nremaining é");
+        assert_eq!(
+            collector.commit_complete_source(),
+            Some("committed\n".to_string())
+        );
+        assert_eq!(collector.finalize_and_drain_source(), "remaining é\n");
+        assert_eq!(collector.finalize_and_drain_source(), "");
+        assert_eq!(collector.commit_complete_source(), None);
+        collector.push_delta("next stream\n");
+        assert_eq!(
+            collector.commit_complete_source(),
+            Some("next stream\n".to_string())
+        );
+        collector.clear();
+        assert_eq!(collector.finalize_and_drain_source(), "");
     }
 
     #[tokio::test]

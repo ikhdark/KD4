@@ -78,6 +78,56 @@ async fn create_process_context(use_remote: bool) -> Result<ProcessContext> {
     }
 }
 
+#[test]
+fn remote_process_drop_outside_runtime_unregisters_immediately() -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let (mut context, process, wake_rx) = runtime.block_on(async {
+        let context = create_process_context(/*use_remote*/ true).await?;
+        let started = context
+            .backend
+            .start(ExecParams {
+                process_id: ProcessId::from("drop-outside-runtime"),
+                argv: vec![
+                    "cmd.exe".to_string(),
+                    "/D".to_string(),
+                    "/S".to_string(),
+                    "/C".to_string(),
+                    "set /p input=".to_string(),
+                ],
+                cwd: PathUri::from_host_native_path(std::env::current_dir()?)?,
+                env_policy: None,
+                env: Default::default(),
+                tty: false,
+                pipe_stdin: true,
+                arg0: None,
+                sandbox: None,
+                enforce_managed_network: false,
+                managed_network: None,
+            })
+            .await?;
+        let wake_rx = started.process.subscribe_wake();
+        Ok::<_, anyhow::Error>((context, started.process, wake_rx))
+    })?;
+    assert!(tokio::runtime::Handle::try_current().is_err());
+    assert!(
+        wake_rx.has_changed().is_ok(),
+        "registered process must retain its wake sender"
+    );
+
+    drop(process);
+
+    assert!(
+        wake_rx.has_changed().is_err(),
+        "dropping the process must unregister it before returning, even without an entered runtime"
+    );
+    if let Some(server) = context._server.as_mut() {
+        runtime.block_on(server.shutdown())?;
+    }
+    Ok(())
+}
+
 async fn assert_exec_process_starts_and_exits(use_remote: bool) -> Result<()> {
     let context = create_process_context(use_remote).await?;
     let session = context

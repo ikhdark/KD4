@@ -15,6 +15,7 @@ use crate::tools::context::ExecCommandToolOutput;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
+use crate::tools::handlers::allows_inline_sandbox_approval;
 use crate::tools::handlers::apply_granted_turn_permissions_uri;
 use crate::tools::handlers::apply_patch::intercept_apply_patch;
 use crate::tools::handlers::command_preflight::preflight_invocation_for_runtime;
@@ -23,7 +24,7 @@ use crate::tools::handlers::command_search::classify_rg_search_with_repository;
 use crate::tools::handlers::command_search::observe_rg_search_scope_state;
 use crate::tools::handlers::command_shape::CommandInvocation;
 use crate::tools::handlers::command_shape::powershell_script_failure_advisory;
-use crate::tools::handlers::normalize_and_validate_additional_permissions;
+use crate::tools::handlers::normalize_and_validate_additional_permissions_uri;
 use crate::tools::handlers::parse_arguments;
 use crate::tools::handlers::parse_arguments_with_base_path;
 use crate::tools::handlers::resolve_search_repository_root;
@@ -67,6 +68,23 @@ use super::ExecCommandArgs;
 use super::ExecCommandEnvironmentArgs;
 use super::get_command;
 use super::post_unified_exec_tool_use_payload;
+
+async fn get_command_async(
+    args: &ExecCommandArgs,
+    shell: Arc<Shell>,
+    allow_login_shell: bool,
+    environment_is_remote: bool,
+) -> Result<super::ResolvedCommand, FunctionCallError> {
+    let args = args.clone();
+    crate::tools::run_blocking_command_analysis(move || {
+        get_command(&args, shell, allow_login_shell, environment_is_remote)
+    })
+    .await
+    .map_err(|error| {
+        FunctionCallError::RespondToModel(format!("shell discovery worker failed: {error}"))
+    })?
+    .map_err(FunctionCallError::RespondToModel)
+}
 
 #[derive(Debug, Deserialize)]
 struct ExecCommandHookArgs {
@@ -355,13 +373,13 @@ impl ExecCommandHandler {
             .clone()
             .map(Arc::new)
             .unwrap_or_else(|| session.user_shell());
-        let original_resolved_command = get_command(
+        let original_resolved_command = get_command_async(
             &args,
             Arc::clone(&shell),
             turn.config.permissions.allow_login_shell,
             environment_is_remote,
         )
-        .map_err(FunctionCallError::RespondToModel)?;
+        .await?;
         let original_safety_command = original_resolved_command.safety_command.clone();
         let direct_runtime = turn.config.features.enabled(Feature::DirectRuntime);
         let preflight = preflight_invocation_for_runtime(
@@ -384,13 +402,13 @@ impl ExecCommandHandler {
             args.replace_command_invocation(&command_invocation);
         }
         let resolved_command = if repair_notice.is_some() {
-            get_command(
+            get_command_async(
                 &args,
                 Arc::clone(&shell),
                 turn.config.permissions.allow_login_shell,
                 environment_is_remote,
             )
-            .map_err(FunctionCallError::RespondToModel)?
+            .await?
         } else {
             original_resolved_command
         };
@@ -429,30 +447,59 @@ impl ExecCommandHandler {
         };
         let search_narrowing = if validation_launch.is_none() && !environment_is_remote {
             if let Some(native_cwd) = native_cwd.as_ref() {
-                let mut search = classify_rg_search_with_repository(
-                    &resolved_command.safety_command,
-                    resolved_command.preflight_shell_type,
-                    native_cwd.as_path(),
-                    || resolve_search_repository_root(native_cwd.as_path()),
-                )
+                let search_command = resolved_command.safety_command.clone();
+                let search_shell_type = resolved_command.preflight_shell_type;
+                let search_cwd = native_cwd.clone();
+                let mut search = crate::tools::run_blocking_command_analysis(move || {
+                    classify_rg_search_with_repository(
+                        &search_command,
+                        search_shell_type,
+                        search_cwd.as_path(),
+                        || resolve_search_repository_root(search_cwd.as_path()),
+                    )
+                })
+                .await
+                .map_err(|error| {
+                    FunctionCallError::RespondToModel(format!(
+                        "command search worker failed: {error}"
+                    ))
+                })?
                 .map_err(FunctionCallError::RespondToModel)?;
                 if let Some((_, search)) = search.as_mut() {
                     observe_rg_search_scope_state(search).await;
                 }
                 search.map(|(root, search)| (root.to_string_lossy().into_owned(), search))
             } else {
-                classify_rg_search_narrowing_without_native_scope(
-                    &resolved_command.safety_command,
-                    resolved_command.preflight_shell_type,
-                )
+                let search_command = resolved_command.safety_command.clone();
+                let search_shell_type = resolved_command.preflight_shell_type;
+                crate::tools::run_blocking_command_analysis(move || {
+                    classify_rg_search_narrowing_without_native_scope(
+                        &search_command,
+                        search_shell_type,
+                    )
+                })
+                .await
+                .map_err(|error| {
+                    FunctionCallError::RespondToModel(format!(
+                        "command search worker failed: {error}"
+                    ))
+                })?
                 .map(|search| (String::new(), search))
             }
         } else {
             None
         };
+        let safety_command = resolved_command.safety_command.clone();
+        let inspection_command = crate::tools::run_blocking_command_analysis(move || {
+            is_known_safe_command(&safety_command)
+        })
+        .await
+        .map_err(|error| {
+            FunctionCallError::RespondToModel(format!("command safety worker failed: {error}"))
+        })?;
         validate_independent_review_shell(
             &turn.session_source,
-            is_known_safe_command(&resolved_command.safety_command),
+            inspection_command,
             args.sandbox_permissions.requests_sandbox_override(),
             args.additional_permissions.is_some(),
         )
@@ -492,7 +539,6 @@ impl ExecCommandHandler {
         let exec_permission_approvals_enabled =
             session.features().enabled(Feature::ExecPermissionApprovals);
         let requested_additional_permissions = additional_permissions.clone();
-        let permission_cwd = native_cwd.as_ref().unwrap_or(&turn.config.cwd);
         let effective_additional_permissions = apply_granted_turn_permissions_uri(
             context.session.as_ref(),
             turn_environment.environment.approval_scope_id(),
@@ -511,10 +557,7 @@ impl ExecCommandHandler {
             .sandbox_permissions
             .requests_sandbox_override()
             && !effective_additional_permissions.permissions_preapproved
-            && !matches!(
-                context.turn.approval_policy.value(),
-                codex_protocol::protocol::AskForApproval::OnRequest
-            )
+            && !allows_inline_sandbox_approval(context.turn.approval_policy.value())
         {
             let approval_policy = context.turn.approval_policy.value();
             return Err(FunctionCallError::RespondToModel(format!(
@@ -525,20 +568,19 @@ impl ExecCommandHandler {
         let implicit_grant = !sandbox_permissions.uses_additional_permissions()
             && !matches!(sandbox_permissions, SandboxPermissions::RequireEscalated)
             && requested_additional_permissions.is_none();
-        let normalized_additional_permissions = match if implicit_grant {
+        let normalized_additional_permissions_uri = match if implicit_grant {
             Ok(effective_additional_permissions
-                .additional_permissions
+                .additional_permissions_uri
                 .clone())
         } else {
-            normalize_and_validate_additional_permissions(
+            normalize_and_validate_additional_permissions_uri(
                 additional_permissions_allowed,
                 context.turn.approval_policy.value(),
                 effective_additional_permissions.sandbox_permissions,
                 effective_additional_permissions
-                    .additional_permissions
+                    .additional_permissions_uri
                     .clone(),
                 effective_additional_permissions.permissions_preapproved,
-                permission_cwd,
             )
         } {
             Ok(normalized) => normalized,
@@ -546,13 +588,13 @@ impl ExecCommandHandler {
                 return Err(FunctionCallError::RespondToModel(err));
             }
         };
-        let normalized_additional_permissions_uri = if implicit_grant {
-            effective_additional_permissions
-                .additional_permissions_uri
-                .clone()
-        } else {
-            normalized_additional_permissions.clone().map(Into::into)
-        };
+        // A foreign grant cannot be represented by the host path type. Keep
+        // its URI profile for the selected execution environment regardless.
+        let normalized_additional_permissions = normalized_additional_permissions_uri
+            .clone()
+            .and_then(|permissions| {
+                codex_protocol::models::AdditionalPermissionProfile::try_from(permissions).ok()
+            });
         let sandbox_context = (
             sandbox_permissions,
             effective_additional_permissions.sandbox_permissions,
@@ -676,6 +718,7 @@ impl ExecCommandHandler {
             Some(&tracker),
             &context.call_id,
             "exec_command",
+            cancellation_token.clone(),
         )
         .await;
         let interception_wall_time = interception_started_at.elapsed();
@@ -701,21 +744,27 @@ impl ExecCommandHandler {
                         .record_exit(&attempt_key, 0)
                         .await;
                 }
-                return Ok(boxed_tool_output(ExecCommandToolOutput {
-                    event_call_id: String::new(),
-                    chunk_id: String::new(),
-                    wall_time: interception_wall_time,
-                    raw_output,
-                    truncation_policy: turn.model_info.truncation_policy.into(),
-                    max_output_tokens,
-                    process_id: None,
-                    exit_code: Some(0),
-                    process_exited: true,
-                    original_token_count: None,
-                    hook_command: Some(hook_command),
-                    raw_output_artifact: Some(raw_output_artifact),
-                    repair_notice,
-                }));
+                return Ok(boxed_tool_output(
+                    ExecCommandToolOutput {
+                        validation: args.validation.clone(),
+                        event_call_id: String::new(),
+                        chunk_id: String::new(),
+                        wall_time: interception_wall_time,
+                        raw_output,
+                        truncation_policy: turn.model_info.truncation_policy.into(),
+                        max_output_tokens,
+                        process_id: None,
+                        exit_code: Some(0),
+                        process_exited: true,
+                        original_token_count: None,
+                        hook_command: Some(hook_command),
+                        raw_output_artifact: Some(raw_output_artifact),
+                        raw_output_reduction_notice: None,
+                        repair_notice,
+                    }
+                    .with_prepared_reduction_notice()
+                    .await,
+                ));
             }
             Ok(None) => {}
             Err(err) => {
@@ -742,6 +791,7 @@ impl ExecCommandHandler {
         let exec_result = manager
             .exec_command(
                 ExecCommandRequest {
+                    validation: args.validation.clone(),
                     command,
                     command_for_safety: safety_command,
                     attempt_key: attempt_key.clone(),
@@ -793,6 +843,7 @@ impl ExecCommandHandler {
             let duration = match &exec_result {
                 Ok(response) => Some(response.wall_time),
                 Err(UnifiedExecError::SandboxDenied { output, .. }) => Some(output.duration),
+                Err(UnifiedExecError::ToolHistoryPersistence { duration, .. }) => Some(*duration),
                 Err(UnifiedExecError::ProcessFailed { .. }) if tracked_execution.is_some() => {
                     validation_execution_wall_started_at.map(|started_at| started_at.elapsed())
                 }
@@ -849,7 +900,9 @@ impl ExecCommandHandler {
                     }
                 }
                 attach_powershell_failure_advisory(&mut response, shell_type, is_powershell_script);
-                Ok(boxed_tool_output(response))
+                Ok(boxed_tool_output(
+                    response.with_prepared_reduction_notice().await,
+                ))
             }
             Err(UnifiedExecError::SandboxDenied {
                 output,
@@ -893,6 +946,7 @@ impl ExecCommandHandler {
                 }
                 let original_token_count = approx_token_count(&output_text);
                 let mut response = ExecCommandToolOutput {
+                    validation: args.validation.clone(),
                     event_call_id: context.call_id.clone(),
                     chunk_id: generate_chunk_id(),
                     wall_time: output.duration,
@@ -907,10 +961,48 @@ impl ExecCommandHandler {
                     original_token_count: Some(original_token_count),
                     hook_command: Some(hook_command),
                     raw_output_artifact: Some(finalized_artifact),
+                    raw_output_reduction_notice: None,
                     repair_notice,
                 };
                 attach_powershell_failure_advisory(&mut response, shell_type, is_powershell_script);
-                Ok(boxed_tool_output(response))
+                Ok(boxed_tool_output(
+                    response.with_prepared_reduction_notice().await,
+                ))
+            }
+            Err(UnifiedExecError::ToolHistoryPersistence {
+                message, exit_code, ..
+            }) => {
+                // The process completed; retain its actual outcome in command
+                // accounting while ending this model turn on failed durability.
+                if !known_delta_hit && !validation_attempt {
+                    let tracked = if let Some((execution_id, parent_tool_execution_id)) =
+                        tracked_execution.as_ref()
+                    {
+                        session
+                            .services
+                            .command_execution
+                            .finish_running_process_with_execution_id(
+                                process_id,
+                                *execution_id,
+                                parent_tool_execution_id,
+                                Some(exit_code),
+                            )
+                            .await
+                    } else {
+                        CompletionApplyResult::Missing
+                    };
+                    if !matches!(
+                        tracked,
+                        CompletionApplyResult::Applied | CompletionApplyResult::AlreadyApplied
+                    ) {
+                        session
+                            .services
+                            .command_execution
+                            .record_exit(&attempt_key, exit_code)
+                            .await;
+                    }
+                }
+                Err(FunctionCallError::Fatal(message))
             }
             Err(UnifiedExecError::ValidationSkipped(skipped)) => {
                 record_late_validation_skip(&turn, &skipped);

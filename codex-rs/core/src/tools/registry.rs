@@ -1153,6 +1153,8 @@ impl ToolRegistry {
             }
         }
         let dispatch_trace = ToolDispatchTrace::start(&invocation);
+        dispatch_state.attach_trace(dispatch_trace.clone());
+        dispatch_trace.wait_for_start().await;
         let (tool, tool_spec, code_mode_argument_preflight) = match self.tools.get(&tool_name) {
             Some(registered) => (
                 Arc::clone(registered.runtime()),
@@ -1233,8 +1235,20 @@ impl ToolRegistry {
         }
 
         let phase_started = Instant::now();
-        notify_tool_start(&invocation).await;
+        let start_result = notify_tool_start(&invocation).await;
         record_lifecycle_phase(&invocation, "notify_start", phase_started);
+        if let Err(error) = start_result {
+            dispatch_trace.record_failed(&error).await;
+            notify_tool_finish_if_unclaimed(
+                &invocation,
+                dispatch_state.as_ref(),
+                ToolCallOutcome::Failed {
+                    handler_executed: false,
+                },
+            )
+            .await;
+            return Err(error);
+        }
 
         let mut hook_rewrote_input = false;
         let pre_tool_use_payload =

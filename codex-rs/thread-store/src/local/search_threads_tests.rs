@@ -79,6 +79,11 @@ async fn search_threads_pages_through_equal_timestamps() {
     }
 
     for state_db in [None, Some(runtime.clone())] {
+        let storage = if state_db.is_some() {
+            "SQLite"
+        } else {
+            "rollout scan"
+        };
         let store = LocalThreadStore::new(config.clone(), state_db);
         for sort_key in [
             ThreadSortKey::CreatedAt,
@@ -105,14 +110,20 @@ async fn search_threads_pages_through_equal_timestamps() {
                 assert_eq!(
                     second.items.len(),
                     1,
-                    "equal-timestamp match must not be skipped"
+                    "equal-timestamp match must not be skipped: {storage}, {sort_key:?}, {sort_direction:?}"
                 );
-                let mut found = vec![
+                let found = vec![
                     first.items[0].thread.thread_id,
                     second.items[0].thread.thread_id,
                 ];
-                found.sort_by_key(ToString::to_string);
-                assert_eq!(found, thread_ids);
+                let expected = match sort_direction {
+                    SortDirection::Asc => thread_ids.clone(),
+                    SortDirection::Desc => thread_ids.iter().rev().copied().collect(),
+                };
+                assert_eq!(
+                    found, expected,
+                    "{storage}, {sort_key:?}, {sort_direction:?}"
+                );
                 assert!(second.next_cursor.is_none());
                 assert_eq!(first.items[0].snippet, "Hello from user");
                 assert_eq!(second.items[0].snippet, "Hello from user");
@@ -181,4 +192,83 @@ async fn search_threads_falls_back_to_legacy_name_for_default_sqlite_title() {
         page.items[0].thread.name.as_deref(),
         Some("Legacy chosen name")
     );
+}
+
+#[tokio::test]
+async fn search_threads_rejects_unserializable_cursor_without_truncating_matches() {
+    let home = TempDir::new().expect("temp dir");
+    let first_uuid = Uuid::from_u128(601);
+    let second_uuid = Uuid::from_u128(602);
+    let first_id = ThreadId::from_string(&first_uuid.to_string()).expect("first thread id");
+    let second_id = ThreadId::from_string(&second_uuid.to_string()).expect("second thread id");
+    let first_path = write_session_file(home.path(), "2025-01-03T12-31-00", first_uuid)
+        .expect("first matching rollout");
+    let second_path = write_session_file(home.path(), "2025-01-03T12-30-00", second_uuid)
+        .expect("second matching rollout");
+    let first_original = std::fs::read_to_string(&first_path).expect("first rollout bytes");
+    let second_original = std::fs::read(&second_path).expect("second rollout bytes");
+    let (metadata, rest) = first_original.split_once('\n').expect("metadata line");
+    let mut metadata: serde_json::Value = serde_json::from_str(metadata).expect("metadata JSON");
+    // The legacy timestamp parser accepts this year, but RFC3339 cannot encode it.
+    // Keep the filename ordinary so the real rollout scanner discovers this boundary item.
+    metadata["payload"]["timestamp"] = serde_json::json!("-0001-01-01T00-00-00");
+    let invalid_rollout = format!("{metadata}\n{rest}");
+    std::fs::write(&first_path, &invalid_rollout).expect("write legacy metadata timestamp");
+    let store = LocalThreadStore::new(test_config(home.path()), None);
+    let params = SearchThreadsParams {
+        page_size: 1,
+        cursor: None,
+        sort_key: ThreadSortKey::CreatedAt,
+        sort_direction: SortDirection::Desc,
+        allowed_sources: Vec::new(),
+        archived: false,
+        search_term: "Hello from user".to_string(),
+    };
+
+    let error = store
+        .search_threads(params.clone())
+        .await
+        .expect_err("an unrepresentable next page must not look like search exhaustion");
+    match error {
+        crate::ThreadStoreError::Internal { message } => assert_eq!(
+            message,
+            "failed to serialize thread search cursor: format error: The year component cannot be formatted into the requested format."
+        ),
+        other => panic!("expected the cursor serialization error, got {other}"),
+    }
+    assert_eq!(
+        std::fs::read(&first_path).unwrap(),
+        invalid_rollout.as_bytes()
+    );
+    assert_eq!(std::fs::read(&second_path).unwrap(), second_original);
+
+    // Repair the input and use the same normal store entry point: both matches remain reachable.
+    std::fs::write(&first_path, &first_original).expect("restore valid metadata timestamp");
+    let first = store
+        .search_threads(params.clone())
+        .await
+        .expect("first page");
+    assert_eq!(first.items.len(), 1);
+    assert_eq!(first.items[0].thread.thread_id, first_id);
+    assert_eq!(first.items[0].snippet, "Hello from user");
+    assert_eq!(
+        first.next_cursor.as_deref(),
+        Some(format!("2025-01-03T12:31:00Z|{first_id}").as_str())
+    );
+    let second = store
+        .search_threads(SearchThreadsParams {
+            cursor: first.next_cursor,
+            ..params
+        })
+        .await
+        .expect("second page");
+    assert_eq!(second.items.len(), 1);
+    assert_eq!(second.items[0].thread.thread_id, second_id);
+    assert_eq!(second.items[0].snippet, "Hello from user");
+    assert!(second.next_cursor.is_none());
+    assert_eq!(
+        std::fs::read(&first_path).unwrap(),
+        first_original.as_bytes()
+    );
+    assert_eq!(std::fs::read(&second_path).unwrap(), second_original);
 }

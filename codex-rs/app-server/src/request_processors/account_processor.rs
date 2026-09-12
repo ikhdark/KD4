@@ -15,6 +15,14 @@ const LOGIN_ISSUER_OVERRIDE_ENV_VAR: &str = "CODEX_APP_SERVER_LOGIN_ISSUER";
 #[cfg(debug_assertions)]
 const LOGIN_OPEN_APP_URL_OVERRIDE_ENV_VAR: &str = "CODEX_APP_SERVER_DEV_OPEN_APP_URL";
 
+#[cfg(test)]
+struct DeviceCodeLoginTestControl {
+    issuer: String,
+    prepared: Option<oneshot::Sender<()>>,
+    release: Option<oneshot::Receiver<()>>,
+    committing: Option<oneshot::Sender<()>>,
+}
+
 enum ActiveLogin {
     Browser {
         shutdown_handle: ShutdownHandle,
@@ -82,6 +90,8 @@ pub(crate) struct AccountRequestProcessor {
     config_manager: ConfigManager,
     backend_client: BackendClient,
     active_login: Arc<Mutex<Option<ActiveLogin>>>,
+    #[cfg(test)]
+    device_code_test_control: Arc<std::sync::Mutex<Option<DeviceCodeLoginTestControl>>>,
 }
 
 impl AccountRequestProcessor {
@@ -104,7 +114,32 @@ impl AccountRequestProcessor {
             config_manager,
             backend_client,
             active_login: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            device_code_test_control: Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn observe_device_code_commit_for_test(
+        &self,
+        issuer: String,
+        prepared: oneshot::Sender<()>,
+        release: oneshot::Receiver<()>,
+        committing: oneshot::Sender<()>,
+    ) {
+        let control = DeviceCodeLoginTestControl {
+            issuer,
+            prepared: Some(prepared),
+            release: Some(release),
+            committing: Some(committing),
+        };
+        assert!(
+            self.device_code_test_control
+                .lock()
+                .unwrap()
+                .replace(control)
+                .is_none()
+        );
     }
 
     fn backend_client_for_auth(&self, auth: &CodexAuth) -> BackendClient {
@@ -470,10 +505,17 @@ impl AccountRequestProcessor {
         let opts = self
             .login_chatgpt_common(codex_streamlined_login, login_success_page)
             .await?;
-        let server = run_login_server(opts)
+        let server = run_login_server_async(opts)
+            .await
             .map_err(|err| internal_error(format!("failed to start login server: {err}")))?;
         let login_id = Uuid::new_v4();
         let shutdown_handle = server.cancel_handle();
+        // Own cancellation before awaiting the registry: dropping this request
+        // while another account operation holds the lock must stop its server.
+        let pending_login = ActiveLogin::Browser {
+            shutdown_handle: shutdown_handle.clone(),
+            login_id,
+        };
 
         // Replace active login if present.
         {
@@ -481,10 +523,7 @@ impl AccountRequestProcessor {
             if let Some(existing) = guard.take() {
                 drop(existing);
             }
-            *guard = Some(ActiveLogin::Browser {
-                shutdown_handle: shutdown_handle.clone(),
-                login_id,
-            });
+            *guard = Some(pending_login);
         }
 
         let outgoing_clone = self.outgoing.clone();
@@ -554,6 +593,16 @@ impl AccountRequestProcessor {
                 LoginSuccessPage::default(),
             )
             .await?;
+        #[cfg(test)]
+        let mut test_control = self.device_code_test_control.lock().unwrap().take();
+        #[cfg(test)]
+        let opts = {
+            let mut opts = opts;
+            if let Some(control) = &test_control {
+                opts.issuer = control.issuer.clone();
+            }
+            opts
+        };
         let device_code = request_device_code(&opts)
             .await
             .map_err(Self::login_chatgpt_device_code_start_error)?;
@@ -582,16 +631,43 @@ impl AccountRequestProcessor {
         let active_login = self.active_login.clone();
         tokio::spawn(async move {
             let _ = response_enqueued.await;
-            let (success, error_msg) = tokio::select! {
-                _ = cancel.cancelled() => {
-                    (false, Some("Login was not completed".to_string()))
-                }
-                r = complete_device_code_login(opts, device_code) => {
-                    match r {
-                        Ok(()) => (true, None),
-                        Err(err) => (false, Some(err.to_string())),
+            let result = async {
+                let pending = tokio::select! {
+                    _ = cancel.cancelled() => {
+                        return Err(IoError::new(std::io::ErrorKind::Interrupted, "Login was not completed"));
+                    }
+                    result = prepare_device_code_login(opts, device_code) => result?,
+                };
+                #[cfg(test)]
+                if let Some(control) = &mut test_control {
+                    if let Some(prepared) = control.prepared.take() {
+                        let _ = prepared.send(());
+                    }
+                    if let Some(release) = control.release.take() {
+                        let _ = release.await;
                     }
                 }
+                // Cancellation and persistence admission share the existing login
+                // registry lock. Once removed here, cancellation returns NotFound:
+                // the owned completion task must finish any admitted auth write.
+                {
+                    let mut guard = active_login.lock().await;
+                    if guard.as_ref().map(ActiveLogin::login_id) != Some(login_id) {
+                        return Err(IoError::new(std::io::ErrorKind::Interrupted, "Login was not completed"));
+                    }
+                    guard.take();
+                }
+                #[cfg(test)]
+                if let Some(control) = &mut test_control {
+                    if let Some(committing) = control.committing.take() {
+                        let _ = committing.send(());
+                    }
+                }
+                pending.persist().await
+            }.await;
+            let (success, error_msg) = match result {
+                Ok(()) => (true, None),
+                Err(error) => (false, Some(error.to_string())),
             };
 
             Self::send_chatgpt_login_completion_notifications(
@@ -1326,5 +1402,100 @@ mod tests {
             };
             assert_eq!(workspace_messages_feature_disabled(&err), expected);
         }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(login_port)]
+    async fn cancelled_login_start_closes_callback_before_registry_ownership() -> anyhow::Result<()>
+    {
+        use tokio::io::AsyncReadExt;
+        use tokio::io::AsyncWriteExt;
+
+        let server = core_test_support::responses::start_mock_server().await;
+        let model_catalog = codex_models_manager::bundled_models_response()?;
+        let test = core_test_support::test_codex::test_codex()
+            .with_config(move |config| config.model_catalog = Some(model_catalog))
+            .build(&server)
+            .await?;
+        let config = Arc::new(test.config.clone());
+        let config_manager =
+            ConfigManager::without_managed_config_for_tests(config.codex_home.to_path_buf());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            tx,
+            codex_analytics::AnalyticsEventsClient::disabled(),
+        ));
+        outgoing
+            .connection_opened(
+                ConnectionId(1),
+                Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            )
+            .await;
+        let processor = AccountRequestProcessor::new(
+            AuthManager::from_auth_for_testing(CodexAuth::from_api_key("dummy")),
+            Arc::clone(&test.thread_manager),
+            outgoing,
+            config,
+            config_manager,
+        );
+        // This is the registered OAuth callback port. An unrelated listener
+        // must not accidentally satisfy the live-server probe below.
+        let callback_address = (std::net::Ipv4Addr::LOCALHOST, 1455);
+        drop(std::net::TcpListener::bind(callback_address)?);
+        let active_login = processor.active_login.lock().await;
+        assert!(active_login.is_none());
+        let mut login = Box::pin(processor.login_account(
+            ConnectionRequestId {
+                connection_id: ConnectionId(1),
+                request_id: RequestId::Integer(1),
+            },
+            LoginAccountParams::Chatgpt {
+                codex_streamlined_login: false,
+                use_hosted_login_success_page: false,
+                app_brand: None,
+            },
+        ));
+        let callback_running = async {
+            loop {
+                if let Ok(mut stream) = tokio::net::TcpStream::connect(callback_address).await {
+                    stream
+                        .write_all(b"GET /startup-probe HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                        .await?;
+                    let mut status = [0_u8; 12];
+                    stream.read_exact(&mut status).await?;
+                    assert_eq!(&status, b"HTTP/1.1 404");
+                    return Ok::<(), anyhow::Error>(());
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::select! {
+            _ = &mut login => panic!("login must wait for registry ownership"),
+            result = tokio::time::timeout(Duration::from_secs(5), callback_running) => result??,
+        }
+        // A real HTTP reply proves the callback workers started, not merely
+        // that bind_server has reserved the port on its blocking worker.
+        drop(login);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match std::net::TcpListener::bind(callback_address) {
+                    Ok(listener) => break listener,
+                    Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    Err(error) => panic!("failed checking callback release: {error}"),
+                }
+            }
+        })
+        .await?;
+        assert!(active_login.is_none());
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        assert!(!test.codex_home_path().join("auth.json").exists());
+        drop(active_login);
+        test.codex.shutdown_and_wait().await?;
+        Ok(())
     }
 }

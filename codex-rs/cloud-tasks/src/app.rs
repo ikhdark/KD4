@@ -123,6 +123,21 @@ impl App {
         self.list_generation
     }
 
+    pub(crate) fn apply_environments_loaded(
+        &mut self,
+        result: anyhow::Result<Vec<EnvironmentRow>>,
+    ) {
+        self.env_loading = false;
+        match result {
+            Ok(list) => {
+                self.environments = list;
+                self.env_error = None;
+                self.env_last_loaded = Some(std::time::Instant::now());
+            }
+            Err(error) => self.env_error = Some(error.to_string()),
+        }
+    }
+
     pub(crate) fn apply_tasks_loaded(
         &mut self,
         generation: u64,

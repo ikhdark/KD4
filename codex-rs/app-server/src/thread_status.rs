@@ -12,7 +12,7 @@ use codex_protocol::ThreadId;
 use codex_protocol::protocol::TurnAbortReason;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use std::sync::Mutex;
 #[cfg(test)]
 use tokio::sync::mpsc;
 use tokio::sync::watch;
@@ -35,7 +35,6 @@ pub(crate) struct ThreadStatusSubscription {
     receiver: Option<watch::Receiver<ThreadStatus>>,
     state: Arc<Mutex<ThreadWatchState>>,
     thread_id: String,
-    handle: tokio::runtime::Handle,
 }
 
 impl ThreadStatusSubscription {
@@ -48,7 +47,6 @@ impl ThreadStatusSubscription {
             receiver: Some(receiver),
             state,
             thread_id,
-            handle: tokio::runtime::Handle::current(),
         }
     }
 
@@ -70,14 +68,10 @@ impl ThreadStatusSubscription {
 impl Drop for ThreadStatusSubscription {
     fn drop(&mut self) {
         drop(self.receiver.take());
-        let state = Arc::clone(&self.state);
-        let thread_id = self.thread_id.clone();
-        self.handle.spawn(async move {
-            state
-                .lock()
-                .await
-                .remove_status_watcher_if_unused(&thread_id);
-        });
+        self.state
+            .lock()
+            .expect("thread watch state poisoned")
+            .remove_status_watcher_if_unused(&self.thread_id);
     }
 }
 
@@ -98,14 +92,20 @@ impl ThreadWatchActiveGuard {
 
 impl Drop for ThreadWatchActiveGuard {
     fn drop(&mut self) {
-        let manager = self.manager.clone();
-        let thread_id = self.thread_id.clone();
-        let guard_type = self.guard_type;
-        self.handle.spawn(async move {
-            manager
-                .note_active_guard_released(thread_id, guard_type)
-                .await;
-        });
+        let notification = self
+            .manager
+            .note_active_guard_released(&self.thread_id, self.guard_type);
+        if let Some(notification) = notification
+            && let Some(outgoing) = self.manager.outgoing.clone()
+        {
+            // Canonical state and local watchers have already been updated. Only
+            // network delivery depends on the originating runtime remaining alive.
+            self.handle.spawn(async move {
+                outgoing
+                    .send_server_notification(ServerNotification::ThreadStatusChanged(notification))
+                    .await;
+            });
+        }
     }
 }
 
@@ -161,14 +161,17 @@ impl ThreadWatchManager {
     }
 
     pub(crate) async fn loaded_status_for_thread(&self, thread_id: &str) -> ThreadStatus {
-        self.state.lock().await.loaded_status_for_thread(thread_id)
+        self.state
+            .lock()
+            .expect("thread watch state poisoned")
+            .loaded_status_for_thread(thread_id)
     }
 
     pub(crate) async fn loaded_statuses_for_threads(
         &self,
         thread_ids: Vec<String>,
     ) -> HashMap<String, ThreadStatus> {
-        let state = self.state.lock().await;
+        let state = self.state.lock().expect("thread watch state poisoned");
         thread_ids
             .into_iter()
             .map(|thread_id| {
@@ -182,7 +185,7 @@ impl ThreadWatchManager {
     pub(crate) async fn running_turn_count(&self) -> usize {
         self.state
             .lock()
-            .await
+            .expect("thread watch state poisoned")
             .runtime_by_thread_id
             .values()
             .filter(|runtime| runtime.running)
@@ -264,33 +267,45 @@ impl ThreadWatchManager {
         thread_id: &str,
         guard_type: ThreadWatchActiveGuardType,
     ) -> ThreadWatchActiveGuard {
-        self.update_runtime_for_thread(thread_id, move |runtime| {
-            runtime.is_loaded = true;
-            let counter = Self::pending_counter(runtime, guard_type);
-            *counter = counter.saturating_add(1);
-        })
-        .await;
-        ThreadWatchActiveGuard::new(self.clone(), thread_id.to_string(), guard_type)
+        let notification = self.mutate_state(|state| {
+            state.update_runtime(thread_id, move |runtime| {
+                runtime.is_loaded = true;
+                let counter = Self::pending_counter(runtime, guard_type);
+                *counter = counter.saturating_add(1);
+            })
+        });
+        // Own the decrement before notification delivery can suspend or be canceled.
+        let guard = ThreadWatchActiveGuard::new(self.clone(), thread_id.to_string(), guard_type);
+        self.publish_notification(notification).await;
+        guard
+    }
+
+    fn mutate_state<F>(&self, mutate: F) -> Option<ThreadStatusChangedNotification>
+    where
+        F: FnOnce(&mut ThreadWatchState) -> Option<ThreadStatusChangedNotification>,
+    {
+        let mut state = self.state.lock().expect("thread watch state poisoned");
+        let notification = mutate(&mut state);
+        let running_turn_count = state
+            .runtime_by_thread_id
+            .values()
+            .filter(|runtime| runtime.running)
+            .count();
+        // Retain the count for late subscribers and publish under the state
+        // lock so an older mutation cannot overwrite a newer count.
+        self.running_turn_count_tx.send_replace(running_turn_count);
+        notification
     }
 
     async fn mutate_and_publish<F>(&self, mutate: F)
     where
         F: FnOnce(&mut ThreadWatchState) -> Option<ThreadStatusChangedNotification>,
     {
-        let notification = {
-            let mut state = self.state.lock().await;
-            let notification = mutate(&mut state);
-            let running_turn_count = state
-                .runtime_by_thread_id
-                .values()
-                .filter(|runtime| runtime.running)
-                .count();
-            // Retain the count for late subscribers and publish under the state
-            // lock so an older mutation cannot overwrite a newer count.
-            self.running_turn_count_tx.send_replace(running_turn_count);
-            notification
-        };
+        let notification = self.mutate_state(mutate);
+        self.publish_notification(notification).await;
+    }
 
+    async fn publish_notification(&self, notification: Option<ThreadStatusChangedNotification>) {
         if let Some(notification) = notification
             && let Some(outgoing) = &self.outgoing
         {
@@ -302,7 +317,11 @@ impl ThreadWatchManager {
 
     pub(crate) async fn subscribe(&self, thread_id: ThreadId) -> Option<ThreadStatusSubscription> {
         let thread_id = thread_id.to_string();
-        let receiver = self.state.lock().await.subscribe(thread_id.clone());
+        let receiver = self
+            .state
+            .lock()
+            .expect("thread watch state poisoned")
+            .subscribe(thread_id.clone());
         Some(ThreadStatusSubscription::new(
             receiver,
             Arc::clone(&self.state),
@@ -310,16 +329,17 @@ impl ThreadWatchManager {
         ))
     }
 
-    async fn note_active_guard_released(
+    fn note_active_guard_released(
         &self,
-        thread_id: String,
+        thread_id: &str,
         guard_type: ThreadWatchActiveGuardType,
-    ) {
-        self.update_runtime_for_thread(&thread_id, move |runtime| {
-            let counter = Self::pending_counter(runtime, guard_type);
-            *counter = counter.saturating_sub(1);
+    ) -> Option<ThreadStatusChangedNotification> {
+        self.mutate_state(|state| {
+            state.update_runtime(thread_id, move |runtime| {
+                let counter = Self::pending_counter(runtime, guard_type);
+                *counter = counter.saturating_sub(1);
+            })
         })
-        .await;
     }
 
     async fn update_runtime_for_thread<F>(&self, thread_id: &str, update: F)
@@ -984,7 +1004,7 @@ mod tests {
             manager
                 .state
                 .lock()
-                .await
+                .expect("thread watch state poisoned")
                 .status_watcher_by_thread_id
                 .contains_key(INTERACTIVE_THREAD_ID),
             "the live subscription should keep its sender until it is dropped"
@@ -996,7 +1016,7 @@ mod tests {
                 if !manager
                     .state
                     .lock()
-                    .await
+                    .expect("thread watch state poisoned")
                     .status_watcher_by_thread_id
                     .contains_key(INTERACTIVE_THREAD_ID)
                 {
@@ -1007,6 +1027,239 @@ mod tests {
         })
         .await
         .expect("dropped thread status subscription should prune its sender");
+    }
+
+    #[tokio::test]
+    async fn cancelled_permission_request_releases_state_before_outgoing_queue_drains() {
+        let (outgoing_tx, outgoing_rx) = mpsc::channel(1);
+        let manager = ThreadWatchManager::new_with_outgoing(Arc::new(OutgoingMessageSender::new(
+            outgoing_tx,
+            codex_analytics::AnalyticsEventsClient::disabled(),
+        )));
+        manager
+            .upsert_thread(test_thread(
+                INTERACTIVE_THREAD_ID,
+                codex_app_server_protocol::SessionSource::Cli,
+            ))
+            .await;
+        let subscription = manager
+            .subscribe(ThreadId::from_string(INTERACTIVE_THREAD_ID).expect("valid thread id"))
+            .await
+            .expect("status subscription");
+        assert_eq!(
+            outgoing_rx.len(),
+            1,
+            "initial status fills the real outgoing queue"
+        );
+        assert_eq!(*subscription.borrow(), ThreadStatus::Idle);
+
+        let mut request = Box::pin(manager.note_permission_requested(INTERACTIVE_THREAD_ID));
+        assert!(
+            futures::poll!(request.as_mut()).is_pending(),
+            "permission publication must be blocked by outgoing backpressure"
+        );
+        assert_pending_request_counts(&manager, 1, 0);
+        assert_eq!(
+            *subscription.borrow(),
+            ThreadStatus::Active {
+                active_flags: vec![ThreadActiveFlag::WaitingOnApproval],
+            }
+        );
+
+        drop(request);
+        // No await, yield, outgoing receive or fresh manager operation can repair this state.
+        assert_pending_request_counts(&manager, 0, 0);
+        assert_eq!(*subscription.borrow(), ThreadStatus::Idle);
+        assert_eq!(
+            outgoing_rx.len(),
+            1,
+            "cleanup must not require draining the queue"
+        );
+        assert_eq!(
+            manager
+                .loaded_status_for_thread(INTERACTIVE_THREAD_ID)
+                .await,
+            ThreadStatus::Idle
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_user_input_request_releases_state_before_outgoing_queue_drains() {
+        let (outgoing_tx, outgoing_rx) = mpsc::channel(1);
+        let manager = ThreadWatchManager::new_with_outgoing(Arc::new(OutgoingMessageSender::new(
+            outgoing_tx,
+            codex_analytics::AnalyticsEventsClient::disabled(),
+        )));
+        manager
+            .upsert_thread(test_thread(
+                INTERACTIVE_THREAD_ID,
+                codex_app_server_protocol::SessionSource::Cli,
+            ))
+            .await;
+        let subscription = manager
+            .subscribe(ThreadId::from_string(INTERACTIVE_THREAD_ID).expect("valid thread id"))
+            .await
+            .expect("status subscription");
+        assert_eq!(
+            outgoing_rx.len(),
+            1,
+            "initial status fills the real outgoing queue"
+        );
+        assert_eq!(*subscription.borrow(), ThreadStatus::Idle);
+
+        let mut request = Box::pin(manager.note_user_input_requested(INTERACTIVE_THREAD_ID));
+        assert!(
+            futures::poll!(request.as_mut()).is_pending(),
+            "user-input publication must be blocked by outgoing backpressure"
+        );
+        assert_pending_request_counts(&manager, 0, 1);
+        assert_eq!(
+            *subscription.borrow(),
+            ThreadStatus::Active {
+                active_flags: vec![ThreadActiveFlag::WaitingOnUserInput],
+            }
+        );
+
+        drop(request);
+        // The observer must see rollback immediately, before any asynchronous cleanup runs.
+        assert_pending_request_counts(&manager, 0, 0);
+        assert_eq!(*subscription.borrow(), ThreadStatus::Idle);
+        assert_eq!(
+            outgoing_rx.len(),
+            1,
+            "cleanup must not require draining the queue"
+        );
+        assert_eq!(
+            manager
+                .loaded_status_for_thread(INTERACTIVE_THREAD_ID)
+                .await,
+            ThreadStatus::Idle
+        );
+    }
+
+    #[test]
+    fn active_guards_and_subscriptions_cleanup_after_originating_runtime_is_dropped() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("originating runtime");
+        let (
+            manager,
+            permission_guard,
+            user_input_guard,
+            first_subscription,
+            second_subscription,
+            _outgoing_rx,
+        ) = runtime.block_on(async {
+            let (outgoing_tx, outgoing_rx) = mpsc::channel(8);
+            let manager =
+                ThreadWatchManager::new_with_outgoing(Arc::new(OutgoingMessageSender::new(
+                    outgoing_tx,
+                    codex_analytics::AnalyticsEventsClient::disabled(),
+                )));
+            manager
+                .upsert_thread(test_thread(
+                    INTERACTIVE_THREAD_ID,
+                    codex_app_server_protocol::SessionSource::Cli,
+                ))
+                .await;
+            let thread_id = ThreadId::from_string(INTERACTIVE_THREAD_ID).expect("valid thread id");
+            let first_subscription = manager.subscribe(thread_id).await.expect("first observer");
+            let second_subscription = manager.subscribe(thread_id).await.expect("second observer");
+            let permission_guard = manager
+                .note_permission_requested(INTERACTIVE_THREAD_ID)
+                .await;
+            let user_input_guard = manager
+                .note_user_input_requested(INTERACTIVE_THREAD_ID)
+                .await;
+            assert_pending_request_counts(&manager, 1, 1);
+            assert_eq!(
+                *first_subscription.borrow(),
+                ThreadStatus::Active {
+                    active_flags: vec![
+                        ThreadActiveFlag::WaitingOnApproval,
+                        ThreadActiveFlag::WaitingOnUserInput,
+                    ],
+                }
+            );
+            (
+                manager,
+                permission_guard,
+                user_input_guard,
+                first_subscription,
+                second_subscription,
+                outgoing_rx,
+            )
+        });
+        drop(runtime);
+
+        drop(permission_guard);
+        assert_pending_request_counts(&manager, 0, 1);
+        assert_eq!(
+            *first_subscription.borrow(),
+            ThreadStatus::Active {
+                active_flags: vec![ThreadActiveFlag::WaitingOnUserInput],
+            }
+        );
+        drop(user_input_guard);
+        assert_pending_request_counts(&manager, 0, 0);
+        assert_eq!(*first_subscription.borrow(), ThreadStatus::Idle);
+        assert_eq!(*second_subscription.borrow(), ThreadStatus::Idle);
+
+        drop(first_subscription);
+        {
+            let state = manager.state.lock().expect("watch state lock");
+            let sender = state
+                .status_watcher_by_thread_id
+                .get(INTERACTIVE_THREAD_ID)
+                .expect("remaining subscriber must retain its sender");
+            assert_eq!(sender.receiver_count(), 1);
+        }
+        drop(second_subscription);
+        assert!(
+            !manager
+                .state
+                .lock()
+                .expect("watch state lock")
+                .status_watcher_by_thread_id
+                .contains_key(INTERACTIVE_THREAD_ID),
+            "the final subscriber must synchronously prune its sender without a runtime"
+        );
+
+        // Only after inspecting raw cleanup do normal reads run on a different runtime.
+        let replacement_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("replacement runtime");
+        replacement_runtime.block_on(async {
+            assert_eq!(
+                manager
+                    .loaded_status_for_thread(INTERACTIVE_THREAD_ID)
+                    .await,
+                ThreadStatus::Idle
+            );
+            assert_eq!(manager.running_turn_count().await, 0);
+            let subscription = manager
+                .subscribe(ThreadId::from_string(INTERACTIVE_THREAD_ID).expect("valid thread id"))
+                .await
+                .expect("new observer after cleanup");
+            assert_eq!(*subscription.borrow(), ThreadStatus::Idle);
+            drop(subscription);
+        });
+    }
+
+    fn assert_pending_request_counts(
+        manager: &ThreadWatchManager,
+        permission: u32,
+        user_input: u32,
+    ) {
+        let state = manager.state.lock().expect("watch state lock");
+        let runtime = state
+            .runtime_by_thread_id
+            .get(INTERACTIVE_THREAD_ID)
+            .expect("normal upsert must retain thread runtime facts");
+        assert_eq!(runtime.pending_permission_requests, permission);
+        assert_eq!(runtime.pending_user_input_requests, user_input);
     }
 
     async fn wait_for_status(

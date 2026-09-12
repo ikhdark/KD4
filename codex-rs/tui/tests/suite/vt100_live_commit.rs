@@ -29,15 +29,17 @@ fn live_001_commit_on_overflow() {
 
     let screen = term.backend().vt100().screen();
 
-    // The words "one" and "two" should appear above the viewport.
     let joined = screen.contents();
-    assert!(
-        joined.contains("one"),
-        "expected committed 'one' to be visible\n{joined}"
+    assert_eq!(
+        joined
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .collect::<Vec<_>>(),
+        vec!["one", "two"]
     );
-    assert!(
-        joined.contains("two"),
-        "expected committed 'two' to be visible\n{joined}"
+    let retained = rb.drain_commit_ready(0);
+    assert_eq!(
+        retained.into_iter().map(|row| row.text).collect::<Vec<_>>(),
+        vec!["three", "four", "five"]
     );
-    // The last three (three,four,five) remain in the live ring, not committed here.
 }

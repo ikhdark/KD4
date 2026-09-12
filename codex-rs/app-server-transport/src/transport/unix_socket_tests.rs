@@ -178,9 +178,24 @@ async fn control_socket_shutdown_closes_incomplete_websocket_handshakes() {
         .await
         .expect("acceptor should drain connection tasks")
         .expect("acceptor should join");
-    let _ = timeout(Duration::from_secs(1), stream.read(&mut byte))
+    let closed = timeout(Duration::from_secs(1), stream.read(&mut byte))
         .await
         .expect("shutdown should close the accepted raw socket");
+    match closed {
+        Ok(0) => {}
+        Err(err) => assert!(
+            matches!(
+                err.kind(),
+                std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::NotConnected
+                    | std::io::ErrorKind::UnexpectedEof
+            ),
+            "shutdown should report a closed socket, got {err}"
+        ),
+        Ok(count) => panic!("shutdown must close the socket, not deliver {count} bytes"),
+    }
     assert_socket_path_removed(socket_path.as_path());
 }
 

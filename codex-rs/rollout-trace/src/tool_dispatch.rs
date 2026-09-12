@@ -177,12 +177,21 @@ impl ToolDispatchTraceContext {
 
     /// Records a dispatch failure before the tool produced a normal result payload.
     pub fn record_failed(&self, error: impl Display) {
+        self.record_error(ExecutionStatus::Failed, error);
+    }
+
+    /// Records cancellation after the owning runtime has completed cleanup.
+    pub fn record_cancelled(&self, error: impl Display) {
+        self.record_error(ExecutionStatus::Cancelled, error);
+    }
+
+    fn record_error(&self, status: ExecutionStatus, error: impl Display) {
         let ToolDispatchTraceContextState::Enabled(context) = &self.state else {
             return;
         };
         append_tool_call_ended(
             context,
-            ExecutionStatus::Failed,
+            status,
             &DispatchedToolTraceResponse::Error {
                 error: error.to_string(),
             },

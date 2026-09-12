@@ -316,26 +316,41 @@ impl Session {
         }
 
         let _elicitation = self.services.elicitations.register();
+        let cleanup = tokio_util::sync::CancellationToken::new();
+        let _cleanup_on_drop = cleanup.clone().drop_guard();
         let (tx_response, rx_response) = oneshot::channel();
-        let prev_entry = {
+        let (originating_turn_state, prev_entry) = {
             let mut active = self.active_turn.lock().await;
             match active.as_mut() {
                 Some(at) => {
                     let mut ts = at.turn_state.lock().await;
-                    ts.insert_pending_elicitation(
+                    let previous = ts.insert_pending_elicitation(
                         server_name.clone(),
                         request_id.clone(),
                         tx_response,
-                    )
+                    );
+                    (Some(Arc::clone(&at.turn_state)), previous)
                 }
-                None => None,
+                None => (None, None),
             }
         };
+        if let Some(turn_state) = originating_turn_state {
+            let server_name = server_name.clone();
+            let request_id = request_id.clone();
+            self.terminal_tasks.spawn(async move {
+                cleanup.cancelled().await;
+                turn_state
+                    .lock()
+                    .await
+                    .remove_closed_pending_elicitation(&server_name, &request_id);
+            });
+        }
         if prev_entry.is_some() {
             warn!(
                 "Overwriting existing pending elicitation for server_name: {server_name}, request_id: {request_id}"
             );
         }
+        drop(prev_entry);
         let id = match request_id {
             rmcp::model::NumberOrString::String(value) => {
                 codex_protocol::mcp::RequestId::String(value.to_string())

@@ -622,14 +622,32 @@ impl CatalogRequestProcessor {
             } else {
                 codex_core_plugins::PluginHookLoadOutcome::default()
             };
-            let hooks = codex_hooks::list_hooks(codex_hooks::HooksConfig {
+            let hooks_config = codex_hooks::HooksConfig {
                 feature_enabled: config.features.enabled(Feature::CodexHooks),
                 bypass_hook_trust: config.bypass_hook_trust,
                 config_layer_stack: Some(config.config_layer_stack.as_ref().clone()),
                 plugin_hook_sources: plugin_hooks.hook_sources,
                 plugin_hook_load_warnings: plugin_hooks.hook_load_warnings,
                 ..Default::default()
-            });
+            };
+            let hooks =
+                match tokio::task::spawn_blocking(move || codex_hooks::list_hooks(hooks_config))
+                    .await
+                {
+                    Ok(hooks) => hooks,
+                    Err(err) => {
+                        data.push(codex_app_server_protocol::HooksListEntry {
+                            errors: vec![codex_app_server_protocol::HookErrorInfo {
+                                path: cwd.clone(),
+                                message: format!("hook discovery task failed: {err}"),
+                            }],
+                            cwd,
+                            hooks: Vec::new(),
+                            warnings: Vec::new(),
+                        });
+                        continue;
+                    }
+                };
             data.push(codex_app_server_protocol::HooksListEntry {
                 cwd,
                 hooks: hooks_to_info(&hooks.hooks),

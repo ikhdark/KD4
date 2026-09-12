@@ -61,6 +61,7 @@ async fn guardian_review_request_includes_patch_context() {
     let expected_cwd = action.cwd.clone();
     let expected_patch = action.patch.clone();
     let request = ApplyPatchRequest {
+        cancellation_token: tokio_util::sync::CancellationToken::new(),
         turn_environment: test_turn_environment(codex_exec_server::LOCAL_ENVIRONMENT_ID),
         action,
         file_paths: vec![PathUri::from_abs_path(&path)],
@@ -99,6 +100,7 @@ async fn guardian_review_request_preserves_foreign_paths() {
     let expected_cwd = action.cwd.clone();
     let expected_patch = action.patch.clone();
     let request = ApplyPatchRequest {
+        cancellation_token: tokio_util::sync::CancellationToken::new(),
         turn_environment: test_turn_environment("remote"),
         action,
         file_paths: vec![path.clone()],
@@ -165,6 +167,7 @@ async fn permission_request_payload_uses_apply_patch_hook_name_and_aliases() {
         ApplyPatchAction::new_add_for_test(&PathUri::from_abs_path(&path), "hello".to_string());
     let expected_patch = action.patch.clone();
     let req = ApplyPatchRequest {
+        cancellation_token: tokio_util::sync::CancellationToken::new(),
         turn_environment: test_turn_environment(codex_exec_server::LOCAL_ENVIRONMENT_ID),
         action,
         file_paths: vec![PathUri::from_abs_path(&path)],
@@ -200,6 +203,7 @@ async fn approval_keys_include_environment_id_and_approval_scope() {
         .abs();
     let path_uri = PathUri::from_abs_path(&path);
     let mut req = ApplyPatchRequest {
+        cancellation_token: tokio_util::sync::CancellationToken::new(),
         turn_environment: test_turn_environment("remote"),
         action: ApplyPatchAction::new_add_for_test(&path_uri, "hello".to_string()),
         file_paths: vec![path_uri.clone()],
@@ -240,6 +244,7 @@ async fn sandbox_retry_session_approval_is_cached_separately() {
         let turn = turn.clone();
         async move {
             let req = ApplyPatchRequest {
+                cancellation_token: tokio_util::sync::CancellationToken::new(),
                 turn_environment: test_turn_environment("remote"),
                 action: ApplyPatchAction::new_add_for_test(&path_uri, "hello".to_string()),
                 file_paths: vec![path_uri],
@@ -349,6 +354,7 @@ async fn sandbox_cwd_uses_patch_action_cwd() {
         .join("apply-patch-runtime-sandbox-cwd.txt")
         .abs();
     let req = ApplyPatchRequest {
+        cancellation_token: tokio_util::sync::CancellationToken::new(),
         turn_environment: test_turn_environment(codex_exec_server::LOCAL_ENVIRONMENT_ID),
         action: ApplyPatchAction::new_add_for_test(
             &PathUri::from_abs_path(&path),
@@ -380,6 +386,7 @@ async fn file_system_sandbox_context_uses_active_attempt() {
         )),
     };
     let req = ApplyPatchRequest {
+        cancellation_token: tokio_util::sync::CancellationToken::new(),
         turn_environment: test_turn_environment(codex_exec_server::LOCAL_ENVIRONMENT_ID),
         action: ApplyPatchAction::new_add_for_test(
             &PathUri::from_abs_path(&path),
@@ -449,6 +456,7 @@ async fn no_sandbox_attempt_has_no_file_system_context() {
         .join("apply-patch-runtime-none.txt")
         .abs();
     let req = ApplyPatchRequest {
+        cancellation_token: tokio_util::sync::CancellationToken::new(),
         turn_environment: test_turn_environment(codex_exec_server::LOCAL_ENVIRONMENT_ID),
         action: ApplyPatchAction::new_add_for_test(
             &PathUri::from_abs_path(&path),

@@ -202,16 +202,23 @@ impl V2Residency {
                 claim.restore();
                 continue;
             }
-            if timeout(
+            match timeout(
                 RESIDENCY_MATERIALIZE_TIMEOUT,
-                candidate_thread.ensure_rollout_materialized(),
+                candidate_thread.try_ensure_rollout_materialized(),
             )
             .await
-            .is_err()
             {
-                warn!("timed out materializing v2 resident thread {candidate_thread_id}");
-                claim.restore();
-                continue;
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    warn!("failed to materialize v2 resident thread {candidate_thread_id}: {err}");
+                    claim.restore();
+                    continue;
+                }
+                Err(_) => {
+                    warn!("timed out materializing v2 resident thread {candidate_thread_id}");
+                    claim.restore();
+                    continue;
+                }
             }
             if let Err(err) = candidate_thread.request_shutdown().await {
                 warn!(

@@ -314,9 +314,35 @@ impl GoalToolExecutor {
         event_id: &str,
         budget_limited_goal_disposition: BudgetLimitedGoalDisposition,
     ) -> Result<Option<ThreadGoal>, FunctionCallError> {
+        for pending_turn_id in self.accounting_state.pending_turn_ids() {
+            self.account_goal_progress_for_turn(
+                pending_turn_id.clone(),
+                codex_state::GoalAccountingMode::ActiveOnly,
+                event_id,
+                BudgetLimitedGoalDisposition::ClearActive,
+            )
+            .await?;
+            self.accounting_state.finish_turn(&pending_turn_id);
+        }
         let Some(turn_id) = self.accounting_state.current_turn_id() else {
             return Ok(None);
         };
+        self.account_goal_progress_for_turn(
+            turn_id,
+            mode,
+            event_id,
+            budget_limited_goal_disposition,
+        )
+        .await
+    }
+
+    async fn account_goal_progress_for_turn(
+        &self,
+        turn_id: String,
+        mode: codex_state::GoalAccountingMode,
+        event_id: &str,
+        budget_limited_goal_disposition: BudgetLimitedGoalDisposition,
+    ) -> Result<Option<ThreadGoal>, FunctionCallError> {
         let _accounting_permit = self
             .accounting_state
             .progress_accounting_permit()

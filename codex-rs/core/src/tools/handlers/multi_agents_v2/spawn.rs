@@ -39,6 +39,8 @@ use codex_context_fragments::ModelContextBudget;
 use codex_git_utils::get_git_repo_root;
 use codex_otel::SessionTelemetry;
 use codex_protocol::AgentPath;
+use codex_protocol::ThreadId;
+use codex_protocol::error::CodexErr;
 use codex_tools::ToolSpec;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use sha2::Digest;
@@ -50,13 +52,19 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use uuid::Uuid;
 
 const MAX_UNTRACKED_SNAPSHOT_FILE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_UNTRACKED_SNAPSHOT_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
+const WORKTREE_GIT_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Default)]
 pub(crate) struct Handler {
@@ -91,6 +99,7 @@ async fn handle_spawn_agent(
         step_context,
         payload,
         call_id,
+        cancellation_token,
         ..
     } = invocation;
     let turn = Arc::clone(&step_context.turn);
@@ -323,6 +332,8 @@ async fn handle_spawn_agent(
                 &main_repo_root,
                 config.codex_home.as_path(),
                 &args.task_name,
+                &cancellation_token,
+                &session.terminal_tasks,
             ))
             .await?;
             config.cwd = match AbsolutePathBuf::from_absolute_path(&workspace.path) {
@@ -368,6 +379,16 @@ async fn handle_spawn_agent(
                 Vec::new(),
             ),
         };
+        if cancellation_token.is_cancelled() {
+            if let Some(workspace) = isolated_workspace.take()
+                && let Err(error) = cleanup_isolated_worktree(&workspace).await
+            {
+                tracing::warn!(path = %workspace.path.display(), %error, "failed to clean cancelled isolated worktree");
+            }
+            return Err(FunctionCallError::RespondToModel(
+                "spawn_agent cancelled".to_string(),
+            ));
+        }
         let isolated_integrator_available = resolve_role_config(&config, "integrator").is_some();
         let prepared = prepared_typed_spawn.take().ok_or_else(|| {
             FunctionCallError::RespondToModel(
@@ -509,17 +530,20 @@ async fn handle_spawn_agent(
                 "spawn_agent: typed spawn reservation became unavailable".to_string(),
             )
         })?;
-        Box::pin(
-            session
-                .services
-                .agent_control
-                .spawn_agent_with_prepared_typed_task_capsule(
-                    config,
-                    canonical_payload.clone(),
-                    spawn_source,
-                    options,
-                    prepared,
-                ),
+        await_spawn_or_cancel(
+            &cancellation_token,
+            Box::pin(
+                session
+                    .services
+                    .agent_control
+                    .spawn_agent_with_prepared_typed_task_capsule(
+                        config,
+                        canonical_payload.clone(),
+                        spawn_source,
+                        options,
+                        prepared,
+                    ),
+            ),
         )
         .await
     } else {
@@ -543,32 +567,38 @@ async fn handle_spawn_agent(
                     "spawn_agent: typed spawn reservation became unavailable".to_string(),
                 )
             })?;
-            Box::pin(
-                session
-                    .services
-                    .agent_control
-                    .spawn_agent_with_prepared_typed_communication(
-                        config,
-                        communication,
-                        context,
-                        spawn_source,
-                        options,
-                        prepared,
-                    ),
+            await_spawn_or_cancel(
+                &cancellation_token,
+                Box::pin(
+                    session
+                        .services
+                        .agent_control
+                        .spawn_agent_with_prepared_typed_communication(
+                            config,
+                            communication,
+                            context,
+                            spawn_source,
+                            options,
+                            prepared,
+                        ),
+                ),
             )
             .await
         } else {
-            Box::pin(
-                session
-                    .services
-                    .agent_control
-                    .spawn_agent_with_communication(
-                        config,
-                        communication,
-                        context,
-                        Some(spawn_source),
-                        options,
-                    ),
+            await_spawn_or_cancel(
+                &cancellation_token,
+                Box::pin(
+                    session
+                        .services
+                        .agent_control
+                        .spawn_agent_with_communication(
+                            config,
+                            communication,
+                            context,
+                            Some(spawn_source),
+                            options,
+                        ),
+                ),
             )
             .await
         }
@@ -576,56 +606,86 @@ async fn handle_spawn_agent(
     let spawned_agent = match spawned_agent {
         Ok(spawned_agent) => spawned_agent,
         Err(error) => {
-            if let Some((assignment, _, _)) = typed_task.as_ref() {
-                let coordinator = session.services.agent_control.task_coordinator();
-                if let Some(store) = coordinator.store() {
-                    if let Err(rollback_error) = store
-                        .abandon_agent_task(
-                            TaskActor::Root,
-                            assignment.assignment_id,
-                            format!("spawn failed before the typed agent started: {error}"),
-                        )
-                        .await
-                    {
-                        tracing::warn!(
-                            assignment_id = %assignment.assignment_id,
-                            %rollback_error,
-                            "failed to abandon typed assignment after spawn failure"
-                        );
-                    }
-                    // A terminal fallback receipt may race the explicit abandonment while the
-                    // child is shutting down. Removal performs its own terminal-state check, so
-                    // attempt it independently and never delete an active task's binding.
-                    if let Err(cleanup_error) = coordinator
-                        .remove_agent_task_binding(assignment.assignment_id)
-                        .await
-                    {
-                        tracing::warn!(
-                            assignment_id = %assignment.assignment_id,
-                            %cleanup_error,
-                            "failed to remove typed task binding after spawn failure"
-                        );
-                    }
-                    coordinator
-                        .maybe_emit_terminal_metrics(
-                            assignment.assignment_id,
-                            &turn.session_telemetry,
-                        )
-                        .await;
+            let assignment_id = typed_task
+                .as_ref()
+                .map(|(assignment, _, _)| assignment.assignment_id);
+            let control = session.services.agent_control.clone();
+            let child_thread_id = assignment_id
+                .and_then(|id| control.task_coordinator().binding_for_assignment(id))
+                .and_then(|binding| binding.thread_id)
+                .and_then(|id| ThreadId::from_string(&id).ok());
+            let telemetry = turn.session_telemetry.clone();
+            let failure_reason = error.to_string();
+            let cleanup = async move {
+                if let Some(child_thread_id) = child_thread_id
+                    && let Err(error) = control.wait_for_agent_termination(child_thread_id).await
+                {
+                    tracing::warn!(%child_thread_id, %error, "could not observe failed spawned child termination");
+                    return;
                 }
-            }
-            if let Some(workspace) = isolated_workspace.take()
-                && let Err(cleanup_error) = cleanup_isolated_worktree(&workspace).await
-            {
-                tracing::warn!(
-                    path = %workspace.path.display(),
-                    %cleanup_error,
-                    "failed to clean isolated worktree after spawn failure"
-                );
+                if let Some(assignment_id) = assignment_id {
+                    let coordinator = control.task_coordinator();
+                    if let Some(store) = coordinator.store() {
+                        if let Err(rollback_error) = store
+                            .abandon_agent_task(
+                                TaskActor::Root,
+                                assignment_id,
+                                format!(
+                                    "spawn failed before the typed agent was returned: {failure_reason}"
+                                ),
+                            )
+                            .await
+                        {
+                            tracing::warn!(
+                                assignment_id = %assignment_id,
+                                %rollback_error,
+                                "failed to abandon typed assignment after spawn failure"
+                            );
+                        }
+                        // The child may have sealed its own terminal receipt during shutdown.
+                        // Removal checks terminal state independently of explicit abandonment.
+                        if let Err(cleanup_error) =
+                            coordinator.remove_agent_task_binding(assignment_id).await
+                        {
+                            tracing::warn!(
+                                assignment_id = %assignment_id,
+                                %cleanup_error,
+                                "failed to remove typed task binding after spawn failure"
+                            );
+                        }
+                        coordinator
+                            .maybe_emit_terminal_metrics(assignment_id, &telemetry)
+                            .await;
+                    }
+                }
+                if let Some(workspace) = isolated_workspace.take()
+                    && let Err(cleanup_error) = cleanup_isolated_worktree(&workspace).await
+                {
+                    tracing::warn!(
+                        path = %workspace.path.display(),
+                        %cleanup_error,
+                        "failed to clean isolated worktree after spawn failure"
+                    );
+                }
+            };
+            if child_thread_id.is_some() {
+                // Dropping the spawn future queues rollback. Its child can still report
+                // usage until shutdown completes, so keep binding and metrics alive.
+                // Preserve the runtime's commit barrier. If its bounded cancellation
+                // supervisor drops this waiter, the tracked cleanup still owns the work.
+                if let Err(error) = session.terminal_tasks.spawn(cleanup).await {
+                    tracing::warn!(%error, "failed spawned child finalization task failed");
+                }
+            } else {
+                cleanup.await;
             }
             return Err(collab_spawn_error(error));
         }
     };
+    if let Some(workspace) = &isolated_workspace {
+        // The successfully started agent now owns the worktree lifetime.
+        workspace.cleanup_required.store(false, Ordering::Release);
+    }
     if let Some(metric) = typed_reservation_metric.as_mut() {
         metric.mark_retained();
     }
@@ -834,6 +894,26 @@ async fn reusable_spawn_result(
 struct IsolatedWorkspace {
     main_repo_root: PathBuf,
     path: PathBuf,
+    cleanup_required: AtomicBool,
+    terminal_tasks: TaskTracker,
+}
+
+impl Drop for IsolatedWorkspace {
+    fn drop(&mut self) {
+        if !self.cleanup_required.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        let repo_root = self.main_repo_root.clone();
+        let path = self.path.clone();
+        // The handler can be dropped between two awaited admission steps.
+        // Preserve rollback ownership even when there is no caller left to await it.
+        let terminal_tasks = self.terminal_tasks.clone();
+        self.terminal_tasks.spawn(async move {
+            if let Err(error) = cleanup_isolated_worktree_paths(&repo_root, &path, &terminal_tasks).await {
+                tracing::warn!(path = %path.display(), %error, "failed to roll back isolated worktree");
+            }
+        });
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -846,8 +926,11 @@ async fn create_isolated_worktree(
     repo_root: &Path,
     codex_home: &Path,
     task_name: &str,
+    cancellation_token: &CancellationToken,
+    terminal_tasks: &TaskTracker,
 ) -> Result<IsolatedWorkspace, FunctionCallError> {
-    let initial_overlay = capture_workspace_overlay(repo_root).await?;
+    let initial_overlay =
+        capture_workspace_overlay(repo_root, cancellation_token, terminal_tasks).await?;
     let repository_key = format!(
         "{:x}",
         Sha256::digest(repo_root.to_string_lossy().as_bytes())
@@ -875,31 +958,38 @@ async fn create_isolated_worktree(
         ))
     })?;
     let path = parent.join(leaf);
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo_root)
-        .args(["worktree", "add", "--detach"])
-        .arg(&path)
-        .arg("HEAD")
-        .output()
-        .await
-        .map_err(|error| {
-            FunctionCallError::RespondToModel(format!(
-                "spawn_agent: could not launch git worktree add: {error}"
-            ))
-        })?;
-    if !output.status.success() {
-        return Err(FunctionCallError::RespondToModel(format!(
-            "spawn_agent: git worktree add failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
-    }
     let workspace = IsolatedWorkspace {
         main_repo_root: repo_root.to_path_buf(),
         path,
+        cleanup_required: AtomicBool::new(true),
+        terminal_tasks: terminal_tasks.clone(),
     };
+    let mut command = Command::new("git");
+    command
+        .arg("-C")
+        .arg(repo_root)
+        .args(["worktree", "add", "--detach"])
+        .arg(&workspace.path)
+        .arg("HEAD");
+    let output = run_worktree_git(command, None, cancellation_token, terminal_tasks).await;
+    let error = match output {
+        Ok(output) if output.status.success() => None,
+        Ok(output) => Some(format!(
+            "spawn_agent: git worktree add failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )),
+        Err(error) => Some(format!(
+            "spawn_agent: could not complete git worktree add: {error}"
+        )),
+    };
+    if let Some(error) = error {
+        if let Err(cleanup_error) = cleanup_isolated_worktree(&workspace).await {
+            tracing::warn!(path = %workspace.path.display(), %cleanup_error, "failed to clean isolated worktree after checkout failure");
+        }
+        return Err(FunctionCallError::RespondToModel(error));
+    }
     let populate_result = Box::pin(async {
-        let current_overlay = capture_workspace_overlay(repo_root).await?;
+        let current_overlay = capture_workspace_overlay(repo_root, cancellation_token, terminal_tasks).await?;
         if current_overlay != initial_overlay {
             return Err(FunctionCallError::RespondToModel(
                 "spawn_agent: the shared worktree changed while its isolated snapshot was being created; retry after the current writer finishes"
@@ -907,38 +997,17 @@ async fn create_isolated_worktree(
             ));
         }
         if !initial_overlay.tracked_diff.is_empty() {
-            let mut child = Command::new("git")
-                .arg("-C")
+            let mut command = Command::new("git");
+            command.arg("-C")
                 .arg(&workspace.path)
-                .args(["apply", "--binary", "--whitespace=nowarn", "-"])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
+                .args(["apply", "--binary", "--whitespace=nowarn", "-"]);
+            let output = run_worktree_git(command, Some(&initial_overlay.tracked_diff), cancellation_token, terminal_tasks)
+                .await
                 .map_err(|error| {
                     FunctionCallError::RespondToModel(format!(
                         "spawn_agent: could not apply the shared-worktree snapshot: {error}"
                     ))
                 })?;
-            let mut stdin = child.stdin.take().ok_or_else(|| {
-                FunctionCallError::RespondToModel(
-                    "spawn_agent: git apply stdin was unavailable".to_string(),
-                )
-            })?;
-            stdin
-                .write_all(&initial_overlay.tracked_diff)
-                .await
-                .map_err(|error| {
-                    FunctionCallError::RespondToModel(format!(
-                        "spawn_agent: could not stream the shared-worktree snapshot: {error}"
-                    ))
-                })?;
-            drop(stdin);
-            let output = child.wait_with_output().await.map_err(|error| {
-                FunctionCallError::RespondToModel(format!(
-                    "spawn_agent: could not finish applying the shared-worktree snapshot: {error}"
-                ))
-            })?;
             if !output.status.success() {
                 return Err(FunctionCallError::RespondToModel(format!(
                     "spawn_agent: isolated snapshot apply failed: {}",
@@ -979,12 +1048,15 @@ async fn create_isolated_worktree(
 
 async fn capture_workspace_overlay(
     repo_root: &Path,
+    cancellation_token: &CancellationToken,
+    terminal_tasks: &TaskTracker,
 ) -> Result<WorkspaceOverlay, FunctionCallError> {
-    let diff = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .arg("-C")
         .arg(repo_root)
-        .args(["diff", "--binary", "--no-ext-diff", "HEAD", "--"])
-        .output()
+        .args(["diff", "--binary", "--no-ext-diff", "HEAD", "--"]);
+    let diff = run_worktree_git(command, None, cancellation_token, terminal_tasks)
         .await
         .map_err(|error| {
             FunctionCallError::RespondToModel(format!(
@@ -997,11 +1069,12 @@ async fn capture_workspace_overlay(
             String::from_utf8_lossy(&diff.stderr).trim()
         )));
     }
-    let untracked = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .arg("-C")
         .arg(repo_root)
-        .args(["ls-files", "--others", "--exclude-standard", "-z"])
-        .output()
+        .args(["ls-files", "--others", "--exclude-standard", "-z"]);
+    let untracked = run_worktree_git(command, None, cancellation_token, terminal_tasks)
         .await
         .map_err(|error| {
             FunctionCallError::RespondToModel(format!(
@@ -1091,14 +1164,174 @@ async fn capture_workspace_overlay(
     })
 }
 
+#[cfg(unix)]
+struct WorktreeProcessGroup(u32);
+
+#[cfg(unix)]
+impl Drop for WorktreeProcessGroup {
+    fn drop(&mut self) {
+        let _ = codex_utils_pty::process_group::kill_process_group(self.0);
+    }
+}
+
+async fn run_worktree_git(
+    mut command: Command,
+    input: Option<&[u8]>,
+    cancellation_token: &CancellationToken,
+    terminal_tasks: &TaskTracker,
+) -> std::io::Result<std::process::Output> {
+    command
+        .kill_on_drop(true)
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    command.process_group(0);
+    #[cfg(windows)]
+    command.creation_flags(codex_utils_pty::WINDOWS_CREATE_SUSPENDED);
+    let input = input.map(<[u8]>::to_vec);
+    let cancellation = cancellation_token.child_token();
+    let _cancel_on_drop = cancellation.clone().drop_guard();
+    // A session-owned worker retains the process through termination and reaping,
+    // including cancellation while Command::spawn is on the blocking pool.
+    terminal_tasks.spawn(async move {
+        #[cfg(windows)]
+        let managed = codex_utils_pty::ManagedRootProcess::reserve_with_reclaim().await?;
+        #[cfg(windows)]
+        managed.require_descendant_containment()?;
+        if cancellation.is_cancelled() {
+            return Err(std::io::Error::new(ErrorKind::Interrupted, "worktree Git command cancelled"));
+        }
+        let mut child = tokio::task::spawn_blocking(move || command.spawn())
+            .await.map_err(std::io::Error::other)??;
+        let pid = child.id().ok_or_else(|| std::io::Error::other("missing worktree Git pid"))?;
+        #[cfg(unix)]
+        let _process_group = WorktreeProcessGroup(pid);
+        #[cfg(windows)]
+        if let Err(error) = managed.attach_and_resume(pid) {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            return Err(error);
+        }
+        let stdin = child.stdin.take();
+        let mut stdout = child.stdout.take().expect("piped worktree stdout");
+        let mut stderr = child.stderr.take().expect("piped worktree stderr");
+        let mut stdout_bytes = Vec::new();
+        let mut stderr_bytes = Vec::new();
+        let result = {
+            let operation = async {
+                let write_input = async {
+                    if let (Some(mut stdin), Some(input)) = (stdin, input) {
+                        stdin.write_all(&input).await?;
+                        stdin.shutdown().await?;
+                    }
+                    Ok::<(), std::io::Error>(())
+                };
+                let (_, _, _, status) = tokio::try_join!(write_input,
+                    stdout.read_to_end(&mut stdout_bytes),
+                    stderr.read_to_end(&mut stderr_bytes), child.wait())?;
+                Ok(status)
+            };
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => Err(std::io::Error::new(ErrorKind::Interrupted, "worktree Git command cancelled")),
+                result = tokio::time::timeout(WORKTREE_GIT_TIMEOUT, operation) => {
+                    result.unwrap_or_else(|_| Err(std::io::Error::new(ErrorKind::TimedOut, "worktree Git command timed out")))
+                }
+            }
+        };
+        if result.is_err() {
+            #[cfg(windows)]
+            let _ = managed.terminate();
+            #[cfg(unix)]
+            let _ = codex_utils_pty::process_group::kill_process_group(pid);
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+        }
+        result.map(|status| std::process::Output {status, stdout: stdout_bytes, stderr: stderr_bytes})
+    }).await.map_err(std::io::Error::other)?
+}
+
+async fn await_spawn_or_cancel<T>(
+    cancellation_token: &CancellationToken,
+    spawn: impl std::future::Future<Output = Result<T, CodexErr>>,
+) -> Result<T, CodexErr> {
+    tokio::select! {
+        biased;
+        _ = cancellation_token.cancelled() => Err(CodexErr::TurnAborted),
+        result = spawn => result,
+    }
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn cancelled_spawn_never_polls_admission_and_drops_in_flight_reservation() {
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+    let entered = AtomicBool::new(false);
+    let result = await_spawn_or_cancel(&cancellation, async {
+        entered.store(true, Ordering::Release);
+        Ok(())
+    })
+    .await;
+    assert!(matches!(result, Err(CodexErr::TurnAborted)));
+    assert!(!entered.load(Ordering::Acquire));
+
+    struct Reservation(Arc<AtomicBool>);
+    impl Drop for Reservation {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+    let cancellation = CancellationToken::new();
+    let worker_cancellation = cancellation.clone();
+    let released = Arc::new(AtomicBool::new(false));
+    let worker_released = Arc::clone(&released);
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let operation = tokio::spawn(async move {
+        await_spawn_or_cancel(&worker_cancellation, async {
+            let _reservation = Reservation(worker_released);
+            entered_tx.send(()).expect("admission entered");
+            std::future::pending::<Result<(), CodexErr>>().await
+        })
+        .await
+    });
+    entered_rx.await.expect("in-flight reservation");
+    cancellation.cancel();
+    let result = operation.await.expect("cancelled admission");
+    assert!(matches!(result, Err(CodexErr::TurnAborted)));
+    assert!(released.load(Ordering::Acquire));
+}
+
 async fn cleanup_isolated_worktree(workspace: &IsolatedWorkspace) -> Result<(), std::io::Error> {
-    let output = Command::new("git")
+    let result = cleanup_isolated_worktree_paths(
+        &workspace.main_repo_root,
+        &workspace.path,
+        &workspace.terminal_tasks,
+    )
+    .await;
+    if result.is_ok() {
+        workspace.cleanup_required.store(false, Ordering::Release);
+    }
+    result
+}
+
+async fn cleanup_isolated_worktree_paths(
+    repo_root: &Path,
+    path: &Path,
+    terminal_tasks: &TaskTracker,
+) -> std::io::Result<()> {
+    let mut command = Command::new("git");
+    command
         .arg("-C")
-        .arg(&workspace.main_repo_root)
+        .arg(repo_root)
         .args(["worktree", "remove", "--force"])
-        .arg(&workspace.path)
-        .output()
-        .await?;
+        .arg(path);
+    let output = run_worktree_git(command, None, &CancellationToken::new(), terminal_tasks).await?;
     if output.status.success() {
         Ok(())
     } else {
@@ -1110,6 +1343,14 @@ async fn cleanup_isolated_worktree(workspace: &IsolatedWorkspace) -> Result<(), 
 }
 
 impl CoreToolRuntime for Handler {
+    fn waits_for_runtime_cancellation(&self) -> bool {
+        true
+    }
+
+    fn cancellation_requires_commit_barrier(&self) -> bool {
+        true
+    }
+
     fn matches_kind(&self, payload: &ToolPayload) -> bool {
         matches!(payload, ToolPayload::Function { .. })
     }
@@ -1301,8 +1542,21 @@ async fn construct_and_attach_task_capsule(
     let mut symbol_handles = HashSet::new();
     let mut distinct_paths = BTreeMap::new();
 
-    for handle in handles {
-        let path = normalize_repo_path(repo_root, handle.path())?;
+    let normalization_root = repo_root.to_path_buf();
+    let handles = tokio::task::spawn_blocking(move || {
+        handles
+            .into_iter()
+            .map(|handle| {
+                let path = normalize_repo_path(&normalization_root, handle.path())?;
+                Ok((handle, path))
+            })
+            .collect::<Result<Vec<_>, StoreError>>()
+    })
+    .await
+    .map_err(|error| {
+        StoreError::CorruptData(format!("task capsule handle normalization failed: {error}"))
+    })??;
+    for (handle, path) in handles {
         if !scopes.iter().any(|scope| scope.covers_path(&path)) {
             return Err(StoreError::InvalidTaskCapsule(format!(
                 "relevant handle {path:?} is outside the assignment read/write scope"

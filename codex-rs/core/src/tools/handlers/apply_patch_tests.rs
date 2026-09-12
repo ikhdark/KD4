@@ -29,6 +29,270 @@ fn sample_patch() -> &'static str {
 *** End Patch"#
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn registered_remote_apply_patch_preserves_requested_sandbox() {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD;
+    use codex_protocol::config_types::WindowsSandboxLevel;
+    use codex_protocol::models::PermissionProfile;
+    use codex_protocol::models::ResponseInputItem;
+    use codex_protocol::permissions::FileSystemAccessMode;
+    use codex_protocol::permissions::FileSystemPath;
+    use codex_protocol::permissions::FileSystemSandboxEntry;
+    use codex_protocol::permissions::FileSystemSpecialPath;
+    use codex_protocol::protocol::AskForApproval;
+    use codex_protocol::protocol::EventMsg;
+    use codex_protocol::protocol::ReviewDecision;
+    use futures::SinkExt;
+    use futures::StreamExt;
+    use std::time::Duration;
+    use tokio_tungstenite::tungstenite::Message;
+
+    for (sandbox_enabled, deny_write) in [(true, false), (true, true), (false, false)] {
+        let home = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+        let backing = TempDir::new().unwrap();
+        let remote_file = backing.path().join("remote.txt");
+        std::fs::write(&remote_file, b"original\n").unwrap();
+        let cwd = workspace.path().abs();
+        let cwd_uri = PathUri::from_abs_path(&cwd);
+        let target_uri = cwd_uri.join("remote.txt").unwrap();
+        let permissions = if sandbox_enabled {
+            PermissionProfile::from_runtime_permissions(
+                &FileSystemSandboxPolicy::restricted(vec![
+                    FileSystemSandboxEntry {
+                        path: FileSystemPath::Special {
+                            value: FileSystemSpecialPath::Root,
+                        },
+                        access: FileSystemAccessMode::Read,
+                    },
+                    FileSystemSandboxEntry {
+                        path: FileSystemPath::Special {
+                            value: FileSystemSpecialPath::project_roots(None),
+                        },
+                        access: FileSystemAccessMode::Write,
+                    },
+                ]),
+                NetworkSandboxPolicy::Restricted,
+            )
+        } else {
+            PermissionProfile::Disabled
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel();
+        let server_file = remote_file.clone();
+        let server_target = target_uri.clone();
+        let server_cwd = cwd_uri.clone();
+        let observed_operations = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let server_operations = Arc::clone(&observed_operations);
+        let server = tokio::spawn(async move {
+            let accepted = tokio::select! {
+                accepted = listener.accept() => accepted.unwrap(),
+                _ = &mut stop_rx => return Vec::new(),
+            };
+            let mut socket = tokio_tungstenite::accept_async(accepted.0).await.unwrap();
+            let mut writes = Vec::new();
+            loop {
+                let frame = tokio::select! {
+                    frame = socket.next() => frame,
+                    _ = &mut stop_rx => break,
+                };
+                let Some(Ok(frame)) = frame else { break };
+                let message: serde_json::Value = match frame {
+                    Message::Text(text) => serde_json::from_str(text.as_ref()).unwrap(),
+                    Message::Binary(bytes) => serde_json::from_slice(bytes.as_ref()).unwrap(),
+                    Message::Ping(_) | Message::Pong(_) => continue,
+                    Message::Close(_) => break,
+                    other => panic!("unexpected executor frame: {other:?}"),
+                };
+                let method = message["method"].as_str().unwrap();
+                server_operations.lock().unwrap().push(method.to_string());
+                let mut error = None;
+                let result = match method {
+                    "initialize" => json!({"sessionId": "remote-patch-sandbox"}),
+                    "initialized" => continue,
+                    "environment/info" => json!({
+                        "operatingSystem": "windows",
+                        "shell": {"name": "cmd", "path": "cmd.exe"},
+                        "cwd": server_cwd,
+                    }),
+                    "fs/canonicalize" => json!({"path": message["params"]["path"]}),
+                    "fs/getMetadata" => json!({
+                        "isDirectory": false, "isFile": true, "isSymlink": false,
+                        "size": std::fs::metadata(&server_file).unwrap().len(),
+                    }),
+                    "fs/readFile" => json!({
+                        "dataBase64": STANDARD.encode(std::fs::read(&server_file).unwrap()),
+                    }),
+                    "fs/writeFile" => {
+                        let params = message["params"].clone();
+                        assert_eq!(params["path"], json!(server_target));
+                        writes.push(params.clone());
+                        if deny_write {
+                            error = Some(
+                                json!({"code": -32000, "message": "Permission denied: remote patch policy"}),
+                            );
+                        } else {
+                            let bytes = STANDARD
+                                .decode(params["dataBase64"].as_str().unwrap())
+                                .unwrap();
+                            std::fs::write(&server_file, bytes).unwrap();
+                        }
+                        json!({})
+                    }
+                    method => panic!("unexpected executor operation {method}: {message}"),
+                };
+                let response = match error {
+                    Some(error) => json!({"id": message["id"], "error": error}),
+                    None => json!({"id": message["id"], "result": result}),
+                };
+                socket
+                    .send(Message::Text(response.to_string().into()))
+                    .await
+                    .unwrap();
+            }
+            writes
+        });
+        let (session, mut turn, events) =
+            crate::session::tests::make_session_and_context_with_auth_config_home_and_rx(
+                codex_login::CodexAuth::from_api_key("Test API Key"),
+                Vec::new(),
+                home.path(),
+                |config| {
+                    config.cwd = cwd.clone();
+                    config.workspace_roots = vec![cwd.clone()];
+                    config.permissions.approval_policy =
+                        crate::config::Constrained::allow_any(AskForApproval::UnlessTrusted);
+                    config.permissions.windows_sandbox_private_desktop = deny_write;
+                    config
+                        .permissions
+                        .set_permission_profile(permissions.clone())
+                        .unwrap();
+                },
+            )
+            .await;
+        let turn_mut = Arc::get_mut(&mut turn).unwrap();
+        // On Windows this makes select_initial return None while policy still
+        // requests sandboxing. Other hosts prove the same portable wire policy.
+        turn_mut.windows_sandbox_level = WindowsSandboxLevel::Disabled;
+        turn_mut.model_info.apply_patch_tool_type =
+            Some(codex_protocol::openai_models::ApplyPatchToolType::Freeform);
+        turn_mut.environments.turn_environments = vec![TurnEnvironment::new(
+            "patch-remote".into(),
+            Arc::new(codex_exec_server::Environment::create_for_tests(Some(url)).unwrap()),
+            cwd_uri.clone(),
+            None,
+        )];
+        *session.active_turn.lock().await = Some(crate::state::ActiveTurn::default());
+        let step = StepContext::for_test(turn);
+        let router = Arc::new(crate::tools::router::ToolRouter::from_context(
+            step.as_ref(),
+            crate::tools::router::ToolRouterParams {
+                tool_suggest_candidates: None,
+                deferred_mcp_tools: None,
+                mcp_tools: None,
+                extension_tool_executors: Vec::new(),
+                dynamic_tools: &[],
+                exposure_identity: Default::default(),
+            },
+            &Default::default(),
+        ));
+        assert!(step.set_tool_router(router).is_ok());
+        let runtime = crate::tools::parallel::ToolCallRuntime::new(
+            session.clone(),
+            step,
+            Arc::new(Mutex::new(TurnDiffTracker::new())),
+        );
+        let call = runtime.handle_tool_call(
+            crate::tools::router::ToolCall {
+                tool_name: codex_tools::ToolName::plain("apply_patch"),
+                call_id: "remote-sandbox-patch".into(),
+                payload: ToolPayload::Custom {
+                    input: "*** Begin Patch\n*** Add File: remote.txt\n+replacement\n*** End Patch"
+                        .into(),
+                },
+            },
+            tokio_util::sync::CancellationToken::new(),
+        );
+        tokio::pin!(call);
+        let mut approvals = 0;
+        let response = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                tokio::select! {
+                    result = &mut call => break result.unwrap(),
+                    event = events.recv() => {
+                        if let EventMsg::ApplyPatchApprovalRequest(request) = event.unwrap().msg {
+                            approvals += 1;
+                            let decision = if approvals == 1 { ReviewDecision::Approved } else { ReviewDecision::Denied };
+                            session.notify_approval(&request.call_id, decision).await;
+                        }
+                    }
+                }
+            }
+        }).await.unwrap_or_else(|error| {
+            panic!("registered remote patch completes (sandbox={sandbox_enabled}, deny={deny_write}, approvals={approvals}, operations={:?}): {error}", observed_operations.lock().unwrap())
+        });
+        stop_tx.send(()).unwrap();
+        let writes = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            writes.len(),
+            1,
+            "one remote write attempt, no unapproved retry"
+        );
+        assert!(
+            approvals >= 1,
+            "registered patch must enter approval orchestration"
+        );
+        assert_eq!(writes[0]["path"], json!(target_uri));
+        assert_eq!(
+            STANDARD
+                .decode(writes[0]["dataBase64"].as_str().unwrap())
+                .unwrap(),
+            b"replacement\n"
+        );
+        let expected_sandbox =
+            sandbox_enabled.then(|| codex_exec_server::FileSystemSandboxContext {
+                permissions: permissions.into(),
+                cwd: Some(cwd_uri),
+                workspace_roots: Vec::new(),
+                windows_sandbox_level: WindowsSandboxLevel::Disabled,
+                windows_sandbox_private_desktop: deny_write,
+            });
+        assert_eq!(
+            writes[0]["sandbox"],
+            json!(expected_sandbox),
+            "remote write must retain canonical policy intent without host workspace roots"
+        );
+        let ResponseInputItem::CustomToolCallOutput { output, .. } = response else {
+            panic!("registered patch must return a custom tool output");
+        };
+        let text = output.body.to_text().unwrap();
+        if deny_write {
+            assert!(!text.contains("Success. Updated"), "{text}");
+            assert!(
+                text.contains("Exit code: 1") && text.contains("Failed to write file"),
+                "{text}"
+            );
+            assert_eq!(
+                std::fs::read(&remote_file).unwrap(),
+                b"original\n",
+                "denied patch must preserve remote contents"
+            );
+        } else {
+            assert!(text.contains("Success. Updated"), "{text}");
+            assert_eq!(std::fs::read(&remote_file).unwrap(), b"replacement\n");
+        }
+        assert!(
+            !cwd.join("remote.txt").exists(),
+            "selected remote patch must never write through the host filesystem"
+        );
+    }
+}
+
 async fn invocation_for_payload(payload: ToolPayload) -> ToolInvocation {
     let (session, turn) = make_session_and_context().await;
     let turn = Arc::new(turn);
@@ -339,6 +603,7 @@ async fn input_state_determined_environment_mismatch_blocks_exact_retry_without_
         /*tracker*/ None,
         "phase31-call",
         "shell",
+        tokio_util::sync::CancellationToken::new(),
     )
     .await;
 
@@ -421,6 +686,7 @@ async fn input_state_determined_implicit_patch_blocks_exact_retry_without_mutati
         /*tracker*/ None,
         "implicit-patch-call",
         "shell",
+        tokio_util::sync::CancellationToken::new(),
     )
     .await
     {
@@ -477,6 +743,7 @@ async fn validation_commands_bypass_apply_patch_interception() {
         /*tracker*/ None,
         "validation-apply-patch-call",
         "shell",
+        tokio_util::sync::CancellationToken::new(),
     )
     .await;
 

@@ -1391,7 +1391,9 @@ impl Renderable for McpServerElicitationOverlay {
         let inner = menu_surface_inset(outer);
         let inner_width = inner.width.max(1);
         let height = 1u16
-            .saturating_add(self.wrapped_prompt_lines(inner_width).len() as u16)
+            .saturating_add(
+                u16::try_from(self.wrapped_prompt_lines(inner_width).len()).unwrap_or(u16::MAX),
+            )
             .saturating_add(self.input_height(inner_width))
             .saturating_add(self.footer_tip_lines(inner_width).len() as u16)
             .saturating_add(menu_surface_padding_height());
@@ -1424,7 +1426,7 @@ impl Renderable for McpServerElicitationOverlay {
         let mut input_height = min_input_height;
         remaining = remaining.saturating_sub(input_height);
 
-        let prompt_height = (prompt_lines.len() as u16).min(remaining);
+        let prompt_height = prompt_lines.len().min(usize::from(remaining)) as u16;
         remaining = remaining.saturating_sub(prompt_height);
         input_height = input_height.saturating_add(remaining);
 
@@ -1489,7 +1491,7 @@ impl Renderable for McpServerElicitationOverlay {
         let min_input_height = MIN_COMPOSER_HEIGHT.min(remaining);
         let mut input_height = min_input_height;
         remaining = remaining.saturating_sub(input_height);
-        let prompt_height = (prompt_lines.len() as u16).min(remaining);
+        let prompt_height = prompt_lines.len().min(usize::from(remaining)) as u16;
         remaining = remaining.saturating_sub(prompt_height);
         input_height = input_height.saturating_add(remaining);
         let input_area = Rect {
@@ -1517,7 +1519,7 @@ impl BottomPaneView for McpServerElicitationOverlay {
 
         if matches!(key_event.code, KeyCode::Esc) {
             self.dispatch_cancel();
-            self.done = true;
+            self.advance_queue_or_complete();
             return;
         }
 
@@ -1653,7 +1655,7 @@ impl BottomPaneView for McpServerElicitationOverlay {
             return CancellationEvent::Handled;
         }
         self.dispatch_cancel();
-        self.done = true;
+        self.advance_queue_or_complete();
         CancellationEvent::Handled
     }
 
@@ -1847,6 +1849,37 @@ mod tests {
         let mut buf = Buffer::empty(area);
         overlay.render(area, &mut buf);
         snapshot_buffer(&buf)
+    }
+
+    #[test]
+    fn oversized_form_prompt_keeps_visible_text_and_cursor_below_it() {
+        let (tx, mut rx) = test_sender();
+        let request = from_form_request(
+            ThreadId::default(),
+            form_request(
+                &"prompt\n".repeat(65_536),
+                serde_json::json!({
+                    "type": "object",
+                    "properties": { "answer": { "type": "string" } },
+                }),
+                None,
+            ),
+        )
+        .expect("supported text form");
+        let overlay = McpServerElicitationOverlay::new(request, tx, true, false, false);
+        assert_eq!(overlay.desired_height(40), u16::MAX);
+
+        let area = Rect::new(0, 0, 40, 20);
+        let rendered = render_snapshot(&overlay, area);
+        for line in rendered.lines().skip(2).take(7) {
+            assert_eq!(line.trim(), "prompt");
+        }
+        let (_, cursor_y) = overlay.cursor_pos(area).expect("text input cursor");
+        assert!((9..20).contains(&cursor_y));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
     }
 
     #[test]
@@ -2394,6 +2427,75 @@ mod tests {
                 meta: None,
             }
         );
+    }
+
+    #[test]
+    fn bottom_pane_cancellation_preserves_queued_elicitations() {
+        use crate::bottom_pane::BottomPane;
+        use crate::bottom_pane::BottomPaneParams;
+        use crate::tui::FrameRequester;
+
+        for ctrl_c in [false, true] {
+            let (tx, mut rx) = test_sender();
+            let thread_id = ThreadId::new();
+            let mut pane = BottomPane::new(BottomPaneParams {
+                app_event_tx: tx,
+                frame_requester: FrameRequester::test_dummy(),
+                has_input_focus: true,
+                enhanced_keys_supported: false,
+                placeholder_text: "Ask Codex".to_string(),
+                disable_paste_burst: true,
+                animations_enabled: false,
+                skills: Some(Vec::new()),
+            });
+            for (id, message) in [
+                ("request-first", "First request"),
+                ("request-second", "Second request"),
+            ] {
+                pane.push_mcp_server_elicitation_request(
+                    McpServerElicitationFormRequest::from_app_server_request(
+                        thread_id,
+                        request_id(id),
+                        form_request(message, empty_object_schema(), None),
+                    )
+                    .expect("supported form"),
+                );
+            }
+            for id in ["request-first", "request-second"] {
+                assert!(pane.has_active_view(), "request must remain actionable");
+                if ctrl_c {
+                    assert_eq!(pane.on_ctrl_c(), CancellationEvent::Handled);
+                } else {
+                    pane.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+                }
+                let AppEvent::SubmitThreadOp {
+                    thread_id: actual_thread,
+                    op,
+                } = rx.try_recv().expect("one cancellation must be delivered")
+                else {
+                    panic!("expected targeted cancellation");
+                };
+                assert_eq!(actual_thread, thread_id);
+                assert_eq!(
+                    op,
+                    Op::ResolveElicitation {
+                        server_name: "server-1".to_string(),
+                        request_id: request_id(id),
+                        decision: McpServerElicitationAction::Cancel,
+                        content: None,
+                        meta: None,
+                    }
+                );
+                assert!(matches!(
+                    rx.try_recv(),
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+                ));
+            }
+            assert!(
+                !pane.has_active_view(),
+                "last resolution must close the overlay"
+            );
+        }
     }
 
     #[test]

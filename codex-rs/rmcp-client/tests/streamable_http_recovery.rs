@@ -58,6 +58,72 @@ const RESOURCE_URI: &str = "memo://codex/example-note";
 const SIMULATED_NO_RESPONSE_MESSAGE: &str =
     "http/request failed: error sending request for url (simulated no response)";
 
+#[tokio::test]
+async fn streamable_http_rejects_unrepresentable_headers_before_sending() -> anyhow::Result<()> {
+    let server = wiremock::MockServer::start().await;
+    let home = tempfile::tempdir()?;
+    let client = codex_rmcp_client::RmcpClient::new_streamable_http_client(
+        "invalid-header",
+        home.path().to_path_buf(),
+        &format!("{}/mcp", server.uri()),
+        Some("explicit-bearer".to_string()),
+        Some(std::collections::HashMap::from([(
+            "x-required-header".to_string(),
+            "caf\u{e9}".to_string(),
+        )])),
+        None,
+        codex_config::types::OAuthCredentialsStoreMode::File,
+        codex_config::types::AuthKeyringBackendKind::Direct,
+        Arc::new(codex_exec_server::ReqwestHttpClient),
+        None,
+    )
+    .await?;
+    let error = streamable_http_test_support::initialize_client(&client)
+        .await
+        .expect_err("invalid header must fail initialization");
+    assert!(
+        format!("{error:#}").contains("header `x-required-header` cannot be represented"),
+        "unexpected error: {error:#}"
+    );
+    assert_eq!(
+        server
+            .received_requests()
+            .await
+            .expect("recorded requests")
+            .len(),
+        0
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn streamable_http_echo_honors_environment_selector() -> anyhow::Result<()> {
+    let (_server, base_url) = spawn_streamable_http_server().await?;
+    let client = create_client(&base_url).await?;
+    for (name, expected) in [
+        ("MCP_TEST_ECHO_SELECTED", Some("selected-environment-value")),
+        ("MCP_TEST_ECHO_MISSING_07a5ec54", None),
+    ] {
+        let result = client
+            .call_tool(
+                "echo".to_string(),
+                Some(serde_json::json!({"message": "selected", "env_var": name})),
+                None,
+                Some(Duration::from_secs(5)),
+            )
+            .await?;
+        assert_eq!(
+            result.structured_content,
+            Some(serde_json::json!({
+                "echo": "ECHOING: selected",
+                "env": expected,
+            }))
+        );
+        assert_ne!(result.is_error, Some(true));
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 struct FailFirstInitializeHttpClient {
     inner: Arc<dyn HttpClient>,

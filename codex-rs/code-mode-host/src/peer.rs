@@ -16,7 +16,6 @@ use codex_code_mode_protocol::host::HostToClient;
 use codex_code_mode_protocol::host::RequestId;
 use codex_code_mode_protocol::host::SessionId;
 use codex_code_mode_protocol::host::WireResult;
-use tokio::sync::Mutex;
 use tokio::sync::Notify;
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::Semaphore;
@@ -29,7 +28,7 @@ const MAX_PENDING_DELEGATE_CALLS: usize = 256;
 
 pub(super) struct HostPeer {
     outgoing_tx: mpsc::Sender<EncodedFrame>,
-    pending: Mutex<HashMap<DelegateRequestId, PendingDelegate>>,
+    pending: StdMutex<HashMap<DelegateRequestId, PendingDelegate>>,
     delegate_permits: Arc<Semaphore>,
     cell_routes: StdMutex<HashMap<(SessionId, CellId), CellRoute>>,
     cell_routes_changed: Notify,
@@ -62,7 +61,7 @@ impl HostPeer {
     pub(super) fn new(outgoing_tx: mpsc::Sender<EncodedFrame>) -> Self {
         Self {
             outgoing_tx,
-            pending: Mutex::new(HashMap::new()),
+            pending: StdMutex::new(HashMap::new()),
             delegate_permits: Arc::new(Semaphore::new(MAX_PENDING_DELEGATE_CALLS)),
             cell_routes: StdMutex::new(HashMap::new()),
             cell_routes_changed: Notify::new(),
@@ -130,16 +129,23 @@ impl HostPeer {
         let Ok(permit) = Arc::clone(&self.delegate_permits).try_acquire_owned() else {
             return Err("code-mode host has too many pending delegate calls".to_string());
         };
-        let id = DelegateRequestId::new(self.next_request_id.fetch_add(1, Ordering::Relaxed));
-        let (response_tx, response_rx) = oneshot::channel();
-        self.pending.lock().await.insert(
-            id,
-            PendingDelegate {
-                response_tx,
-                dispatched: false,
-                _permit: permit,
-            },
+        let id = DelegateRequestId::new(
+            self.next_request_id
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+                .map_err(|_| "code-mode delegate request ID space exhausted".to_string())?,
         );
+        let (response_tx, response_rx) = oneshot::channel();
+        self.pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(
+                id,
+                PendingDelegate {
+                    response_tx,
+                    dispatched: false,
+                    _permit: permit,
+                },
+            );
         let mut pending = PendingDelegateRequest::new(Arc::clone(self), id);
         let cell_id = match &request {
             DelegateRequest::InvokeTool { invocation } => invocation.cell_id.clone().into(),
@@ -154,23 +160,32 @@ impl HostPeer {
                 dispatched_tx,
             },
         ) {
-            self.pending.lock().await.remove(&id);
+            self.pending
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&id);
             pending.disarm();
             return Err(err);
         }
 
         let dispatched = tokio::select! {
+            _ = cancellation_token.cancelled() => {
+                return Err("code mode delegate request cancelled".to_string());
+            }
             dispatched = dispatched_rx => dispatched.map_err(|_| {
                 "code-mode cell route closed before dispatching delegate request".to_string()
             })?,
             _ = self.disconnected.cancelled() => {
-                self.pending.lock().await.remove(&id);
+                self.pending.lock().unwrap_or_else(PoisonError::into_inner).remove(&id);
                 pending.disarm();
                 return Err("code-mode client connection closed".to_string());
             }
         };
         if let Err(err) = dispatched {
-            self.pending.lock().await.remove(&id);
+            self.pending
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&id);
             pending.disarm();
             return Err(err);
         }
@@ -183,14 +198,14 @@ impl HostPeer {
                 })?
             }
             _ = cancellation_token.cancelled() => {
-                if self.remove_pending(id).await.is_some() {
+                if self.remove_pending(id).is_some() {
                     let _ = self.send(HostToClient::CancelDelegateRequest { id });
                 }
                 pending.disarm();
                 Err("code mode delegate request cancelled".to_string())
             }
             _ = self.disconnected.cancelled() => {
-                self.pending.lock().await.remove(&id);
+                self.pending.lock().unwrap_or_else(PoisonError::into_inner).remove(&id);
                 pending.disarm();
                 Err("code-mode client connection closed".to_string())
             }
@@ -202,7 +217,7 @@ impl HostPeer {
         id: DelegateRequestId,
         response: Result<DelegateResponse, String>,
     ) {
-        if let Some(pending) = self.remove_pending(id).await {
+        if let Some(pending) = self.remove_pending(id) {
             let _ = pending.response_tx.send(response);
         }
     }
@@ -316,7 +331,7 @@ impl HostPeer {
         dispatched_tx: oneshot::Sender<Result<(), String>>,
     ) {
         let result = {
-            let mut pending = self.pending.lock().await;
+            let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
             let Some(pending) = pending.get_mut(&id) else {
                 let _ = dispatched_tx.send(Err(
                     "code-mode delegate request was cancelled before dispatch".to_string(),
@@ -372,8 +387,11 @@ impl HostPeer {
         result
     }
 
-    async fn remove_pending(&self, id: DelegateRequestId) -> Option<PendingDelegate> {
-        self.pending.lock().await.remove(&id)
+    fn remove_pending(&self, id: DelegateRequestId) -> Option<PendingDelegate> {
+        self.pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&id)
     }
 
     pub(super) fn spawn_critical<F>(self: &Arc<Self>, task_name: &'static str, future: F)
@@ -525,14 +543,11 @@ impl Drop for PendingDelegateRequest {
         let Some(id) = self.id.take() else {
             return;
         };
-        let peer = Arc::clone(&self.peer);
-        tokio::spawn(async move {
-            if let Some(pending) = peer.remove_pending(id).await
-                && pending.dispatched
-            {
-                let _ = peer.send(HostToClient::CancelDelegateRequest { id });
-            }
-        });
+        if let Some(pending) = self.peer.remove_pending(id)
+            && pending.dispatched
+        {
+            let _ = self.peer.send(HostToClient::CancelDelegateRequest { id });
+        }
     }
 }
 

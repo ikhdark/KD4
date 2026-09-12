@@ -21,6 +21,65 @@ use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 
 #[test]
+fn intersect_uri_permission_profiles_materializes_grants_and_denies_for_reuse() {
+    let cwd = PathUri::parse("file:///home/remote/project").expect("request cwd");
+    let later_cwd = PathUri::parse("file:///home/remote/later").expect("later cwd");
+    let permissions = UriAdditionalPermissionProfile {
+        network: None,
+        file_system: Some(FileSystemPermissions {
+            entries: vec![
+                FileSystemSandboxEntry {
+                    path: FileSystemPath::Special {
+                        value: FileSystemSpecialPath::project_roots(None),
+                    },
+                    access: FileSystemAccessMode::Write,
+                },
+                FileSystemSandboxEntry {
+                    path: FileSystemPath::Special {
+                        value: FileSystemSpecialPath::project_roots(Some("private".into())),
+                    },
+                    access: FileSystemAccessMode::Deny,
+                },
+            ],
+            glob_scan_max_depth: None,
+        }),
+    };
+    let granted = intersect_uri_permission_profiles(permissions.clone(), permissions, &cwd);
+    assert_eq!(
+        granted.file_system.as_ref().unwrap().entries,
+        vec![
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Path { path: cwd.clone() },
+                access: FileSystemAccessMode::Write
+            },
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Path {
+                    path: cwd.join("private").unwrap()
+                },
+                access: FileSystemAccessMode::Deny
+            },
+        ]
+    );
+    for (base, has_write) in [(&cwd, true), (&later_cwd, false)] {
+        let request = UriAdditionalPermissionProfile {
+            network: None,
+            file_system: Some(FileSystemPermissions::from_read_write_roots(
+                None,
+                Some(vec![base.clone()]),
+            )),
+        };
+        let reused = intersect_uri_permission_profiles(request, granted.clone(), base);
+        assert_eq!(
+            reused.file_system.as_ref().is_some_and(|fs| fs
+                .entries
+                .iter()
+                .any(|entry| entry.access == FileSystemAccessMode::Write)),
+            has_write
+        );
+    }
+}
+
+#[test]
 fn intersect_uri_permission_profiles_resolves_project_roots_in_foreign_cwd() {
     let cwd = PathUri::parse("file:///home/remote/project").expect("foreign cwd URI");
     let child = cwd.join("generated").expect("child URI");

@@ -116,6 +116,35 @@ impl Drop for StagedRolloutFiles {
     }
 }
 
+pub(super) async fn rollback_created_thread(
+    store: &LocalThreadStore,
+    thread_id: codex_protocol::ThreadId,
+) -> ThreadStoreResult<()> {
+    let store = store.clone();
+    // StateRuntime may await auxiliary cleanup after its primary transaction
+    // commits. Retain the staged files until the whole commit path finishes,
+    // so dropping the caller cannot restore files for an already-deleted row.
+    tokio::spawn(async move {
+        let staged = stage_thread_deletes(&store, &[thread_id]).await?;
+        if let Some(state_db) = store.state_db().await {
+            state_db
+                .delete_thread(thread_id)
+                .await
+                .map_err(|err| ThreadStoreError::Internal {
+                    message: format!(
+                        "failed to delete state for rolled-back thread {thread_id}: {err}"
+                    ),
+                })?;
+        }
+        staged.commit().await;
+        Ok(())
+    })
+    .await
+    .map_err(|err| ThreadStoreError::Internal {
+        message: format!("thread rollback persistence task failed: {err}"),
+    })?
+}
+
 pub(super) async fn delete_thread(
     store: &LocalThreadStore,
     params: DeleteThreadParams,
@@ -608,5 +637,225 @@ mod tests {
             .preflight_delete_thread(DeleteThreadParams { thread_id })
             .await
             .expect("cancelled deletion leaves the thread discoverable");
+    }
+
+    async fn rollback_fixture() -> (
+        TempDir,
+        LocalThreadStore,
+        std::sync::Arc<codex_state::StateRuntime>,
+        ThreadId,
+        PathBuf,
+    ) {
+        let home = TempDir::new().expect("temp dir");
+        let config = test_config(home.path());
+        let state = codex_state::StateRuntime::init(
+            home.path().to_path_buf(),
+            config.default_model_provider_id.clone(),
+        )
+        .await
+        .expect("real state databases");
+        state.mark_backfill_complete(None).await.unwrap();
+        let uuid = Uuid::new_v4();
+        let thread_id = ThreadId::from_string(&uuid.to_string()).unwrap();
+        let path = write_session_file(home.path(), "2025-01-03T12-30-00", uuid).unwrap();
+        let builder = codex_state::ThreadMetadataBuilder::new(
+            thread_id,
+            path.clone(),
+            chrono::Utc::now(),
+            codex_protocol::protocol::SessionSource::Cli,
+        );
+        state
+            .upsert_thread_preserving_timestamps(&builder.build(&config.default_model_provider_id))
+            .await
+            .unwrap();
+        codex_rollout::append_thread_name(home.path(), thread_id, "rolled-back child")
+            .await
+            .unwrap();
+        let store = LocalThreadStore::new(config, Some(std::sync::Arc::clone(&state)));
+        (home, store, state, thread_id, path)
+    }
+
+    #[tokio::test]
+    async fn rollback_created_thread_removes_files_state_and_name_index() {
+        for materialized in [true, false] {
+            let (home, store, state, thread_id, path) = rollback_fixture().await;
+            let compressed = path.with_extension("jsonl.zst");
+            if materialized {
+                std::fs::write(&compressed, b"compressed sibling").unwrap();
+            } else {
+                std::fs::remove_file(&path).unwrap();
+            }
+            store
+                .rollback_created_thread(thread_id)
+                .await
+                .expect("complete local rollback");
+            assert!(!path.exists());
+            assert!(!compressed.exists());
+            assert!(state.get_thread(thread_id).await.unwrap().is_none());
+            assert!(
+                codex_rollout::find_thread_name_by_id(home.path(), &thread_id)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(matches!(
+                store
+                    .read_thread(crate::ReadThreadParams {
+                        thread_id,
+                        include_archived: true,
+                        include_history: true,
+                    })
+                    .await,
+                Err(ThreadStoreError::ThreadNotFound { .. })
+            ));
+            store
+                .rollback_created_thread(thread_id)
+                .await
+                .expect("rollback is idempotent for missing persistence");
+            state.close().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn rollback_created_thread_restores_files_and_state_on_primary_failure() {
+        use sqlx::Connection;
+        let (home, store, state, thread_id, path) = rollback_fixture().await;
+        let original = std::fs::read(&path).unwrap();
+        let mut connection = sqlx::SqliteConnection::connect_with(
+            &sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(codex_state::state_db_path(home.path())),
+        )
+        .await
+        .unwrap();
+        sqlx::query("CREATE TRIGGER reject_rollback BEFORE DELETE ON threads BEGIN SELECT RAISE(ABORT, 'blocked primary delete'); END")
+            .execute(&mut connection).await.unwrap();
+        let error = store
+            .rollback_created_thread(thread_id)
+            .await
+            .expect_err("real primary transaction must fail");
+        assert!(error.to_string().contains("blocked primary delete"));
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert!(state.get_thread(thread_id).await.unwrap().is_some());
+        assert_eq!(
+            codex_rollout::find_thread_name_by_id(home.path(), &thread_id)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("rolled-back child")
+        );
+        store
+            .read_thread(crate::ReadThreadParams {
+                thread_id,
+                include_archived: true,
+                include_history: true,
+            })
+            .await
+            .expect("failed rollback remains normally readable");
+        sqlx::query("DROP TRIGGER reject_rollback")
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        store
+            .rollback_created_thread(thread_id)
+            .await
+            .expect("retry completes both persistence surfaces");
+        assert!(!path.exists());
+        assert!(state.get_thread(thread_id).await.unwrap().is_none());
+        connection.close().await.unwrap();
+        state.close().await;
+    }
+
+    #[tokio::test]
+    async fn rollback_created_thread_completion_survives_cancellation_after_primary_commit() {
+        use sqlx::Connection;
+        use std::time::Duration;
+        let (home, store, state, thread_id, path) = rollback_fixture().await;
+        let mut logs_lock = sqlx::SqliteConnection::connect_with(
+            &sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(codex_state::logs_db_path(home.path())),
+        )
+        .await
+        .unwrap();
+        // Block the real auxiliary DELETE after StateRuntime's primary transaction
+        // commits, while the original caller would still own a restorable file guard.
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut logs_lock)
+            .await
+            .unwrap();
+        let deleting = store.clone();
+        let operation =
+            tokio::spawn(async move { deleting.rollback_created_thread(thread_id).await });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while state.get_thread(thread_id).await.unwrap().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("primary SQLite delete commits while auxiliary database is locked");
+        assert!(
+            !path.exists(),
+            "physical rollout is staged out of discovery"
+        );
+        assert!(
+            !operation.is_finished(),
+            "auxiliary lock holds the real delete operation"
+        );
+        assert_eq!(
+            codex_rollout::find_thread_name_by_id(home.path(), &thread_id)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("rolled-back child")
+        );
+        operation.abort();
+        assert!(
+            operation
+                .await
+                .expect_err("caller cancelled")
+                .is_cancelled()
+        );
+        assert!(
+            !path.exists(),
+            "cancelled waiter cannot restore a rollout whose primary row was deleted"
+        );
+        sqlx::query("ROLLBACK")
+            .execute(&mut logs_lock)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let name_gone = codex_rollout::find_thread_name_by_id(home.path(), &thread_id)
+                    .await
+                    .unwrap()
+                    .is_none();
+                let staging_gone = std::fs::read_dir(home.path()).unwrap().all(|entry| {
+                    !entry
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("thread-delete-")
+                });
+                if name_gone && staging_gone {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("owned rollback finishes compatibility cleanup and releases staged files");
+        assert!(!path.exists());
+        assert!(state.get_thread(thread_id).await.unwrap().is_none());
+        assert!(matches!(
+            store
+                .read_thread(crate::ReadThreadParams {
+                    thread_id,
+                    include_archived: true,
+                    include_history: true,
+                })
+                .await,
+            Err(ThreadStoreError::ThreadNotFound { .. })
+        ));
+        logs_lock.close().await.unwrap();
+        state.close().await;
     }
 }

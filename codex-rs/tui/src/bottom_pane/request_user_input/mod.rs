@@ -3289,6 +3289,35 @@ mod tests {
     }
 
     #[test]
+    fn oversized_question_keeps_visible_prompt_with_and_without_options() {
+        for mut question in [
+            question_without_options("q1", "Details"),
+            question_with_options("q1", "Choice"),
+        ] {
+            question.question = "prompt\n".repeat(65_536);
+            let (tx, mut rx) = test_sender();
+            let overlay = RequestUserInputOverlay::new(
+                request_event("turn-1", vec![question]),
+                tx,
+                true,
+                false,
+                false,
+            );
+            assert_eq!(overlay.desired_height(40), u16::MAX);
+            let area = Rect::new(0, 0, 40, 20);
+            let rendered = render_snapshot(&overlay, area);
+            for line in rendered.lines().skip(1).take(7) {
+                assert_eq!(line.trim(), "prompt");
+            }
+            assert_eq!(overlay.cursor_pos(area), None);
+            assert!(matches!(
+                rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ));
+        }
+    }
+
+    #[test]
     fn large_paste_is_preserved_when_switching_questions() {
         let (tx, _rx) = test_sender();
         let mut overlay = RequestUserInputOverlay::new(

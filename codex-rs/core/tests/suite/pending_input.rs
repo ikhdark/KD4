@@ -614,7 +614,6 @@ fn assert_two_responses_input_snapshot(snapshot_name: &str, requests: &[Vec<u8>]
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "TODO(aibrahim): flaky"]
 async fn injected_user_input_triggers_follow_up_request_with_deltas() {
     let (gate_completed_tx, gate_completed_rx) = oneshot::channel();
 
@@ -699,7 +698,23 @@ async fn injected_user_input_triggers_follow_up_request_with_deltas() {
         .await
         .unwrap();
 
-    let _ = gate_completed_tx.send(());
+    // submit() only enqueues the input. The submission loop processes this
+    // settings operation after admitting that input to the active turn, so its
+    // acknowledgment is a barrier before the first response may finish.
+    codex
+        .submit(Op::ThreadSettings {
+            thread_settings: ThreadSettingsOverrides::default(),
+        })
+        .await
+        .expect("submit input admission barrier");
+    wait_for_event(&codex, |event| {
+        matches!(event, EventMsg::ThreadSettingsApplied(_))
+    })
+    .await;
+    assert_eq!(server.requests().await.len(), 1);
+    gate_completed_tx
+        .send(())
+        .expect("first response is still waiting for completion");
 
     wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
 
@@ -710,12 +725,24 @@ async fn injected_user_input_triggers_follow_up_request_with_deltas() {
     let second_body: Value = serde_json::from_slice(&requests[1]).expect("parse second request");
 
     let first_texts = message_input_texts(&first_body, "user");
-    assert!(first_texts.iter().any(|text| text == "first prompt"));
-    assert!(!first_texts.iter().any(|text| text == "second prompt"));
+    assert_eq!(
+        first_texts
+            .iter()
+            .filter(|text| matches!(text.as_str(), "first prompt" | "second prompt"))
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        vec!["first prompt"]
+    );
 
     let second_texts = message_input_texts(&second_body, "user");
-    assert!(second_texts.iter().any(|text| text == "first prompt"));
-    assert!(second_texts.iter().any(|text| text == "second prompt"));
+    assert_eq!(
+        second_texts
+            .iter()
+            .filter(|text| matches!(text.as_str(), "first prompt" | "second prompt"))
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        vec!["first prompt", "second prompt"]
+    );
 
     server.shutdown().await;
 }

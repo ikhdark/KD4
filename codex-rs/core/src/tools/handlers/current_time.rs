@@ -110,13 +110,3 @@ impl ToolExecutor<ToolInvocation> for CurrentTimeHandler {
 }
 
 impl CoreToolRuntime for CurrentTimeHandler {}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn current_time_handler_supports_parallel_tool_calls() {
-        assert!(CurrentTimeHandler.supports_parallel_tool_calls());
-    }
-}

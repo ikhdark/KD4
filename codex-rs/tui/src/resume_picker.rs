@@ -59,8 +59,9 @@ use ratatui::text::Span;
 use ratatui::widgets::Clear;
 use ratatui::widgets::Widget;
 use tokio::sync::mpsc;
+use tokio::sync::watch;
 use tokio_stream::StreamExt;
-use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio_stream::wrappers::ReceiverStream;
 use tracing::warn;
 use unicode_width::UnicodeWidthStr;
 
@@ -346,7 +347,7 @@ async fn run_resume_picker_with_launch_context(
     app_server: AppServerSession,
     launch_context: SessionPickerLaunchContext,
 ) -> Result<SessionSelection> {
-    let (bg_tx, bg_rx) = mpsc::unbounded_channel();
+    let (bg_tx, bg_rx) = mpsc::channel(1);
     let uses_remote_workspace = app_server.uses_remote_workspace();
     let cwd_filter = picker_cwd_filter(
         config.cwd.as_path(),
@@ -392,7 +393,7 @@ pub async fn run_fork_picker_with_app_server(
     show_all: bool,
     app_server: AppServerSession,
 ) -> Result<SessionSelection> {
-    let (bg_tx, bg_rx) = mpsc::unbounded_channel();
+    let (bg_tx, bg_rx) = mpsc::channel(1);
     let uses_remote_workspace = app_server.uses_remote_workspace();
     let cwd_filter = picker_cwd_filter(
         config.cwd.as_path(),
@@ -436,7 +437,7 @@ async fn run_session_picker_with_loader(
     tui: &mut Tui,
     options: SessionPickerRunOptions,
     picker_loader: PickerLoader,
-    bg_rx: mpsc::UnboundedReceiver<BackgroundEvent>,
+    bg_rx: mpsc::Receiver<BackgroundEvent>,
 ) -> Result<SessionSelection> {
     let alt = AltScreenGuard::enter(tui);
     let mut state = PickerState::new(
@@ -457,7 +458,7 @@ async fn run_session_picker_with_loader(
     state.request_frame();
 
     let mut tui_events = alt.tui.event_stream().fuse();
-    let mut background_events = UnboundedReceiverStream::new(bg_rx).fuse();
+    let mut background_events = ReceiverStream::new(bg_rx).fuse();
 
     loop {
         tokio::select! {
@@ -555,13 +556,32 @@ fn spawn_app_server_page_loader(
     include_non_interactive: bool,
     raw_reasoning_visibility: RawReasoningVisibility,
     file_opener: UriBasedFileOpener,
-    bg_tx: mpsc::UnboundedSender<BackgroundEvent>,
+    bg_tx: mpsc::Sender<BackgroundEvent>,
 ) -> PickerLoader {
+    // Only the latest pending page can match PickerState's current request token.
+    let (page_tx, mut page_rx) = watch::channel::<Option<PageLoadRequest>>(None);
     let (request_tx, mut request_rx) = mpsc::unbounded_channel::<PickerLoadRequest>();
 
     tokio::spawn(async move {
         let mut app_server = app_server;
-        while let Some(request) = request_rx.recv().await {
+        loop {
+            let request = tokio::select! {
+                changed = page_rx.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    let Some(request) = page_rx.borrow_and_update().clone() else {
+                        continue;
+                    };
+                    PickerLoadRequest::Page(request)
+                }
+                request = request_rx.recv() => {
+                    let Some(request) = request else {
+                        break;
+                    };
+                    request
+                }
+            };
             match request {
                 PickerLoadRequest::Page(request) => {
                     let cursor = request.cursor.map(|PageCursor::AppServer(cursor)| cursor);
@@ -574,15 +594,19 @@ fn spawn_app_server_page_loader(
                         include_non_interactive,
                     )
                     .await;
-                    let _ = bg_tx.send(BackgroundEvent::Page {
-                        request_token: request.request_token,
-                        search_token: request.search_token,
-                        page,
-                    });
+                    let _ = bg_tx
+                        .send(BackgroundEvent::Page {
+                            request_token: request.request_token,
+                            search_token: request.search_token,
+                            page,
+                        })
+                        .await;
                 }
                 PickerLoadRequest::Preview { thread_id } => {
                     let preview = load_transcript_preview(&mut app_server, thread_id).await;
-                    let _ = bg_tx.send(BackgroundEvent::Preview { thread_id, preview });
+                    let _ = bg_tx
+                        .send(BackgroundEvent::Preview { thread_id, preview })
+                        .await;
                 }
                 PickerLoadRequest::Transcript { thread_id } => {
                     let transcript = load_session_transcript(
@@ -592,10 +616,12 @@ fn spawn_app_server_page_loader(
                         file_opener,
                     )
                     .await;
-                    let _ = bg_tx.send(BackgroundEvent::Transcript {
-                        thread_id,
-                        transcript,
-                    });
+                    let _ = bg_tx
+                        .send(BackgroundEvent::Transcript {
+                            thread_id,
+                            transcript,
+                        })
+                        .await;
                 }
             }
         }
@@ -604,8 +630,13 @@ fn spawn_app_server_page_loader(
         }
     });
 
-    Arc::new(move |request: PickerLoadRequest| {
-        let _ = request_tx.send(request);
+    Arc::new(move |request: PickerLoadRequest| match request {
+        PickerLoadRequest::Page(request) => {
+            page_tx.send_replace(Some(request));
+        }
+        request => {
+            let _ = request_tx.send(request);
+        }
     })
 }
 
@@ -1906,18 +1937,19 @@ fn search_line(state: &PickerState, width: u16) -> Line<'_> {
     } else {
         format!("Search: {}", state.query).into()
     };
+    let width = usize::from(width);
     let mut toolbar = toolbar_line(state, /*compact*/ false);
-    if toolbar.width() as u16 > width.saturating_sub(2) {
+    if toolbar.width() > width.saturating_sub(2) {
         toolbar = toolbar_line(state, /*compact*/ true);
     }
     let search_width = UnicodeWidthStr::width(search.content.as_ref());
     let toolbar_width = toolbar.width();
     let spacer_width = width
-        .saturating_sub((search_width + toolbar_width) as u16)
-        .max(2) as usize;
+        .saturating_sub(search_width.saturating_add(toolbar_width))
+        .max(2);
     let available_search_width = width
-        .saturating_sub(toolbar_width as u16)
-        .saturating_sub(spacer_width as u16) as usize;
+        .saturating_sub(toolbar_width)
+        .saturating_sub(spacer_width);
     let search = if search_width > available_search_width {
         let truncated = truncate_text(search.content.as_ref(), available_search_width);
         if state.query.is_empty() {
@@ -3230,6 +3262,108 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn picker_reload_storm_coalesces_before_rpc_and_results_apply_backpressure() {
+        use crate::app_server_session::ThreadParamsMode;
+        use codex_app_server_client::AppServerClient;
+        use codex_app_server_client::RemoteAppServerClient;
+        use codex_app_server_client::RemoteAppServerConnectArgs;
+        use codex_app_server_client::RemoteAppServerEndpoint;
+        use futures::SinkExt;
+        use std::time::Duration;
+        use tokio_tungstenite::tungstenite::Message;
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            for action in [SessionPickerAction::Resume, SessionPickerAction::Fork] {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+                let selected_id = ThreadId::new();
+                let thread = Thread {
+                    id: selected_id.to_string(), extra: None, session_id: selected_id.to_string(),
+                    forked_from_id: None, parent_thread_id: None, preview: "latest remote preview".to_string(),
+                    ephemeral: false, history_mode: Default::default(), model_provider: "openai".to_string(),
+                    created_at: 1, updated_at: 2, recency_at: Some(2),
+                    status: codex_app_server_protocol::ThreadStatus::Idle, path: None,
+                    cwd: test_path_buf("/tmp").abs(), cli_version: "0.0.0".to_string(),
+                    source: codex_app_server_protocol::SessionSource::Cli, thread_source: None,
+                    agent_nickname: None, agent_role: None, git_info: None,
+                    name: Some("latest remote session".to_string()), turns: Vec::new(),
+                };
+                let (arrived_tx, mut arrived_rx) = mpsc::channel(3);
+                let (release_tx, mut release_rx) = mpsc::channel(3);
+                let peer = tokio::spawn(async move {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                    let init = futures::StreamExt::next(&mut socket).await.unwrap().unwrap();
+                    let init: serde_json::Value = serde_json::from_str(init.to_text().unwrap()).unwrap();
+                    assert_eq!(init["method"], "initialize");
+                    socket.send(Message::Text(serde_json::json!({"id":init["id"],"result":{}}).to_string().into())).await.unwrap();
+                    let initialized = futures::StreamExt::next(&mut socket).await.unwrap().unwrap();
+                    let initialized: serde_json::Value = serde_json::from_str(initialized.to_text().unwrap()).unwrap();
+                    assert_eq!(initialized["method"], "initialized");
+                    for expected_sort in ["updated_at", "created_at", "updated_at"] {
+                        let request = futures::StreamExt::next(&mut socket).await.unwrap().unwrap();
+                        let request: serde_json::Value = serde_json::from_str(request.to_text().unwrap()).unwrap();
+                        assert_eq!(request["method"], "thread/list");
+                        assert_eq!(request["params"]["sortKey"], expected_sort);
+                        assert!(request["params"]["cursor"].is_null());
+                        arrived_tx.send(()).await.unwrap();
+                        release_rx.recv().await.unwrap();
+                        socket.send(Message::Text(serde_json::json!({"id":request["id"],"result":{"data":[thread],"nextCursor":null}}).to_string().into())).await.unwrap();
+                    }
+                    let _ = release_rx.recv().await;
+                });
+                let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+                    endpoint: RemoteAppServerEndpoint::WebSocket { websocket_url: endpoint, auth_token: None },
+                    client_name: "codex-tui-test".to_string(), client_version: "0.0.0-test".to_string(),
+                    experimental_api: true, mcp_server_openai_form_elicitation: false,
+                    opt_out_notification_methods: Vec::new(), channel_capacity: 8,
+                }).await.unwrap();
+                let session = AppServerSession::new(AppServerClient::Remote(client), ThreadParamsMode::Remote);
+                let (bg_tx, mut bg_rx) = mpsc::channel(1);
+                let loader = spawn_app_server_page_loader(session, false, RawReasoningVisibility::Hidden, UriBasedFileOpener::None, bg_tx);
+                let mut state = PickerState::new(FrameRequester::test_dummy(), loader, ProviderFilter::Any, true, None, action);
+                state.start_initial_load();
+                arrived_rx.recv().await.unwrap();
+                state.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)).await.unwrap();
+                // First RPC is held; no scheduler progress can admit these obsolete pages.
+                for _ in 0..10_001 {
+                    state.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)).await.unwrap();
+                }
+                assert_eq!(state.sort_key, ThreadSortKey::CreatedAt);
+                release_tx.send(()).await.unwrap();
+                arrived_rx.recv().await.unwrap();
+                assert_eq!(bg_rx.len(), 1, "first result retained while UI is busy");
+                state.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)).await.unwrap();
+                release_tx.send(()).await.unwrap();
+                assert!(tokio::time::timeout(Duration::from_millis(50), arrived_rx.recv()).await.is_err(), "loader must not start another RPC while its result send is blocked");
+
+                state.handle_background_event(bg_rx.recv().await.unwrap()).await.unwrap();
+                assert!(state.all_rows.is_empty(), "obsolete first page must not become selectable");
+                arrived_rx.recv().await.unwrap();
+                state.handle_background_event(bg_rx.recv().await.unwrap()).await.unwrap();
+                assert!(state.all_rows.is_empty(), "superseded second page must remain discarded");
+                release_tx.send(()).await.unwrap();
+                state.handle_background_event(bg_rx.recv().await.unwrap()).await.unwrap();
+                assert_eq!(state.filtered_rows.len(), 1);
+                assert_eq!(state.filtered_rows[0].thread_name.as_deref(), Some("latest remote session"));
+                let selected = state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)).await.unwrap();
+                match (action, selected) {
+                    (SessionPickerAction::Resume, Some(SessionSelection::Resume(target))) |
+                    (SessionPickerAction::Fork, Some(SessionSelection::Fork(target))) => {
+                        assert_eq!(target.thread_id, selected_id);
+                        assert_eq!(target.path, None);
+                    }
+                    _ => panic!("latest server row must reach the requested resume/fork consumer"),
+                }
+                drop(state);
+                drop(bg_rx);
+                drop(release_tx);
+                peer.await.unwrap();
+            }
+        }).await.expect("picker loader must preserve progress under obsolete reload pressure");
+    }
+
     fn page_only_loader(loader: impl Fn(PageLoadRequest) + Send + Sync + 'static) -> PickerLoader {
         Arc::new(move |request| {
             if let PickerLoadRequest::Page(request) = request {
@@ -3328,18 +3462,21 @@ mod tests {
             ThreadId::from_string("019dabc1-0ef5-7431-b81c-03037f51f62c").expect("thread id");
         let row = Row {
             path: Some(PathBuf::from("/tmp/a.jsonl")),
-            preview: String::from("first message"),
+            preview: String::from("initial prompt"),
             thread_id: Some(thread_id),
-            thread_name: Some(String::from("My session")),
+            thread_name: Some(String::from("Named conversation")),
             created_at: None,
             updated_at: None,
-            cwd: Some(PathBuf::from("/tmp/codex-session-picker")),
-            git_branch: Some(String::from("fcoury/session-picker")),
+            cwd: Some(PathBuf::from("/tmp/codex-project-workspace")),
+            git_branch: Some(String::from("feature/topic-branch")),
         };
 
-        assert!(row.matches_query("session-picker"));
-        assert!(row.matches_query("fcoury"));
-        assert!(row.matches_query(&thread_id.to_string()[..8]));
+        assert!(row.matches_query("initial"));
+        assert!(row.matches_query("conversation"));
+        assert!(row.matches_query("project-workspace"));
+        assert!(row.matches_query("topic-branch"));
+        assert!(row.matches_query("019dabc1"));
+        assert!(!row.matches_query("unrelated-query"));
     }
 
     #[test]
@@ -3565,8 +3702,15 @@ mod tests {
 
         assert_eq!(params.cursor, Some(String::from("cursor-1")));
         assert_eq!(params.model_providers, None);
-        let source_kinds = crate::resume_source_kinds(/*include_non_interactive*/ true);
-        assert_eq!(params.source_kinds, Some(source_kinds));
+        assert_eq!(
+            params.source_kinds,
+            Some(vec![
+                ThreadSourceKind::Cli,
+                ThreadSourceKind::VsCode,
+                ThreadSourceKind::Exec,
+                ThreadSourceKind::AppServer,
+            ])
+        );
     }
 
     #[test]
@@ -4644,6 +4788,34 @@ session_picker_view = "dense"
     }
 
     #[test]
+    fn oversized_search_query_preserves_visible_search_and_toolbar() {
+        let loader = page_only_loader(|_| {});
+        let mut state = PickerState::new(
+            FrameRequester::test_dummy(),
+            loader,
+            ProviderFilter::MatchDefault(String::from("openai")),
+            /*show_all*/ false,
+            Some(PathBuf::from("/tmp/project")),
+            SessionPickerAction::Resume,
+        );
+        let area = Rect::new(0, 0, 100, 1);
+        let mut rendered = Vec::new();
+        for query_len in [256, 65_536] {
+            state.query = "x".repeat(query_len);
+            let mut buffer = ratatui::buffer::Buffer::empty(area);
+            search_line(&state, area.width).render(area, &mut buffer);
+            let text = (0..area.width)
+                .map(|x| buffer[(x, 0)].symbol())
+                .collect::<String>();
+            assert!(text.starts_with("Search: xxxxxxxxxx"));
+            assert!(text.contains("Filter:"));
+            assert!(text.contains("Sort:"));
+            rendered.push(text);
+        }
+        assert_eq!(rendered[0], rendered[1]);
+    }
+
+    #[test]
     fn search_line_compacts_toolbar_on_narrow_width() {
         let loader = page_only_loader(|_| {});
         let state = PickerState::new(
@@ -4822,49 +4994,63 @@ session_picker_view = "dense"
 
     #[test]
     fn dense_zebra_summary_line_uses_full_width_background() {
-        let line = dense_summary_line(DenseSummaryInput {
-            marker: selection_marker(/*is_selected*/ false, /*is_expanded*/ false),
-            date: "15m ago",
-            title: "Zebra dense row",
-            is_selected: false,
-            is_zebra: true,
-            width: 80,
-        });
+        crate::terminal_palette::with_test_terminal_colors(
+            (0, 0, 0),
+            crate::terminal_palette::StdoutColorLevel::TrueColor,
+            || {
+                let line = dense_summary_line(DenseSummaryInput {
+                    marker: selection_marker(
+                        /*is_selected*/ false, /*is_expanded*/ false,
+                    ),
+                    date: "15m ago",
+                    title: "Zebra dense row",
+                    is_selected: false,
+                    is_zebra: true,
+                    width: 80,
+                });
 
-        assert_eq!(line.width(), 80);
-        assert_eq!(line.style.bg, dense_zebra_style().bg);
+                assert_eq!(line.width(), 80);
+                assert_eq!(line.style.bg, Some(Color::Rgb(14, 14, 14)));
+            },
+        );
     }
 
     #[test]
     fn comfortable_zebra_lines_use_full_width_background() {
-        let loader = page_only_loader(|_| {});
-        let mut state = PickerState::new(
-            FrameRequester::test_dummy(),
-            loader,
-            ProviderFilter::MatchDefault(String::from("openai")),
-            /*show_all*/ true,
-            /*filter_cwd*/ None,
-            SessionPickerAction::Resume,
-        );
-        state.relative_time_reference =
-            Some(parse_timestamp_str("2026-05-02T12:00:00Z").expect("timestamp"));
-        let row = make_row(
-            "/tmp/a.jsonl",
-            "2026-05-02T11:45:00Z",
-            "Zebra comfortable row",
-        );
+        crate::terminal_palette::with_test_terminal_colors(
+            (0, 0, 0),
+            crate::terminal_palette::StdoutColorLevel::TrueColor,
+            || {
+                let loader = page_only_loader(|_| {});
+                let mut state = PickerState::new(
+                    FrameRequester::test_dummy(),
+                    loader,
+                    ProviderFilter::MatchDefault(String::from("openai")),
+                    /*show_all*/ true,
+                    /*filter_cwd*/ None,
+                    SessionPickerAction::Resume,
+                );
+                state.relative_time_reference =
+                    Some(parse_timestamp_str("2026-05-02T12:00:00Z").expect("timestamp"));
+                let row = make_row(
+                    "/tmp/a.jsonl",
+                    "2026-05-02T11:45:00Z",
+                    "Zebra comfortable row",
+                );
 
-        let lines = render_comfortable_session_lines(
-            &row, &state, /*is_selected*/ false, /*is_expanded*/ false,
-            /*is_zebra*/ true, /*width*/ 100,
-        );
+                let lines = render_comfortable_session_lines(
+                    &row, &state, /*is_selected*/ false, /*is_expanded*/ false,
+                    /*is_zebra*/ true, /*width*/ 100,
+                );
 
-        assert_eq!(lines.len(), 2);
-        assert!(lines.iter().all(|line| line.width() == 100));
-        assert!(
-            lines
-                .iter()
-                .all(|line| line.style.bg == dense_zebra_style().bg)
+                assert_eq!(lines.len(), 2);
+                assert!(lines.iter().all(|line| line.width() == 100));
+                assert!(
+                    lines
+                        .iter()
+                        .all(|line| line.style.bg == Some(Color::Rgb(14, 14, 14)))
+                );
+            },
         );
     }
 

@@ -35,6 +35,7 @@ use codex_protocol::protocol::ReviewDecision;
 use codex_sandboxing::SandboxType;
 use codex_sandboxing::SandboxablePreference;
 use codex_sandboxing::policy_transforms::effective_permission_profile;
+use codex_sandboxing::policy_transforms::effective_permission_profile_uri;
 use codex_utils_path_uri::PathUri;
 use futures::future::BoxFuture;
 use std::path::PathBuf;
@@ -61,14 +62,18 @@ pub struct ApplyPatchRequest {
     pub exec_approval_requirement: ExecApprovalRequirement,
     pub additional_permissions: Option<AdditionalPermissionProfile>,
     pub permissions_preapproved: bool,
+    pub cancellation_token: tokio_util::sync::CancellationToken,
 }
 
 #[derive(Default)]
 pub struct ApplyPatchRuntime {
     committed_delta: AppliedPatchDelta,
     typed_mutations_started: bool,
+    mutation_finalization_attempted: bool,
     mutation_repo_root: Option<PathBuf>,
     mutation_repo_paths: Vec<String>,
+    workspace_operation_permit: Option<tokio::sync::OwnedMutexGuard<()>>,
+    mutation_in_progress: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Debug)]
@@ -82,8 +87,18 @@ impl ApplyPatchRuntime {
         Self::default()
     }
 
+    pub fn mutation_in_progress(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        self.mutation_in_progress.clone()
+    }
+
     pub fn committed_delta(&self) -> &AppliedPatchDelta {
         &self.committed_delta
+    }
+
+    pub async fn finish_cancelled_mutation_evidence(&mut self, ctx: &ToolCtx) {
+        if self.mutation_repo_root.is_some() && !self.mutation_finalization_attempted {
+            self.finish_mutation_evidence(ctx, true).await;
+        }
     }
 
     async fn begin_mutation_evidence(
@@ -145,7 +160,8 @@ impl ApplyPatchRuntime {
             ctx.session
                 .services
                 .git_workspace
-                .note_host_workspace_mutation_paths(&repo_root, &repo_paths);
+                .note_host_workspace_mutation_paths(&repo_root, &repo_paths)
+                .await;
         }
 
         if let Some(binding) = binding.as_ref() {
@@ -168,6 +184,12 @@ impl ApplyPatchRuntime {
                             "apply_patch: mutation evidence could not be recorded for `{path}`: {error}"
                         ))
                     })?;
+                // Each successful begin is already durable. Retain it before
+                // attempting the next path, which can independently fail.
+                self.mutation_repo_root = Some(repo_root.clone());
+                if !self.mutation_repo_paths.contains(path) {
+                    self.mutation_repo_paths.push(path.clone());
+                }
             }
         }
 
@@ -179,14 +201,27 @@ impl ApplyPatchRuntime {
 
     async fn finish_mutation_evidence(&mut self, ctx: &ToolCtx, finalize_typed_mutations: bool) {
         self.typed_mutations_started = false;
-        let repo_root = self.mutation_repo_root.take();
-        let repo_paths = std::mem::take(&mut self.mutation_repo_paths);
+        let (repo_root, repo_paths) = if finalize_typed_mutations {
+            (
+                self.mutation_repo_root.take(),
+                std::mem::take(&mut self.mutation_repo_paths),
+            )
+        } else {
+            // A denied attempt can await retry approval. Retain the pending
+            // evidence for cancellation there, while still rechecking admission
+            // on a later runtime attempt.
+            (
+                self.mutation_repo_root.clone(),
+                self.mutation_repo_paths.clone(),
+            )
+        };
         if let Some(repo_root) = repo_root.as_ref() {
             if self.committed_delta.is_exact() && !repo_paths.is_empty() {
                 ctx.session
                     .services
                     .git_workspace
-                    .note_host_workspace_mutation_paths(repo_root, &repo_paths);
+                    .note_host_workspace_mutation_paths(repo_root, &repo_paths)
+                    .await;
             } else if !self.committed_delta.is_empty() {
                 ctx.session
                     .services
@@ -195,6 +230,9 @@ impl ApplyPatchRuntime {
             }
         }
 
+        if finalize_typed_mutations {
+            self.mutation_finalization_attempted = true;
+        }
         if finalize_typed_mutations && let Some(repo_root) = repo_root.as_ref() {
             let coordinator = ctx.session.services.agent_control.task_coordinator();
             let binding = coordinator.binding_for_source(&ctx.turn.session_source);
@@ -231,6 +269,20 @@ impl ApplyPatchRuntime {
         req: &ApplyPatchRequest,
         attempt: &SandboxAttempt<'_>,
     ) -> Option<FileSystemSandboxContext> {
+        if req.turn_environment.environment.is_remote() {
+            // The executor chooses its own platform sandbox. Preserve the requested
+            // policy even when this host cannot select a concrete sandbox wrapper.
+            return attempt.sandbox_requested.then(|| FileSystemSandboxContext {
+                permissions: effective_permission_profile_uri(
+                    attempt.exec_server_permissions,
+                    req.additional_permissions.clone().map(Into::into).as_ref(),
+                ),
+                cwd: Some(attempt.sandbox_cwd.clone()),
+                workspace_roots: Vec::new(),
+                windows_sandbox_level: attempt.windows_sandbox_level,
+                windows_sandbox_private_desktop: attempt.windows_sandbox_private_desktop,
+            });
+        }
         if attempt.sandbox == SandboxType::None {
             return None;
         }
@@ -287,6 +339,9 @@ fn native_mutation_repo_paths(
             Err(_) => complete = false,
         }
     }
+    // Patch changes originate in a map. Keep admission and any rejection stable
+    // across equivalent requests, including partially admitted multi-path calls.
+    paths.sort_unstable();
     Ok(NativeMutationRepoPaths { paths, complete })
 }
 
@@ -423,59 +478,82 @@ impl ToolRuntime<ApplyPatchRequest, ApplyPatchRuntimeOutput> for ApplyPatchRunti
         attempt: &SandboxAttempt<'_>,
         ctx: &ToolCtx,
     ) -> Result<ApplyPatchRuntimeOutput, ToolError> {
-        self.begin_mutation_evidence(req, ctx).await?;
-        let started_at = Instant::now();
-        let fs = req.turn_environment.environment.get_filesystem();
-        let sandbox = Self::file_system_sandbox_context_for_attempt(req, attempt);
-        let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
-        let _workspace_operation_permit = if let Ok(native_cwd) = req.action.cwd.to_abs_path() {
-            let workspace_root =
-                get_git_repo_root(&native_cwd).unwrap_or_else(|| native_cwd.to_path_buf());
-            Some(
-                crate::workspace_operation_gate::acquire_workspace_operation(&workspace_root).await,
+        self.mutation_in_progress
+            .store(true, std::sync::atomic::Ordering::Release);
+        let result = async {
+            if let Err(error) = self.begin_mutation_evidence(req, ctx).await {
+                self.finish_mutation_evidence(ctx, true).await;
+                return Err(error);
+            }
+            let started_at = Instant::now();
+            let fs = req.turn_environment.environment.get_filesystem();
+            let sandbox = Self::file_system_sandbox_context_for_attempt(req, attempt);
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            if self.workspace_operation_permit.is_none() {
+                self.workspace_operation_permit =
+                    if let Ok(native_cwd) = req.action.cwd.to_abs_path() {
+                        let workspace_root = get_git_repo_root(&native_cwd)
+                            .unwrap_or_else(|| native_cwd.to_path_buf());
+                        Some(
+                            crate::workspace_operation_gate::acquire_workspace_operation(
+                                &workspace_root,
+                            )
+                            .await,
+                        )
+                    } else {
+                        None
+                    };
+            }
+            let result = codex_apply_patch::apply_patch_with_cancellation(
+                &req.action.patch,
+                &req.action.cwd,
+                &mut stdout,
+                &mut stderr,
+                fs.as_ref(),
+                sandbox.as_ref(),
+                &|| req.cancellation_token.is_cancelled(),
             )
-        } else {
-            None
-        };
-        let result = codex_apply_patch::apply_patch(
-            &req.action.patch,
-            &req.action.cwd,
-            &mut stdout,
-            &mut stderr,
-            fs.as_ref(),
-            sandbox.as_ref(),
-        )
-        .await;
-        let stdout = String::from_utf8_lossy(&stdout).into_owned();
-        let stderr = String::from_utf8_lossy(&stderr).into_owned();
-        let failed = result.is_err();
-        let exit_code = if failed { 1 } else { 0 };
-        let delta = match result {
-            Ok(delta) => delta,
-            Err(failure) => failure.into_parts().1,
-        };
-        self.committed_delta.append(delta);
-        let output = ExecToolCallOutput {
-            exit_code,
-            stdout: StreamOutput::new(stdout.clone()),
-            stderr: StreamOutput::new(stderr.clone()),
-            aggregated_output: StreamOutput::new(format!("{stdout}{stderr}")),
-            duration: started_at.elapsed(),
-            timed_out: false,
-        };
-        let sandbox_denied = failed && is_likely_sandbox_denied(attempt.sandbox, &output);
-        self.finish_mutation_evidence(ctx, !sandbox_denied).await;
-        if sandbox_denied {
-            return Err(ToolError::Codex(CodexErr::Sandbox(SandboxErr::Denied {
-                output: Box::new(output),
-                network_policy_decision: None,
-            })));
+            .await;
+            let stdout = String::from_utf8_lossy(&stdout).into_owned();
+            let stderr = String::from_utf8_lossy(&stderr).into_owned();
+            let failed = result.is_err();
+            let exit_code = if failed { 1 } else { 0 };
+            let delta = match result {
+                Ok(delta) => delta,
+                Err(failure) => failure.into_parts().1,
+            };
+            self.committed_delta.append(delta);
+            let output = ExecToolCallOutput {
+                exit_code,
+                stdout: StreamOutput::new(stdout.clone()),
+                stderr: StreamOutput::new(stderr.clone()),
+                aggregated_output: StreamOutput::new(format!("{stdout}{stderr}")),
+                duration: started_at.elapsed(),
+                timed_out: false,
+            };
+            let sandbox_denied = failed && is_likely_sandbox_denied(attempt.sandbox, &output);
+            self.finish_mutation_evidence(ctx, !sandbox_denied).await;
+            if sandbox_denied {
+                // A denied attempt with no possible writes need not serialize the
+                // next user approval. Retain the gate for any committed/uncertain delta.
+                if self.committed_delta.is_empty() && self.committed_delta.is_exact() {
+                    self.workspace_operation_permit.take();
+                }
+                return Err(ToolError::Codex(CodexErr::Sandbox(SandboxErr::Denied {
+                    output: Box::new(output),
+                    network_policy_decision: None,
+                })));
+            }
+            Ok(ApplyPatchRuntimeOutput {
+                exec_output: output,
+                delta: self.committed_delta.clone(),
+            })
         }
-        Ok(ApplyPatchRuntimeOutput {
-            exec_output: output,
-            delta: self.committed_delta.clone(),
-        })
+        .await;
+        self.mutation_in_progress
+            .store(false, std::sync::atomic::Ordering::Release);
+        result
     }
 }
 

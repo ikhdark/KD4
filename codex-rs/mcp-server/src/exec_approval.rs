@@ -59,6 +59,7 @@ pub(crate) async fn handle_exec_approval_request(
     approval_id: String,
     codex_parsed_cmd: Vec<ParsedCommand>,
     thread_id: ThreadId,
+    cancellation: tokio_util::sync::CancellationToken,
 ) {
     let escaped_command =
         shlex::try_join(command.iter().map(String::as_str)).unwrap_or_else(|_| command.join(" "));
@@ -93,10 +94,9 @@ pub(crate) async fn handle_exec_approval_request(
         }
     };
 
-    let on_response = outgoing
+    let pending = outgoing
         .send_request("elicitation/create", Some(params_json))
-        .await
-        .receiver;
+        .await;
 
     // Listen for the response on a separate task so we don't block the main agent loop.
     {
@@ -104,7 +104,13 @@ pub(crate) async fn handle_exec_approval_request(
         let approval_id = approval_id.clone();
         let event_id = event_id.clone();
         tokio::spawn(async move {
-            on_exec_approval_response(approval_id, event_id, on_response, codex).await;
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => {
+                    outgoing.cancel_request(&pending.id).await;
+                }
+                _ = on_exec_approval_response(approval_id, event_id, pending.receiver, codex) => {}
+            }
         });
     }
 }

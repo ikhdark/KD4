@@ -216,22 +216,32 @@ impl ChatWidget {
         self.request_redraw();
     }
 
-    pub(crate) fn approve_recent_auto_review_denial(&mut self, thread_id: ThreadId, id: String) {
-        let Some(event) = self.review.recent_auto_review_denials.take(&id) else {
+    pub(crate) fn recent_auto_review_denial(
+        &mut self,
+        thread_id: ThreadId,
+        id: &str,
+    ) -> Option<GuardianAssessmentEvent> {
+        if self.thread_id() != Some(thread_id) {
+            self.add_error_message("That thread is no longer available.".to_string());
+            return None;
+        }
+        let event = self
+            .review
+            .recent_auto_review_denials
+            .entries()
+            .find(|event| event.id == id)
+            .cloned();
+        if event.is_none() {
             self.add_error_message("That auto-review denial is no longer available.".to_string());
-            return;
-        };
+        }
+        event
+    }
 
-        self.app_event_tx.send(AppEvent::SubmitThreadOp {
-            thread_id,
-            op: AppCommand::approve_guardian_denied_action(event),
-        });
+    pub(crate) fn complete_recent_auto_review_denial(&mut self, id: &str) {
+        self.review.recent_auto_review_denials.take(id);
         self.add_info_message(
-            "Approval recorded for one retry of the selected auto-review denial.".to_string(),
-            Some(
-                "The model will see the approval context; the retry still goes through auto-review."
-                    .to_string(),
-            ),
+            "Approval submitted for one retry of the selected auto-review denial.".to_string(),
+            Some("The retry still goes through auto-review.".to_string()),
         );
     }
 
@@ -326,23 +336,61 @@ impl ChatWidget {
                         });
                     })];
                 }
-                if let Some((sample_paths, extra_count, failed_scan)) =
-                    self.world_writable_warning_details()
+                if !self
+                    .config
+                    .notices
+                    .hide_world_writable_warning
+                    .unwrap_or(false)
                 {
                     let preset = preset.clone();
                     return vec![Box::new(move |tx| {
-                        tx.send(AppEvent::OpenWorldWritableWarningConfirmation {
-                            preset: Some(preset.clone()),
+                        tx.send(AppEvent::CheckWorldWritablePermissionMode {
+                            preset: preset.clone(),
+                            label: label.clone(),
+                            approvals_reviewer,
                             profile_selection: profile_selection.clone(),
-                            sample_paths: sample_paths.clone(),
-                            extra_count,
-                            failed_scan,
                         });
                     })];
                 }
             }
         }
         apply_actions()
+    }
+
+    pub(crate) async fn apply_permission_mode_after_world_writable_scan(
+        &mut self,
+        preset: ApprovalPreset,
+        label: String,
+        approvals_reviewer: ApprovalsReviewer,
+        profile_selection: Option<PermissionProfileSelection>,
+    ) {
+        if let Some((sample_paths, extra_count, failed_scan)) =
+            self.world_writable_warning_details().await
+        {
+            self.open_world_writable_warning_confirmation(
+                Some(preset),
+                profile_selection,
+                sample_paths,
+                extra_count,
+                failed_scan,
+            );
+            return;
+        }
+        let actions = profile_selection.map_or_else(
+            || {
+                Self::approval_preset_actions(
+                    AskForApproval::from(preset.approval),
+                    preset.permission_profile,
+                    preset.active_permission_profile,
+                    label,
+                    approvals_reviewer,
+                )
+            },
+            Self::permission_profile_selection_actions,
+        );
+        for action in actions {
+            action(&self.app_event_tx);
+        }
     }
 
     pub(super) fn preset_matches_current(

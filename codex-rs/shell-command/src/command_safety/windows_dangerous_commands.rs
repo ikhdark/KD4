@@ -77,25 +77,8 @@ pub(crate) fn is_dangerous_powershell_words(words: &[String]) -> bool {
         return true;
     }
 
-    if let Some(first) = tokens_lc.first() {
-        // Legacy ShellExecute path via url.dll
-        if first == "rundll32"
-            && tokens_lc
-                .iter()
-                .any(|t| t.contains("url.dll,fileprotocolhandler"))
-            && has_url
-        {
-            return true;
-        }
-        if first == "mshta" && has_url {
-            return true;
-        }
-        if is_browser_executable(first) && has_url {
-            return true;
-        }
-        if matches!(first.as_str(), "explorer" | "explorer.exe") && has_url {
-            return true;
-        }
+    if is_direct_gui_launch(&tokens_lc) {
+        return true;
     }
 
     // Check for force delete operations (e.g., Remove-Item -Force)
@@ -448,6 +431,31 @@ mod tests {
     }
 
     #[test]
+    fn powershell_gui_executables_use_direct_argv_classification() {
+        for executable in ["rundll32", "RUNDLL32.EXE", "mshta", "MsHtA.ExE"] {
+            let args = if executable.to_ascii_lowercase().starts_with("rundll32") {
+                "url.dll,FileProtocolHandler https://example.com"
+            } else {
+                "https://example.com"
+            };
+            let script = format!("{executable} {args}");
+            let invocation = vec_str(&["powershell", "-Command", &script]);
+            assert!(
+                crate::is_dangerous_command::command_might_be_dangerous(&invocation),
+                "{script}"
+            );
+        }
+        for script in [
+            "mshta.exe local.hta",
+            "rundll32.exe url.dll,FileProtocolHandler local.txt",
+        ] {
+            assert!(!crate::is_dangerous_command::command_might_be_dangerous(
+                &vec_str(&["powershell", "-Command", script])
+            ));
+        }
+    }
+
+    #[test]
     fn cmd_start_with_url_is_dangerous() {
         assert!(is_dangerous_command_windows(&vec_str(&[
             "cmd",
@@ -455,6 +463,29 @@ mod tests {
             "start",
             "https://example.com"
         ])));
+    }
+
+    #[test]
+    fn direct_gui_launch_normalizes_executable_ascii_case() {
+        use crate::is_dangerous_command::command_might_be_dangerous;
+
+        for executable in ["rundll32", "RUNDLL32.EXE", "bin/RuNdLl32.ExE"] {
+            assert!(command_might_be_dangerous(&vec_str(&[
+                executable,
+                "URL.DLL,FileProtocolHandler",
+                "https://example.com",
+            ])));
+            assert!(!command_might_be_dangerous(&vec_str(&[
+                executable,
+                "URL.DLL,FileProtocolHandler",
+                "local.txt",
+            ])));
+            assert!(!command_might_be_dangerous(&vec_str(&[
+                executable,
+                "other.dll,OtherEntryPoint",
+                "https://example.com",
+            ])));
+        }
     }
 
     #[test]

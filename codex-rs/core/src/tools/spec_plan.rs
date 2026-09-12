@@ -35,6 +35,7 @@ use crate::tools::handlers::WaitForEnvironmentHandler;
 use crate::tools::handlers::WriteStdinHandler;
 use crate::tools::handlers::agent_jobs::ReportAgentJobResultHandler;
 use crate::tools::handlers::agent_jobs::SpawnAgentsOnCsvHandler;
+use crate::tools::handlers::allows_inline_sandbox_approval;
 use crate::tools::handlers::extension_tools::ExtensionToolAdapter;
 use crate::tools::handlers::multi_agents::CloseAgentHandler;
 use crate::tools::handlers::multi_agents::ResumeAgentHandler;
@@ -905,10 +906,8 @@ fn add_shell_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut Planne
     }
 
     let allow_login_shell = turn_context.config.permissions.allow_login_shell;
-    let allow_escalated_sandbox_permissions = matches!(
-        turn_context.approval_policy.value(),
-        AskForApproval::OnRequest
-    );
+    let allow_escalated_sandbox_permissions =
+        allows_inline_sandbox_approval(turn_context.approval_policy.value());
     let exec_permission_approvals_enabled = features.enabled(Feature::ExecPermissionApprovals);
     let include_environment_id = matches!(environment_mode, ToolEnvironmentMode::Multiple);
     let shell_command_options = ShellCommandHandlerOptions {
@@ -949,6 +948,12 @@ fn add_shell_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut Planne
                 ShellCommandHandler::new(shell_command_options),
                 TypedToolClass::Shell,
             );
+            // Foreign-cwd legacy calls forward to unified exec and can return a
+            // live session; keep its existing polling consumer available.
+            if primary_environment_uses_foreign_cwd(context.step_context) {
+                planned_tools
+                    .add_with_authorization_class(WriteStdinHandler, TypedToolClass::Shell);
+            }
         }
     }
 }
@@ -1496,6 +1501,14 @@ impl ToolExecutor<ToolInvocation> for MultiAgentV2NamespaceOverride {
 }
 
 impl CoreToolRuntime for MultiAgentV2NamespaceOverride {
+    fn waits_for_runtime_cancellation(&self) -> bool {
+        self.handler.waits_for_runtime_cancellation()
+    }
+
+    fn cancellation_requires_commit_barrier(&self) -> bool {
+        self.handler.cancellation_requires_commit_barrier()
+    }
+
     fn matches_kind(&self, payload: &crate::tools::context::ToolPayload) -> bool {
         self.handler.matches_kind(payload)
     }

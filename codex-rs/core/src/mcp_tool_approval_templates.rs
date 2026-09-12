@@ -313,7 +313,43 @@ mod tests {
 
     #[test]
     fn bundled_templates_load() {
-        assert_eq!(CONSEQUENTIAL_TOOL_MESSAGE_TEMPLATES.is_some(), true);
+        let params =
+            json!({"pr_number": 42, "repo_full_name": "owner/repo", "comment": "Reviewed"});
+        let rendered = render_mcp_tool_approval_template(
+            "codex_apps",
+            Some("connector_76869538009648d5b282a4bb21c3d157"),
+            Some("GitHub"),
+            Some("add_comment_to_issue"),
+            Some(&params),
+        )
+        .expect("bundled GitHub approval template should render");
+
+        assert_eq!(
+            rendered.question,
+            "Allow GitHub to add a comment to a pull request?"
+        );
+        assert_eq!(rendered.elicitation_message, rendered.question);
+        assert_eq!(rendered.tool_params, Some(params));
+        assert_eq!(
+            rendered.tool_params_display,
+            vec![
+                RenderedMcpToolApprovalParam {
+                    name: "pr_number".to_string(),
+                    value: json!(42),
+                    display_name: "Pull request".to_string(),
+                },
+                RenderedMcpToolApprovalParam {
+                    name: "repo_full_name".to_string(),
+                    value: json!("owner/repo"),
+                    display_name: "Repository".to_string(),
+                },
+                RenderedMcpToolApprovalParam {
+                    name: "comment".to_string(),
+                    value: json!("Reviewed"),
+                    display_name: "Comment".to_string(),
+                },
+            ]
+        );
     }
 
     #[test]

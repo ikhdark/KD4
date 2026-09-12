@@ -1,7 +1,4 @@
 use std::collections::HashMap;
-use std::ffi::OsStr;
-use std::ffi::OsString;
-use std::io::ErrorKind;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -12,12 +9,6 @@ use app_test_support::TestAppServer;
 use app_test_support::to_response;
 use app_test_support::write_chatgpt_auth;
 use app_test_support::write_mock_responses_config_toml_with_chatgpt_base_url;
-use codex_app_server::AppServerRuntimeOptions;
-use codex_app_server::AppServerTransport;
-use codex_app_server::AppServerWebsocketAuthSettings;
-use codex_app_server::PluginStartupTasks;
-use codex_app_server::RemoteControlStartupMode;
-use codex_app_server::run_main;
 use codex_app_server_protocol::JSONRPCError;
 use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::RemoteControlClient;
@@ -36,15 +27,10 @@ use codex_app_server_protocol::RemoteControlPairingStatusResponse;
 use codex_app_server_protocol::RemoteControlStatusChangedNotification;
 use codex_app_server_protocol::RemoteControlStatusReadResponse;
 use codex_app_server_protocol::RequestId;
-use codex_arg0::Arg0DispatchPaths;
-use codex_config::LoaderOverrides;
 use codex_config::types::AuthCredentialsStoreMode;
-use codex_protocol::protocol::SessionSource;
 use codex_state::RemoteControlEnrollmentRecord;
 use codex_state::StateRuntime;
-use codex_utils_cli::CliConfigOverrides;
 use pretty_assertions::assert_eq;
-use serial_test::serial;
 use tempfile::TempDir;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::AsyncReadExt;
@@ -60,32 +46,6 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const REMOTE_CONTROL_DISABLED_BY_REQUIREMENTS_MESSAGE: &str =
     "remote control is disabled by managed requirements";
-
-struct EnvVarGuard {
-    key: &'static str,
-    original: Option<OsString>,
-}
-
-impl EnvVarGuard {
-    fn set(key: &'static str, value: &OsStr) -> Self {
-        let original = std::env::var_os(key);
-        unsafe {
-            std::env::set_var(key, value);
-        }
-        Self { key, original }
-    }
-}
-
-impl Drop for EnvVarGuard {
-    fn drop(&mut self) {
-        unsafe {
-            match &self.original {
-                Some(value) => std::env::set_var(self.key, value),
-                None => std::env::remove_var(self.key),
-            }
-        }
-    }
-}
 
 async fn remote_control_preference(
     state_db: &StateRuntime,
@@ -211,48 +171,39 @@ async fn managed_requirements_allow_remote_control_true_does_not_enable_or_block
 }
 
 #[tokio::test]
-#[serial]
 async fn explicit_remote_control_startup_fails_when_disabled_by_requirements() -> Result<()> {
     let codex_home = TempDir::new()?;
     std::fs::write(
         codex_home.path().join("requirements.toml"),
         "allow_remote_control = false\n",
     )?;
-    let system_requirements_path = codex_home.path().join("requirements.toml");
     let socket_path = codex_home.path().join("app-server.sock");
     let state_db_path = codex_state::state_db_path(codex_home.path());
     let corrupt_state = b"not a sqlite database";
     std::fs::write(&state_db_path, corrupt_state)?;
-    let transport =
-        AppServerTransport::from_listen_url(&format!("unix://{}", socket_path.display()))?;
-    let _codex_home_guard = EnvVarGuard::set("CODEX_HOME", codex_home.path().as_os_str());
-
-    let result = timeout(
+    let output = timeout(
         STARTUP_TIMEOUT,
-        run_main(
-            Arg0DispatchPaths {
-                codex_self_exe: Some(std::env::current_exe()?),
-            },
-            CliConfigOverrides::default(),
-            LoaderOverrides::with_system_requirements_path_for_tests(system_requirements_path),
-            /*strict_config*/ false,
-            /*default_analytics_enabled*/ false,
-            transport,
-            SessionSource::VSCode,
-            AppServerWebsocketAuthSettings::default(),
-            AppServerRuntimeOptions {
-                plugin_startup_tasks: PluginStartupTasks::Skip,
-                remote_control_startup_mode: RemoteControlStartupMode::EnabledEphemeral,
-                install_shutdown_signal_handler: false,
-            },
-        ),
+        tokio::process::Command::new(codex_utils_cargo_bin::cargo_bin("codex-app-server")?)
+            .env("CODEX_HOME", codex_home.path())
+            .env(
+                "CODEX_APP_SERVER_MANAGED_CONFIG_PATH",
+                codex_home.path().join("managed_config.toml"),
+            )
+            .env_remove("CODEX_APP_SERVER_DISABLE_MANAGED_CONFIG")
+            .args([
+                "--remote-control",
+                "--listen",
+                &format!("unix://{}", socket_path.display()),
+            ])
+            .kill_on_drop(true)
+            .output(),
     )
-    .await?;
-    let err = result.expect_err("managed requirements should reject explicit remote control");
-    assert_eq!(err.kind(), ErrorKind::InvalidInput);
-    assert_eq!(
-        err.to_string(),
-        REMOTE_CONTROL_DISABLED_BY_REQUIREMENTS_MESSAGE
+    .await??;
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(
+        stderr.contains(REMOTE_CONTROL_DISABLED_BY_REQUIREMENTS_MESSAGE),
+        "expected managed-policy rejection, got: {stderr}"
     );
     assert!(!socket_path.exists());
     assert_eq!(

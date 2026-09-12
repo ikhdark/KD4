@@ -2,6 +2,10 @@
 
 use super::*;
 
+#[cfg(test)]
+pub(super) type WorldWritableScanForTest =
+    Arc<dyn Fn(&Config) -> Option<(Vec<String>, usize, bool)> + Send + Sync>;
+
 fn legacy_windows_sandbox_is_compatible() -> bool {
     codex_windows_sandbox::legacy_restricted_token_enforces_delete_child()
 }
@@ -27,36 +31,63 @@ impl ChatWidget {
                 .is_some()
     }
 
-    pub(crate) fn world_writable_warning_details(&self) -> Option<(Vec<String>, usize, bool)> {
-        if self
-            .config
-            .notices
-            .hide_world_writable_warning
-            .unwrap_or(false)
-        {
-            return None;
-        }
-        let cwd = self.config.cwd.clone();
-        let workspace_roots = self.config.effective_workspace_roots();
-        let env_map: std::collections::HashMap<String, String> = std::env::vars().collect();
-        let permission_profile = self.config.permissions.effective_permission_profile();
-        let Ok(permissions) =
-            codex_windows_sandbox::ResolvedWindowsSandboxPermissions::try_from_permission_profile_for_workspace_roots(
-                &permission_profile,
-                workspace_roots.as_slice(),
-            )
-        else {
-            return None;
-        };
-        match codex_windows_sandbox::apply_world_writable_scan_and_denies_for_permissions(
-            self.config.codex_home.as_path(),
-            cwd.as_path(),
-            &env_map,
-            &permissions,
-            Some(self.config.codex_home.as_path()),
-        ) {
-            Ok(_) => None,
-            Err(_) => Some((Vec::new(), 0, true)),
+    #[cfg(test)]
+    pub(crate) fn set_world_writable_scan_for_test(
+        &mut self,
+        scan: impl Fn(&Config) -> Option<(Vec<String>, usize, bool)> + Send + Sync + 'static,
+    ) {
+        self.world_writable_scan_for_test = Some(Arc::new(scan));
+    }
+
+    pub(crate) fn world_writable_warning_details(
+        &self,
+    ) -> impl std::future::Future<Output = Option<(Vec<String>, usize, bool)>> + Send + use<> {
+        self.world_writable_warning_details_for_config(self.config.clone())
+    }
+
+    pub(crate) fn world_writable_warning_details_for_config(
+        &self,
+        config: Config,
+    ) -> impl std::future::Future<Output = Option<(Vec<String>, usize, bool)>> + Send + use<> {
+        #[cfg(test)]
+        let scan_override = self.world_writable_scan_for_test.clone();
+        async move {
+            if config.notices.hide_world_writable_warning.unwrap_or(false) {
+                return None;
+            }
+            tokio::task::spawn_blocking(move || {
+                #[cfg(test)]
+                if let Some(scan) = scan_override {
+                    return scan(&config);
+                }
+                let cwd = config.cwd.clone();
+                let workspace_roots = config.effective_workspace_roots();
+                let env_map: std::collections::HashMap<String, String> = std::env::vars().collect();
+                let permission_profile = config.permissions.effective_permission_profile();
+                let Ok(permissions) =
+                    codex_windows_sandbox::ResolvedWindowsSandboxPermissions::try_from_permission_profile_for_workspace_roots(
+                        &permission_profile,
+                        workspace_roots.as_slice(),
+                    )
+                else {
+                    return None;
+                };
+                match codex_windows_sandbox::apply_world_writable_scan_and_denies_for_permissions(
+                    config.codex_home.as_path(),
+                    cwd.as_path(),
+                    &env_map,
+                    &permissions,
+                    Some(config.codex_home.as_path()),
+                ) {
+                    Ok(_) => None,
+                    Err(_) => Some((Vec::new(), 0, true)),
+                }
+            })
+            .await
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, "world-writable scan worker failed");
+                Some((Vec::new(), 0, true))
+            })
         }
     }
 

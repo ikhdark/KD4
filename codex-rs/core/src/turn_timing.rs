@@ -2153,10 +2153,20 @@ impl TurnTimingState {
         let model_visible_at_ms = state
             .elapsed_since_start(sample.time.monotonic_ns)
             .map(u128_to_u64_ms);
-        if let Some(tool_call) = state.tool_calls.iter_mut().find(|tool_call| {
-            tool_call.call_id == call_id && tool_call.output_model_visible_at_ms.is_none()
-        }) {
-            tool_call.output_model_visible_at_ms = model_visible_at_ms;
+        // Dispatch timings arrive in completion order, while the relay publishes
+        // outputs in request order. Prefer its execution-specific delivery mark
+        // when call IDs are reused; legacy callers without relay marks remain FIFO.
+        let index = state
+            .tool_calls
+            .iter()
+            .enumerate()
+            .filter(|(_, tool_call)| {
+                tool_call.call_id == call_id && tool_call.output_model_visible_at_ms.is_none()
+            })
+            .min_by_key(|(_, tool_call)| tool_call.delivered_at_ms.is_none())
+            .map(|(index, _)| index);
+        if let Some(index) = index {
+            state.tool_calls[index].output_model_visible_at_ms = model_visible_at_ms;
         }
     }
 

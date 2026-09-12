@@ -4,6 +4,7 @@ use codex_protocol::models::ShellCommandToolCallParams;
 use codex_tools::ToolName;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathConvention;
+use codex_utils_path_uri::PathUri;
 
 use crate::FunctionCallError;
 use crate::agent::task_capabilities::is_independent_review_source;
@@ -321,11 +322,12 @@ impl ShellCommandHandler {
         );
         let use_login_shell = Self::resolve_use_login_shell(params.login, allow_login_shell)?;
         let session_shell = session.user_shell();
-        let original_safety_shell = resolve_command_shell(
+        let original_safety_shell = resolve_command_shell_async(
             &original_invocation,
             &turn_environment,
             session_shell.as_ref(),
-        )?;
+        )
+        .await?;
         let original_safety_command =
             original_invocation.to_safety_args(&original_safety_shell, use_login_shell)?;
         let original_shell_type = if original_invocation.is_argv() {
@@ -381,11 +383,12 @@ impl ShellCommandHandler {
         maybe_emit_implicit_skill_invocation(session.as_ref(), turn.as_ref(), &hook_command, &cwd)
             .await;
         let safety_shell = if command_repaired {
-            resolve_command_shell(
+            resolve_command_shell_async(
                 &command_invocation,
                 &turn_environment,
                 session_shell.as_ref(),
-            )?
+            )
+            .await?
         } else {
             original_safety_shell
         };
@@ -443,7 +446,7 @@ impl ShellCommandHandler {
                 exec_params.cwd.as_path(),
             )
             .await;
-        let validation_cwd = exec_params.cwd.to_string_lossy().into_owned();
+        let validation_cwd = PathUri::from_abs_path(&exec_params.cwd).to_string();
         let attempt_key = if validation_launch.is_none() {
             let attempt_key = CommandAttemptKey::new(
                 tool_name.name.as_str(),
@@ -458,12 +461,20 @@ impl ShellCommandHandler {
             .with_runtime_context(&runtime_context)
             .with_repository_epoch(repository_epoch)
             .with_workspace_identity(workspace_identity.as_deref());
-            let mut search = classify_rg_search_with_repository(
-                &safety_command,
-                shell_type,
-                exec_params.cwd.as_path(),
-                || resolve_search_repository_root(exec_params.cwd.as_path()),
-            )
+            let search_command = safety_command.clone();
+            let search_cwd = exec_params.cwd.clone();
+            let mut search = crate::tools::run_blocking_command_analysis(move || {
+                classify_rg_search_with_repository(
+                    &search_command,
+                    shell_type,
+                    search_cwd.as_path(),
+                    || resolve_search_repository_root(search_cwd.as_path()),
+                )
+            })
+            .await
+            .map_err(|error| {
+                FunctionCallError::RespondToModel(format!("command search worker failed: {error}"))
+            })?
             .map_err(FunctionCallError::RespondToModel)?;
             if let Some((_, search)) = search.as_mut() {
                 observe_rg_search_scope_state(search).await;
@@ -487,6 +498,7 @@ impl ShellCommandHandler {
             None
         };
         let run_args = RunExecLikeArgs {
+            validation: params.validation.clone(),
             tool_name,
             exec_params,
             stall_timeout_ms,
@@ -513,6 +525,23 @@ impl ShellCommandHandler {
         };
         run_exec_like(run_args).await.map(boxed_tool_output)
     }
+}
+
+async fn resolve_command_shell_async(
+    invocation: &CommandInvocation,
+    turn_environment: &TurnEnvironment,
+    session_shell: &Shell,
+) -> Result<Shell, FunctionCallError> {
+    let invocation = invocation.clone();
+    let turn_environment = turn_environment.clone();
+    let session_shell = session_shell.clone();
+    crate::tools::run_blocking_command_analysis(move || {
+        resolve_command_shell(&invocation, &turn_environment, &session_shell)
+    })
+    .await
+    .map_err(|error| {
+        FunctionCallError::RespondToModel(format!("shell discovery worker failed: {error}"))
+    })?
 }
 
 pub(super) fn resolve_command_shell(

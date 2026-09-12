@@ -369,12 +369,14 @@ fn append_quoted(arg: &OsStr, cmdline: &mut Vec<u16>) {
 
 #[cfg(test)]
 mod tests {
-    use super::CONPTY;
     use super::MIN_CONPTY_BUILD;
     use super::build_cmdline;
     use super::build_environment_block;
     use super::windows_build_number;
+    use crate::win::ConPtySystem;
     use portable_pty::CommandBuilder;
+    use portable_pty::PtySize;
+    use portable_pty::PtySystem;
     use std::ffi::OsString;
     use std::os::windows::ffi::OsStringExt;
     use std::path::Path;
@@ -388,8 +390,39 @@ mod tests {
     }
 
     #[test]
-    fn conpty_functions_load() {
-        std::sync::LazyLock::force(&CONPTY);
+    fn conpty_functions_create_and_resize_console() {
+        let system = ConPtySystem::default();
+        let initial_size = PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        let invalid_size = PtySize {
+            rows: 0,
+            ..initial_size
+        };
+        assert!(system.openpty(invalid_size).is_err());
+
+        let pair = system.openpty(initial_size).expect("create console");
+        assert_eq!(pair.master.get_size().unwrap(), initial_size);
+
+        let resized = PtySize {
+            rows: 30,
+            cols: 100,
+            ..initial_size
+        };
+        pair.master.resize(resized).expect("resize console");
+        assert_eq!(pair.master.get_size().unwrap(), resized);
+
+        // ResizePseudoConsole accepts zero but rejects negative COORD values.
+        // u16::MAX is outside that API's signed dimension range.
+        let invalid_resize = PtySize {
+            rows: u16::MAX,
+            ..resized
+        };
+        assert!(pair.master.resize(invalid_resize).is_err());
+        assert_eq!(pair.master.get_size().unwrap(), resized);
     }
 
     #[test]

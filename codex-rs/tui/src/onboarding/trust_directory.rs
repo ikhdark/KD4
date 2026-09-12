@@ -221,6 +221,7 @@ mod tests {
         };
         widget.handle_key_event(release);
         assert_eq!(widget.selection, None);
+        assert!(!widget.should_quit);
 
         let press = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         widget.handle_key_event(press);

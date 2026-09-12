@@ -329,6 +329,17 @@ pub(crate) fn resolve_tool_environment<'a>(
     )
 }
 
+/// Whether a fresh inline sandbox override may reach its approval flow.
+/// Untrusted mode still classifies ordinary commands itself; it does not accept
+/// model-requested sandbox overrides. Preapproved grants bypass this check.
+pub(crate) fn allows_inline_sandbox_approval(policy: AskForApproval) -> bool {
+    match policy {
+        AskForApproval::OnRequest => true,
+        AskForApproval::Granular(config) => config.allows_sandbox_approval(),
+        AskForApproval::UnlessTrusted | AskForApproval::Never => false,
+    }
+}
+
 /// Validates feature/policy constraints for `with_additional_permissions` and
 /// normalizes any path-based permissions. Errors if the request is invalid.
 pub(crate) fn normalize_and_validate_additional_permissions(
@@ -339,6 +350,56 @@ pub(crate) fn normalize_and_validate_additional_permissions(
     permissions_preapproved: bool,
     _cwd: &Path,
 ) -> Result<Option<AdditionalPermissionProfile>, String> {
+    normalize_and_validate_permission_profile(
+        additional_permissions_allowed,
+        approval_policy,
+        sandbox_permissions,
+        additional_permissions,
+        permissions_preapproved,
+        normalize_additional_permissions,
+        AdditionalPermissionProfile::is_empty,
+    )
+}
+
+/// Retains foreign environment paths through permission validation. The native
+/// conversion is only a compatibility projection, never the grant authority.
+pub(super) fn normalize_and_validate_additional_permissions_uri(
+    additional_permissions_allowed: bool,
+    approval_policy: AskForApproval,
+    sandbox_permissions: SandboxPermissions,
+    additional_permissions: Option<UriAdditionalPermissionProfile>,
+    permissions_preapproved: bool,
+) -> Result<Option<UriAdditionalPermissionProfile>, String> {
+    normalize_and_validate_permission_profile(
+        additional_permissions_allowed,
+        approval_policy,
+        sandbox_permissions,
+        additional_permissions,
+        permissions_preapproved,
+        |permissions| {
+            match AdditionalPermissionProfile::try_from(permissions.clone()) {
+                // Preserve native path normalization for existing local callers.
+                Ok(native) => normalize_additional_permissions(native).map(Into::into),
+                Err(_) => {
+                    codex_sandboxing::policy_transforms::normalize_uri_additional_permissions(
+                        permissions,
+                    )
+                }
+            }
+        },
+        UriAdditionalPermissionProfile::is_empty,
+    )
+}
+
+fn normalize_and_validate_permission_profile<T>(
+    additional_permissions_allowed: bool,
+    approval_policy: AskForApproval,
+    sandbox_permissions: SandboxPermissions,
+    additional_permissions: Option<T>,
+    permissions_preapproved: bool,
+    normalize: fn(T) -> Result<T, String>,
+    is_empty: fn(&T) -> bool,
+) -> Result<Option<T>, String> {
     let uses_additional_permissions = matches!(
         sandbox_permissions,
         SandboxPermissions::WithAdditionalPermissions
@@ -355,9 +416,9 @@ pub(crate) fn normalize_and_validate_additional_permissions(
     }
 
     if uses_additional_permissions {
-        if !permissions_preapproved && !matches!(approval_policy, AskForApproval::OnRequest) {
+        if !permissions_preapproved && !allows_inline_sandbox_approval(approval_policy) {
             return Err(format!(
-                "approval policy is {approval_policy:?}; reject command — you cannot request additional permissions unless the approval policy is OnRequest"
+                "approval policy is {approval_policy:?}; reject command — this policy does not allow inline sandbox approval requests"
             ));
         }
         let Some(additional_permissions) = additional_permissions else {
@@ -366,8 +427,8 @@ pub(crate) fn normalize_and_validate_additional_permissions(
                     .to_string(),
             );
         };
-        let normalized = normalize_additional_permissions(additional_permissions)?;
-        if normalized.is_empty() {
+        let normalized = normalize(additional_permissions)?;
+        if is_empty(&normalized) {
             return Err(
                 "`additional_permissions` must include at least one requested permission in `network` or `file_system`"
                     .to_string(),
@@ -440,8 +501,8 @@ pub(super) async fn apply_granted_turn_permissions_uri(
     if matches!(sandbox_permissions, SandboxPermissions::RequireEscalated) {
         return EffectiveAdditionalPermissions {
             sandbox_permissions,
+            additional_permissions_uri: additional_permissions.clone().map(Into::into),
             additional_permissions,
-            additional_permissions_uri: None,
             permissions_preapproved: false,
         };
     }
@@ -679,6 +740,104 @@ mod tests {
         .expect("preapproved permissions should be allowed");
 
         assert_eq!(normalized, Some(network_permissions()));
+    }
+
+    #[test]
+    fn uri_permissions_preserve_foreign_grants_and_enforce_inline_policy() {
+        use codex_protocol::request_permissions::UriAdditionalPermissionProfile;
+        use codex_utils_path_uri::PathUri;
+
+        let uri = if cfg!(windows) {
+            "file:///foreign-environment/output"
+        } else {
+            "file://foreign-environment/share/output"
+        };
+        let path = PathUri::parse(uri).expect("foreign filesystem URI");
+        assert!(
+            path.to_abs_path().is_err(),
+            "fixture must reject host projection"
+        );
+        let profile = UriAdditionalPermissionProfile {
+            network: Some(NetworkPermissions {
+                enabled: Some(true),
+            }),
+            file_system: Some(FileSystemPermissions::from_read_write_roots(
+                None,
+                Some(vec![path]),
+            )),
+        };
+        let validate = |allowed, policy, mode, permissions, preapproved| {
+            super::normalize_and_validate_additional_permissions_uri(
+                allowed,
+                policy,
+                mode,
+                permissions,
+                preapproved,
+            )
+        };
+        assert_eq!(
+            validate(
+                true,
+                AskForApproval::OnRequest,
+                SandboxPermissions::WithAdditionalPermissions,
+                Some(profile.clone()),
+                false
+            )
+            .expect("enabled inline request retains both permission domains"),
+            Some(profile.clone()),
+        );
+        assert_eq!(
+            validate(
+                false,
+                AskForApproval::Never,
+                SandboxPermissions::WithAdditionalPermissions,
+                Some(profile.clone()),
+                true
+            )
+            .expect("already approved grants remain usable"),
+            Some(profile.clone()),
+        );
+        for (allowed, policy, mode, permissions, expected_error) in [
+            (
+                false,
+                AskForApproval::OnRequest,
+                SandboxPermissions::WithAdditionalPermissions,
+                Some(profile.clone()),
+                "additional permissions are disabled",
+            ),
+            (
+                true,
+                AskForApproval::Never,
+                SandboxPermissions::WithAdditionalPermissions,
+                Some(profile.clone()),
+                "does not allow inline sandbox approval requests",
+            ),
+            (
+                true,
+                AskForApproval::OnRequest,
+                SandboxPermissions::RequireEscalated,
+                Some(profile),
+                "requires `sandbox_permissions` set to `with_additional_permissions`",
+            ),
+            (
+                true,
+                AskForApproval::OnRequest,
+                SandboxPermissions::WithAdditionalPermissions,
+                None,
+                "missing `additional_permissions`",
+            ),
+            (
+                true,
+                AskForApproval::OnRequest,
+                SandboxPermissions::WithAdditionalPermissions,
+                Some(UriAdditionalPermissionProfile::default()),
+                "must include at least one requested permission",
+            ),
+        ] {
+            let error = validate(allowed, policy, mode, permissions, false)
+                .expect_err("invalid requests must remain rejected");
+            assert!(error.contains(expected_error), "{error}");
+        }
     }
 
     #[test]

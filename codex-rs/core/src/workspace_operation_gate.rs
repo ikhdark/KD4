@@ -12,7 +12,10 @@ use tokio::sync::OwnedMutexGuard;
 static WORKSPACE_GATES: OnceLock<Mutex<HashMap<PathBuf, Weak<AsyncMutex<()>>>>> = OnceLock::new();
 
 pub(crate) async fn acquire_workspace_operation(root: &Path) -> OwnedMutexGuard<()> {
-    let identity = dunce::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let identity = tokio::fs::canonicalize(root)
+        .await
+        .map(|path| dunce::simplified(&path).to_path_buf())
+        .unwrap_or_else(|_| root.to_path_buf());
     let gate = {
         let mut gates = WORKSPACE_GATES
             .get_or_init(|| Mutex::new(HashMap::new()))
@@ -41,7 +44,7 @@ mod tests {
         assert!(
             tokio::time::timeout(
                 std::time::Duration::from_millis(20),
-                acquire_workspace_operation(temp.path()),
+                acquire_workspace_operation(&temp.path().join(".")),
             )
             .await
             .is_err()

@@ -39,6 +39,15 @@ pub struct StartedNetworkProxy {
 }
 
 impl StartedNetworkProxy {
+    #[cfg(test)]
+    pub(crate) fn from_running_proxy_for_test(
+        proxy: NetworkProxy,
+        handle: NetworkProxyHandle,
+        codex_home: PathBuf,
+    ) -> Self {
+        Self::new(proxy, handle, codex_home)
+    }
+
     fn new(proxy: NetworkProxy, handle: NetworkProxyHandle, codex_home: PathBuf) -> Self {
         Self {
             proxy,
@@ -133,7 +142,9 @@ impl NetworkProxySpec {
         enable_network_approval_flow: bool,
         audit_metadata: NetworkProxyAuditMetadata,
     ) -> std::io::Result<StartedNetworkProxy> {
-        let state = self.build_state_with_audit_metadata(codex_home, audit_metadata)?;
+        let state = self
+            .build_state_with_audit_metadata(codex_home, audit_metadata)
+            .await?;
         let absolute_codex_home =
             codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(codex_home)
                 .map_err(std::io::Error::other)?;
@@ -196,7 +207,9 @@ impl NetworkProxySpec {
         &self,
         started_proxy: &StartedNetworkProxy,
     ) -> std::io::Result<()> {
-        let state = self.build_config_state_for_spec(&started_proxy.codex_home)?;
+        let state = self
+            .build_config_state_for_spec(&started_proxy.codex_home)
+            .await?;
         started_proxy
             .proxy()
             .replace_config_state(state)
@@ -206,12 +219,12 @@ impl NetworkProxySpec {
             })
     }
 
-    fn build_state_with_audit_metadata(
+    async fn build_state_with_audit_metadata(
         &self,
         codex_home: &Path,
         audit_metadata: NetworkProxyAuditMetadata,
     ) -> std::io::Result<NetworkProxyState> {
-        let state = self.build_config_state_for_spec(codex_home)?;
+        let state = self.build_config_state_for_spec(codex_home).await?;
         let reloader = Arc::new(StaticNetworkProxyReloader::new(state.clone()));
         Ok(NetworkProxyState::with_reloader_and_audit_metadata(
             state,
@@ -220,12 +233,19 @@ impl NetworkProxySpec {
         ))
     }
 
-    fn build_config_state_for_spec(&self, codex_home: &Path) -> std::io::Result<ConfigState> {
-        build_config_state_with_codex_home(
-            self.config.clone(),
-            self.constraints.clone(),
-            codex_home,
-        )
+    async fn build_config_state_for_spec(&self, codex_home: &Path) -> std::io::Result<ConfigState> {
+        let config = self.config.clone();
+        let constraints = self.constraints.clone();
+        let codex_home = codex_home.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            build_config_state_with_codex_home(config, constraints, &codex_home)
+        })
+        .await
+        .map_err(|err| {
+            std::io::Error::other(format!(
+                "network proxy state construction task failed: {err}"
+            ))
+        })?
         .map_err(|err| std::io::Error::other(format!("failed to build network proxy state: {err}")))
     }
 

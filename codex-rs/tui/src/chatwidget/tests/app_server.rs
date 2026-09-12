@@ -974,6 +974,8 @@ async fn live_app_server_command_execution_strips_shell_wrapper() {
 #[tokio::test]
 async fn live_app_server_collab_wait_items_render_history() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    handle_turn_started(&mut chat, "turn-1");
+    assert!(chat.bottom_pane.is_task_running());
     let sender_thread_id =
         ThreadId::from_string("019cff70-2599-75e2-af72-b90000000001").expect("valid thread id");
     let receiver_thread_id =
@@ -1056,12 +1058,106 @@ async fn live_app_server_collab_wait_items_render_history() {
         /*replay_kind*/ None,
     );
 
+    assert!(chat.bottom_pane.is_task_running());
     let combined = drain_insert_history(&mut rx)
         .into_iter()
         .map(|lines| lines_to_single_string(&lines))
         .collect::<Vec<_>>()
         .join("\n");
+    assert_eq!(combined.matches("Finished waiting").count(), 1);
+    assert!(!combined.contains("Waiting failed"));
+    assert!(combined.contains("Robie [explorer]: Completed"));
+    assert!(combined.contains("Ada [reviewer]: Running"));
     assert_chatwidget_snapshot!("app_server_collab_wait_items_render_history", combined);
+
+    chat.handle_server_notification(
+        ServerNotification::TurnCompleted(TurnCompletedNotification {
+            thread_id: "thread-1".to_string(),
+            turn: app_server_turn("turn-1", AppServerTurnStatus::Completed, None, None),
+            surfaced_result: None,
+            timing: None,
+        }),
+        /*replay_kind*/ None,
+    );
+    assert!(!chat.bottom_pane.is_task_running());
+    assert!(chat.bottom_pane.status_widget().is_none());
+
+    let after_turn = drain_insert_history(&mut rx)
+        .into_iter()
+        .map(|lines| lines_to_single_string(&lines))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!after_turn.contains("Finished waiting"));
+    assert!(!after_turn.contains("Waiting failed"));
+}
+
+#[tokio::test]
+async fn live_app_server_failed_collab_wait_is_terminal_without_success_history() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let sender_thread_id =
+        ThreadId::from_string("019cff70-2599-75e2-af72-b90000000001").expect("valid thread id");
+    let receiver_thread_id =
+        ThreadId::from_string("019cff70-2599-75e2-af72-b958ce5dc1cc").expect("valid thread id");
+    chat.thread_id = Some(sender_thread_id);
+    chat.set_collab_agent_metadata(
+        receiver_thread_id,
+        Some("Robie".to_string()),
+        Some("explorer".to_string()),
+    );
+    handle_turn_started(&mut chat, "turn-1");
+    assert!(chat.bottom_pane.is_task_running());
+
+    let wait_item = |status| AppServerThreadItem::CollabAgentToolCall {
+        id: "wait-1".to_string(),
+        tool: AppServerCollabAgentTool::Wait,
+        status,
+        sender_thread_id: sender_thread_id.to_string(),
+        receiver_thread_ids: vec![receiver_thread_id.to_string()],
+        prompt: None,
+        model: None,
+        reasoning_effort: None,
+        agents_states: HashMap::new(),
+    };
+    chat.handle_server_notification(
+        ServerNotification::ItemStarted(ItemStartedNotification {
+            thread_id: sender_thread_id.to_string(),
+            turn_id: "turn-1".to_string(),
+            started_at_ms: 0,
+            item: wait_item(AppServerCollabAgentToolCallStatus::InProgress),
+        }),
+        /*replay_kind*/ None,
+    );
+    chat.handle_server_notification(
+        ServerNotification::ItemCompleted(ItemCompletedNotification {
+            thread_id: sender_thread_id.to_string(),
+            turn_id: "turn-1".to_string(),
+            completed_at_ms: 0,
+            item: wait_item(AppServerCollabAgentToolCallStatus::Failed),
+        }),
+        /*replay_kind*/ None,
+    );
+    assert!(chat.bottom_pane.is_task_running());
+    chat.handle_server_notification(
+        ServerNotification::TurnCompleted(TurnCompletedNotification {
+            thread_id: sender_thread_id.to_string(),
+            turn: app_server_turn("turn-1", AppServerTurnStatus::Interrupted, None, None),
+            surfaced_result: None,
+            timing: None,
+        }),
+        /*replay_kind*/ None,
+    );
+    assert!(!chat.bottom_pane.is_task_running());
+    assert!(chat.bottom_pane.status_widget().is_none());
+
+    let combined = drain_insert_history(&mut rx)
+        .into_iter()
+        .map(|lines| lines_to_single_string(&lines))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(combined.matches("Waiting for Robie [explorer]").count(), 1);
+    assert_eq!(combined.matches("Waiting failed").count(), 1);
+    assert!(!combined.contains("Finished waiting"));
+    assert!(combined.contains("No agents completed yet"));
 }
 
 #[tokio::test]
@@ -1104,8 +1200,8 @@ async fn live_app_server_collab_spawn_completed_renders_requested_model_and_effo
                 sender_thread_id: sender_thread_id.to_string(),
                 receiver_thread_ids: vec![spawned_thread_id.to_string()],
                 prompt: Some("Explore the repo".to_string()),
-                model: Some("gpt-5".to_string()),
-                reasoning_effort: Some(ReasoningEffortConfig::High),
+                model: None,
+                reasoning_effort: None,
                 agents_states: HashMap::from([(
                     spawned_thread_id.to_string(),
                     AppServerCollabAgentState {
@@ -1125,10 +1221,95 @@ async fn live_app_server_collab_spawn_completed_renders_requested_model_and_effo
         .map(|lines| lines_to_single_string(&lines))
         .collect::<Vec<_>>()
         .join("\n");
+    assert!(chat.pending_collab_spawn_requests.is_empty());
+    assert!(combined.contains("(gpt-5 high)"));
     assert_chatwidget_snapshot!(
         "app_server_collab_spawn_completed_renders_requested_model_and_effort",
         combined
     );
+}
+
+#[tokio::test]
+async fn live_app_server_terminal_turn_releases_pending_collab_spawn_metadata() {
+    for terminal_status in [
+        AppServerTurnStatus::Completed,
+        AppServerTurnStatus::Failed,
+        AppServerTurnStatus::Interrupted,
+    ] {
+        let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+        let spawned_thread_id = "019cff70-2599-75e2-af72-b91781b41a8e";
+        handle_turn_started(&mut chat, "turn-1");
+        chat.handle_server_notification(
+            ServerNotification::ItemStarted(ItemStartedNotification {
+                thread_id: "thread-1".to_string(),
+                turn_id: "turn-1".to_string(),
+                started_at_ms: 0,
+                item: AppServerThreadItem::CollabAgentToolCall {
+                    id: "spawn-1".to_string(),
+                    tool: AppServerCollabAgentTool::SpawnAgent,
+                    status: AppServerCollabAgentToolCallStatus::InProgress,
+                    sender_thread_id: "019cff70-2599-75e2-af72-b90000000002".to_string(),
+                    receiver_thread_ids: Vec::new(),
+                    prompt: Some("Explore the repo".to_string()),
+                    model: Some("stale-spawn-model".to_string()),
+                    reasoning_effort: Some(ReasoningEffortConfig::High),
+                    agents_states: HashMap::new(),
+                },
+            }),
+            /*replay_kind*/ None,
+        );
+        assert_eq!(chat.pending_collab_spawn_requests.len(), 1);
+        chat.handle_server_notification(
+            ServerNotification::TurnCompleted(TurnCompletedNotification {
+                thread_id: "thread-1".to_string(),
+                turn: app_server_turn("turn-1", terminal_status, None, None),
+                surfaced_result: None,
+                timing: None,
+            }),
+            /*replay_kind*/ None,
+        );
+        assert!(chat.pending_collab_spawn_requests.is_empty());
+        let _ = drain_insert_history(&mut rx);
+
+        // A later completion without its own metadata must not inherit the ended turn's request.
+        handle_turn_started(&mut chat, "turn-2");
+        chat.handle_server_notification(
+            ServerNotification::ItemCompleted(ItemCompletedNotification {
+                thread_id: "thread-1".to_string(),
+                turn_id: "turn-2".to_string(),
+                completed_at_ms: 0,
+                item: AppServerThreadItem::CollabAgentToolCall {
+                    id: "spawn-1".to_string(),
+                    tool: AppServerCollabAgentTool::SpawnAgent,
+                    status: AppServerCollabAgentToolCallStatus::Completed,
+                    sender_thread_id: "019cff70-2599-75e2-af72-b90000000002".to_string(),
+                    receiver_thread_ids: vec![spawned_thread_id.to_string()],
+                    prompt: Some("A later completed request".to_string()),
+                    model: None,
+                    reasoning_effort: None,
+                    agents_states: HashMap::from([(
+                        spawned_thread_id.to_string(),
+                        AppServerCollabAgentState {
+                            status: AppServerCollabAgentStatus::PendingInit,
+                            message: None,
+                            surfaced_result: None,
+                            last_agent_message: None,
+                        },
+                    )]),
+                },
+            }),
+            /*replay_kind*/ None,
+        );
+        let combined = drain_insert_history(&mut rx)
+            .into_iter()
+            .map(|lines| lines_to_single_string(&lines))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(combined.contains("A later completed request"));
+        assert!(!combined.contains("stale-spawn-model"));
+        assert!(!combined.contains(" high)"));
+        assert!(chat.pending_collab_spawn_requests.is_empty());
+    }
 }
 
 #[tokio::test]
@@ -1514,4 +1695,121 @@ async fn live_app_server_thread_closed_requests_immediate_exit() {
     );
 
     assert_matches!(rx.try_recv(), Ok(AppEvent::Exit(ExitMode::Immediate)));
+}
+
+#[tokio::test]
+async fn live_app_server_command_completion_preserves_status_without_exit_code() {
+    use ratatui::style::Color;
+
+    for (status, exit_code, expected_label, expected_color, succeeds) in [
+        (
+            AppServerCommandExecutionStatus::Declined,
+            None,
+            "Declined",
+            Color::Red,
+            false,
+        ),
+        (
+            AppServerCommandExecutionStatus::Failed,
+            None,
+            "Failed",
+            Color::Red,
+            false,
+        ),
+        (
+            AppServerCommandExecutionStatus::Completed,
+            None,
+            "Ran",
+            Color::Green,
+            true,
+        ),
+        (
+            AppServerCommandExecutionStatus::Completed,
+            Some(0),
+            "Ran",
+            Color::Green,
+            true,
+        ),
+    ] {
+        let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+        let thread_id = "019cff70-2599-75e2-af72-b90000000002";
+        let mut item = AppServerThreadItem::CommandExecution {
+            id: "approval-command".to_string(),
+            command: "echo reviewed-command".to_string(),
+            cwd: test_path_buf("/tmp").abs().into(),
+            process_id: None,
+            parent_call_id: None,
+            parent_cell_id: None,
+            runtime_tool_call_id: None,
+            execution_id: None,
+            source: AppServerCommandExecutionSource::Agent,
+            status: AppServerCommandExecutionStatus::InProgress,
+            command_actions: vec![AppServerCommandAction::Unknown {
+                command: "echo reviewed-command".to_string(),
+            }],
+            aggregated_output: None,
+            exit_code: None,
+            duration_ms: None,
+        };
+        chat.handle_server_notification(
+            ServerNotification::ItemStarted(ItemStartedNotification {
+                thread_id: thread_id.to_string(),
+                turn_id: "turn-approval".to_string(),
+                started_at_ms: 0,
+                item: item.clone(),
+            }),
+            None,
+        );
+        let AppServerThreadItem::CommandExecution {
+            status: item_status,
+            exit_code: item_exit_code,
+            ..
+        } = &mut item
+        else {
+            unreachable!()
+        };
+        *item_status = status;
+        *item_exit_code = exit_code;
+        chat.handle_server_notification(
+            ServerNotification::ItemCompleted(ItemCompletedNotification {
+                thread_id: thread_id.to_string(),
+                turn_id: "turn-approval".to_string(),
+                completed_at_ms: 1,
+                item,
+            }),
+            None,
+        );
+        let cells = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|event| match event {
+                AppEvent::InsertHistoryCell(cell) => Some(cell),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(cells.len(), 1, "one completed command must reach history");
+        let display = cells[0].display_lines(80);
+        let display_text = lines_to_single_string(&display);
+        assert!(display_text.contains(expected_label), "{display_text:?}");
+        assert!(
+            display_text.contains("reviewed-command"),
+            "{display_text:?}"
+        );
+        let marker = display
+            .iter()
+            .flat_map(|line| &line.spans)
+            .find(|span| span.content.contains('•'))
+            .expect("command status marker");
+        assert_eq!(marker.style.fg, Some(expected_color));
+        let transcript = lines_to_single_string(&cells[0].transcript_lines(80));
+        if succeeds {
+            assert!(transcript.contains('✓'), "{transcript:?}");
+            assert!(!transcript.contains('✗'), "{transcript:?}");
+        } else {
+            assert!(transcript.contains(expected_label), "{transcript:?}");
+            assert!(transcript.contains('✗'), "{transcript:?}");
+            assert!(!transcript.contains('✓'), "{transcript:?}");
+            assert!(!transcript.contains(" (0)"), "{transcript:?}");
+        }
+        assert!(!chat.running_commands.contains_key("approval-command"));
+        assert!(chat.transcript.active_cell.is_none());
+    }
 }

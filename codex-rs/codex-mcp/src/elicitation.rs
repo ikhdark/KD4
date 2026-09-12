@@ -31,7 +31,6 @@ use futures::future::BoxFuture;
 use futures::future::FutureExt;
 use rmcp::model::ElicitationAction;
 use rmcp::model::RequestId;
-use tokio::sync::Mutex;
 use tokio::sync::oneshot;
 
 static NEXT_ELICITATION_REQUEST_ID: AtomicU64 = AtomicU64::new(0);
@@ -86,7 +85,22 @@ struct ActiveElicitation {
 /// the same server request ID without colliding.
 #[derive(Clone, Default)]
 pub struct ElicitationRequestRouter {
-    requests: Arc<Mutex<ResponderMap>>,
+    requests: Arc<StdMutex<ResponderMap>>,
+}
+
+struct PendingElicitationRequest {
+    router: ElicitationRequestRouter,
+    key: (String, RequestId),
+}
+
+impl Drop for PendingElicitationRequest {
+    fn drop(&mut self) {
+        self.router
+            .requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.key);
+    }
 }
 
 impl ElicitationRequestRouter {
@@ -98,7 +112,7 @@ impl ElicitationRequestRouter {
     ) -> Result<()> {
         self.requests
             .lock()
-            .await
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&(server_name, id))
             .ok_or_else(|| anyhow!("elicitation request not found"))?
             .send(response)
@@ -282,11 +296,18 @@ impl ElicitationRequestManager {
                 };
                 let (tx, rx) = oneshot::channel();
                 let _active_elicitation = lifecycle.as_ref().map(ElicitationLifecycle::start);
+                let pending_request = PendingElicitationRequest {
+                    router: router.clone(),
+                    key: (server_name.clone(), routed_request_id),
+                };
                 {
-                    let mut lock = router.requests.lock().await;
-                    lock.insert((server_name.clone(), routed_request_id), tx);
+                    let mut lock = router
+                        .requests
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    lock.insert(pending_request.key.clone(), tx);
                 }
-                let _ = tx_event
+                tx_event
                     .send(Event {
                         id: "mcp_elicitation_request".to_string(),
                         msg: EventMsg::ElicitationRequest(ElicitationRequestEvent {
@@ -296,7 +317,8 @@ impl ElicitationRequestManager {
                             request,
                         }),
                     })
-                    .await;
+                    .await
+                    .context("failed to deliver elicitation request")?;
                 rx.await
                     .context("elicitation request channel closed unexpectedly")
             }

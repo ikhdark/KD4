@@ -21,49 +21,23 @@ pub(super) struct PendingWindowsSandboxSetup {
 }
 
 impl App {
-    pub(super) fn spawn_world_writable_scan(
-        cwd: AbsolutePathBuf,
-        workspace_roots: Vec<AbsolutePathBuf>,
-        env_map: std::collections::HashMap<String, String>,
-        logs_base_dir: AbsolutePathBuf,
-        permission_profile: PermissionProfile,
-        tx: AppEventSender,
-    ) {
-        let Ok(permissions) =
-            codex_windows_sandbox::ResolvedWindowsSandboxPermissions::try_from_permission_profile_for_workspace_roots(
-                &permission_profile,
-                workspace_roots.as_slice(),
-            )
-        else {
-            return;
-        };
-
-        tokio::task::spawn_blocking(move || {
-            let logs_base_dir_path = logs_base_dir.as_path();
-            let result =
-                codex_windows_sandbox::apply_world_writable_scan_and_denies_for_permissions(
-                    logs_base_dir_path,
-                    cwd.as_path(),
-                    &env_map,
-                    &permissions,
-                    Some(logs_base_dir_path),
-                );
-            if result.is_err() {
-                // Scan failed: warn without examples.
-                send_world_writable_scan_failed(&tx);
+    pub(super) fn spawn_world_writable_scan(&self) {
+        let scan = self
+            .chat_widget
+            .world_writable_warning_details_for_config(self.config.clone());
+        let tx = self.app_event_tx.clone();
+        tokio::spawn(async move {
+            if let Some((sample_paths, extra_count, failed_scan)) = scan.await {
+                tx.send(AppEvent::OpenWorldWritableWarningConfirmation {
+                    preset: None,
+                    profile_selection: None,
+                    sample_paths,
+                    extra_count,
+                    failed_scan,
+                });
             }
         });
     }
-}
-
-fn send_world_writable_scan_failed(tx: &AppEventSender) {
-    tx.send(AppEvent::OpenWorldWritableWarningConfirmation {
-        preset: None,
-        profile_selection: None,
-        sample_paths: Vec::new(),
-        extra_count: 0usize,
-        failed_scan: true,
-    });
 }
 
 pub(super) fn side_return_shortcut_matches(key_event: KeyEvent) -> bool {

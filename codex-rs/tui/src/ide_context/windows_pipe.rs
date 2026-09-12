@@ -81,6 +81,8 @@ impl WindowsPipeStream {
             .chain(std::iter::once(0))
             .collect::<Vec<_>>();
 
+        // SAFETY: wide_path is NUL terminated and remains live for this call. Null security
+        // attributes and template handles are permitted; a successful handle is owned below.
         let handle = unsafe {
             CreateFileW(
                 wide_path.as_ptr(),
@@ -118,6 +120,8 @@ impl Read for WindowsPipeStream {
         let handle = operation.as_ref().handle_raw();
         let buffer = operation.as_mut().buffer_mut_ptr();
         let overlapped = operation.as_ref().overlapped_ptr();
+        // SAFETY: operation owns the live handle, pinned OVERLAPPED, and writable buffer of
+        // bytes_to_read bytes. complete retains them through completion or transfers to the reaper.
         let result = unsafe {
             ReadFile(
                 handle,
@@ -144,6 +148,8 @@ impl Write for WindowsPipeStream {
         let handle = operation.as_ref().handle_raw();
         let buffer = operation.as_ref().buffer_ptr();
         let overlapped = operation.as_ref().overlapped_ptr();
+        // SAFETY: operation owns the live handle, pinned OVERLAPPED, and initialized buffer of
+        // bytes_to_write bytes. They remain live until completion, including cancellation reaping.
         let result = unsafe {
             WriteFile(
                 handle,
@@ -190,11 +196,15 @@ impl OverlappedOperation {
         buffer: Vec<u8>,
         permit: OperationPermit,
     ) -> io::Result<PinnedOperation> {
+        // SAFETY: null attributes and name create an unnamed event with default security.
+        // The returned handle is checked before it is placed in OwnedHandle.
         let event = unsafe { CreateEventW(ptr::null(), TRUE, FALSE, ptr::null()) };
         if event.is_null() {
             return Err(io::Error::last_os_error());
         }
 
+        // SAFETY: OVERLAPPED is a Win32 C struct whose fields permit zero initialization;
+        // hEvent is assigned the live private event before any I/O is issued.
         let mut overlapped = unsafe { std::mem::zeroed::<OVERLAPPED>() };
         overlapped.hEvent = event;
         Ok(Box::pin(Self {
@@ -246,6 +256,7 @@ impl OverlappedOperation {
                 return Err(error);
             }
 
+            // SAFETY: operation retains ownership of this live event for the entire wait.
             match unsafe {
                 WaitForSingleObject(
                     operation.as_ref().event_raw(),
@@ -272,6 +283,8 @@ impl OverlappedOperation {
         let mut bytes_transferred = 0;
         let handle = operation.as_ref().handle_raw();
         let overlapped = operation.as_ref().overlapped_ptr();
+        // SAFETY: the issuing call and this query share operation's live handle and pinned
+        // OVERLAPPED; bytes_transferred is a writable local and FALSE requests no blocking wait.
         let result =
             unsafe { GetOverlappedResult(handle, overlapped, &mut bytes_transferred, FALSE) };
         if result == 0 {
@@ -287,6 +300,8 @@ impl OverlappedOperation {
     ) -> io::Result<CompletedOperation> {
         let handle = operation.as_ref().handle_raw();
         let overlapped = operation.as_ref().overlapped_ptr();
+        // SAFETY: the handle and OVERLAPPED still belong to operation. Cancellation does not
+        // release them: retire_pending_operation keeps them allocated until terminal completion.
         unsafe {
             CancelIoEx(handle, overlapped);
         }
@@ -458,6 +473,8 @@ fn pending_operation_is_terminal(operation: Pin<&OverlappedOperation>) -> bool {
     let mut bytes_transferred = 0;
     let handle = operation.as_ref().handle_raw();
     let overlapped = operation.as_ref().overlapped_ptr();
+    // SAFETY: the reaper retains the pinned operation, buffer, and handle during this query;
+    // bytes_transferred is writable, and FALSE makes the query nonblocking.
     let result = unsafe { GetOverlappedResult(handle, overlapped, &mut bytes_transferred, FALSE) };
     if result != 0 {
         return true;
@@ -469,6 +486,7 @@ fn pending_operation_is_terminal(operation: Pin<&OverlappedOperation>) -> bool {
 
     // A completed operation that failed still signals its private event. Retain the allocation on
     // any ambiguous API error until Windows independently reports completion through that event.
+    // SAFETY: operation owns the live event throughout this zero-timeout status query.
     unsafe { WaitForSingleObject(operation.as_ref().event_raw(), 0) == WAIT_OBJECT_0 }
 }
 
@@ -483,11 +501,15 @@ impl OwnedHandle {
 // SAFETY: Win32 HANDLE values may be used and closed from another thread. Arc ensures CloseHandle
 // runs exactly once and never while an issued OverlappedOperation still holds the handle.
 unsafe impl Send for OwnedHandle {}
+// SAFETY: Win32 handles support concurrent use; shared references cannot close the handle,
+// and the last Arc owner closes it only after every operation releases its reference.
 unsafe impl Sync for OwnedHandle {}
 
 impl Drop for OwnedHandle {
     fn drop(&mut self) {
         if !self.0.is_null() && self.0 != INVALID_HANDLE_VALUE {
+            // SAFETY: this is the sole owning destructor, and invalid sentinel handles are
+            // excluded above. All Arc-held users have released the handle before this drop.
             unsafe {
                 CloseHandle(self.0);
             }
@@ -508,7 +530,7 @@ impl TokenUserBuffer {
             ));
         }
 
-        // GetTokenInformation writes TOKEN_USER into a byte buffer. Vec<u8> has
+        // SAFETY: GetTokenInformation writes TOKEN_USER into a byte buffer. Vec<u8> has
         // no TOKEN_USER alignment guarantee, so copy the fixed header out with
         // an unaligned read before using its SID pointer.
         let token_user =
@@ -519,11 +541,14 @@ impl TokenUserBuffer {
 
 fn validate_pipe_server_owner(pipe_handle: HANDLE) -> io::Result<()> {
     let mut server_process_id = 0;
+    // SAFETY: the caller retains the opened pipe handle; server_process_id is writable.
     let result = unsafe { GetNamedPipeServerProcessId(pipe_handle, &mut server_process_id) };
     if result == 0 {
         return Err(io::Error::last_os_error());
     }
 
+    // SAFETY: the process ID came from the pipe query. Failure is checked before ownership
+    // is established; the requested query access is sufficient for opening its token.
     let server_process =
         unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, server_process_id) };
     if server_process.is_null() {
@@ -531,10 +556,14 @@ fn validate_pipe_server_owner(pipe_handle: HANDLE) -> io::Result<()> {
     }
     let server_process = OwnedHandle(server_process);
     let server_token = open_process_token(server_process.raw())?;
+    // SAFETY: GetCurrentProcess has no preconditions and returns a borrowed pseudo-handle;
+    // open_process_token obtains its own token handle without closing the process handle.
     let current_token = open_process_token(unsafe { GetCurrentProcess() })?;
     let server_user = token_user(server_token.raw())?;
     let current_user = token_user(current_token.raw())?;
 
+    // SAFETY: both SIDs were returned by successful TokenUser queries, and their owning
+    // buffers remain live and unmodified until EqualSid returns.
     if unsafe { EqualSid(server_user.sid()?, current_user.sid()?) } == 0 {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -547,6 +576,8 @@ fn validate_pipe_server_owner(pipe_handle: HANDLE) -> io::Result<()> {
 
 fn open_process_token(process: HANDLE) -> io::Result<OwnedHandle> {
     let mut token = ptr::null_mut();
+    // SAFETY: callers provide a live process or current-process pseudo-handle, and token
+    // is a writable output slot. A successful output is transferred to OwnedHandle.
     let result = unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) };
     if result == 0 {
         return Err(io::Error::last_os_error());
@@ -557,6 +588,8 @@ fn open_process_token(process: HANDLE) -> io::Result<OwnedHandle> {
 
 fn token_user(token: HANDLE) -> io::Result<TokenUserBuffer> {
     let mut return_length = 0;
+    // SAFETY: token is live; a null buffer with zero size queries the required length,
+    // which is written to the valid return_length output slot.
     unsafe {
         GetTokenInformation(token, TokenUser, ptr::null_mut(), 0, &mut return_length);
     }
@@ -565,6 +598,8 @@ fn token_user(token: HANDLE) -> io::Result<TokenUserBuffer> {
     }
 
     let mut buffer = vec![0_u8; return_length as usize];
+    // SAFETY: buffer has the requested writable length, token remains live, and the
+    // output length slot is valid. The buffer is exposed as TokenUserBuffer only on success.
     let result = unsafe {
         GetTokenInformation(
             token,

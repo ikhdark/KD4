@@ -311,10 +311,12 @@ async fn run_remote_compact_task_inner_impl(
 
     let reference_context_item = match &initial_context_injection {
         InitialContextInjection::DoNotInject => None,
-        InitialContextInjection::AtStart(_) => Some(compaction_turn_context.to_turn_context_item()),
+        InitialContextInjection::AtStart(_) => {
+            Some(compaction_turn_context.to_turn_context_item_async().await)
+        }
         #[cfg(test)]
         InitialContextInjection::BeforeLastUserMessage(_) => {
-            Some(compaction_turn_context.to_turn_context_item())
+            Some(compaction_turn_context.to_turn_context_item_async().await)
         }
     };
     let compacted_request_prefix = new_history
@@ -327,21 +329,31 @@ async fn run_remote_compact_task_inner_impl(
         new_window_ids.previous_window_id.map(|id| id.to_string()),
         new_window_ids.window_id.to_string(),
     );
-    if let Some(trace_input_history) = trace_input_history.as_deref() {
-        compaction_trace.record_installed(&CompactionCheckpointTracePayload {
-            input_history: trace_input_history,
-            replacement_history: &new_history,
-        });
-    }
+    let trace_replacement_history = trace_input_history.as_ref().map(|_| new_history.clone());
     sess.replace_compacted_history(
-        compaction_turn_context.as_ref(),
+        compaction_turn_context,
         new_history,
         reference_context_item,
         world_state_baseline,
         fragment_digests,
         compacted_item,
     )
-    .await;
+    .await?;
+    if let (Some(trace_input_history), Some(replacement_history)) =
+        (trace_input_history, trace_replacement_history)
+    {
+        let compaction_trace = compaction_trace.clone();
+        let _ = crate::tools::tool_dispatch_trace::run_trace_recording(
+            &sess.terminal_tasks,
+            move || {
+                compaction_trace.record_installed(&CompactionCheckpointTracePayload {
+                    input_history: &trace_input_history,
+                    replacement_history: &replacement_history,
+                });
+            },
+        )
+        .await;
+    }
     if let Some(client_session) = client_session {
         client_session.rebase_remote_compaction_history(
             &compacted_request_prefix,
@@ -385,12 +397,27 @@ async fn run_remote_compaction_request_v2(
     let mut retry_state = ResponsesStreamRetryState::default();
     turn_context.turn_timing_state.begin_compaction_generation();
     loop {
-        let trace_attempt = compaction_trace.start_attempt(&RemoteCompactionV2TraceRequest {
-            model: turn_context.model_info.slug.as_str(),
-            instructions: prompt.base_instructions.text.as_str(),
-            input: &prompt.input,
-            parallel_tool_calls: prompt.parallel_tool_calls,
-        });
+        let trace_attempt = if compaction_trace.is_enabled() {
+            let compaction_trace = compaction_trace.clone();
+            let model = turn_context.model_info.slug.clone();
+            let instructions = prompt.base_instructions.text.clone();
+            let input = Arc::clone(&prompt.input);
+            let parallel_tool_calls = prompt.parallel_tool_calls;
+            crate::tools::tool_dispatch_trace::run_trace_recording(
+                &sess.terminal_tasks,
+                move || {
+                    compaction_trace.start_attempt(&RemoteCompactionV2TraceRequest {
+                        model: &model,
+                        instructions: &instructions,
+                        input: &input,
+                        parallel_tool_calls,
+                    })
+                },
+            )
+            .await
+        } else {
+            None
+        };
         let model_request_timing_guard = turn_context.turn_timing_state.begin_model_request_wait();
         let inference_trace_context = InferenceTraceContext::disabled();
         let stream_result = tokio::select! {
@@ -421,11 +448,19 @@ async fn run_remote_compaction_request_v2(
             }
             Err(err) => Err(err),
         };
-        trace_attempt.record_result(
-            result
+        if let Some(trace_attempt) = trace_attempt {
+            let trace_result = result
                 .as_ref()
-                .map(|output| std::slice::from_ref(&output.compaction_output)),
-        );
+                .map(|output| vec![output.compaction_output.clone()])
+                .map_err(ToString::to_string);
+            crate::tools::tool_dispatch_trace::run_trace_recording(
+                &sess.terminal_tasks,
+                move || {
+                    trace_attempt.record_result(trace_result.as_deref());
+                },
+            )
+            .await;
+        }
 
         match result {
             Ok(compaction_output) => return Ok(compaction_output),
@@ -547,7 +582,6 @@ fn persisted_v2_compacted_item(
 mod tests {
     use super::*;
     use crate::client::ModelClient;
-    use crate::compact::content_items_to_text;
     use crate::responses_metadata::CodexResponsesRequestKind;
     use codex_login::auth::AgentIdentityAuthPolicy;
     use codex_model_provider::create_model_provider;
@@ -626,7 +660,7 @@ mod tests {
         }
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test]
     async fn remote_compaction_v2_retry_records_distinct_trace_attempts() -> anyhow::Result<()> {
         core_test_support::skip_if_no_network!(Ok(()));
 
@@ -702,7 +736,7 @@ mod tests {
             thread_id: thread_id.clone(),
         })?;
         let compaction_trace = CompactionTraceContext::enabled(
-            writer,
+            Arc::clone(&writer),
             thread_id,
             turn_id,
             compaction_id.clone(),
@@ -734,22 +768,76 @@ mod tests {
         );
         let mut client_session = session.services.model_client.new_session();
 
-        let output = run_remote_compaction_request_v2(
+        struct HeldTracePayload {
+            entered: std::sync::mpsc::SyncSender<()>,
+            release: std::sync::mpsc::Receiver<()>,
+            timed_out: Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl serde::Serialize for HeldTracePayload {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                self.entered.send(()).expect("signal the real writer lock");
+                if self
+                    .release
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .is_err()
+                {
+                    self.timed_out
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                serializer.serialize_unit()
+            }
+        }
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let timed_out = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let holding_writer = std::thread::spawn({
+            let writer = Arc::clone(&writer);
+            let timed_out = Arc::clone(&timed_out);
+            move || {
+                writer.write_json_payload(
+                    codex_rollout_trace::RawPayloadKind::SessionMetadata,
+                    &HeldTracePayload {
+                        entered: entered_tx,
+                        release: release_rx,
+                        timed_out,
+                    },
+                )
+            }
+        });
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("the real trace writer holds its normal serialization lock");
+        let cancellation = CancellationToken::new();
+        let mut request = Box::pin(run_remote_compaction_request_v2(
             &session,
             &turn_context,
             &mut client_session,
             &prompt,
             &responses_metadata,
             &compaction_trace,
-            &CancellationToken::new(),
-        )
-        .await?;
-        let input_history = vec![prompt.input[0].clone()];
-        let replacement_history = vec![output.compaction_output];
-        compaction_trace.record_installed(&CompactionCheckpointTracePayload {
-            input_history: &input_history,
-            replacement_history: &replacement_history,
-        });
+            &cancellation,
+        ));
+        assert!(futures::poll!(request.as_mut()).is_pending());
+        // A single-thread async runtime must continue while the real writer is
+        // busy, and the upstream request must wait for its trace start record.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        assert!(
+            !timed_out.load(std::sync::atomic::Ordering::SeqCst),
+            "trace lock contention must not block the async runtime thread"
+        );
+        assert!(
+            request_log.requests().is_empty(),
+            "upstream requests must follow the persisted trace start"
+        );
+        release_tx
+            .send(())
+            .expect("release writer after independent async progress");
+        holding_writer.join().expect("trace writer thread joins")?;
+        let output = request.await?;
+        assert!(
+            matches!(output.compaction_output, ResponseItem::Compaction { encrypted_content, .. }
+            if encrypted_content == "encrypted replacement context")
+        );
 
         assert_eq!(request_log.requests().len(), 2);
         let rollout = replay_bundle(trace_dir.path())?;
@@ -783,18 +871,42 @@ mod tests {
                 .count(),
             1
         );
-        let installed = rollout
-            .compactions
-            .get(&compaction_id)
-            .expect("successful retry should install one compaction checkpoint");
-        assert_eq!(rollout.compactions.len(), 1);
+        let events = std::fs::read_to_string(trace_dir.path().join("trace.jsonl"))?
+            .lines()
+            .map(serde_json::from_str::<codex_rollout_trace::RawTraceEvent>)
+            .collect::<Result<Vec<_>, _>>()?;
+        let attempts = events
+            .iter()
+            .filter_map(|event| match &event.payload {
+                RawTraceEventPayload::CompactionRequestStarted {
+                    compaction_request_id,
+                    ..
+                } => Some(("started", compaction_request_id.as_str())),
+                RawTraceEventPayload::CompactionRequestFailed {
+                    compaction_request_id,
+                    ..
+                } => Some(("failed", compaction_request_id.as_str())),
+                RawTraceEventPayload::CompactionRequestCompleted {
+                    compaction_request_id,
+                    ..
+                } => Some(("completed", compaction_request_id.as_str())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(attempts.len(), 4);
         assert_eq!(
-            installed
-                .request_ids
-                .iter()
-                .cloned()
-                .collect::<std::collections::BTreeSet<_>>(),
-            request_ids
+            attempts.iter().map(|(kind, _)| *kind).collect::<Vec<_>>(),
+            vec!["started", "failed", "started", "completed"]
+        );
+        assert_eq!(attempts[0].1, attempts[1].1);
+        assert_eq!(attempts[2].1, attempts[3].1);
+        assert_ne!(attempts[0].1, attempts[2].1);
+        assert!(
+            !events.iter().any(|event| matches!(
+                event.payload,
+                RawTraceEventPayload::CompactionInstalled { .. }
+            )),
+            "request attempts alone must not claim history checkpoint installation"
         );
 
         Ok(())
@@ -888,26 +1000,79 @@ mod tests {
 
     #[test]
     fn build_v2_compacted_history_bounds_unresolved_user_text() {
-        let input = vec![message(
-            "user",
-            &"retained ".repeat(20_000),
-            /*phase*/ None,
-        )];
+        let text = format!(
+            "HEAD_USER_CONSTRAINT\n{}MIDDLE_USER_CONSTRAINT\n{}TAIL_USER_CONSTRAINT",
+            "retained ".repeat(10_000),
+            "retained ".repeat(10_000),
+        );
+        let original_tokens = approx_token_count(&text);
+        assert!(original_tokens > 16_000);
+        let input = vec![ResponseItem::Message {
+            id: Some(codex_protocol::ResponseItemId::from_server(
+                "unresolved-user-7".to_string(),
+            )),
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText { text: text.clone() }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: Some(
+                codex_protocol::models::InternalChatMessageMetadataPassthrough {
+                    turn_id: Some("turn-7".to_string()),
+                },
+            ),
+        }];
         let output = ResponseItem::Compaction {
             id: None,
             encrypted_content: "new".to_string(),
             internal_chat_message_metadata_passthrough: None,
         };
 
-        let (history, _) = build_v2_compacted_history(input, output.clone());
+        let (history, retained_image_count) = build_v2_compacted_history(input, output.clone());
 
-        assert_eq!(history.len(), 2);
-        let ResponseItem::Message { content, .. } = &history[0] else {
+        // The bounded user tail and its omission receipt precede the exact opaque checkpoint.
+        assert_eq!(history.len(), 3);
+        assert_eq!(retained_image_count, 0);
+        let ResponseItem::Message { role, content, .. } = &history[0] else {
             panic!("expected bounded unresolved user message");
         };
-        let retained = content_items_to_text(content).expect("retained user text");
-        assert!(approx_token_count(&retained) <= 4_000);
-        assert_eq!(history[1], output);
+        assert_eq!(role, "user");
+        let [ContentItem::InputText { text: retained }] = content.as_slice() else {
+            panic!("expected one retained user text item");
+        };
+        let retained_tokens = approx_token_count(retained);
+        // Literal contract expectations reject both an unbounded tail and the retired 4k cap.
+        assert!(retained_tokens > 4_000);
+        assert!(retained_tokens <= 16_000);
+        assert!(retained.len() < text.len());
+        assert!(retained.starts_with("HEAD_USER_CONSTRAINT\n"));
+        assert!(retained.contains("MIDDLE_USER_CONSTRAINT\n"));
+        assert!(retained.ends_with("TAIL_USER_CONSTRAINT"));
+        assert_eq!(history[0].turn_id(), Some("turn-7"));
+
+        let ResponseItem::Message { role, content, .. } = &history[1] else {
+            panic!("expected intermediate omission receipt");
+        };
+        assert_eq!(role, "user");
+        let [ContentItem::InputText { text: receipt }] = content.as_slice() else {
+            panic!("expected one omission receipt text item");
+        };
+        let receipt: serde_json::Value =
+            serde_json::from_str(receipt).expect("typed text-omission receipt");
+        assert_eq!(
+            receipt,
+            serde_json::json!({
+                "version": 1,
+                "kind": "codex_local_compaction_text_omission",
+                "role": "user",
+                "source_item_id": "unresolved-user-7",
+                "source_index": 0,
+                "turn_id": "turn-7",
+                "original_tokens": original_tokens,
+                "retained_tokens": retained_tokens,
+                "omitted_tokens": original_tokens - retained_tokens,
+                "unresolved": true,
+            })
+        );
+        assert_eq!(history[2], output);
     }
 
     #[test]

@@ -1049,7 +1049,9 @@ fn node_operations(binary: &str, args: &[String]) -> Vec<ValidationOperation> {
             .map_or_else(Vec::new, |selector| selector_operations(selector));
     }
     if binary == "yarn" && command == "workspace" {
-        return args[command_index + 2..]
+        return args
+            .get(command_index + 2..)
+            .unwrap_or_default()
             .iter()
             .position(|argument| argument.eq_ignore_ascii_case("run"))
             .and_then(|run_offset| args.get(command_index + 3 + run_offset))
@@ -1795,6 +1797,31 @@ mod tests {
                 "echo 'cargo test && still text'".to_string(),
             )),
             ValidationClassification::NonValidation
+        );
+    }
+
+    #[test]
+    fn incomplete_yarn_workspace_arguments_do_not_panic_or_invent_validation() {
+        for args in [
+            vec!["workspace"],
+            vec!["--cwd", "web", "workspace"],
+            vec!["workspace", "web"],
+            vec!["workspace", "web", "run"],
+        ] {
+            assert_eq!(
+                classify_validation(&argv("yarn", &args)),
+                ValidationClassification::NonValidation,
+            );
+        }
+        assert_eq!(
+            classify_validation(&argv("yarn", &["workspace", "web", "run", "check"])),
+            ValidationClassification::Validation {
+                leaves: vec![ValidationCommandDescriptor {
+                    operation: ValidationOperation::Check,
+                }],
+                has_unclassified_targets: false,
+                exit_code_is_authoritative: true,
+            },
         );
     }
 

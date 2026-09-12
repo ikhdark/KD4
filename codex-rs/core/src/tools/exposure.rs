@@ -110,81 +110,65 @@ impl Default for ToolExposureIdentity {
 mod tests {
     use super::*;
 
-    #[test]
-    fn identity_changes_only_at_declared_coarse_exposure_transitions() {
-        let base = ToolExposureIdentity {
-            selected_skill_direct_mcp_entrypoints: Vec::new(),
-            agent_surface_stage: AgentSurfaceStage::SpawnOnly,
-            goal_surface_state: GoalSurfaceState::Disabled,
-            extension_tool_surface_revision: 0,
-            mcp_tool_catalog_revision: 0,
-            mcp_resources_available: false,
-            tool_search_available: false,
-            request_user_input_eligible: false,
-            collaboration_mode: ModeKind::Default,
-            environment_mode: EnvironmentSurfaceMode::None,
-            environment_starting: false,
-        };
-        assert_eq!(base, base.clone());
+    #[tokio::test]
+    async fn identity_changes_only_at_declared_coarse_exposure_transitions() {
+        use crate::session::step_context::StepContext;
+        use crate::session::tests::make_session_and_context;
+        use crate::tools::handlers::ToolSearchHandlerCache;
+        use crate::tools::router::ToolRouter;
+        use crate::tools::router::ToolRouterParams;
+        use std::sync::Arc;
 
-        let mut changed = base.clone();
-        changed.goal_surface_state = GoalSurfaceState::Inactive;
-        assert_ne!(base, changed);
-
-        let mut changed = base.clone();
-        changed.extension_tool_surface_revision = 1;
-        assert_ne!(base, changed);
-
-        let mut changed = base.clone();
-        changed.mcp_tool_catalog_revision = 1;
-        assert_ne!(base, changed);
-
-        let mut changed = base.clone();
-        changed.mcp_resources_available = true;
-        assert_ne!(base, changed);
-
-        let mut changed = base.clone();
-        changed.tool_search_available = true;
-        assert_ne!(base, changed);
-
-        let mut changed = base.clone();
-        changed.request_user_input_eligible = true;
-        assert_ne!(base, changed);
-
-        let mut changed = base.clone();
-        changed.collaboration_mode = ModeKind::Plan;
-        assert_ne!(base, changed);
-
-        let mut changed = base.clone();
-        changed.agent_surface_stage = AgentSurfaceStage::Lifecycle;
-        assert_ne!(base, changed);
-
-        let mut changed = base.clone();
-        changed.environment_mode = EnvironmentSurfaceMode::One;
-        assert_ne!(base, changed);
-
-        let mut changed = base.clone();
-        changed.environment_starting = true;
-        assert_ne!(base, changed);
-
-        let mut changed = base.clone();
-        changed
-            .selected_skill_direct_mcp_entrypoints
-            .push(DirectMcpToolEntrypoint {
-                server_name: "repo-atlas".to_string(),
-                tool_name: "task".to_string(),
-            });
-        assert_ne!(base, changed);
+        let (_session, turn) = make_session_and_context().await;
+        let step = StepContext::for_test(Arc::new(turn));
+        let cache = ToolSearchHandlerCache::default();
+        // Reuse the actual planning consumer and its cache across both directions
+        // of the transition; stale registration or visibility must not survive.
+        for eligible in [false, true, false] {
+            let router = ToolRouter::from_context(
+                step.as_ref(),
+                ToolRouterParams {
+                    mcp_tools: None,
+                    deferred_mcp_tools: None,
+                    tool_suggest_candidates: None,
+                    extension_tool_executors: Vec::new(),
+                    dynamic_tools: &[],
+                    exposure_identity: ToolExposureIdentity {
+                        request_user_input_eligible: eligible,
+                        ..ToolExposureIdentity::default()
+                    },
+                },
+                &cache,
+            );
+            assert_eq!(
+                router
+                    .registered_tool_names_for_test()
+                    .iter()
+                    .any(|name| name.to_string() == "request_user_input"),
+                eligible,
+                "registration must follow current eligibility",
+            );
+            assert_eq!(
+                router
+                    .model_visible_specs()
+                    .iter()
+                    .any(|spec| spec.name() == "request_user_input"),
+                eligible,
+                "model-visible schemas must follow current eligibility",
+            );
+        }
     }
 
     #[test]
     fn zero_one_or_many_counts_collapse_to_boolean_identity() {
-        let one_resource_server = ToolExposureIdentity {
-            mcp_resources_available: true,
-            ..ToolExposureIdentity::default()
-        };
-        let two_resource_servers = one_resource_server.clone();
-        assert_eq!(one_resource_server, two_resource_servers);
+        for (count, expected) in [
+            (0, EnvironmentSurfaceMode::None),
+            (1, EnvironmentSurfaceMode::One),
+            (2, EnvironmentSurfaceMode::Multiple),
+            (usize::MAX, EnvironmentSurfaceMode::Multiple),
+        ] {
+            assert_eq!(EnvironmentSurfaceMode::from_count(count), expected);
+        }
     }
 
     #[test]

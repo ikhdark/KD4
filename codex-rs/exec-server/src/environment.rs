@@ -108,7 +108,15 @@ impl EnvironmentManager {
         if let Some(config) = noise_environment_config_from_env()? {
             return Self::from_noise_environment_config(config, local_runtime_paths);
         }
-        let provider = environment_provider_from_codex_home(codex_home.as_ref())?;
+        let codex_home = codex_home.as_ref().to_path_buf();
+        let provider =
+            tokio::task::spawn_blocking(move || environment_provider_from_codex_home(&codex_home))
+                .await
+                .map_err(|error| {
+                    ExecServerError::Protocol(format!(
+                        "environment config discovery task failed: {error}"
+                    ))
+                })??;
         Self::from_snapshot(provider.snapshot().await?, local_runtime_paths)
     }
 
@@ -686,6 +694,131 @@ mod tests {
     fn test_runtime_paths() -> ExecServerRuntimePaths {
         ExecServerRuntimePaths::new(std::env::current_exe().expect("current exe"))
             .expect("runtime paths")
+    }
+
+    #[test]
+    fn environment_manager_home_discovery_preserves_selection_errors_and_progress() {
+        const CHILD_ENV: &str = "CODEX_TEST_ENVIRONMENT_HOME_DISCOVERY";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            // Exercise the real environment-based fallback without changing this test
+            // process's environment or connecting to the user's configured remote host.
+            let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .arg("--exact")
+                .arg("environment::tests::environment_manager_home_discovery_preserves_selection_errors_and_progress")
+                .arg("--nocapture")
+                .env(CHILD_ENV, "1")
+                .env(super::CODEX_EXEC_SERVER_URL_ENV_VAR, "none")
+                .env_remove(super::CODEX_EXEC_SERVER_NOISE_REGISTRY_URL_ENV_VAR)
+                .env_remove(super::CODEX_EXEC_SERVER_NOISE_ENVIRONMENT_ID_ENV_VAR)
+                .env_remove(super::CODEX_EXEC_SERVER_NOISE_AUTH_TOKEN_ENV_VAR)
+                .env_remove(super::CODEX_EXEC_SERVER_NOISE_CHATGPT_ACCOUNT_ID_ENV_VAR)
+                .output()
+                .expect("isolated environment discovery test");
+            assert!(
+                output.status.success(),
+                "isolated discovery failed: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let home = tempfile::tempdir().expect("isolated home");
+        let path = home.path().join("environments.toml");
+        let runtime_paths = test_runtime_paths();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .expect("single-worker runtime");
+        runtime.block_on(async {
+            let missing = EnvironmentManager::from_codex_home(home.path(), None)
+                .await
+                .expect("missing file uses disabled legacy provider");
+            assert_eq!(missing.default_environment_id(), None);
+            assert_local_environment_unavailable(&missing);
+            assert!(
+                missing
+                    .environments
+                    .read()
+                    .expect("environment registry")
+                    .is_empty()
+            );
+            assert!(!path.exists(), "discovery must not create a default config");
+
+            let configured = "default = \"local\"\ninclude_local = true\n";
+            std::fs::write(&path, configured).expect("configured provider");
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let occupied = tokio::task::spawn_blocking(move || {
+                started_tx.send(()).expect("report occupied worker");
+                let _ = release_rx.recv_timeout(Duration::from_secs(5));
+            });
+            started_rx.await.expect("worker occupied");
+            let mut discovery = Box::pin(EnvironmentManager::from_codex_home(
+                home.path(),
+                Some(runtime_paths.clone()),
+            ));
+            assert!(futures::poll!(discovery.as_mut()).is_pending());
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert!(futures::poll!(discovery.as_mut()).is_pending());
+            release_tx.send(()).expect("release discovery worker");
+            occupied.await.expect("blocking worker exits");
+            let manager = timeout(Duration::from_secs(5), discovery)
+                .await
+                .expect("discovery completes")
+                .expect("configured provider overrides disabled fallback");
+            assert_eq!(manager.default_environment_id(), Some(LOCAL_ENVIRONMENT_ID));
+            let local = manager
+                .default_environment()
+                .expect("configured local environment");
+            assert!(!local.is_remote());
+            assert_eq!(local.local_runtime_paths(), Some(&runtime_paths));
+            assert!(Arc::ptr_eq(
+                &local,
+                &manager.try_local_environment().expect("local lookup")
+            ));
+            assert_eq!(
+                std::fs::read_to_string(&path).expect("config remains"),
+                configured
+            );
+
+            std::fs::write(&path, "default = [").expect("invalid config");
+            let malformed =
+                EnvironmentManager::from_codex_home(home.path(), Some(runtime_paths.clone()))
+                    .await
+                    .expect_err("malformed present config cannot silently fall back");
+            assert!(
+                malformed
+                    .to_string()
+                    .contains("failed to parse environment config"),
+                "{malformed}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&path).expect("invalid config remains"),
+                "default = ["
+            );
+
+            std::fs::remove_file(&path).expect("replace config with unreadable directory");
+            std::fs::create_dir(&path).expect("directory at config path");
+            let unreadable = EnvironmentManager::from_codex_home(home.path(), Some(runtime_paths))
+                .await
+                .expect_err("present unreadable config cannot silently fall back");
+            assert!(
+                unreadable
+                    .to_string()
+                    .contains("failed to read environment config"),
+                "{unreadable}"
+            );
+            assert!(
+                unreadable.to_string().contains(&path.display().to_string()),
+                "{unreadable}"
+            );
+            assert!(
+                path.is_dir(),
+                "failed discovery must not replace the config path"
+            );
+        });
     }
 
     fn successful_process_argv() -> Vec<String> {

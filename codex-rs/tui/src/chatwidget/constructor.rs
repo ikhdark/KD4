@@ -108,6 +108,8 @@ impl ChatWidget {
             transcript: TranscriptState::new(active_cell),
             raw_output_mode: config.tui_raw_output_mode,
             config,
+            #[cfg(test)]
+            world_writable_scan_for_test: None,
             effective_service_tier,
             skills_all: Vec::new(),
             skills_initial_state: None,
@@ -146,6 +148,10 @@ impl ChatWidget {
             plan_stream_controller: None,
             pending_stream_consolidations: 0,
             clipboard_lease: None,
+            #[cfg(test)]
+            clipboard_image_reader_for_test: None,
+            #[cfg(test)]
+            clipboard_image_directory_for_test: None,
             copy_last_response_binding,
             running_commands: HashMap::new(),
             collab_agent_metadata: HashMap::new(),

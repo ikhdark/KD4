@@ -17,9 +17,29 @@ const TEST_INSTRUCTIONS: &str = "Global test instructions";
 
 #[tokio::test]
 async fn build_prompt_input_includes_context_and_user_message() -> Result<()> {
+    assert_prompt_input_and_bundled_skill_cache(true).await
+}
+
+#[tokio::test]
+async fn build_prompt_input_removes_disabled_bundled_skills_and_preserves_user_message()
+-> Result<()> {
+    assert_prompt_input_and_bundled_skill_cache(false).await
+}
+
+async fn assert_prompt_input_and_bundled_skill_cache(bundled_enabled: bool) -> Result<()> {
     let codex_home = TempDir::new()?;
     let cwd = TempDir::new()?;
     std::fs::write(codex_home.path().join("AGENTS.md"), TEST_INSTRUCTIONS)?;
+    std::fs::write(
+        codex_home.path().join("config.toml"),
+        format!("[skills.bundled]\nenabled = {bundled_enabled}\n"),
+    )?;
+    let cached_system_skills = codex_home.path().join("skills/.system");
+    if !bundled_enabled {
+        let stale_skill = cached_system_skills.join("stale-skill");
+        std::fs::create_dir_all(&stale_skill)?;
+        std::fs::write(stale_skill.join("SKILL.md"), "# stale bundled skill\n")?;
+    }
     let config = ConfigBuilder::default()
         .codex_home(codex_home.path().to_path_buf())
         .harness_overrides(ConfigOverrides {
@@ -43,6 +63,12 @@ async fn build_prompt_input_includes_context_and_user_message() -> Result<()> {
         user_instructions_provider,
     )
     .await?;
+
+    assert_eq!(
+        cached_system_skills.exists(),
+        bundled_enabled,
+        "normal prompt construction must honor the configured bundled skill cache policy"
+    );
 
     let expected_user_message = ResponseItem::Message {
         id: None,

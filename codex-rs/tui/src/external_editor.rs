@@ -98,56 +98,65 @@ pub(crate) async fn run_editor(seed: &str, editor_cmd: &[String]) -> Result<Stri
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
-    use serial_test::serial;
     use std::fs;
 
-    struct EnvGuard {
-        visual: Option<String>,
-        editor: Option<String>,
-    }
-
-    impl EnvGuard {
-        fn new() -> Self {
-            Self {
-                visual: env::var("VISUAL").ok(),
-                editor: env::var("EDITOR").ok(),
-            }
+    fn run_in_editor_environment(
+        test_name: &str,
+        visual: Option<&str>,
+        editor: Option<&str>,
+    ) -> bool {
+        const CHILD_TEST: &str = "CODEX_TUI_EDITOR_ENVIRONMENT_TEST";
+        if env::var(CHILD_TEST).as_deref() == Ok(test_name) {
+            return false;
         }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            restore_env("VISUAL", self.visual.take());
-            restore_env("EDITOR", self.editor.take());
+        // Configure the child before startup; never mutate the environment of
+        // this multithreaded test process while unrelated code may read it.
+        let mut command = std::process::Command::new(env::current_exe().unwrap());
+        command
+            .args(["--exact", test_name, "--nocapture"])
+            .env(CHILD_TEST, test_name)
+            .env_remove("VISUAL")
+            .env_remove("EDITOR");
+        if let Some(visual) = visual {
+            command.env("VISUAL", visual);
         }
-    }
-
-    fn restore_env(key: &str, value: Option<String>) {
-        match value {
-            Some(val) => unsafe { env::set_var(key, val) },
-            None => unsafe { env::remove_var(key) },
+        if let Some(editor) = editor {
+            command.env("EDITOR", editor);
         }
+        let output = command
+            .output()
+            .expect("run isolated editor environment test");
+        assert!(
+            output.status.success(),
+            "child failed: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        true
     }
 
     #[test]
-    #[serial]
     fn resolve_editor_prefers_visual() {
-        let _guard = EnvGuard::new();
-        unsafe {
-            env::set_var("VISUAL", "vis");
-            env::set_var("EDITOR", "ed");
+        if run_in_editor_environment(
+            "external_editor::tests::resolve_editor_prefers_visual",
+            Some("vis --wait"),
+            Some("ed"),
+        ) {
+            return;
         }
         let cmd = resolve_editor_command().unwrap();
-        assert_eq!(cmd, vec!["vis".to_string()]);
+        assert_eq!(cmd, vec!["vis".to_string(), "--wait".to_string()]);
     }
 
     #[test]
-    #[serial]
     fn resolve_editor_errors_when_unset() {
-        let _guard = EnvGuard::new();
-        unsafe {
-            env::remove_var("VISUAL");
-            env::remove_var("EDITOR");
+        if run_in_editor_environment(
+            "external_editor::tests::resolve_editor_errors_when_unset",
+            None,
+            None,
+        ) {
+            return;
         }
         assert!(matches!(
             resolve_editor_command(),

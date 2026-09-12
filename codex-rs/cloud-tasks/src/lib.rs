@@ -1093,17 +1093,7 @@ pub async fn run_main(cli: Cli) -> anyhow::Result<()> {
                             }
                         }
                         app::AppEvent::EnvironmentsLoaded(result) => {
-                            app.env_loading = false;
-                            match result {
-                                Ok(list) => {
-                                    app.environments = list;
-                                    app.env_error = None;
-                                    app.env_last_loaded = Some(std::time::Instant::now());
-                                }
-                                Err(e) => {
-                                    app.env_error = Some(e.to_string());
-                                }
-                            }
+                            app.apply_environments_loaded(result);
                             needs_redraw = true;
                             let _ = frame_tx.send(Instant::now());
                         }
@@ -2351,7 +2341,7 @@ mod tests {
         let now = Utc::now();
         let tasks = vec![
             TaskSummary {
-                id: TaskId("task_1".to_string()),
+                id: TaskId("task_1/a?b#c% d\u{00e9}".to_string()),
                 title: "Example task".to_string(),
                 status: TaskStatus::Ready,
                 updated_at: now,
@@ -2386,7 +2376,7 @@ mod tests {
         assert_eq!(
             lines,
             vec![
-                "https://chatgpt.com/codex/tasks/task_1".to_string(),
+                "https://chatgpt.com/codex/tasks/task_1%2Fa%3Fb%23c%25%20d%C3%A9".to_string(),
                 "  [READY] Example task".to_string(),
                 "  Env  •  0s ago".to_string(),
                 "  +5/-2 • 3 files".to_string(),
@@ -2436,20 +2426,27 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "very slow"]
     fn composer_input_renders_typed_characters() {
         let mut composer = ComposerInput::new();
-        let key = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
+        assert!(composer.is_empty());
+        let key = KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE);
         match composer.input(key) {
             ComposerAction::Submitted(_) => panic!("unexpected submission"),
             ComposerAction::None => {}
         }
 
+        // The real event loop schedules this public flush after a held ASCII key.
+        if composer.is_in_paste_burst() {
+            std::thread::sleep(ComposerInput::recommended_flush_delay());
+            assert!(composer.flush_paste_burst_if_due());
+        }
+        assert!(!composer.is_empty(), "typed input must reach the draft");
+
         let area = Rect::new(0, 0, 20, 5);
         let mut buf = Buffer::empty(area);
         composer.render_ref(area, &mut buf);
 
-        let found = buf.content().iter().any(|cell| cell.symbol() == "a");
+        let found = buf.content().iter().any(|cell| cell.symbol() == "z");
         assert!(found, "typed character was not rendered: {buf:?}");
 
         composer.set_hint_items(vec![("⌃O", "env"), ("⌃C", "quit")]);
@@ -2462,5 +2459,11 @@ mod tests {
             .collect::<Vec<_>>()
             .join("");
         assert!(footer.contains("⌃O env"));
+
+        match composer.input(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)) {
+            ComposerAction::Submitted(text) => assert_eq!(text, "z"),
+            ComposerAction::None => panic!("Enter must submit the typed draft"),
+        }
+        assert!(composer.is_empty(), "submission must clear the draft");
     }
 }

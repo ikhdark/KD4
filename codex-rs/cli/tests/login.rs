@@ -60,6 +60,33 @@ fn login_with_api_key_reads_stdin_and_writes_auth_json() -> Result<()> {
 }
 
 #[test]
+fn login_status_masks_non_ascii_keys_without_panicking() -> Result<()> {
+    for key in ["1234567é123456789", "sk-proj-123456éabcd"] {
+        let codex_home = TempDir::new()?;
+        write_file_auth_config(codex_home.path())?;
+        codex_command(codex_home.path())?
+            .env_remove("OPENAI_API_KEY")
+            .env_remove("CODEX_API_KEY")
+            .args(["login", "--with-api-key"])
+            .write_stdin(format!("{key}\n"))
+            .assert()
+            .success();
+        let auth_before = read_auth_json(codex_home.path())?;
+        assert_eq!(auth_before["OPENAI_API_KEY"], key);
+
+        codex_command(codex_home.path())?
+            .env_remove("OPENAI_API_KEY")
+            .env_remove("CODEX_API_KEY")
+            .args(["login", "status"])
+            .assert()
+            .success()
+            .stderr("Logged in using an API key - ***\n");
+        assert_eq!(read_auth_json(codex_home.path())?, auth_before);
+    }
+    Ok(())
+}
+
+#[test]
 fn login_rejects_removed_api_key_argument() -> Result<()> {
     let codex_home = TempDir::new()?;
     let mut cmd = codex_command(codex_home.path())?;

@@ -476,7 +476,7 @@ impl AsyncManagedClient {
     // single call site instead of introducing a one-off params wrapper.
     #[instrument(level = "trace", skip_all, fields(server_name = %server_name))]
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
+    pub(crate) async fn new(
         server_name: String,
         codex_home: PathBuf,
         startup_submit_id: String,
@@ -502,9 +502,15 @@ impl AsyncManagedClient {
             .map(ToolFilter::from_config)
             .unwrap_or_default();
         let cached_server_info = if is_codex_apps_mcp_server {
-            codex_apps_tools_cache_context
-                .as_ref()
-                .and_then(load_startup_cached_codex_apps_server_info)
+            if let Some(context) = codex_apps_tools_cache_context.clone() {
+                tokio::task::spawn_blocking(move || {
+                    load_startup_cached_codex_apps_server_info(&context)
+                })
+                .await
+                .expect("Codex Apps startup server-info cache worker failed")
+            } else {
+                None
+            }
         } else {
             None
         };
@@ -1045,8 +1051,11 @@ fn spawn_tool_catalog_refresh_worker(
                 )
                 .await?;
                 let refreshed = match (codex_apps_tools_cache_context.as_ref(), fetch_ticket) {
-                    (Some(cache_context), Some(fetch_ticket)) => cache_context
-                        .publish_if_newest_accepted(fetch_ticket, &server_info, refreshed),
+                    (Some(cache_context), Some(fetch_ticket)) => {
+                        cache_context
+                            .publish_if_newest_accepted(fetch_ticket, &server_info, refreshed)
+                            .await
+                    }
                     (None, None) => refreshed,
                     _ => unreachable!("Codex Apps fetch ticket requires cache context"),
                 };
@@ -1167,7 +1176,9 @@ async fn start_server_task(
         .await?;
         let tools = match (codex_apps_tools_cache_context.as_ref(), fetch_ticket) {
             (Some(cache_context), Some(fetch_ticket)) => {
-                cache_context.publish_if_newest_accepted(fetch_ticket, &server_info, tools)
+                cache_context
+                    .publish_if_newest_accepted(fetch_ticket, &server_info, tools)
+                    .await
             }
             (None, None) => tools,
             _ => unreachable!("Codex Apps fetch ticket requires cache context"),
@@ -1603,16 +1614,19 @@ mod tests {
         let revision = AtomicU64::new(0);
         let cached = vec![test_tool_info("cached")];
 
+        advance_tool_catalog_revision_if_changed(None, &[], &revision);
         advance_tool_catalog_revision_if_changed(Some(&cached), &cached, &revision);
-        advance_tool_catalog_revision_if_changed(None, &[test_tool_info("live")], &revision);
         assert_eq!(revision.load(Ordering::Acquire), 0);
+
+        advance_tool_catalog_revision_if_changed(None, &[test_tool_info("live")], &revision);
+        assert_eq!(revision.load(Ordering::Acquire), 1);
 
         advance_tool_catalog_revision_if_changed(
             Some(&cached),
             &[test_tool_info("live")],
             &revision,
         );
-        assert_eq!(revision.load(Ordering::Acquire), 1);
+        assert_eq!(revision.load(Ordering::Acquire), 2);
     }
 
     #[test]

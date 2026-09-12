@@ -829,7 +829,7 @@ fn measure_rows_height_inner(
         .map(|(_, r)| r)
     {
         let wrapped_lines = wrap_row_lines(row, desc_col, content_width).len();
-        total = total.saturating_add(wrapped_lines as u16);
+        total = total.saturating_add(u16::try_from(wrapped_lines).unwrap_or(u16::MAX));
     }
     total.max(1)
 }
@@ -841,6 +841,24 @@ mod tests {
     use ratatui::buffer::Buffer;
     use ratatui::layout::Rect;
     use ratatui::style::Modifier;
+
+    #[test]
+    fn oversized_option_reserves_visible_rows_without_height_wraparound() {
+        let rows = vec![GenericDisplayRow {
+            name: "x".repeat(65_536),
+            ..Default::default()
+        }];
+        let state = ScrollState::default();
+        let height = measure_rows_height(&rows, &state, 1, 2);
+        assert_eq!(height, u16::MAX);
+
+        let area = Rect::new(0, 0, 2, height.min(3));
+        let mut buf = Buffer::empty(area);
+        assert_eq!(render_rows(area, &mut buf, &rows, &state, 1, "empty"), 3);
+        for y in 0..3 {
+            assert_eq!(buf[(0, y)].symbol(), "x");
+        }
+    }
 
     #[test]
     fn one_cell_width_falls_back_without_panic_for_wrapped_two_column_rows() {

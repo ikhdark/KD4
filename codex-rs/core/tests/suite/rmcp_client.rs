@@ -2401,6 +2401,8 @@ struct EnvVarGuard {
 impl EnvVarGuard {
     fn set(key: &'static str, value: &std::ffi::OsStr) -> Self {
         let original = std::env::var_os(key);
+        // SAFETY: This Windows test target uses the thread-safe Windows environment API.
+        // Callers also serialize changes to the same fixture variable with serial_test.
         unsafe {
             std::env::set_var(key, value);
         }
@@ -2410,6 +2412,8 @@ impl EnvVarGuard {
 
 impl Drop for EnvVarGuard {
     fn drop(&mut self) {
+        // SAFETY: Restoring the Windows environment uses the same thread-safe API as set;
+        // the caller's serial_test guard still covers this fixture's lifetime.
         unsafe {
             match &self.original {
                 Some(value) => std::env::set_var(self.key, value),

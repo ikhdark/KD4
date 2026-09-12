@@ -87,7 +87,7 @@ pub(crate) fn output_lines(
         include_prefix,
     } = params;
     let output = match output {
-        Some(output) if only_err && output.exit_code == 0 => {
+        Some(output) if only_err && output.is_success() => {
             return OutputLines {
                 lines: Vec::new(),
                 omitted: None,
@@ -200,8 +200,10 @@ impl HistoryCell for ExecCell {
                     .duration
                     .map(format_duration)
                     .unwrap_or_else(|| "unknown".to_string());
-                let mut result: Line = if output.exit_code == 0 {
+                let mut result: Line = if output.is_success() {
                     Line::from("✓".green().bold())
+                } else if let Some(label) = output.terminal_failure_label() {
+                    Line::from(vec!["✗".red().bold(), format!(" {label}").into()])
                 } else {
                     Line::from(vec![
                         "✗".red().bold(),
@@ -337,14 +339,20 @@ impl ExecCell {
             panic!("Expected exactly one call in a command display cell");
         };
         let layout = EXEC_DISPLAY_LAYOUT;
-        let success = call.output.as_ref().map(|o| o.exit_code == 0);
+        let success = call.output.as_ref().map(CommandOutput::is_success);
         let bullet = match success {
             Some(true) => "•".green().bold(),
             Some(false) => "•".red().bold(),
             None => activity_marker(call.start_time, self.animations_enabled()),
         };
         let is_interaction = call.is_unified_exec_interaction();
-        let title = if is_interaction {
+        let title = if let Some(label) = call
+            .output
+            .as_ref()
+            .and_then(CommandOutput::terminal_failure_label)
+        {
+            label
+        } else if is_interaction {
             ""
         } else if self.is_active() {
             "Running"
@@ -683,6 +691,30 @@ const EXEC_DISPLAY_LAYOUT: ExecDisplayLayout = ExecDisplayLayout::new(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completed_command_transcript_preserves_large_duration() {
+        let mut cell = new_active_exec_command(
+            "duration-call".to_string(),
+            vec!["echo".to_string(), "done".to_string()],
+            Vec::new(),
+            ExecCommandSource::UserShell,
+            false,
+        );
+        assert!(cell.complete_call(
+            "duration-call",
+            CommandOutput::new(0, "done".to_string(), "done".to_string()),
+            std::time::Duration::MAX,
+        ));
+
+        let lines = cell.transcript_lines(80);
+
+        assert!(lines.iter().any(|line| line.to_string() == "done"));
+        assert_eq!(
+            lines.last().expect("completion line").to_string(),
+            "✓ • 307445734561825860m 15s"
+        );
+    }
     use codex_app_server_protocol::CommandExecutionSource as ExecCommandSource;
     use pretty_assertions::assert_eq;
 

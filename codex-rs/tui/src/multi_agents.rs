@@ -218,6 +218,7 @@ pub(crate) fn tool_call_history_cell(
                 Some(waiting_begin(receiver_thread_ids, &mut agent_metadata))
             } else {
                 Some(waiting_end(
+                    status,
                     receiver_thread_ids,
                     agents_states,
                     &mut agent_metadata,
@@ -357,12 +358,18 @@ fn waiting_begin(
 }
 
 fn waiting_end(
+    status: &CollabAgentToolCallStatus,
     receiver_thread_ids: &[String],
     agents_states: &std::collections::HashMap<String, CollabAgentState>,
     agent_metadata: &mut impl FnMut(ThreadId) -> AgentMetadata,
 ) -> PlainHistoryCell {
     let details = wait_complete_lines(receiver_thread_ids, agents_states, agent_metadata);
-    collab_event(title_text("Finished waiting"), details)
+    let title = if matches!(status, CollabAgentToolCallStatus::Failed) {
+        "Waiting failed"
+    } else {
+        "Finished waiting"
+    };
+    collab_event(title_text(title), details)
 }
 
 fn close_end(

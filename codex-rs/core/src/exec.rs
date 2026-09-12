@@ -267,12 +267,14 @@ impl ExecExpiration {
     /// If ExecExpiration is a timeout, returns the timeout in milliseconds.
     pub(crate) fn timeout_ms(&self) -> Option<u64> {
         match self {
-            ExecExpiration::Timeout(duration) => Some(duration.as_millis() as u64),
+            ExecExpiration::Timeout(duration) => {
+                Some(u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+            }
             ExecExpiration::DefaultTimeout => Some(DEFAULT_EXEC_COMMAND_TIMEOUT_MS),
             ExecExpiration::Cancellation(_) | ExecExpiration::CancellationSet(_) => None,
             ExecExpiration::TimeoutOrCancellation { timeout, .. }
             | ExecExpiration::TimeoutOrCancellationSet { timeout, .. } => {
-                Some(timeout.as_millis() as u64)
+                Some(u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX))
             }
         }
     }
@@ -410,15 +412,38 @@ pub async fn process_exec_tool_call(
     windows_sandbox_workspace_roots: &[AbsolutePathBuf],
     stdout_stream: Option<StdoutStream>,
 ) -> Result<ExecToolCallOutput> {
-    let exec_req = build_exec_request(
+    let exec_req = build_exec_request_async(
         params,
         permission_profile,
         sandbox_cwd,
         windows_sandbox_workspace_roots,
-    )?;
+    )
+    .await?;
 
     // Route through the sandboxing module for a single, unified execution path.
     crate::sandboxing::execute_env(exec_req, stdout_stream).await
+}
+
+/// Builds a request on an owned blocking worker for async command consumers.
+/// The synchronous constructor remains available to synchronous callers.
+pub async fn build_exec_request_async(
+    params: ExecParams,
+    permission_profile: &PermissionProfile,
+    sandbox_cwd: &AbsolutePathBuf,
+    windows_sandbox_workspace_roots: &[AbsolutePathBuf],
+) -> Result<ExecRequest> {
+    let permission_profile = permission_profile.clone();
+    let sandbox_cwd = sandbox_cwd.clone();
+    let workspace_roots = windows_sandbox_workspace_roots.to_vec();
+    tokio::task::spawn_blocking(move || {
+        build_exec_request(params, &permission_profile, &sandbox_cwd, &workspace_roots)
+    })
+    .await
+    .map_err(|error| {
+        CodexErr::Io(io::Error::other(format!(
+            "exec request preparation worker failed: {error}"
+        )))
+    })?
 }
 
 /// Transform a portable exec request into the concrete argv/env that should be
@@ -707,11 +732,11 @@ async fn exec_windows_sandbox(
         ..
     } = params;
     if let Some(network) = network.as_ref() {
-        network
-            .apply_to_env_for_optional_environment(&mut env, network_environment_id.as_deref())
-            .map_err(|err| {
-                network_proxy_environment_error(network_environment_id.as_deref(), err)
-            })?;
+        env = network
+            .prepare_for_optional_environment_async(env, network_environment_id.as_deref())
+            .await
+            .map_err(|err| network_proxy_environment_error(network_environment_id.as_deref(), err))?
+            .env;
     }
 
     // Windows sandbox capture still receives timeout and cancellation separately.
@@ -1061,11 +1086,11 @@ async fn exec(
         justification: _,
     } = params;
     if let Some(network) = network.as_ref() {
-        network
-            .apply_to_env_for_optional_environment(&mut env, network_environment_id.as_deref())
-            .map_err(|err| {
-                network_proxy_environment_error(network_environment_id.as_deref(), err)
-            })?;
+        env = network
+            .prepare_for_optional_environment_async(env, network_environment_id.as_deref())
+            .await
+            .map_err(|err| network_proxy_environment_error(network_environment_id.as_deref(), err))?
+            .env;
     }
 
     let (program, args) = command.split_first().ok_or_else(|| {
@@ -1076,7 +1101,7 @@ async fn exec(
     })?;
     let arg0_ref = arg0.as_deref();
     let managed_root = ManagedRootProcess::reserve_with_reclaim().await?;
-    let mut child = spawn_child_async(SpawnChildRequest {
+    let child = spawn_child_async(SpawnChildRequest {
         program: PathBuf::from(program),
         args: args.into(),
         arg0: arg0_ref,
@@ -1098,8 +1123,9 @@ async fn exec(
             .id()
             .ok_or_else(|| io::Error::other("missing child process id"))?,
     ) {
-        let _ = child.start_kill();
-        let _ = child.wait().await;
+        if let Err(cleanup_error) = managed_root.cleanup_after_failed_attach(child).await {
+            tracing::warn!("Failed to clean up uncontained exec child: {cleanup_error}");
+        }
         return Err(err.into());
     }
     if let Some(after_spawn) = after_spawn {
@@ -1115,26 +1141,11 @@ async fn exec(
     .await
 }
 
-fn kill_child_process_tree(child: &mut Child, managed_root: &ManagedRootProcess) -> io::Result<()> {
-    match managed_root.terminate() {
-        Ok(()) => return Ok(()),
-        Err(err) => {
-            tracing::warn!(
-                "Windows direct exec failed to terminate process tree; \
-                 falling back to the root process: {err}"
-            );
-        }
-    }
-
-    child.start_kill()
-}
-
 async fn terminate_and_reap_child_process_tree(
-    child: &mut Child,
-    managed_root: &ManagedRootProcess,
+    child: Child,
+    managed_root: ManagedRootProcess,
 ) -> io::Result<()> {
-    kill_child_process_tree(child, managed_root)?;
-    child.wait().await.map(|_| ())
+    managed_root.terminate_and_reap(child).await
 }
 
 /// Consumes the output of a child process according to the configured capture
@@ -1205,8 +1216,8 @@ async fn consume_output(
             match outcome {
                 Some(ExecExpirationOutcome::TimedOut) => {
                     terminate_and_reap_child_process_tree(
-                        &mut child,
-                        &managed_root,
+                        child,
+                        managed_root,
                     ).await?;
                     (
                         synthetic_exit_status(EXIT_CODE_SIGNAL_BASE + TIMEOUT_CODE),
@@ -1214,7 +1225,7 @@ async fn consume_output(
                     )
                 }
                 Some(ExecExpirationOutcome::Cancelled) => {
-                    terminate_and_reap_child_process_tree(&mut child, &managed_root).await?;
+                    terminate_and_reap_child_process_tree(child, managed_root).await?;
                     (synthetic_exit_status_for_code(/*code*/ 1), false)
                 }
                 None => unreachable!("expiration wait only resolves while expiration is active"),

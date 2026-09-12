@@ -397,6 +397,9 @@ impl App {
             return Ok(());
         }
 
+        // Keep the displayed widget, transcript and active receiver together if terminal I/O fails.
+        tui.clear_for_thread_switch()?;
+
         let previous_thread_id = self.active_thread_id;
         self.store_active_thread_receiver().await;
         self.active_thread_id = None;
@@ -428,7 +431,7 @@ impl App {
         );
         self.replace_chat_widget(ChatWidget::new_with_app_event(init));
 
-        self.reset_for_thread_switch(tui)?;
+        self.reset_for_thread_switch(tui);
         self.replay_thread_snapshot(snapshot, !is_replay_only);
         if is_replay_only {
             let message = if attached_replay_only {
@@ -454,26 +457,9 @@ impl App {
                 .is_none_or(|entry| !entry.is_closed)
     }
 
-    pub(super) fn reset_for_thread_switch(&mut self, tui: &mut tui::Tui) -> Result<()> {
+    pub(super) fn reset_for_thread_switch(&mut self, tui: &mut tui::Tui) {
         self.reset_transcript_state_after_clear();
         tui.clear_pending_history_lines();
-        Self::clear_terminal_for_thread_switch(&mut tui.terminal)?;
-        Ok(())
-    }
-
-    pub(super) fn clear_terminal_for_thread_switch<B>(
-        terminal: &mut crate::custom_terminal::Terminal<B>,
-    ) -> Result<()>
-    where
-        B: Backend + Write,
-    {
-        terminal.clear_scrollback_and_visible_screen_ansi()?;
-        let mut area = terminal.viewport_area;
-        if area.y > 0 {
-            area.y = 0;
-            terminal.set_viewport_area(area);
-        }
-        Ok(())
     }
 
     pub(super) fn reset_thread_event_state(&mut self) {
@@ -555,7 +541,8 @@ impl App {
             self.chat_widget.thread_id(),
             self.chat_widget.thread_name(),
             self.chat_widget.rollout_path().as_deref(),
-        );
+        )
+        .await;
         self.shutdown_current_thread(app_server).await;
         let tracked_thread_ids: Vec<ThreadId> =
             self.thread_event_channels.keys().copied().collect();
@@ -791,7 +778,8 @@ impl App {
             self.chat_widget.thread_id(),
             self.chat_widget.thread_name(),
             self.chat_widget.rollout_path().as_deref(),
-        );
+        )
+        .await;
         match app_server
             .resume_thread(resume_config.clone(), target_session.thread_id)
             .await

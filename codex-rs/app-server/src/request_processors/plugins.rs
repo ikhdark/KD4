@@ -598,7 +598,8 @@ impl PluginRequestProcessor {
                 config.codex_home.as_path(),
                 &remote_plugin_service_config,
                 auth.as_ref(),
-            );
+            )
+            .await;
         let (mut data, marketplace_load_errors) = if include_local {
             let config_for_marketplace_listing = plugins_input.clone();
             let plugins_manager_for_marketplace_listing = plugins_manager.clone();

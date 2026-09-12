@@ -121,12 +121,6 @@ fn decoded_body(req: &wiremock::Request) -> Option<Vec<u8>> {
     }
 }
 
-fn has_subagent_notification(req: &ResponsesRequest) -> bool {
-    req.message_input_texts("user")
-        .iter()
-        .any(|text| text.contains("<subagent_notification>"))
-}
-
 fn tool_parameter_description(tool: &Value, parameter_name: &str) -> Option<String> {
     tool.get("parameters")
         .and_then(|parameters| parameters.get("properties"))
@@ -473,6 +467,9 @@ async fn setup_turn_one_with_custom_spawned_child(
             .ok_or_else(|| anyhow::anyhow!("expected parent rollout path"))?;
         let deadline = Instant::now() + Duration::from_secs(6);
         loop {
+            // Completion injects an ordered append without a new parent turn.
+            // The disk reader must request the normal durability barrier.
+            test.codex.flush_rollout().await?;
             let has_notification = tokio::fs::read_to_string(&rollout_path)
                 .await
                 .is_ok_and(|rollout| rollout.contains("<subagent_notification>"));
@@ -878,7 +875,25 @@ async fn subagent_notification_is_included_without_wait() -> Result<()> {
     test.submit_turn(TURN_2_NO_WAIT_PROMPT).await?;
 
     let turn2_requests = wait_for_requests(&turn2).await?;
-    assert!(turn2_requests.iter().any(has_subagent_notification));
+    let notifications = turn2_requests
+        .iter()
+        .flat_map(|request| request.message_input_texts("user"))
+        .filter_map(|text| {
+            text.split_once("<subagent_notification>")
+                .and_then(|(_, body)| body.split_once("</subagent_notification>"))
+                .map(|(body, _)| serde_json::from_str::<Value>(body).expect("notification JSON"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(notifications.len(), 1);
+    assert_eq!(
+        notifications[0]["status"],
+        json!({ "completed": "child done" })
+    );
+    assert!(
+        notifications[0]["agent_path"]
+            .as_str()
+            .is_some_and(|path| !path.is_empty())
+    );
 
     Ok(())
 }

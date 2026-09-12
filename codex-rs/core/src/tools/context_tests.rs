@@ -956,6 +956,7 @@ fn token_efficiency_exec_output_omits_redundant_headers() {
         arguments: "{}".to_string(),
     };
     let response = ExecCommandToolOutput {
+        validation: None,
         event_call_id: "call-42".to_string(),
         chunk_id: "abc123".to_string(),
         wall_time: std::time::Duration::from_millis(1250),
@@ -968,6 +969,7 @@ fn token_efficiency_exec_output_omits_redundant_headers() {
         original_token_count: Some(100),
         hook_command: None,
         raw_output_artifact: None,
+        raw_output_reduction_notice: None,
         repair_notice: None,
     }
     .to_response_item("call-42", &payload);
@@ -996,6 +998,7 @@ fn token_efficiency_exec_output_omits_redundant_headers() {
 #[test]
 fn retained_exec_command_process_is_yielded_not_timed_out() {
     let output = ExecCommandToolOutput {
+        validation: None,
         event_call_id: "retained-call".to_string(),
         chunk_id: "retained-chunk".to_string(),
         wall_time: std::time::Duration::from_millis(250),
@@ -1008,6 +1011,7 @@ fn retained_exec_command_process_is_yielded_not_timed_out() {
         original_token_count: Some(3),
         hook_command: None,
         raw_output_artifact: None,
+        raw_output_reduction_notice: None,
         repair_notice: None,
     };
 
@@ -1040,6 +1044,7 @@ fn retained_exec_command_process_is_yielded_not_timed_out() {
 #[test]
 fn tool_result_correctness_missing_exit_code_is_not_reported_as_success() {
     let output = ExecCommandToolOutput {
+        validation: None,
         event_call_id: "missing-exit-call".to_string(),
         chunk_id: "missing-exit-chunk".to_string(),
         wall_time: std::time::Duration::from_millis(10),
@@ -1052,6 +1057,7 @@ fn tool_result_correctness_missing_exit_code_is_not_reported_as_success() {
         original_token_count: Some(3),
         hook_command: None,
         raw_output_artifact: None,
+        raw_output_reduction_notice: None,
         repair_notice: None,
     };
 
@@ -1072,6 +1078,7 @@ fn tool_result_correctness_missing_exit_code_is_not_reported_as_success() {
 #[test]
 fn tool_result_correctness_exited_process_with_pending_output_is_not_live() {
     let output = ExecCommandToolOutput {
+        validation: None,
         event_call_id: "pending-output-call".to_string(),
         chunk_id: "pending-output-chunk".to_string(),
         wall_time: std::time::Duration::from_millis(10),
@@ -1084,6 +1091,7 @@ fn tool_result_correctness_exited_process_with_pending_output_is_not_live() {
         original_token_count: Some(2),
         hook_command: None,
         raw_output_artifact: None,
+        raw_output_reduction_notice: None,
         repair_notice: None,
     };
 
@@ -1110,6 +1118,7 @@ fn tool_result_correctness_exited_process_with_pending_output_is_not_live() {
 fn exec_command_projection_metadata_preserves_authoritative_first_output() {
     let raw_output = "first output line\n".repeat(100);
     let output = ExecCommandToolOutput {
+        validation: None,
         event_call_id: "call-first-output".to_string(),
         chunk_id: "chunk-first-output".to_string(),
         wall_time: std::time::Duration::from_millis(1),
@@ -1122,6 +1131,7 @@ fn exec_command_projection_metadata_preserves_authoritative_first_output() {
         original_token_count: Some(300),
         hook_command: None,
         raw_output_artifact: None,
+        raw_output_reduction_notice: None,
         repair_notice: None,
     };
 
@@ -1154,6 +1164,7 @@ fn exec_command_projection_metadata_preserves_authoritative_first_output() {
 #[test]
 fn token_efficiency_exec_projection_reports_truncation_once() {
     let output = ExecCommandToolOutput {
+        validation: None,
         event_call_id: "call-hard-limit".to_string(),
         chunk_id: "chunk-hard-limit".to_string(),
         wall_time: std::time::Duration::from_millis(1),
@@ -1166,6 +1177,7 @@ fn token_efficiency_exec_projection_reports_truncation_once() {
         original_token_count: Some(100),
         hook_command: Some("echo ok".to_string()),
         raw_output_artifact: None,
+        raw_output_reduction_notice: None,
         repair_notice: None,
     };
 
@@ -1182,6 +1194,7 @@ fn token_efficiency_exec_projection_reports_truncation_once() {
 #[test]
 fn exec_command_projection_reports_reduction_from_per_call_limit() {
     let output = ExecCommandToolOutput {
+        validation: None,
         event_call_id: "call-per-call-limit".to_string(),
         chunk_id: "chunk-per-call-limit".to_string(),
         wall_time: std::time::Duration::from_millis(1),
@@ -1194,6 +1207,7 @@ fn exec_command_projection_reports_reduction_from_per_call_limit() {
         original_token_count: Some(10),
         hook_command: None,
         raw_output_artifact: None,
+        raw_output_reduction_notice: None,
         repair_notice: None,
     };
 
@@ -1211,6 +1225,7 @@ fn token_backfire_unified_exec_keeps_complete_output_that_fits_budget() {
         .collect::<Vec<_>>()
         .join("\n");
     let output = ExecCommandToolOutput {
+        validation: None,
         event_call_id: "call-complete-output".to_string(),
         chunk_id: "chunk-complete-output".to_string(),
         wall_time: std::time::Duration::from_millis(1),
@@ -1223,6 +1238,7 @@ fn token_backfire_unified_exec_keeps_complete_output_that_fits_budget() {
         original_token_count: Some(codex_utils_string::approx_token_count(&raw_output)),
         hook_command: Some("enumerate evidence".to_string()),
         raw_output_artifact: None,
+        raw_output_reduction_notice: None,
         repair_notice: None,
     };
 
@@ -1295,6 +1311,7 @@ fn token_efficiency_exec_output_preserves_live_process_state_for_large_output() 
         .collect::<Vec<_>>()
         .join("\n");
     let response = ExecCommandToolOutput {
+        validation: None,
         event_call_id: "call-live".to_string(),
         chunk_id: "chunk-live".to_string(),
         wall_time: std::time::Duration::from_millis(25),
@@ -1307,6 +1324,7 @@ fn token_efficiency_exec_output_preserves_live_process_state_for_large_output() 
         original_token_count: Some(20_000),
         hook_command: Some("cargo test".to_string()),
         raw_output_artifact: None,
+        raw_output_reduction_notice: None,
         repair_notice: None,
     }
     .response_text();
@@ -1335,6 +1353,7 @@ fn exec_command_tool_output_summarizes_and_links_retained_raw_output() {
     let artifact_path =
         std::path::PathBuf::from(format!(r"C:\codex\tool-output\{artifact_id}.log"));
     let output = ExecCommandToolOutput {
+        validation: None,
         event_call_id: "call-summary".to_string(),
         chunk_id: "chunk-summary".to_string(),
         wall_time: std::time::Duration::from_millis(25),
@@ -1353,6 +1372,7 @@ fn exec_command_tool_output_summarizes_and_links_retained_raw_output() {
             truncated: false,
             handle: std::sync::Arc::new(tempfile::tempfile().expect("artifact handle")),
         }),
+        raw_output_reduction_notice: None,
         repair_notice: Some("Command preflight applied one repair".to_string()),
     };
 
@@ -1380,7 +1400,7 @@ fn exec_command_tool_output_summarizes_and_links_retained_raw_output() {
     );
 }
 
-fn artifact_backed_exec_output(
+async fn artifact_backed_exec_output(
     raw_output: &[u8],
     max_output_tokens: Option<usize>,
 ) -> (
@@ -1389,50 +1409,44 @@ fn artifact_backed_exec_output(
     std::path::PathBuf,
     tempfile::TempDir,
 ) {
-    let artifact_id: ToolOutputArtifactId = "019fa78a-0e8e-78d1-8a9d-b67d330eb5b6".parse().unwrap();
     let retained_root = tempfile::tempdir().expect("retained artifact root");
-    let artifact_directory = retained_root.path().join("tool-output").join("thread");
-    std::fs::create_dir_all(&artifact_directory).expect("create artifact directory");
-    let artifact_path = artifact_directory.join(format!("{artifact_id}.log"));
-    std::fs::write(&artifact_path, raw_output).expect("write retained artifact");
-    (
-        ExecCommandToolOutput {
-            event_call_id: "call-artifact".to_string(),
-            chunk_id: "chunk-artifact".to_string(),
-            wall_time: std::time::Duration::from_millis(1),
-            raw_output: raw_output.to_vec(),
-            truncation_policy: TruncationPolicy::Tokens(10_000),
-            max_output_tokens,
-            process_id: None,
-            exit_code: Some(0),
-            process_exited: true,
-            original_token_count: None,
-            hook_command: None,
-            raw_output_artifact: Some(RawOutputArtifact::Stored {
-                id: artifact_id,
-                path: artifact_path.clone(),
-                bytes: raw_output.len() as u64,
-                truncated: false,
-                handle: std::sync::Arc::new(
-                    std::fs::OpenOptions::new()
-                        .read(true)
-                        .write(true)
-                        .open(&artifact_path)
-                        .expect("artifact handle"),
-                ),
-            }),
-            repair_notice: None,
-        },
-        artifact_id,
-        artifact_path,
-        retained_root,
+    let artifact = crate::tools::command_output_artifact::create_raw_output_artifact(
+        retained_root.path(),
+        "thread",
+        raw_output,
     )
+    .await;
+    let artifact_id = artifact.artifact_id().expect("normal artifact creation");
+    let artifact_path = retained_root
+        .path()
+        .join("tool-output/thread")
+        .join(format!("{artifact_id}.log"));
+    let output = ExecCommandToolOutput {
+        validation: None,
+        event_call_id: "call-artifact".to_string(),
+        chunk_id: "chunk-artifact".to_string(),
+        wall_time: std::time::Duration::from_millis(1),
+        raw_output: raw_output.to_vec(),
+        truncation_policy: TruncationPolicy::Tokens(10_000),
+        max_output_tokens,
+        process_id: None,
+        exit_code: Some(0),
+        process_exited: true,
+        original_token_count: None,
+        hook_command: None,
+        raw_output_artifact: Some(artifact),
+        raw_output_reduction_notice: None,
+        repair_notice: None,
+    }
+    .with_prepared_reduction_notice()
+    .await;
+    (output, artifact_id, artifact_path, retained_root)
 }
 
-#[test]
-fn exec_model_output_exposes_artifact_id_not_path() {
+#[tokio::test]
+async fn exec_model_output_exposes_artifact_id_not_path() {
     let (output, artifact_id, artifact_path, _retained_root) =
-        artifact_backed_exec_output(b"complete output\n", Some(1_000));
+        artifact_backed_exec_output(b"complete output\n", Some(1_000)).await;
 
     let response = output.response_text();
 
@@ -1440,10 +1454,10 @@ fn exec_model_output_exposes_artifact_id_not_path() {
     assert!(!response.contains(&artifact_path.to_string_lossy().to_string()));
 }
 
-#[test]
-fn exec_code_mode_exposes_artifact_id_not_path() {
+#[tokio::test]
+async fn exec_code_mode_exposes_artifact_id_not_path() {
     let (mut output, artifact_id, artifact_path, _retained_root) =
-        artifact_backed_exec_output(b"complete output\n", Some(1_000));
+        artifact_backed_exec_output(b"complete output\n", Some(1_000)).await;
 
     let result = output.code_mode_result(&ToolPayload::Function {
         arguments: "{}".to_string(),
@@ -1463,6 +1477,7 @@ fn exec_code_mode_exposes_artifact_id_not_path() {
         owned_path: Some(artifact_path.clone()),
         bytes: 7,
     });
+    output.prepare_reduction_notice().await;
     let failed_result = output.code_mode_result(&ToolPayload::Function {
         arguments: "{}".to_string(),
     });
@@ -1477,9 +1492,9 @@ fn exec_code_mode_exposes_artifact_id_not_path() {
     );
 }
 
-#[test]
-fn exec_code_mode_makes_empty_completion_explicit() {
-    let (mut output, _, _, _retained_root) = artifact_backed_exec_output(b"", Some(1_000));
+#[tokio::test]
+async fn exec_code_mode_makes_empty_completion_explicit() {
+    let (mut output, _, _, _retained_root) = artifact_backed_exec_output(b"", Some(1_000)).await;
     output.raw_output_artifact = None;
 
     let result = output.code_mode_result(&ToolPayload::Function {
@@ -1492,11 +1507,11 @@ fn exec_code_mode_makes_empty_completion_explicit() {
     );
 }
 
-#[test]
-fn token_efficiency_artifact_recovery_notice_does_not_repeat_id() {
+#[tokio::test]
+async fn token_efficiency_artifact_recovery_notice_does_not_repeat_id() {
     let raw_output = "word ".repeat(200);
     let (output, artifact_id, _, _retained_root) =
-        artifact_backed_exec_output(raw_output.as_bytes(), Some(100));
+        artifact_backed_exec_output(raw_output.as_bytes(), Some(100)).await;
 
     let response = output.response_text();
 
@@ -1504,24 +1519,44 @@ fn token_efficiency_artifact_recovery_notice_does_not_repeat_id() {
     assert!(response.contains("using the raw output artifact above"));
     assert!(response.contains("do not rerun the producer.]"));
     assert_eq!(response.matches(&artifact_id.to_string()).count(), 1);
+    assert!(codex_utils_string::approx_token_count(&response) <= 100);
+    assert!(
+        response
+            .find(&artifact_id.to_string())
+            .expect("artifact ID")
+            < response
+                .find("using the raw output artifact above")
+                .expect("recovery instruction")
+    );
+    let code_mode = output.code_mode_result(&ToolPayload::Function {
+        arguments: "{}".to_string(),
+    });
+    assert!(
+        code_mode["output"]
+            .as_str()
+            .expect("code-mode output")
+            .contains("[command output reduced; recover the full retained output")
+    );
+    assert_eq!(code_mode["raw_output_artifact_id"], artifact_id.to_string());
 }
 
-#[test]
-fn exec_reduction_notice_is_absent_for_complete_output() {
+#[tokio::test]
+async fn exec_reduction_notice_is_absent_for_complete_output() {
     let (output, _, _, _retained_root) =
-        artifact_backed_exec_output(b"complete output\n", Some(1_000));
+        artifact_backed_exec_output(b"complete output\n", Some(1_000)).await;
 
     let response = output.response_text();
 
     assert!(!response.contains("[command output reduced;"));
 }
 
-#[test]
-fn exec_reduction_notice_is_absent_after_artifact_is_evicted() {
+#[tokio::test]
+async fn exec_reduction_notice_is_absent_after_artifact_is_evicted() {
     let raw_output = "word ".repeat(200);
-    let (output, _, artifact_path, _retained_root) =
-        artifact_backed_exec_output(raw_output.as_bytes(), Some(4));
+    let (mut output, _, artifact_path, _retained_root) =
+        artifact_backed_exec_output(raw_output.as_bytes(), Some(4)).await;
     std::fs::remove_file(&artifact_path).expect("evict retained artifact");
+    output.prepare_reduction_notice().await;
 
     let response = output.response_text();
 
@@ -1529,6 +1564,7 @@ fn exec_reduction_notice_is_absent_after_artifact_is_evicted() {
     assert!(!response.contains("full retained output is available"));
 
     std::fs::create_dir(&artifact_path).expect("replace artifact with nonregular entry");
+    output.prepare_reduction_notice().await;
     let nonregular_response = output.response_text();
     assert!(!nonregular_response.contains("[command output reduced;"));
     assert!(!nonregular_response.contains("full retained output is available"));

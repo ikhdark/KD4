@@ -315,7 +315,7 @@ fn write_stdin_tool_matches_expected_spec() {
         (
             "yield_time_ms".to_string(),
             bounded_integer(
-                "Wait before yielding output. Non-empty writes default to 250 ms and cap at 30000 ms; empty polls default to one event-driven 60000 ms wait. A wait deadline does not terminate the process.".to_string(),
+                "Wait before yielding output. Non-empty writes default to 250 ms and cap at 30000 ms; empty polls wait for output or completion for at least 60000 ms even when a shorter yield is requested. A wait deadline does not terminate the process.".to_string(),
                 crate::unified_exec::MIN_YIELD_TIME_MS,
                 crate::unified_exec::DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS,
             ),

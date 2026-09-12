@@ -50,6 +50,55 @@ async fn connection_failures_are_classified_without_exposing_request_urls() {
     assert!(!error.to_string().contains("url-secret"));
 }
 
+#[tokio::test]
+async fn invalid_json_body_is_rejected_before_network_dispatch() {
+    struct InvalidJson;
+    impl serde::Serialize for InvalidJson {
+        fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            Err(serde::ser::Error::custom("test JSON serialization failure"))
+        }
+    }
+
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind listener");
+    listener.set_nonblocking(true).expect("set nonblocking");
+    let address = listener.local_addr().expect("listener address");
+    let transport = ReqwestTransport::from_http_client(HttpClient::new(test_reqwest_client()));
+    let mut request =
+        Request::new(Method::POST, format!("http://{address}/responses")).with_json(&InvalidJson);
+    request.timeout = Some(Duration::from_millis(500));
+    assert_eq!(
+        request
+            .clone()
+            .into_prepared()
+            .expect_err("preparation must fail"),
+        "test JSON serialization failure"
+    );
+    let error = transport
+        .execute(request.clone())
+        .await
+        .expect_err("execute must fail");
+    assert!(
+        matches!(error, TransportError::Build(message) if message == "test JSON serialization failure")
+    );
+    let error = match transport.stream(request).await {
+        Err(error) => error,
+        Ok(_) => panic!("stream must reject invalid JSON"),
+    };
+    assert!(
+        matches!(error, TransportError::Build(message) if message == "test JSON serialization failure")
+    );
+    assert_eq!(
+        listener
+            .accept()
+            .expect_err("invalid JSON must never connect")
+            .kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
 fn test_reqwest_client() -> reqwest::Client {
     reqwest::Client::builder()
         .no_proxy()

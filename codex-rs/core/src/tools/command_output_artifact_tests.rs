@@ -1,13 +1,154 @@
 use super::*;
+use std::time::Duration;
 
 #[tokio::test(flavor = "current_thread")]
+#[serial_test::serial(command_output_artifact)]
 async fn confirmed_performance_artifact_filesystem_operations_use_blocking_pool() {
-    let runtime_thread = std::thread::current().id();
-    let worker_thread = run_blocking_artifact_io(|| Ok(std::thread::current().id()))
-        .await
-        .expect("blocking artifact operation");
+    for attach in [false, true] {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let canonical = CanonicalToolResult::text("retained canonical output\n");
+        let existing = if attach {
+            Some(create_raw_output_artifact(temp.path(), "thread", &canonical.bytes).await)
+        } else {
+            None
+        };
+        let existing_id = existing.as_ref().and_then(RawOutputArtifact::artifact_id);
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let thread_released = Arc::clone(&released);
+        let blocker = std::thread::spawn(move || {
+            let _guard = lock_retention_registry();
+            locked_tx.send(()).expect("notify registry held");
+            // A watchdog also releases an implementation that blocks the sole
+            // runtime thread, so the regression fails instead of hanging.
+            let _ = release_rx.recv_timeout(Duration::from_secs(5));
+            thread_released.store(true, Ordering::Release);
+        });
+        locked_rx.recv().expect("registry held");
+        let home = temp.path().to_path_buf();
+        let expected = canonical.bytes.clone();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let operation = tokio::spawn(async move {
+            entered_tx.send(()).expect("notify operation entry");
+            match existing_id {
+                Some(id) => {
+                    attach_canonical_output_artifact(&home, "thread", &id.to_string(), &canonical)
+                        .await
+                }
+                None => create_canonical_output_artifact(&home, "thread", &canonical).await,
+            }
+        });
+        entered_rx.await.expect("operation entered");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let executor_advanced_while_locked = !released.load(Ordering::Acquire);
+        let _ = release_tx.send(());
+        let artifact = operation.await.expect("artifact operation");
+        blocker.join().expect("registry blocker");
 
-    assert_ne!(worker_thread, runtime_thread);
+        assert!(executor_advanced_while_locked, "attach={attach}");
+        assert!(artifact.complete, "{artifact:?}");
+        let recovered = read_tool_output_selectors(
+            temp.path(),
+            "thread",
+            &artifact.artifact_id().expect("artifact ID"),
+            vec![ToolOutputSelector::Bytes {
+                start: 0,
+                end: expected.len() as u64,
+            }],
+        )
+        .await
+        .expect("read canonical output");
+        assert!(recovered.complete);
+        assert_eq!(
+            recovered.results[0].text.as_deref(),
+            Some("retained canonical output\n")
+        );
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial(command_output_artifact)]
+async fn cancelled_canonical_creation_finishes_owned_family_and_releases_retention() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let directory = temp.path().join("tool-output/thread");
+    tokio::fs::create_dir_all(&directory)
+        .await
+        .expect("artifact directory");
+    let semaphore = retention_sweep_semaphore(directory.parent().expect("output root"));
+    let permit = semaphore.acquire_owned().await.expect("hold retention");
+    let home = temp.path().to_path_buf();
+    let operation = tokio::spawn(async move {
+        create_canonical_output_artifact(
+            &home,
+            "thread",
+            &CanonicalToolResult::text("cancellation preserves exact bytes\n"),
+        )
+        .await
+    });
+    let artifact_id = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let mut entries = tokio::fs::read_dir(&directory)
+                .await
+                .expect("staged directory");
+            while let Some(entry) = entries.next_entry().await.expect("staged entry") {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if let Some(staged) = name.strip_prefix('.')
+                    && let Some((id, _)) = staged.split_once(".segment-")
+                {
+                    return id.to_string();
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("creation reaches retained-family admission");
+    operation.abort();
+    assert!(operation.await.expect_err("cancel caller").is_cancelled());
+    drop(permit);
+
+    let recovered = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(recovered) = read_tool_output_selectors(
+                temp.path(),
+                "thread",
+                &artifact_id,
+                vec![ToolOutputSelector::Lines { start: 1, end: 1 }],
+            )
+            .await
+                && recovered.complete
+            {
+                break recovered;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("owned operation commits despite caller cancellation");
+    assert_eq!(
+        recovered.results[0].text.as_deref(),
+        Some("cancellation preserves exact bytes\n")
+    );
+    let permit = tokio::time::timeout(
+        Duration::from_secs(5),
+        retention_sweep_permit_for_directory(&directory),
+    )
+    .await
+    .expect("worker releases retention")
+    .expect("retention permit");
+    let mut entries = tokio::fs::read_dir(&directory)
+        .await
+        .expect("committed directory");
+    while let Some(entry) = entries.next_entry().await.expect("committed entry") {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        assert!(!name.ends_with(".pending"), "orphan staging: {name}");
+        assert!(
+            !name.ends_with(".transaction"),
+            "unfinished transaction: {name}"
+        );
+    }
+    drop(permit);
 }
 
 #[test]
@@ -27,6 +168,7 @@ async fn token_efficiency_reduced_output_notice_defers_to_tool_schema() {
 
     let notice = artifact
         .reduction_notice()
+        .await
         .expect("stored artifact reduction notice");
 
     assert!(notice.contains("with read_tool_output"));
@@ -972,14 +1114,14 @@ async fn active_output_file_lock_blocks_removal_until_release() {
     active.try_lock().expect("lock active artifact");
 
     assert!(matches!(
-        remove_inactive_output_path(path.clone()).await,
+        remove_inactive_output_path_blocking(path.clone()),
         InactiveRemovalOutcome::Active
     ));
     assert!(path.exists());
 
     drop(active);
     assert!(matches!(
-        remove_inactive_output_path(path.clone()).await,
+        remove_inactive_output_path_blocking(path.clone()),
         InactiveRemovalOutcome::RemovedOrAbsent
     ));
     assert!(!path.exists());
@@ -1101,6 +1243,73 @@ async fn global_retention_bounds_artifacts_across_threads() {
     }
     assert_eq!(retained, max_retained_artifacts_total());
     assert!(keep_path.exists());
+}
+
+#[test]
+fn active_tool_history_verification_bounds_reads_when_artifact_grows() {
+    struct GrowingArtifact {
+        read_bytes: usize,
+    }
+
+    impl Read for GrowingArtifact {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            assert!(buffer.len() <= 65_536, "read memory must remain bounded");
+            self.read_bytes += buffer.len();
+            assert!(
+                self.read_bytes <= 131_074,
+                "must stop after the growth probe"
+            );
+            buffer.fill(b'x');
+            Ok(buffer.len())
+        }
+    }
+
+    // The source keeps growing and never reaches EOF. The verifier must stop
+    // after the declared size plus one byte without an allocation of that size.
+    let mut artifact = GrowingArtifact { read_bytes: 0 };
+    let result = verified_artifact_digest(&mut artifact, 131_073);
+
+    assert_eq!(
+        result,
+        Err("artifact byte count does not match receipt metadata".to_string())
+    );
+    assert_eq!(artifact.read_bytes, 131_074);
+}
+
+#[tokio::test]
+#[serial_test::serial(command_output_artifact)]
+async fn active_tool_history_reconciliation_verifies_complete_bytes_before_protection() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let output = b"0123456789abcdef".repeat(16_385);
+    // Independently computed SHA-256, including the final partial buffer.
+    let digest = "7022bcb095d4bc64f8093af2f1d6cbb2f12ba573c7c2179563602e6ec6990fc5";
+    let mut references = BTreeMap::new();
+    let mut artifacts = Vec::new();
+    for (bytes, sha256) in [
+        (262_160, digest),
+        (262_160, "invalid digest"),
+        (262_159, digest),
+    ] {
+        let artifact = create_raw_output_artifact(temp.path(), "thread", &output).await;
+        let RawOutputArtifact::Stored { id, path, .. } = &artifact else {
+            panic!("expected stored artifact");
+        };
+        references.insert(id.to_string(), (bytes, sha256.to_string()));
+        artifacts.push((id.to_string(), path.clone(), artifact));
+    }
+
+    let live =
+        reconcile_active_tool_history_artifact_protection(temp.path(), "thread", &references).await;
+
+    assert_eq!(live, BTreeSet::from([artifacts[0].0.clone()]));
+    assert!(active_tool_history_protection_path(&artifacts[0].1).exists());
+    for (_, path, _) in &artifacts[1..] {
+        assert!(!active_tool_history_protection_path(path).exists());
+        assert_eq!(
+            tokio::fs::read(path).await.expect("retained artifact"),
+            output
+        );
+    }
 }
 
 #[tokio::test]
@@ -1920,4 +2129,1141 @@ async fn oversized_root_is_sticky_scan_only_until_an_authoritative_in_capacity_s
     let exited = retention_diagnostics_for_test(&root);
     assert_eq!(exited.scan_only_exits, 1);
     assert_eq!(retention_mode_for_test(&root), RetentionModeKind::Indexed);
+}
+
+#[cfg(windows)]
+#[tokio::test]
+#[serial_test::serial(command_output_artifact)]
+async fn canonical_creation_preserves_committed_family_when_recovery_metadata_is_unreadable() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let temp = tempfile::tempdir().expect("tempdir");
+    let canonical = CanonicalToolResult::text("previous committed exact output\n");
+    let artifact = create_canonical_output_artifact(temp.path(), "thread", &canonical).await;
+    assert!(artifact.complete, "{artifact:?}");
+    let id = artifact.artifact_id().expect("artifact ID");
+    let path = temp
+        .path()
+        .join("tool-output/thread")
+        .join(format!("{id}.log"));
+    // This is the on-disk state after metadata was committed but before the
+    // transaction marker was removed. Recovery is entered by public creation.
+    begin_logical_artifact_transaction(&path, false).expect("unfinished transaction marker");
+    let locked_metadata = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(logical_metadata_path(&path))
+        .expect("hold actual metadata sharing lock");
+    let failed = create_canonical_output_artifact(
+        temp.path(),
+        "thread",
+        &CanonicalToolResult::text("new output while recovery is blocked"),
+    )
+    .await;
+    assert!(!failed.complete);
+    assert!(
+        failed
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("reconcile artifact transactions"))
+    );
+    assert_eq!(
+        std::fs::read(&path).expect("committed segment preserved"),
+        canonical.bytes
+    );
+    assert!(
+        logical_transaction_path(&path).exists(),
+        "failed recovery must retain its marker"
+    );
+    drop(locked_metadata);
+    let retried = create_canonical_output_artifact(
+        temp.path(),
+        "thread",
+        &CanonicalToolResult::text("creation resumes after metadata is readable"),
+    )
+    .await;
+    assert!(retried.complete, "{retried:?}");
+    assert!(!logical_transaction_path(&path).exists());
+    let recovered = read_tool_output_selectors(
+        temp.path(),
+        "thread",
+        &id,
+        vec![ToolOutputSelector::Lines { start: 1, end: 1 }],
+    )
+    .await
+    .expect("read preserved family");
+    assert!(recovered.complete);
+    assert_eq!(
+        recovered.results[0].text.as_deref(),
+        Some("previous committed exact output\n")
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial(command_output_artifact)]
+async fn cancelled_history_protection_retains_admission_until_protection_is_visible() {
+    let temp = tempfile::tempdir().expect("artifact home");
+    let body = "history protection survives caller cancellation\n";
+    let artifact =
+        create_canonical_output_artifact(temp.path(), "thread", &CanonicalToolResult::text(body))
+            .await;
+    let id = artifact.artifact_id().expect("canonical artifact");
+    let root = temp.path().join("tool-output");
+    let path = root.join("thread").join(format!("{id}.log"));
+    let marker = active_tool_history_protection_path(&path);
+    let references = BTreeMap::from([(
+        id.clone(),
+        (
+            body.len() as u64,
+            format!("{:x}", Sha256::digest(body.as_bytes())),
+        ),
+    )]);
+    let semaphore = retention_sweep_semaphore(&root);
+    // Real retention-lock I/O remains blocked after the normal reconciliation caller
+    // is cancelled. The process admission must stay owned by that in-flight work.
+    let external_lock = acquire_atomic_write_lock(&retention_interprocess_lock_target(&root))
+        .expect("hold external retention lock");
+    let operation = tokio::spawn({
+        let home = temp.path().to_path_buf();
+        let references = references.clone();
+        async move {
+            reconcile_active_tool_history_artifact_protection(&home, "thread", &references).await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while semaphore.available_permits() != 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("normal reconciliation reaches retention admission");
+    assert!(
+        !marker.exists(),
+        "blocked filesystem acquisition cannot publish protection"
+    );
+    operation.abort();
+    assert!(
+        operation
+            .await
+            .expect_err("cancel reconciliation caller")
+            .is_cancelled()
+    );
+    assert!(
+        semaphore.clone().try_acquire_owned().is_err(),
+        "cancelling caller must not admit a second retention owner while filesystem work continues"
+    );
+    assert_eq!(
+        tokio::fs::read(&path).await.expect("read retained bytes"),
+        body.as_bytes()
+    );
+    drop(external_lock);
+    let permit = tokio::time::timeout(Duration::from_secs(5), semaphore.clone().acquire_owned())
+        .await
+        .expect("owned worker finishes")
+        .expect("retention admission released");
+    assert!(
+        protection_marker_status(&marker, ACTIVE_TOOL_HISTORY_PROTECTION_MARKER_BYTES)
+            .expect("read durable protection marker")
+    );
+    let record = artifact_retention_record(&path)
+        .await
+        .expect("read published artifact record")
+        .expect("artifact retained");
+    assert!(
+        record.protected,
+        "admission releases after protection is visible to retention"
+    );
+    drop(permit);
+    let recovered = read_tool_output_selectors(
+        temp.path(),
+        "thread",
+        &id,
+        vec![ToolOutputSelector::Bytes {
+            start: 0,
+            end: body.len() as u64,
+        }],
+    )
+    .await
+    .expect("recover protected artifact");
+    assert!(recovered.complete);
+    assert_eq!(recovered.results[0].text.as_deref(), Some(body));
+    let live =
+        reconcile_active_tool_history_artifact_protection(temp.path(), "thread", &references).await;
+    assert_eq!(
+        live,
+        BTreeSet::from([id]),
+        "ordinary retry sees completed protection without stranding retention"
+    );
+}
+
+async fn create_protected_pruning_fixture(
+    codex_home: &Path,
+) -> (PathBuf, PathBuf, BTreeMap<String, (u64, String)>) {
+    let mut markers = Vec::new();
+    let mut referenced = BTreeMap::new();
+    for (index, text) in ["old canonical output\n", "referenced canonical output\n"]
+        .into_iter()
+        .enumerate()
+    {
+        let canonical = CanonicalToolResult::text(text);
+        let artifact = create_canonical_output_artifact(codex_home, "thread", &canonical).await;
+        assert!(artifact.complete, "{artifact:?}");
+        let id = artifact.artifact_id().expect("canonical artifact id");
+        protect_active_tool_history_artifact(
+            codex_home,
+            "thread",
+            &id,
+            canonical.exact_bytes,
+            &canonical.sha256,
+        )
+        .await
+        .expect("protect actual canonical artifact");
+        let path = codex_home
+            .join("tool-output/thread")
+            .join(format!("{id}.log"));
+        markers.push(active_tool_history_protection_path(&path));
+        if index == 1 {
+            referenced.insert(id, (canonical.exact_bytes, canonical.sha256));
+        }
+    }
+    (markers.remove(0), markers.remove(0), referenced)
+}
+
+#[tokio::test]
+#[serial_test::serial(command_output_artifact)]
+async fn committed_history_pruning_retains_referenced_markers_without_revalidating_bytes() {
+    for missing in [true, false] {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (obsolete, referenced, references) =
+            create_protected_pruning_fixture(temp.path()).await;
+        let expected_marker = if missing {
+            tokio::fs::remove_file(referenced.with_extension("log"))
+                .await
+                .expect("remove referenced artifact bytes");
+            ACTIVE_TOOL_HISTORY_PROTECTION_MARKER_BYTES
+        } else {
+            tokio::fs::write(referenced.with_extension("log"), b"wrong artifact bytes")
+                .await
+                .expect("change referenced bytes");
+            tokio::fs::write(&referenced, b"invalid marker bytes")
+                .await
+                .expect("change referenced marker bytes");
+            b"invalid marker bytes".as_slice()
+        };
+
+        prune_active_tool_history_artifact_protection(temp.path(), "thread", &references)
+            .await
+            .expect("pruning does not revalidate the committed reference set");
+
+        assert!(!obsolete.exists(), "obsolete protection must be removed");
+        assert_eq!(
+            tokio::fs::read(&referenced)
+                .await
+                .expect("referenced marker must remain"),
+            expected_marker
+        );
+        assert_eq!(
+            tokio::fs::read(obsolete.with_extension("log"))
+                .await
+                .expect("pruning preserves artifact bytes"),
+            b"old canonical output\n"
+        );
+        if missing {
+            assert!(
+                !referenced.with_extension("log").exists(),
+                "pruning must not recreate artifact bytes"
+            );
+        } else {
+            assert_eq!(
+                tokio::fs::read(referenced.with_extension("log"))
+                    .await
+                    .unwrap(),
+                b"wrong artifact bytes"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(command_output_artifact)]
+async fn committed_history_pruning_accepts_absent_directory_but_reports_unreadable_directory() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    prune_active_tool_history_artifact_protection(temp.path(), "thread", &BTreeMap::new())
+        .await
+        .expect("absent artifact directory has no markers to prune");
+    let root = temp.path().join("tool-output");
+    tokio::fs::create_dir_all(&root)
+        .await
+        .expect("artifact root");
+    let directory = root.join("thread");
+    tokio::fs::write(&directory, "not a directory")
+        .await
+        .expect("real read-directory failure");
+    let error =
+        prune_active_tool_history_artifact_protection(temp.path(), "thread", &BTreeMap::new())
+            .await
+            .expect_err("an existing unreadable directory path must not count as empty");
+    assert!(error.contains("protection directory"));
+    assert_eq!(
+        tokio::fs::read(&directory).await.unwrap(),
+        b"not a directory"
+    );
+}
+
+#[cfg(windows)]
+#[tokio::test]
+#[serial_test::serial(command_output_artifact)]
+async fn committed_history_pruning_reports_denied_delete_and_retries_after_repair() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let temp = tempfile::tempdir().expect("tempdir");
+    let (obsolete, referenced, references) = create_protected_pruning_fixture(temp.path()).await;
+    // Permit ordinary readers/writers but deny delete sharing on the obsolete
+    // marker. This is a real filesystem failure, not a fake pruning operation.
+    let deny_delete = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0x1 | 0x2)
+        .open(&obsolete)
+        .expect("hold obsolete marker without delete sharing");
+    let error = prune_active_tool_history_artifact_protection(temp.path(), "thread", &references)
+        .await
+        .expect_err("failed deletion must fail the checkpoint cleanup barrier");
+    assert!(error.contains("failed to remove obsolete active tool-history protection"));
+    assert!(obsolete.exists());
+    assert_eq!(
+        tokio::fs::read(&referenced).await.unwrap(),
+        ACTIVE_TOOL_HISTORY_PROTECTION_MARKER_BYTES
+    );
+    drop(deny_delete);
+
+    prune_active_tool_history_artifact_protection(temp.path(), "thread", &references)
+        .await
+        .expect("explicit retry completes after filesystem repair");
+    assert!(!obsolete.exists());
+    assert_eq!(
+        tokio::fs::read(&referenced).await.unwrap(),
+        ACTIVE_TOOL_HISTORY_PROTECTION_MARKER_BYTES
+    );
+    assert_eq!(
+        tokio::fs::read(referenced.with_extension("log"))
+            .await
+            .unwrap(),
+        b"referenced canonical output\n"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial(command_output_artifact)]
+async fn committed_history_pruning_cancellation_keeps_worker_and_retention_lock_owned() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let (obsolete, referenced, references) = create_protected_pruning_fixture(temp.path()).await;
+    let directory = referenced.parent().expect("thread directory");
+    let root = tool_output_root_for_directory(directory);
+    let semaphore = retention_sweep_semaphore(&root);
+    let external_lock = acquire_atomic_write_lock(&retention_interprocess_lock_target(&root))
+        .expect("hold external retention lock");
+    let operation = tokio::spawn({
+        let home = temp.path().to_path_buf();
+        async move { prune_active_tool_history_artifact_protection(&home, "thread", &references).await }
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while semaphore.available_permits() != 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("pruning worker owns retention admission");
+    operation.abort();
+    assert!(
+        operation
+            .await
+            .expect_err("caller is cancelled")
+            .is_cancelled()
+    );
+    assert!(
+        obsolete.exists(),
+        "filesystem pruning is blocked by the OS lock"
+    );
+    assert!(
+        semaphore.clone().try_acquire_owned().is_err(),
+        "caller cancellation must not release the worker's admission"
+    );
+    drop(external_lock);
+    let completed = tokio::time::timeout(Duration::from_secs(5), semaphore.clone().acquire_owned())
+        .await
+        .expect("accepted worker completes without its caller")
+        .expect("retention gate remains usable");
+    assert!(
+        !obsolete.exists(),
+        "completed worker pruned obsolete protection"
+    );
+    let record = artifact_retention_record(&obsolete.with_extension("log"))
+        .await
+        .expect("read updated retention record")
+        .expect("old artifact is retained");
+    assert!(
+        !record.protected,
+        "admission releases after the removal is visible to retention"
+    );
+    drop(completed);
+    assert_eq!(
+        tokio::fs::read(&referenced).await.unwrap(),
+        ACTIVE_TOOL_HISTORY_PROTECTION_MARKER_BYTES
+    );
+    assert_eq!(
+        tokio::fs::read(referenced.with_extension("log"))
+            .await
+            .unwrap(),
+        b"referenced canonical output\n"
+    );
+}
+
+#[test]
+#[serial_test::serial(command_output_artifact)]
+fn history_protection_finishes_with_one_blocking_thread() {
+    let temp = tempfile::tempdir().expect("artifact home");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .expect("single blocking worker runtime");
+    let result = runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let body = b"single-worker protected output\n";
+            let artifact = create_raw_output_artifact(temp.path(), "thread", body).await;
+            let RawOutputArtifact::Stored { id, path, .. } = artifact else {
+                panic!("normal raw artifact creation must complete with one blocking worker");
+            };
+            protect_active_tool_history_artifact(
+                temp.path(),
+                "thread",
+                &id.to_string(),
+                body.len() as u64,
+                &format!("{:x}", Sha256::digest(body)),
+            )
+            .await
+            .expect("normal public protection completes");
+            let marker = active_tool_history_protection_path(&path);
+            assert!(
+                protection_marker_status(&marker, ACTIVE_TOOL_HISTORY_PROTECTION_MARKER_BYTES)
+                    .expect("valid protection marker")
+            );
+            assert_eq!(
+                tokio::fs::read(&path).await.expect("retained exact bytes"),
+                body
+            );
+            let record = artifact_retention_record(&path)
+                .await
+                .expect("retention record")
+                .expect("artifact remains");
+            assert!(record.protected);
+        })
+        .await
+    });
+    // A regressed nested blocking wait must fail this test rather than hang runtime Drop.
+    runtime.shutdown_timeout(Duration::from_millis(100));
+    result.expect("public protection must not require a second blocking worker");
+}
+
+#[test]
+#[serial_test::serial(command_output_artifact)]
+fn committed_history_pruning_finishes_with_one_blocking_thread() {
+    let temp = tempfile::tempdir().expect("artifact home");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .expect("single blocking worker runtime");
+    let result = runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut markers = Vec::new();
+            let mut references = BTreeMap::new();
+            for (index, body) in [b"old output".as_slice(), b"referenced output".as_slice()]
+                .into_iter()
+                .enumerate()
+            {
+                let artifact = create_raw_output_artifact(temp.path(), "thread", body).await;
+                let RawOutputArtifact::Stored { id, path, .. } = artifact else {
+                    panic!("raw artifact creation should complete");
+                };
+                let digest = format!("{:x}", Sha256::digest(body));
+                protect_active_tool_history_artifact(
+                    temp.path(),
+                    "thread",
+                    &id.to_string(),
+                    body.len() as u64,
+                    &digest,
+                )
+                .await
+                .expect("protect real artifact");
+                markers.push(active_tool_history_protection_path(&path));
+                if index == 1 {
+                    references.insert(id.to_string(), (body.len() as u64, digest));
+                }
+            }
+            prune_active_tool_history_artifact_protection(temp.path(), "thread", &references)
+                .await
+                .expect("prune does not require another blocking worker");
+            assert!(!markers[0].exists());
+            assert_eq!(
+                tokio::fs::read(&markers[1]).await.unwrap(),
+                ACTIVE_TOOL_HISTORY_PROTECTION_MARKER_BYTES
+            );
+            let obsolete = artifact_retention_record(&markers[0].with_extension("log"))
+                .await
+                .expect("indexed old artifact")
+                .expect("old bytes retained");
+            assert!(!obsolete.protected);
+            let current = artifact_retention_record(&markers[1].with_extension("log"))
+                .await
+                .expect("indexed referenced artifact")
+                .expect("referenced bytes retained");
+            assert!(current.protected);
+        })
+        .await
+    });
+    runtime.shutdown_timeout(Duration::from_millis(100));
+    result.expect("pruning must complete with one blocking worker");
+}
+
+#[test]
+#[serial_test::serial(command_output_artifact)]
+fn canonical_creation_finishes_with_one_blocking_thread() {
+    assert_canonical_operation_finishes_with_one_blocking_thread(false);
+}
+
+#[test]
+#[serial_test::serial(command_output_artifact)]
+fn canonical_attachment_finishes_with_one_blocking_thread() {
+    assert_canonical_operation_finishes_with_one_blocking_thread(true);
+}
+
+fn assert_canonical_operation_finishes_with_one_blocking_thread(attach: bool) {
+    let temp = tempfile::tempdir().expect("artifact home");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .expect("single blocking worker runtime");
+    let result = runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let body = "a".repeat(MAX_RAW_OUTPUT_ARTIFACT_BYTES) + &"b".repeat(128);
+            let canonical = CanonicalToolResult::text(body.clone());
+            let raw = if attach {
+                Some(create_raw_output_artifact(temp.path(), "thread", body.as_bytes()).await)
+            } else {
+                None
+            };
+            let raw_id = raw
+                .as_ref()
+                .map(|raw| raw.artifact_id().expect("stored raw ID").to_string());
+
+            // Failed admission must clean completed staging and preserve an existing raw family.
+            inject_retention_sweep_permit_failure_for_test(1);
+            let failed = match &raw_id {
+                Some(id) => {
+                    attach_canonical_output_artifact(temp.path(), "thread", id, &canonical).await
+                }
+                None => create_canonical_output_artifact(temp.path(), "thread", &canonical).await,
+            };
+            assert!(!failed.complete);
+            assert!(
+                failed
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("retention lock"))
+            );
+            let retained_prefix = if attach {
+                MAX_RAW_OUTPUT_ARTIFACT_BYTES as u64
+            } else {
+                0
+            };
+            assert_eq!(failed.retained_bytes, retained_prefix);
+            assert_eq!(
+                failed.unavailable_ranges,
+                vec![CanonicalByteRange::new(retained_prefix, body.len() as u64)]
+            );
+            let directory = temp.path().join("tool-output/thread");
+            for entry in std::fs::read_dir(&directory).expect("staging directory") {
+                let entry = entry.expect("entry");
+                if let Some(id) = &raw_id {
+                    assert_eq!(entry.file_name().to_string_lossy(), format!("{id}.log"));
+                    assert_eq!(
+                        std::fs::read(entry.path()).expect("raw bytes"),
+                        body.as_bytes()[..MAX_RAW_OUTPUT_ARTIFACT_BYTES]
+                    );
+                } else {
+                    panic!(
+                        "failed create left a family member: {}",
+                        entry.path().display()
+                    );
+                }
+            }
+
+            let artifact = match &raw_id {
+                Some(id) => {
+                    attach_canonical_output_artifact(temp.path(), "thread", id, &canonical).await
+                }
+                None => create_canonical_output_artifact(temp.path(), "thread", &canonical).await,
+            };
+            assert!(artifact.complete, "{artifact:?}");
+            assert_eq!(artifact.error, None);
+            assert_eq!(artifact.retained_bytes, body.len() as u64);
+            assert!(artifact.unavailable_ranges.is_empty());
+            let id = artifact.artifact_id().expect("canonical ID");
+            if let Some(raw_id) = raw_id {
+                assert_eq!(id, raw_id, "attachment preserves the public handle");
+            }
+            let path = directory.join(format!("{id}.log"));
+            let metadata: LogicalArtifactMetadata = serde_json::from_slice(
+                &std::fs::read(logical_metadata_path(&path)).expect("committed metadata"),
+            )
+            .expect("logical metadata");
+            assert_eq!(metadata.segments.len(), 2);
+            assert_eq!(metadata.canonical_bytes, body.len() as u64);
+            assert_eq!(
+                metadata.canonical_sha256,
+                format!("{:x}", Sha256::digest(body.as_bytes()))
+            );
+            let mut persisted = std::fs::read(&path).expect("base segment");
+            persisted.extend(std::fs::read(logical_segment_path(&path, 1)).expect("tail segment"));
+            assert_eq!(persisted, body.as_bytes());
+            let recovered = read_tool_output_selectors(
+                temp.path(),
+                "thread",
+                &id,
+                vec![ToolOutputSelector::Bytes {
+                    start: MAX_RAW_OUTPUT_ARTIFACT_BYTES as u64 - 32,
+                    end: MAX_RAW_OUTPUT_ARTIFACT_BYTES as u64 + 32,
+                }],
+            )
+            .await
+            .expect("normal reader crosses segment boundary");
+            assert!(recovered.complete);
+            assert_eq!(
+                recovered.results[0].text.as_deref(),
+                Some(("a".repeat(32) + &"b".repeat(32)).as_str())
+            );
+            let record = artifact_retention_record(&path)
+                .await
+                .expect("retention read")
+                .expect("retained family");
+            assert!(record.bytes >= body.len() as u64);
+            let permit = retention_sweep_permit_for_directory(&directory)
+                .await
+                .expect("released retention ownership");
+            for entry in std::fs::read_dir(&directory).expect("committed directory") {
+                let name = entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned();
+                assert!(
+                    !name.ends_with(".pending") && !name.ends_with(".transaction"),
+                    "uncommitted member: {name}"
+                );
+            }
+            drop(permit);
+        })
+        .await
+    });
+    runtime.shutdown_timeout(Duration::from_millis(100));
+    result.expect("public canonical operation must not require a second blocking worker");
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial(command_output_artifact)]
+async fn cancelled_canonical_attachment_finishes_owned_family_and_releases_retention() {
+    let temp = tempfile::tempdir().expect("artifact home");
+    let body = "a".repeat(MAX_RAW_OUTPUT_ARTIFACT_BYTES) + "attached tail\n";
+    let canonical = CanonicalToolResult::text(body.clone());
+    let raw = create_raw_output_artifact(temp.path(), "thread", body.as_bytes()).await;
+    let id = raw.artifact_id().expect("raw ID");
+    let directory = temp.path().join("tool-output/thread");
+    let root = directory.parent().expect("output root");
+    let permit = retention_sweep_semaphore(root)
+        .acquire_owned()
+        .await
+        .expect("hold admission");
+    let home = temp.path().to_path_buf();
+    let operation = tokio::spawn(async move {
+        attach_canonical_output_artifact(&home, "thread", &id.to_string(), &canonical).await
+    });
+    let pending = staged_logical_segment_path(&directory, id, 1);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !pending.exists() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("attachment stages its additional segment before admission");
+    operation.abort();
+    assert!(
+        operation
+            .await
+            .expect_err("cancel public caller")
+            .is_cancelled()
+    );
+    drop(permit);
+    let recovered = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(recovered) = read_tool_output_selectors(
+                temp.path(),
+                "thread",
+                &id.to_string(),
+                vec![ToolOutputSelector::Bytes {
+                    start: MAX_RAW_OUTPUT_ARTIFACT_BYTES as u64,
+                    end: body.len() as u64,
+                }],
+            )
+            .await
+                && recovered.complete
+                && recovered.results[0].text.as_deref() == Some("attached tail\n")
+            {
+                break recovered;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("owned attachment commits after caller cancellation");
+    assert_eq!(
+        recovered.results[0].text.as_deref(),
+        Some("attached tail\n")
+    );
+    let permit = retention_sweep_permit_for_directory(&directory)
+        .await
+        .expect("attachment releases retention");
+    assert!(!pending.exists());
+    let path = directory.join(format!("{id}.log"));
+    assert_eq!(
+        std::fs::read(&path).expect("preserved base"),
+        body.as_bytes()[..MAX_RAW_OUTPUT_ARTIFACT_BYTES]
+    );
+    assert!(!logical_transaction_path(&path).exists());
+    drop(permit);
+}
+#[test]
+#[serial_test::serial(command_output_artifact)]
+fn raw_retention_worker_keeps_ownership_after_caller_and_runtime_cancellation() {
+    let temp = tempfile::tempdir().expect("artifact home");
+    let directory = temp.path().join("tool-output/thread");
+    let root = directory.parent().expect("output root");
+    let semaphore = retention_sweep_semaphore(root);
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    set_reconciliation_barrier(root, Arc::clone(&barrier));
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .expect("one blocking worker");
+    let retained_after_caller_cancellation = runtime.block_on(async {
+        let home = temp.path().to_path_buf();
+        let operation = tokio::spawn(async move {
+            create_raw_output_artifact(&home, "thread", b"retention survives runtime shutdown\n")
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), barrier.wait())
+            .await
+            .expect("normal raw create enters retention scan");
+        operation.abort();
+        assert!(
+            operation
+                .await
+                .expect_err("cancel raw caller")
+                .is_cancelled()
+        );
+        Arc::clone(&semaphore).try_acquire_owned().is_err()
+    });
+    runtime.shutdown_timeout(Duration::from_millis(100));
+    let retained_after_runtime_cancellation = Arc::clone(&semaphore).try_acquire_owned().is_err();
+
+    let reader_runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .expect("reader runtime");
+    reader_runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(5), barrier.wait())
+            .await
+            .expect("release original worker's scan");
+        let permit = tokio::time::timeout(Duration::from_secs(5), semaphore.acquire_owned())
+            .await
+            .expect("original worker completed")
+            .expect("retention available");
+        let paths = std::fs::read_dir(&directory)
+            .expect("committed directory")
+            .map(|entry| entry.expect("entry").path())
+            .collect::<Vec<_>>();
+        assert_eq!(paths.len(), 1);
+        assert_eq!(
+            std::fs::read(&paths[0]).expect("retained output"),
+            b"retention survives runtime shutdown\n"
+        );
+        assert_eq!(retention_mode_for_test(root), RetentionModeKind::Indexed);
+        let registry = lock_retention_registry();
+        let state = registry
+            .roots
+            .get(&normalized_tool_output_root(root))
+            .expect("published root");
+        let RetentionRootMode::Indexed(index) = &state.mode else {
+            panic!("completed index");
+        };
+        assert_eq!(index.records.len(), 1);
+        assert_eq!(
+            index.total_bytes,
+            b"retention survives runtime shutdown\n".len() as u64
+        );
+        drop(registry);
+        drop(permit);
+        let id = paths[0]
+            .file_stem()
+            .expect("artifact ID")
+            .to_str()
+            .expect("UTF-8 ID");
+        let output = read_tool_output_artifact(temp.path(), "thread", id, 1, 1, 16_384)
+            .await
+            .expect("normal reader after runtime shutdown");
+        assert_eq!(
+            output,
+            format!(
+                "artifact {id}, lines 1–1, 36 retained bytes\nretention survives runtime shutdown\n"
+            )
+        );
+    });
+    assert!(
+        retained_after_caller_cancellation,
+        "caller cancellation released the running filesystem worker's permit"
+    );
+    assert!(
+        retained_after_runtime_cancellation,
+        "runtime shutdown released the running filesystem worker's permit"
+    );
+}
+
+#[test]
+#[serial_test::serial(command_output_artifact)]
+fn reduction_notice_queues_filesystem_work_and_rejects_deleted_artifacts() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .expect("single-worker runtime");
+    runtime.block_on(async {
+        let temp = tempfile::tempdir().expect("artifact home");
+        let artifact = create_raw_output_artifact(temp.path(), "notice", b"recover these bytes\n").await;
+        let RawOutputArtifact::Stored { path, .. } = &artifact else {
+            panic!("normal artifact creation failed");
+        };
+        let path = path.clone();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let released = Arc::new(AtomicBool::new(false));
+        let worker_released = Arc::clone(&released);
+        let occupied = tokio::task::spawn_blocking(move || {
+            entered_tx.send(()).expect("worker occupied");
+            let _ = release_rx.recv_timeout(Duration::from_secs(5));
+            worker_released.store(true, Ordering::Release);
+        });
+        entered_rx.recv().expect("sole blocking worker occupied");
+        let notice = tokio::spawn(async move {
+            let text = artifact.reduction_notice().await;
+            (artifact, text)
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let runtime_advanced_before_worker_release = !released.load(Ordering::Acquire);
+        let notice_waited_for_worker = !notice.is_finished();
+        let _ = release_tx.send(());
+        occupied.await.expect("blocking worker released");
+        let (artifact, text) = notice.await.expect("notice task");
+        assert!(runtime_advanced_before_worker_release);
+        assert!(notice_waited_for_worker, "the actual path check must enter the blocking pool");
+        assert_eq!(text.as_deref(), Some("[command output reduced; recover the full retained output with read_tool_output using the raw output artifact above. Batch exact ranges when possible; do not rerun the producer.]"));
+        assert_eq!(tokio::fs::read(&path).await.expect("retained output"), b"recover these bytes\n");
+        tokio::fs::remove_file(&path).await.expect("expire artifact");
+        assert_eq!(artifact.reduction_notice().await, None, "expired output must not advertise recovery");
+    });
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial(command_output_artifact)]
+async fn incomplete_remint_cleanup_survives_cancellation_while_registry_is_locked() {
+    let temp = tempfile::tempdir().expect("artifact home");
+    let body = b"source remains independently recoverable\n";
+    let source = create_canonical_output_artifact(
+        temp.path(),
+        "source",
+        &CanonicalToolResult::bytes(body.to_vec()),
+    )
+    .await;
+    assert!(source.complete);
+    let id = source.artifact_id().expect("source ID");
+    let digest = format!("{:x}", Sha256::digest(body));
+    let directory = temp.path().join("tool-output/target");
+    tokio::fs::create_dir_all(&directory)
+        .await
+        .expect("target directory");
+    // An existing protected sparse artifact legitimately exhausts the target's
+    // retention budget without allocating or writing a 256 MiB test buffer.
+    let occupied_path = directory.join(format!("{}.log", ToolOutputArtifactId::new()));
+    tokio::fs::File::create(&occupied_path)
+        .await
+        .expect("budget fixture")
+        .set_len(MAX_RETAINED_ARTIFACT_BYTES_PER_THREAD)
+        .await
+        .expect("occupy target budget");
+    let occupied_marker = active_tool_history_protection_path(&occupied_path);
+    tokio::fs::write(
+        &occupied_marker,
+        ACTIVE_TOOL_HISTORY_PROTECTION_MARKER_BYTES,
+    )
+    .await
+    .expect("protect budget fixture");
+    assert_eq!(
+        force_retention_reconciliation_for_test(&temp.path().join("tool-output")).await,
+        RetentionModeKind::Indexed,
+        "observe the external protected budget fixture through the actual filesystem reconciler"
+    );
+    let target_path = directory.join(format!("{id}.log"));
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    set_reconciliation_barrier(&target_path, Arc::clone(&barrier));
+    let operation = tokio::spawn({
+        let home = temp.path().to_path_buf();
+        let id = id.clone();
+        let digest = digest.clone();
+        async move {
+            remint_tool_history_artifact_for_thread(
+                &home,
+                "source",
+                "target",
+                &id,
+                body.len() as u64,
+                &digest,
+            )
+            .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(10), barrier.wait())
+        .await
+        .expect("normal remint commits incomplete target");
+    let metadata: serde_json::Value = serde_json::from_slice(
+        &tokio::fs::read(logical_metadata_path(&target_path))
+            .await
+            .expect("incomplete target metadata"),
+    )
+    .expect("metadata JSON");
+    assert_eq!(metadata["complete"], false);
+    assert_eq!(metadata["retained_bytes"], 0);
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let released = Arc::new(AtomicBool::new(false));
+    let thread_released = Arc::clone(&released);
+    let blocker = std::thread::spawn(move || {
+        let _guard = lock_retention_registry();
+        locked_tx.send(()).expect("registry held");
+        let _ = release_rx.recv_timeout(Duration::from_secs(5));
+        thread_released.store(true, Ordering::Release);
+    });
+    locked_rx.recv().expect("registry locked before rollback");
+    barrier.wait().await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let runtime_advanced_while_locked = !released.load(Ordering::Acquire);
+    let cleanup_waited = !operation.is_finished();
+    // Cancelling this public remint caller must not cancel the already-admitted
+    // cleanup worker waiting on the real registry before its filesystem work.
+    operation.abort();
+    let cancelled = operation
+        .await
+        .expect_err("cancel remint caller")
+        .is_cancelled();
+    let _ = release_tx.send(());
+    blocker.join().expect("registry blocker");
+    assert!(runtime_advanced_while_locked);
+    assert!(cleanup_waited);
+    assert!(cancelled);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let mut entries = tokio::fs::read_dir(&directory)
+                .await
+                .expect("target directory");
+            let mut target_family_exists = false;
+            while let Some(entry) = entries.next_entry().await.expect("target entry") {
+                target_family_exists |= entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(&format!("{id}."));
+            }
+            if !target_family_exists {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("owned cleanup removes complete target family after cancellation");
+    assert_eq!(
+        tokio::fs::metadata(&occupied_path)
+            .await
+            .expect("unrelated protected artifact retained")
+            .len(),
+        MAX_RETAINED_ARTIFACT_BYTES_PER_THREAD
+    );
+    assert_eq!(
+        tokio::fs::read(&occupied_marker)
+            .await
+            .expect("unrelated marker retained"),
+        ACTIVE_TOOL_HISTORY_PROTECTION_MARKER_BYTES
+    );
+    assert_eq!(
+        tokio::fs::read(
+            temp.path()
+                .join("tool-output/source")
+                .join(format!("{id}.log"))
+        )
+        .await
+        .expect("source retained"),
+        body
+    );
+    tokio::fs::remove_file(&occupied_marker)
+        .await
+        .expect("release fixture protection");
+    tokio::fs::remove_file(&occupied_path)
+        .await
+        .expect("release fixture budget");
+    assert_eq!(
+        force_retention_reconciliation_for_test(&temp.path().join("tool-output")).await,
+        RetentionModeKind::Indexed,
+        "reconcile externally removed fixture bytes before the ordinary retry"
+    );
+    let retry = remint_tool_history_artifact_for_thread(
+        temp.path(),
+        "source",
+        "target",
+        &id,
+        body.len() as u64,
+        &digest,
+    )
+    .await
+    .expect("ordinary retry after cancelled cleanup succeeds");
+    assert_eq!(retry, id);
+    assert_eq!(
+        tokio::fs::read(&target_path)
+            .await
+            .expect("retry target bytes"),
+        body
+    );
+    assert_eq!(
+        tokio::fs::read(active_tool_history_protection_path(&target_path))
+            .await
+            .expect("retry protection"),
+        ACTIVE_TOOL_HISTORY_PROTECTION_MARKER_BYTES
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial(command_output_artifact)]
+async fn remint_protection_failure_cleans_target_and_preserves_source_for_retry() {
+    let temp = tempfile::tempdir().expect("artifact home");
+    let body = b"protection failure must not discard the source\n";
+    let source = create_canonical_output_artifact(
+        temp.path(),
+        "source",
+        &CanonicalToolResult::bytes(body.to_vec()),
+    )
+    .await;
+    assert!(source.complete);
+    let id = source.artifact_id().expect("source artifact ID");
+    let digest = format!("{:x}", Sha256::digest(body));
+    let target_path = temp
+        .path()
+        .join("tool-output/target")
+        .join(format!("{id}.log"));
+    tokio::fs::create_dir_all(target_path.parent().expect("target directory"))
+        .await
+        .expect("target directory");
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    set_reconciliation_barrier(&target_path, Arc::clone(&barrier));
+    let operation = tokio::spawn({
+        let home = temp.path().to_path_buf();
+        let id = id.clone();
+        let digest = digest.clone();
+        async move {
+            remint_tool_history_artifact_for_thread(
+                &home,
+                "source",
+                "target",
+                &id,
+                body.len() as u64,
+                &digest,
+            )
+            .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(5), barrier.wait())
+        .await
+        .expect("normal target commit");
+    assert_eq!(
+        tokio::fs::read(&target_path)
+            .await
+            .expect("committed target"),
+        body
+    );
+    let marker = active_tool_history_protection_path(&target_path);
+    // Fault only the external filesystem after the normal target commit. The
+    // production protector must detect this invalid marker and trigger cleanup.
+    tokio::fs::write(&marker, b"invalid external marker")
+        .await
+        .expect("inject invalid marker");
+    barrier.wait().await;
+    let error = operation
+        .await
+        .expect("remint task")
+        .expect_err("invalid marker must fail protection");
+    assert!(
+        error.contains("failed to protect reminted artifact"),
+        "{error}"
+    );
+    assert!(error.contains("protection marker is invalid"), "{error}");
+    let mut entries = tokio::fs::read_dir(target_path.parent().expect("target directory"))
+        .await
+        .expect("target entries");
+    while let Some(entry) = entries.next_entry().await.expect("target entry") {
+        assert!(
+            !entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(&format!("{id}.")),
+            "failed remint retained {}",
+            entry.path().display()
+        );
+    }
+    assert_eq!(
+        tokio::fs::read(
+            temp.path()
+                .join("tool-output/source")
+                .join(format!("{id}.log"))
+        )
+        .await
+        .expect("source unaffected"),
+        body
+    );
+    assert_eq!(
+        remint_tool_history_artifact_for_thread(
+            temp.path(),
+            "source",
+            "target",
+            &id,
+            body.len() as u64,
+            &digest
+        )
+        .await
+        .expect("normal retry succeeds"),
+        id
+    );
+    assert_eq!(
+        tokio::fs::read(&target_path).await.expect("retry target"),
+        body
+    );
+    assert_eq!(
+        tokio::fs::read(&marker).await.expect("retry valid marker"),
+        ACTIVE_TOOL_HISTORY_PROTECTION_MARKER_BYTES
+    );
 }

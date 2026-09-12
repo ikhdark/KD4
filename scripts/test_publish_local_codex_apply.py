@@ -124,86 +124,96 @@ if (-not (Recover-CodexRuntimeBundleTransaction -JournalPath {ps_single_quote(jo
             self.assertFalse(stage.exists())
 
     def test_apply_replaces_target_and_writes_backup(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            temp_path = Path(temp_dir)
-            install_dir = temp_path / "install"
-            install_dir.mkdir()
-            fake_codex = self.copy_valid_codex(
-                temp_path / "fake-codex.exe",
-                timestamp=FRESH_SOURCE_TIME,
-                append_padding=True,
-            )
-            target = install_dir / "codex.exe"
-            target.write_bytes(b"previous-codex")
-            code_mode_host_target = install_dir / "codex-code-mode-host.exe"
-            previous_code_mode_host = b"previous-code-mode-host"
-            code_mode_host_target.write_bytes(previous_code_mode_host)
+        for output_args in ((), ("-Concise",), ("-Concise", "-Verbose")):
+            with self.subTest(output_args=output_args):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    temp_path = Path(temp_dir)
+                    install_dir = temp_path / "install"
+                    install_dir.mkdir()
+                    fake_codex = self.copy_valid_codex(
+                        temp_path / "fake-codex.exe",
+                        timestamp=FRESH_SOURCE_TIME,
+                        append_padding=True,
+                    )
+                    target = install_dir / "codex.exe"
+                    target.write_bytes(b"previous-codex")
+                    code_mode_host_target = install_dir / "codex-code-mode-host.exe"
+                    previous_code_mode_host = b"previous-code-mode-host"
+                    code_mode_host_target.write_bytes(previous_code_mode_host)
 
-            result = self.run_script(
-                "-SkipBuild",
-                "-SourceExe",
-                str(fake_codex),
-                "-InstallDir",
-                str(install_dir),
-            )
+                    result = self.run_script(
+                        *output_args,
+                        "-SkipBuild",
+                        "-SourceExe",
+                        str(fake_codex),
+                        "-InstallDir",
+                        str(install_dir),
+                    )
 
-            self.assertEqual(
-                result.returncode,
-                0,
-                f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
-            )
-            self.assertEqual(target.read_bytes(), fake_codex.read_bytes())
-            self.assertEqual(
-                code_mode_host_target.read_bytes(), self.source_code_mode_host_bytes
-            )
-            sandbox_resources = install_dir / "codex-resources"
-            windows_sandbox_setup_target = (
-                sandbox_resources / "codex-windows-sandbox-setup.exe"
-            )
-            command_runner_target = sandbox_resources / "codex-command-runner.exe"
-            self.assertEqual(
-                windows_sandbox_setup_target.read_bytes(),
-                self.source_windows_sandbox_setup_bytes,
-            )
-            self.assertEqual(
-                command_runner_target.read_bytes(), self.source_command_runner_bytes
-            )
-            backup_dir = install_dir.parent / "publisher-backups"
-            backups = sorted(backup_dir.glob("codex-2*.exe"))
-            self.assertEqual(len(backups), 1)
-            self.assertEqual(backups[0].read_bytes(), b"previous-codex")
-            code_mode_host_backups = sorted(
-                backup_dir.glob("codex-code-mode-host-*.exe")
-            )
-            self.assertEqual(len(code_mode_host_backups), 1)
-            self.assertEqual(
-                code_mode_host_backups[0].read_bytes(), previous_code_mode_host
-            )
-            previous_sha256 = hashlib.sha256(b"previous-codex").hexdigest()
-            previous_code_mode_host_sha256 = hashlib.sha256(
-                previous_code_mode_host
-            ).hexdigest()
-            self.assertIn("targetSha256:", result.stdout)
-            self.assertIn(f"backupSha256: {previous_sha256}", result.stdout)
-            self.assertIn("codeModeHostTargetSha256:", result.stdout)
-            self.assertIn(
-                f"codeModeHostBackupSha256: {previous_code_mode_host_sha256}",
-                result.stdout,
-            )
-            self.assertIn("backupPath:", result.stdout)
-            self.assertIn("codeModeHostBackupPath:", result.stdout)
-            self.assertIn("postPublishVerify: version ok", result.stdout)
-            self.assertIn("codexPostPublishVerify: sha256 ok", result.stdout)
-            self.assertIn("codeModeHostPostPublishVerify: sha256 ok", result.stdout)
-            self.assertIn(
-                "windowsSandboxSetupPostPublishVerify: sha256 ok", result.stdout
-            )
-            self.assertIn("commandRunnerPostPublishVerify: sha256 ok", result.stdout)
-            self.assertRegex(
-                result.stdout,
-                r"targetBeforeVersion: <unavailable: [^\r\n]+>[\r\n]",
-            )
-            self.assert_no_publish_temps(install_dir)
+                    self.assertEqual(
+                        result.returncode,
+                        0,
+                        f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+                    )
+                    self.assertEqual(target.read_bytes(), fake_codex.read_bytes())
+                    self.assertEqual(
+                        code_mode_host_target.read_bytes(), self.source_code_mode_host_bytes
+                    )
+                    sandbox_resources = install_dir / "codex-resources"
+                    windows_sandbox_setup_target = (
+                        sandbox_resources / "codex-windows-sandbox-setup.exe"
+                    )
+                    command_runner_target = sandbox_resources / "codex-command-runner.exe"
+                    self.assertEqual(
+                        windows_sandbox_setup_target.read_bytes(),
+                        self.source_windows_sandbox_setup_bytes,
+                    )
+                    self.assertEqual(
+                        command_runner_target.read_bytes(), self.source_command_runner_bytes
+                    )
+                    backup_dir = install_dir.parent / "publisher-backups"
+                    backups = sorted(backup_dir.glob("codex-2*.exe"))
+                    self.assertEqual(len(backups), 1)
+                    self.assertEqual(backups[0].read_bytes(), b"previous-codex")
+                    code_mode_host_backups = sorted(
+                        backup_dir.glob("codex-code-mode-host-*.exe")
+                    )
+                    self.assertEqual(len(code_mode_host_backups), 1)
+                    self.assertEqual(
+                        code_mode_host_backups[0].read_bytes(), previous_code_mode_host
+                    )
+                    previous_sha256 = hashlib.sha256(b"previous-codex").hexdigest()
+                    previous_code_mode_host_sha256 = hashlib.sha256(
+                        previous_code_mode_host
+                    ).hexdigest()
+                    self.assertIn("publishCommitted: true", result.stdout)
+                    if output_args == ("-Concise",):
+                        self.assertNotIn("targetSha256:", result.stdout)
+                        self.assertNotIn("backupPath:", result.stdout)
+                        self.assertNotIn("desktopAppPackage:", result.stdout)
+                        self.assertLessEqual(len(result.stdout.splitlines()), 12, result.stdout)
+                    else:
+                        self.assertIn("targetSha256:", result.stdout)
+                        self.assertIn(f"backupSha256: {previous_sha256}", result.stdout)
+                        self.assertIn("codeModeHostTargetSha256:", result.stdout)
+                        self.assertIn(
+                            f"codeModeHostBackupSha256: {previous_code_mode_host_sha256}",
+                            result.stdout,
+                        )
+                        self.assertIn("backupPath:", result.stdout)
+                        self.assertIn("codeModeHostBackupPath:", result.stdout)
+                        self.assertIn("postPublishVerify: version ok", result.stdout)
+                        self.assertIn("codexPostPublishVerify: sha256 ok", result.stdout)
+                        self.assertIn("codeModeHostPostPublishVerify: sha256 ok", result.stdout)
+                        self.assertIn(
+                            "windowsSandboxSetupPostPublishVerify: sha256 ok", result.stdout
+                        )
+                        self.assertIn("commandRunnerPostPublishVerify: sha256 ok", result.stdout)
+                        self.assertRegex(
+                            result.stdout,
+                            r"targetBeforeVersion: <unavailable: [^\r\n]+>[\r\n]",
+                        )
+                    self.assert_no_publish_temps(install_dir)
 
     def test_apply_prunes_old_publish_backups(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -298,6 +308,7 @@ if (-not (Recover-CodexRuntimeBundleTransaction -JournalPath {ps_single_quote(jo
             code_mode_host_target.write_bytes(previous_code_mode_host)
 
             result = self.run_script(
+                "-Concise",
                 "-SkipBuild",
                 "-SourceExe",
                 str(fake_codex),
@@ -306,6 +317,7 @@ if (-not (Recover-CodexRuntimeBundleTransaction -JournalPath {ps_single_quote(jo
             )
 
             self.assertNotEqual(result.returncode, 0)
+            self.assertNotIn("publishCommitted: true", result.stdout)
             self.assertEqual(target.read_bytes(), previous)
             self.assertEqual(
                 code_mode_host_target.read_bytes(), previous_code_mode_host

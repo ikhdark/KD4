@@ -31,7 +31,7 @@ Network access JSON:
       "curl",
       "https://example.com"
     ],
-    "cwd": "/repo",
+    "cwd": "file:///repo",
     "justification": "Fetch the release metadata.",
     "sandboxPermissions": "use_default",
     "toolName": "shell"

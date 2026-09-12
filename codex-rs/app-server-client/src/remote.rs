@@ -697,26 +697,39 @@ impl RemoteAppServerClient {
         let mut worker_handle = worker_handle;
         drop(event_rx);
         let (response_tx, response_rx) = oneshot::channel();
-        if command_tx
-            .send(RemoteClientCommand::Shutdown { response_tx })
-            .await
-            .is_ok()
-            && let Ok(Ok(close_result)) = timeout(SHUTDOWN_TIMEOUT, response_rx).await
-        {
-            close_result?;
+        // Queue admission can block behind a stalled socket write, so it must
+        // share the same deadline as the close acknowledgement and worker exit.
+        let shutdown_result = timeout(SHUTDOWN_TIMEOUT, async {
+            let close_result = if command_tx
+                .send(RemoteClientCommand::Shutdown { response_tx })
+                .await
+                .is_ok()
+            {
+                match response_rx.await {
+                    Ok(result) => result,
+                    Err(_) => Ok(()),
+                }
+            } else {
+                Ok(())
+            };
+            let _ = (&mut worker_handle).await;
+            close_result
+        })
+        .await;
+        match shutdown_result {
+            Ok(result) => result,
+            Err(_elapsed) => {
+                worker_handle.abort();
+                let _ = worker_handle.await;
+                Ok(())
+            }
         }
-
-        if let Err(_elapsed) = timeout(SHUTDOWN_TIMEOUT, &mut worker_handle).await {
-            worker_handle.abort();
-            let _ = worker_handle.await;
-        }
-        Ok(())
     }
 }
 
 impl RemoteAppServerRequestHandle {
     pub async fn request(&self, request: ClientRequest) -> IoResult<RequestResult> {
-        self.request_json_rpc(jsonrpc_request_from_client_request(request))
+        self.request_json_rpc(jsonrpc_request_from_client_request(request)?)
             .await
     }
 
@@ -799,10 +812,14 @@ async fn connect_websocket_endpoint(
         request.headers_mut().insert(AUTHORIZATION, header_value);
     }
 
-    ensure_rustls_crypto_provider();
-    let connector = maybe_build_rustls_client_config_with_custom_ca()
-        .map_err(IoError::from)?
-        .map(Connector::Rustls);
+    let connector = tokio::task::spawn_blocking(|| {
+        ensure_rustls_crypto_provider();
+        maybe_build_rustls_client_config_with_custom_ca()
+            .map_err(IoError::from)
+            .map(|config| config.map(Connector::Rustls))
+    })
+    .await
+    .map_err(|error| IoError::other(format!("remote TLS configuration task failed: {error}")))??;
     let websocket_config = remote_websocket_config();
     let stream = timeout(
         CONNECT_TIMEOUT,
@@ -893,22 +910,22 @@ async fn initialize_remote_connection<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let initialize_request_id = RequestId::String("initialize".to_string());
-    let mut pending_events = Vec::new();
-    let mut initialize_response = None;
-    write_jsonrpc_message(
-        stream,
-        JSONRPCMessage::Request(jsonrpc_request_from_client_request(
-            ClientRequest::Initialize {
-                request_id: initialize_request_id.clone(),
-                params,
-            },
-        )),
-        endpoint,
-    )
-    .await?;
-
     timeout(initialize_timeout, async {
+        let initialize_request_id = RequestId::String("initialize".to_string());
+        let mut pending_events = Vec::new();
+        let mut initialize_response = None;
+        write_jsonrpc_message(
+            stream,
+            JSONRPCMessage::Request(jsonrpc_request_from_client_request(
+                ClientRequest::Initialize {
+                    request_id: initialize_request_id.clone(),
+                    params,
+                },
+            )?),
+            endpoint,
+        )
+        .await?;
+
         loop {
             match stream.next().await {
                 Some(Ok(Message::Text(text))) => {
@@ -1006,29 +1023,29 @@ where
                     ));
                 }
             }
-        }
+        }?;
+
+        write_jsonrpc_message(
+            stream,
+            JSONRPCMessage::Notification(jsonrpc_notification_from_client_notification(
+                ClientNotification::Initialized,
+            )),
+            endpoint,
+        )
+        .await?;
+
+        let initialize_response = initialize_response.ok_or_else(|| {
+            IoError::new(ErrorKind::InvalidData, "missing remote initialize response")
+        })?;
+        Ok((pending_events, initialize_response))
     })
     .await
     .map_err(|_| {
         IoError::new(
             ErrorKind::TimedOut,
-            format!("timed out waiting for initialize response from `{endpoint}`"),
+            format!("timed out initializing remote app server at `{endpoint}`"),
         )
-    })??;
-
-    write_jsonrpc_message(
-        stream,
-        JSONRPCMessage::Notification(jsonrpc_notification_from_client_notification(
-            ClientNotification::Initialized,
-        )),
-        endpoint,
-    )
-    .await?;
-
-    let initialize_response = initialize_response.ok_or_else(|| {
-        IoError::new(ErrorKind::InvalidData, "missing remote initialize response")
-    })?;
-    Ok((pending_events, initialize_response))
+    })?
 }
 
 fn app_server_event_from_notification(notification: JSONRPCNotification) -> Option<AppServerEvent> {
@@ -1128,11 +1145,9 @@ async fn deliver_event(
     Ok(())
 }
 
-fn jsonrpc_request_from_client_request(request: ClientRequest) -> JSONRPCRequest {
-    match JSONRPCRequest::try_from(request) {
-        Ok(request) => request,
-        Err(err) => panic!("client request should encode as JSON-RPC request: {err}"),
-    }
+fn jsonrpc_request_from_client_request(request: ClientRequest) -> IoResult<JSONRPCRequest> {
+    JSONRPCRequest::try_from(request)
+        .map_err(|err| IoError::new(ErrorKind::InvalidInput, err))
 }
 
 fn jsonrpc_notification_from_client_notification(
@@ -1177,6 +1192,151 @@ fn websocket_close_error_is_already_closed(err: &TungsteniteError) -> bool {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn remote_startup_deadline_covers_blocked_initialize_write() {
+        use tokio::io::AsyncReadExt;
+        use tokio_tungstenite::tungstenite::protocol::Role;
+
+        let (transport, mut peer) = tokio::io::duplex(8);
+        let stream = WebSocketStream::from_raw_socket(transport, Role::Client, None).await;
+        let result = timeout(
+            INITIALIZE_TIMEOUT + Duration::from_secs(2),
+            RemoteAppServerClient::connect_with_stream(
+                1,
+                "blocked-peer".to_owned(),
+                stream,
+                crate::initialize_params("test", "1", false, false, &[]),
+            ),
+        )
+        .await
+        .expect("the connection deadline must include writing initialize");
+        let error = result.err().expect("an unread peer must time out");
+        assert_eq!(error.kind(), ErrorKind::TimedOut);
+        let mut partial_request = Vec::new();
+        timeout(
+            Duration::from_secs(1),
+            peer.read_to_end(&mut partial_request),
+        )
+        .await
+        .expect("failed initialization must close its transport")
+        .expect("read partial request before EOF");
+        assert!(
+            !partial_request.is_empty(),
+            "the real initialize write must start"
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_shutdown_deadline_covers_full_queue_and_reaps_worker() {
+        use tokio::io::AsyncReadExt;
+        use tokio_tungstenite::tungstenite::protocol::Role;
+
+        let (transport, peer) = tokio::io::duplex(1024);
+        let stream = WebSocketStream::from_raw_socket(transport, Role::Client, None).await;
+        let mut peer = WebSocketStream::from_raw_socket(peer, Role::Server, None).await;
+        let peer_initialize = async {
+            let message = peer
+                .next()
+                .await
+                .expect("initialize frame")
+                .expect("valid frame");
+            let JSONRPCMessage::Request(request) =
+                serde_json::from_str(&message.into_text().expect("text frame")).expect("request")
+            else {
+                panic!("expected initialize request");
+            };
+            assert_eq!(request.method, "initialize");
+            peer.send(Message::Text(
+                serde_json::to_string(&JSONRPCMessage::Response(JSONRPCResponse {
+                    id: request.id,
+                    result: serde_json::json!({ "userAgent": "test/1" }),
+                }))
+                .expect("response JSON")
+                .into(),
+            ))
+            .await
+            .expect("initialize response");
+            let initialized = peer
+                .next()
+                .await
+                .expect("initialized frame")
+                .expect("valid frame");
+            let JSONRPCMessage::Notification(notification) =
+                serde_json::from_str(&initialized.into_text().expect("text frame"))
+                    .expect("initialized notification")
+            else {
+                panic!("expected initialized notification");
+            };
+            assert_eq!(notification.method, "initialized");
+            peer
+        };
+        let (client, mut peer) = tokio::join!(
+            RemoteAppServerClient::connect_with_stream(
+                1,
+                "blocked-peer".to_owned(),
+                stream,
+                crate::initialize_params("test", "1", false, false, &[]),
+            ),
+            peer_initialize,
+        );
+        let client = client.expect("initialize real remote worker");
+        let worker = client.worker_handle.abort_handle();
+        let first_handle = client.request_handle();
+        let first = tokio::spawn(async move {
+            first_handle
+                .request_json_rpc(JSONRPCRequest {
+                    id: RequestId::Integer(1),
+                    method: "test/blocked".to_owned(),
+                    params: Some(serde_json::json!({ "payload": "x".repeat(4096) })),
+                    trace: None,
+                })
+                .await
+        });
+        // Seeing the frame begin proves the normal worker consumed the first
+        // command and is blocked writing its remaining bytes to the full pipe.
+        peer.get_mut()
+            .read_exact(&mut [0_u8; 1])
+            .await
+            .expect("request write begins");
+        let second_handle = client.request_handle();
+        let second = tokio::spawn(async move {
+            second_handle
+                .request_json_rpc(JSONRPCRequest {
+                    id: RequestId::Integer(2),
+                    method: "test/queued".to_owned(),
+                    params: None,
+                    trace: None,
+                })
+                .await
+        });
+        timeout(Duration::from_secs(1), async {
+            while client.command_tx.capacity() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("second request fills the command queue");
+
+        let shutdown = timeout(SHUTDOWN_TIMEOUT + Duration::from_secs(2), client.shutdown()).await;
+        if shutdown.is_err() {
+            worker.abort();
+        }
+        shutdown
+            .expect("shutdown deadline must include queue admission")
+            .expect("shutdown");
+        assert!(
+            worker.is_finished(),
+            "shutdown must reap its blocked worker"
+        );
+        for request in [first, second] {
+            let error = request
+                .await
+                .expect("request task")
+                .expect_err("pending request must fail");
+            assert_eq!(error.kind(), ErrorKind::BrokenPipe);
+        }
+    }
+
     #[test]
     fn cancelled_remote_request_is_abandoned_before_dispatch() {
         let (response_tx, response_rx) = oneshot::channel();
@@ -1189,7 +1349,7 @@ mod tests {
                         refresh_token: false,
                     },
                 },
-            )),
+            ).expect("account request encodes")),
             response_tx,
         };
 
@@ -1203,7 +1363,7 @@ mod tests {
             params: codex_app_server_protocol::GetAccountParams {
                 refresh_token: true,
             },
-        });
+        }).expect("account request encodes");
         assert_eq!(request.method, "account/read");
         assert_eq!(request.id, RequestId::Integer(7));
         assert_eq!(

@@ -46,8 +46,12 @@ pub struct PastedImageInfo {
     pub encoded_format: EncodedImageFormat, // Always PNG for now.
 }
 
-/// Capture image from system clipboard, encode to PNG, and return bytes + info.
-pub fn paste_image_as_png() -> Result<(Vec<u8>, PastedImageInfo), PasteImageError> {
+#[cfg(test)]
+pub(crate) type ClipboardImageReader =
+    Box<dyn FnOnce() -> Result<image::DynamicImage, PasteImageError> + Send>;
+
+/// Read the system clipboard. Its platform APIs are called only in the image-paste worker.
+fn read_clipboard_image() -> Result<image::DynamicImage, PasteImageError> {
     let _span = tracing::debug_span!("paste_image_as_png").entered();
     tracing::debug!("attempting clipboard image read");
     let mut cb = arboard::Clipboard::new()
@@ -86,6 +90,12 @@ pub fn paste_image_as_png() -> Result<(Vec<u8>, PastedImageInfo), PasteImageErro
         image::DynamicImage::ImageRgba8(rgba_img)
     };
 
+    Ok(dyn_img)
+}
+
+fn encode_image_as_png(
+    dyn_img: image::DynamicImage,
+) -> Result<(Vec<u8>, PastedImageInfo), PasteImageError> {
     let mut png: Vec<u8> = Vec::new();
     {
         let span =
@@ -107,27 +117,41 @@ pub fn paste_image_as_png() -> Result<(Vec<u8>, PastedImageInfo), PasteImageErro
     ))
 }
 
-/// Convenience: write to a temp file and return its path + info.
-pub fn paste_image_to_temp_png() -> Result<(PathBuf, PastedImageInfo), PasteImageError> {
-    // First attempt: read image from system clipboard via arboard (native paths or image data).
-    match paste_image_as_png() {
-        Ok((png, info)) => {
-            // Create a unique temporary file with a .png suffix to avoid collisions.
-            let tmp = Builder::new()
-                .prefix("codex-clipboard-")
-                .suffix(".png")
-                .tempfile()
-                .map_err(|e| PasteImageError::IoError(e.to_string()))?;
-            std::fs::write(tmp.path(), &png)
-                .map_err(|e| PasteImageError::IoError(e.to_string()))?;
-            // Persist the file (so it remains after the handle is dropped) and return its PathBuf.
-            let (_file, path) = tmp
-                .keep()
-                .map_err(|e| PasteImageError::IoError(e.error.to_string()))?;
-            Ok((path, info))
-        }
-        Err(e) => Err(e),
-    }
+/// Read, encode and persist on a blocking worker, retaining cancellation cleanup until attachment.
+pub(crate) async fn paste_image_to_temp_png(
+    #[cfg(test)] reader: Option<ClipboardImageReader>,
+    #[cfg(test)] directory: Option<PathBuf>,
+) -> Result<(tempfile::TempPath, PastedImageInfo), PasteImageError> {
+    tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        let image = match reader {
+            Some(read) => read()?,
+            None => read_clipboard_image()?,
+        };
+        #[cfg(not(test))]
+        let image = read_clipboard_image()?;
+        let (png, info) = encode_image_as_png(image)?;
+        let mut builder = Builder::new();
+        builder.prefix("codex-clipboard-").suffix(".png");
+        #[cfg(test)]
+        let tmp = match directory {
+            Some(directory) => builder.tempfile_in(directory),
+            None => builder.tempfile(),
+        };
+        #[cfg(not(test))]
+        let tmp = builder.tempfile();
+        let tmp = tmp.map_err(|e| PasteImageError::IoError(e.to_string()))?;
+        std::fs::write(tmp.path(), &png).map_err(|e| PasteImageError::IoError(e.to_string()))?;
+        // Prepare a cleanup owner before keep() so even a cancelled caller leaves no orphan.
+        let cleanup = tempfile::TempPath::try_from_path(tmp.path().to_path_buf())
+            .map_err(|e| PasteImageError::IoError(e.to_string()))?;
+        let (_file, _path) = tmp
+            .keep()
+            .map_err(|e| PasteImageError::IoError(e.error.to_string()))?;
+        Ok((cleanup, info))
+    })
+    .await
+    .map_err(|e| PasteImageError::IoError(format!("clipboard image worker failed: {e}")))?
 }
 
 /// Normalize pasted text for a single-line search query.
@@ -150,7 +174,7 @@ pub fn normalize_pasted_path(pasted: &str) -> Option<PathBuf> {
         .or_else(|| pasted.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
         .unwrap_or(pasted);
 
-    // file:// URL → filesystem path
+    // file:// URL â†’ filesystem path
     if let Ok(url) = url::Url::parse(unquoted)
         && url.scheme() == "file"
     {
@@ -164,7 +188,7 @@ pub fn normalize_pasted_path(pasted: &str) -> Option<PathBuf> {
         return Some(path);
     }
 
-    // shell-escaped single path → unescaped
+    // shell-escaped single path â†’ unescaped
     let parts: Vec<String> = shlex::Shlex::new(pasted).collect();
     if parts.len() == 1 {
         let part = parts.into_iter().next()?;
@@ -261,7 +285,7 @@ mod pasted_paths_tests {
 
     #[test]
     fn normalize_multiple_tokens_returns_none() {
-        // Two tokens after shell splitting → not a single path
+        // Two tokens after shell splitting â†’ not a single path
         let input = "/home/user/a\\ b.png /home/user/c.png";
         let result = normalize_pasted_path(input);
         assert!(result.is_none());

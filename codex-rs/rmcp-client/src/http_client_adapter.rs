@@ -141,7 +141,7 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
             .http_request_stream(HttpRequestParams {
                 method: "POST".to_string(),
                 url: uri.to_string(),
-                headers: protocol_headers(&headers),
+                headers: protocol_headers(&headers)?,
                 body: Some(body.into()),
                 timeout_ms: None,
                 redirect_policy: HttpRedirectPolicy::Follow,
@@ -263,7 +263,7 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
             .http_request(HttpRequestParams {
                 method: "DELETE".to_string(),
                 url: uri.to_string(),
-                headers: protocol_headers(&headers),
+                headers: protocol_headers(&headers)?,
                 body: None,
                 timeout_ms: None,
                 redirect_policy: HttpRedirectPolicy::Follow,
@@ -334,7 +334,7 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
             .http_request_stream(HttpRequestParams {
                 method: "GET".to_string(),
                 url: uri.to_string(),
-                headers: protocol_headers(&headers),
+                headers: protocol_headers(&headers)?,
                 body: None,
                 timeout_ms: None,
                 redirect_policy: HttpRedirectPolicy::Follow,
@@ -482,13 +482,20 @@ fn is_streamable_http_content_type(content_type: &str) -> bool {
             .starts_with(JSON_MIME_TYPE.as_bytes())
 }
 
-fn protocol_headers(headers: &HeaderMap) -> Vec<HttpHeader> {
+fn protocol_headers(
+    headers: &HeaderMap,
+) -> Result<Vec<HttpHeader>, StreamableHttpError<StreamableHttpClientAdapterError>> {
     headers
         .iter()
-        .filter_map(|(name, value)| {
-            Some(HttpHeader {
+        .map(|(name, value)| {
+            let value = value.to_str().map_err(|_| {
+                StreamableHttpError::Client(StreamableHttpClientAdapterError::Header(format!(
+                    "header `{name}` cannot be represented as an ASCII HTTP header"
+                )))
+            })?;
+            Ok(HttpHeader {
                 name: name.as_str().to_string(),
-                value: value.to_str().ok()?.to_string(),
+                value: value.to_string(),
             })
         })
         .collect()

@@ -361,6 +361,77 @@ async fn abort_all_tasks_clears_empty_active_turn() {
 }
 
 #[tokio::test]
+async fn admitted_task_start_retains_recovered_and_steering_input_in_order() {
+    let (session, turn_context, _events) = make_session_and_context_with_rx().await;
+    let input = |text: &str| {
+        TurnInput::ResponseItem(ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: text.to_string(),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        })
+    };
+    let recovered = input("accepted before startup");
+    let steering = input("accepted during taskless reservation");
+    session
+        .input_queue
+        .restore_transferred_startup_input(vec![recovered.clone()])
+        .await;
+    let turn = ActiveTurn::default();
+    let turn_state = Arc::clone(&turn.turn_state);
+    session
+        .input_queue
+        .extend_pending_input_for_turn_state(turn_state.as_ref(), std::slice::from_ref(&steering))
+        .await
+        .expect("accept steering");
+    *session.active_turn.lock().await = Some(turn);
+    let permit = session
+        .task_start_gate
+        .acquire()
+        .await
+        .expect("task admission");
+    session
+        .start_task_with_admission(&permit, turn_context, Vec::new(), FenceBlockingTask)
+        .await
+        .expect("install admitted task");
+    drop(permit);
+
+    assert!(
+        session
+            .active_turn
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|turn| {
+                turn.task.is_some() && Arc::ptr_eq(&turn.turn_state, &turn_state)
+            })
+    );
+    assert_eq!(
+        session
+            .input_queue
+            .get_pending_input(&session.active_turn)
+            .await,
+        vec![recovered, steering]
+    );
+    assert!(
+        session
+            .input_queue
+            .get_pending_input(&session.active_turn)
+            .await
+            .is_empty()
+    );
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        session.abort_all_tasks(TurnAbortReason::Interrupted),
+    )
+    .await
+    .expect("installed task terminates");
+}
+
+#[tokio::test]
 async fn taskless_placeholder_cleanup_is_pointer_identity_guarded() {
     let (session, _turn_context, _rx) = make_session_and_context_with_rx().await;
     let first = ActiveTurn::default();

@@ -207,7 +207,58 @@ impl ChatWidget {
                 agents_states,
             }),
             item @ ThreadItem::SubAgentActivity { .. } => self.on_sub_agent_activity(item),
-            ThreadItem::DynamicToolCall { .. } => {}
+            ThreadItem::DynamicToolCall {
+                namespace,
+                tool,
+                status,
+                content_items,
+                success,
+                error,
+                ..
+            } => {
+                // A snapshot can contain an unfinished call without a result yet.
+                if !matches!(
+                    status,
+                    codex_app_server_protocol::DynamicToolCallStatus::InProgress
+                ) {
+                    self.flush_answer_stream_with_separator();
+                    let name = namespace
+                        .map_or_else(|| tool.clone(), |namespace| format!("{namespace}.{tool}"));
+                    let failed = matches!(
+                        status,
+                        codex_app_server_protocol::DynamicToolCallStatus::Failed
+                    ) || success == Some(false);
+                    let heading = if failed {
+                        format!("• Failed {name}").red()
+                    } else {
+                        format!("• Called {name}").green()
+                    };
+                    let mut lines = vec![Line::from(heading)];
+                    for content in content_items.unwrap_or_default() {
+                        match content {
+                            codex_app_server_protocol::DynamicToolCallOutputContentItem::InputText { text } => {
+                                lines.extend(text.lines().map(|line| Line::from(format!("  {line}"))));
+                            }
+                            codex_app_server_protocol::DynamicToolCallOutputContentItem::InputImage { .. } => {
+                                lines.push(Line::from("  [Image output]"));
+                            }
+                        }
+                    }
+                    if let Some(error) = error {
+                        lines.extend(
+                            format!("Error: {error}")
+                                .lines()
+                                .map(|line| Line::from(format!("  {line}").red())),
+                        );
+                    }
+                    self.add_to_history(history_cell::PrefixedWrappedHistoryCell::new(
+                        Text::from(lines),
+                        "",
+                        "",
+                    ));
+                    self.request_redraw();
+                }
+            }
             ThreadItem::Sleep { .. } => {}
         }
 

@@ -122,6 +122,17 @@ impl SessionRegistry {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) async fn process_for_test(&self, session_id: &str) -> ProcessHandler {
+        self.sessions
+            .lock()
+            .await
+            .get(session_id)
+            .expect("registered session")
+            .process
+            .clone()
+    }
+
     pub(crate) async fn shutdown(&self) {
         let sessions = std::mem::take(&mut *self.sessions.lock().await);
         for entry in sessions.into_values() {

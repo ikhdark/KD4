@@ -24,7 +24,6 @@ use std::time::UNIX_EPOCH;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::time::timeout;
-use uuid::Uuid;
 
 #[cfg(test)]
 pub(crate) mod test_observation {
@@ -749,47 +748,16 @@ async fn write_record(
 }
 
 async fn atomic_write(path: &Path, bytes: &[u8]) -> Option<()> {
-    let parent = path.parent()?;
-    tokio::fs::create_dir_all(parent).await.ok()?;
-    let temporary = parent.join(format!(".{}.tmp", Uuid::new_v4()));
-    let mut file = tokio::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary)
+    let path = path.to_path_buf();
+    let bytes = bytes.to_vec();
+    // The shared writer replaces the destination in one operation. Keeping the
+    // prior canonical entry in place avoids a second fallible rollback rename.
+    tokio::task::spawn_blocking(move || codex_file_system::write_bytes_atomically(&path, &bytes))
         .await
-        .ok()?;
-    if file.write_all(bytes).await.is_err() || file.sync_all().await.is_err() {
-        let _ = tokio::fs::remove_file(&temporary).await;
-        return None;
-    }
-    drop(file);
-    if tokio::fs::rename(&temporary, path).await.is_err() {
-        // Windows does not replace an existing destination with `rename`. Move
-        // the old record aside first, but keep it until the new record is in
-        // place so an interrupted or failed replacement cannot destroy the
-        // last valid cache entry.
-        let backup = parent.join(format!(".{}.backup", Uuid::new_v4()));
-        let had_previous = match tokio::fs::rename(path, &backup).await {
-            Ok(()) => true,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
-            Err(_) => {
-                let _ = tokio::fs::remove_file(&temporary).await;
-                return None;
-            }
-        };
-        if tokio::fs::rename(&temporary, path).await.is_err() {
-            if had_previous {
-                let _ = tokio::fs::rename(&backup, path).await;
-            }
-            let _ = tokio::fs::remove_file(&temporary).await;
-            return None;
-        }
-        if had_previous {
-            let _ = tokio::fs::remove_file(&backup).await;
-        }
-    }
-    Some(())
+        .ok()?
+        .ok()
 }
+
 
 #[derive(Clone, Copy, Default)]
 struct QuarantineFaults {
@@ -1077,6 +1045,101 @@ mod tests {
             )
             .await,
             Observation::PersistenceFailed
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn failed_evidence_replacement_preserves_canonical_entry_and_retries() {
+        let home = TempDir::new().expect("cache home");
+        let id = identity("project", "readonly-lineage", "readonly-fingerprint");
+        assert_eq!(
+            record_success(
+                home.path(),
+                &id,
+                None,
+                b"immutable output",
+                Duration::from_secs(1)
+            )
+            .await,
+            Observation::Published,
+        );
+        let candidate = lookup(home.path(), &id).await.expect("initial evidence");
+        assert!(!candidate.reusable());
+        let path = evidence_path(home.path(), &id);
+        let previous_bytes = tokio::fs::read(&path).await.expect("initial record bytes");
+        let original_permissions = std::fs::metadata(&path)
+            .expect("record metadata")
+            .permissions();
+        let mut readonly = original_permissions.clone();
+        readonly.set_readonly(true);
+        std::fs::set_permissions(&path, readonly).expect("make replacement unavailable");
+
+        let failed = record_success(
+            home.path(),
+            &id,
+            Some(&candidate),
+            b"immutable output",
+            Duration::from_secs(1),
+        )
+        .await;
+        // Restore attributes before assertions so a regression can still clean
+        // the temporary test home and report the original behavior failure.
+        std::fs::set_permissions(&path, original_permissions).expect("restore record permissions");
+        assert_eq!(failed, Observation::PersistenceFailed);
+        assert_eq!(
+            tokio::fs::read(&path)
+                .await
+                .expect("prior canonical record remains"),
+            previous_bytes
+        );
+        let retained = lookup(home.path(), &id)
+            .await
+            .expect("prior evidence stays accessible");
+        assert_eq!(retained.output, b"immutable output");
+        assert!(
+            !retained.reusable(),
+            "failed publication must not promote reuse"
+        );
+        let entries = std::fs::read_dir(path.parent().expect("evidence directory"))
+            .expect("read evidence directory")
+            .map(|entry| entry.expect("evidence entry").path())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            entries,
+            vec![path.clone()],
+            "failed replacement leaves no recovery-only backup"
+        );
+
+        let retried = test_observation::with_profitability_costs(
+            record_success(
+                home.path(),
+                &id,
+                Some(&retained),
+                b"immutable output",
+                Duration::from_secs(1),
+            ),
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+            Duration::from_millis(10),
+        )
+        .await;
+        assert_eq!(
+            retried,
+            Observation::Unchanged {
+                reuse_enabled: true
+            }
+        );
+        let updated = lookup(home.path(), &id)
+            .await
+            .expect("repaired publication is readable");
+        assert!(updated.reusable());
+        assert_eq!(updated.output, b"immutable output");
+        assert_ne!(
+            tokio::fs::read(path)
+                .await
+                .expect("promoted evidence bytes"),
+            previous_bytes
         );
     }
 

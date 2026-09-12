@@ -634,6 +634,71 @@ fn config_with_pre_tool_use_hook(command: &str) -> TomlValue {
     .expect("config TOML should deserialize")
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn cancelling_registered_hook_terminates_descendants() {
+    use std::time::Duration;
+
+    let temp = tempdir().expect("create temp dir");
+    let config_path =
+        AbsolutePathBuf::try_from(temp.path().join("config.toml")).expect("absolute config path");
+    let stack = ConfigLayerStack::new(
+        vec![ConfigLayerEntry::new(
+            ConfigLayerSource::User {
+                file: config_path,
+                profile: None,
+            },
+            config_with_pre_tool_use_hook(
+                "(printf ready > started; sleep 2; printf escaped > escaped) & exit 0",
+            ),
+        )],
+        ConfigRequirements::default(),
+        ConfigRequirementsToml::default(),
+    )
+    .expect("config layer stack");
+    let hooks = crate::Hooks::new(crate::HooksConfig {
+        feature_enabled: true,
+        bypass_hook_trust: true,
+        config_layer_stack: Some(stack),
+        shell_program: Some("/bin/sh".to_string()),
+        shell_args: vec!["-c".to_string()],
+        ..Default::default()
+    });
+    let mut run = Box::pin(hooks.run_pre_tool_use(PreToolUseRequest {
+        session_id: ThreadId::new(),
+        turn_id: "cancelled-turn".to_string(),
+        subagent: None,
+        cwd: AbsolutePathBuf::try_from(temp.path().to_path_buf()).expect("absolute cwd"),
+        transcript_path: None,
+        model: "gpt-test".to_string(),
+        permission_mode: "default".to_string(),
+        tool_name: "Bash".to_string(),
+        matcher_aliases: Vec::new(),
+        tool_use_id: "cancelled-tool".to_string(),
+        tool_input: serde_json::json!({ "command": "echo hello" }),
+    }));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            tokio::select! {
+                outcome = &mut run => panic!("hook completed before cancellation: {outcome:?}"),
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {
+                    if temp.path().join("started").exists() {
+                        break;
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .expect("registered hook descendant should start");
+    drop(run);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(
+        !temp.path().join("escaped").exists(),
+        "a descendant survived cancellation of the registered hook"
+    );
+}
+
 fn trusted_plugin_hook_stack(
     config_path: AbsolutePathBuf,
     plugin_hook_sources: &[PluginHookSource],

@@ -1069,11 +1069,72 @@ async fn restore_thread_input_state_syncs_sleep_inhibitor_state() {
     assert!(chat.turn_lifecycle.sleep_inhibitor.is_turn_running());
     assert!(chat.bottom_pane.is_task_running());
 
+    #[cfg(windows)]
+    let request_handle = {
+        use windows_sys::Win32::Foundation::GetHandleInformation;
+        use windows_sys::Win32::System::Power::PowerClearRequest;
+        use windows_sys::Win32::System::Power::PowerRequestSystemRequired;
+        use windows_sys::Win32::System::Power::PowerSetRequest;
+
+        let handle = chat
+            .turn_lifecycle
+            .sleep_inhibitor
+            .request_handle_for_test()
+            .expect("normal restored active turn acquires a native power request");
+        let mut flags = 0;
+        // SAFETY: the normal ChatWidget lifecycle still owns this live handle.
+        assert_ne!(unsafe { GetHandleInformation(handle, &mut flags) }, 0);
+        // Read the native request's reference count by removing exactly the
+        // request registered by production. A never-set or double-set request
+        // fails these independent native assertions. Restore it immediately so
+        // normal lifecycle Drop remains responsible for release and close.
+        // SAFETY: handle remains owned and SystemRequired is its request type.
+        assert_ne!(
+            unsafe { PowerClearRequest(handle, PowerRequestSystemRequired) },
+            0,
+            "production must register a real SystemRequired request"
+        );
+        // SAFETY: testing the same valid handle with no remaining request.
+        assert_eq!(
+            unsafe { PowerClearRequest(handle, PowerRequestSystemRequired) },
+            0,
+            "one active turn must register exactly one native request"
+        );
+        // SAFETY: restore the single request before the ordinary lifecycle releases it.
+        assert_ne!(
+            unsafe { PowerSetRequest(handle, PowerRequestSystemRequired) },
+            0
+        );
+        handle
+    };
+
     chat.restore_thread_input_state(/*input_state*/ None);
 
     assert!(!chat.turn_lifecycle.agent_turn_running);
     assert!(!chat.turn_lifecycle.sleep_inhibitor.is_turn_running());
     assert!(!chat.bottom_pane.is_task_running());
+    #[cfg(windows)]
+    {
+        assert!(
+            chat.turn_lifecycle
+                .sleep_inhibitor
+                .request_handle_for_test()
+                .is_none()
+        );
+        let mut flags = 0;
+        // SAFETY: GetHandleInformation validates a handle value without
+        // dereferencing it; the normal idle transition must have closed it.
+        assert_eq!(
+            unsafe {
+                windows_sys::Win32::Foundation::GetHandleInformation(request_handle, &mut flags)
+            },
+            0
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(windows_sys::Win32::Foundation::ERROR_INVALID_HANDLE as i32)
+        );
+    }
 }
 
 #[tokio::test]

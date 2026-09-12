@@ -152,6 +152,107 @@ async fn create_clean_git_repo() -> (TempDir, AbsolutePathBuf) {
 }
 
 #[tokio::test]
+#[cfg(windows)]
+async fn workspace_evidence_timeout_terminates_clean_filter_and_descendant() {
+    assert_workspace_evidence_cleans_filter_tree(false).await;
+}
+
+#[tokio::test]
+#[cfg(windows)]
+async fn workspace_evidence_cancellation_terminates_clean_filter_and_descendant() {
+    assert_workspace_evidence_cleans_filter_tree(true).await;
+}
+
+#[cfg(windows)]
+async fn assert_workspace_evidence_cleans_filter_tree(cancel_after_spawn: bool) {
+    let (_temp, repo) = create_clean_git_repo().await;
+    let before = capture_workspace_evidence_identity(repo.as_path())
+        .await
+        .expect("clean repository identity");
+    let head = run_git(repo.as_path(), &["rev-parse", "HEAD"]).await;
+    assert_eq!(
+        before.head_identity.as_deref(),
+        Some(String::from_utf8(head.stdout).unwrap().trim())
+    );
+    let helper = repo.join("clean-filter.ps1");
+    let pids = repo.join("filter-pids.txt");
+    let pids_literal = pids.display().to_string().replace('\'', "''");
+    std::fs::write(
+        &helper,
+        format!(
+            "$child = Start-Process powershell.exe -ArgumentList '-NoProfile', '-Command', 'Start-Sleep -Seconds 60' -WindowStyle Hidden -PassThru\n[IO.File]::WriteAllText('{pids_literal}', \"$PID $($child.Id)\")\nStart-Sleep -Seconds 60\n"
+        ),
+    )
+    .expect("write clean filter");
+    std::fs::write(repo.join(".gitattributes"), "README.md filter=blocked\n")
+        .expect("write filter attribute");
+    run_git(
+        repo.as_path(),
+        &[
+            "config",
+            "filter.blocked.clean",
+            &format!(
+                "powershell.exe -NoProfile -ExecutionPolicy Bypass -File '{}'",
+                helper.display().to_string().replace('\\', "/")
+            ),
+        ],
+    )
+    .await;
+    run_git(
+        repo.as_path(),
+        &["config", "filter.blocked.required", "true"],
+    )
+    .await;
+    // Git status can conclude different-sized files changed without cleaning;
+    // keep the length of the original "initial\n" to force content inspection.
+    std::fs::write(repo.join("README.md"), "changed\n").expect("edit tracked file");
+
+    let result = if cancel_after_spawn {
+        let operation = capture_workspace_evidence_identity(repo.as_path());
+        tokio::pin!(operation);
+        tokio::select! {
+            result = &mut operation => panic!("capture completed before cancellation: {result:?}"),
+            _ = async {
+                while !std::fs::read_to_string(&pids).is_ok_and(|contents| {
+                    contents.split_whitespace().filter_map(|pid| pid.parse::<u32>().ok()).count() == 2
+                }) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            } => {}
+        }
+        None
+    } else {
+        capture_workspace_evidence_identity(repo.as_path()).await
+    };
+    let ids = std::fs::read_to_string(&pids)
+        .expect("Git must launch the configured filter")
+        .split_whitespace()
+        .map(|pid| pid.parse::<u32>().expect("recorded process id").to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(ids.len(), 2);
+    let ids = ids.join(",");
+    let observed = Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-Command",
+            &format!("$live = @(Get-Process -Id {ids} -ErrorAction SilentlyContinue); $live | ForEach-Object {{ $_.Id }}; $live | Stop-Process -Force -ErrorAction SilentlyContinue"),
+        ])
+        .output()
+        .await
+        .expect("observe and clean up filter processes");
+    assert!(
+        result.is_none_or(|identity| identity.unavailable),
+        "incomplete status must not produce an available workspace identity"
+    );
+    assert!(observed.status.success());
+    assert!(
+        observed.stdout.is_empty(),
+        "workspace capture left filter processes alive: {}",
+        String::from_utf8_lossy(&observed.stdout)
+    );
+}
+
+#[tokio::test]
 async fn ordinary_workspace_identity_accepts_256_paths_and_rejects_257() {
     let (_temp, repo) = create_clean_git_repo().await;
     for index in 0..255 {
@@ -172,7 +273,103 @@ async fn ordinary_workspace_identity_accepts_256_paths_and_rejects_257() {
     assert!(
         capture_workspace_evidence_identity(repo.as_path())
             .await
+            .is_some_and(|identity| identity.unavailable)
+    );
+}
+
+#[tokio::test]
+async fn unavailable_workspace_capture_cannot_reuse_successful_tool_output() {
+    use crate::tool_history::ToolHistoryState;
+    use crate::tool_history::WorkspaceEvidenceObservation;
+    use codex_protocol::models::FunctionCallOutputPayload;
+    use codex_protocol::models::ResponseItem;
+
+    let (_temp, repo) = create_clean_git_repo().await;
+    let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
+    for index in 0..257 {
+        std::fs::write(
+            repo.join(format!("untracked-{index}.txt")),
+            "first contents",
+        )
+        .unwrap();
+    }
+    let before = cache.workspace_evidence_identity(repo.as_path()).await;
+    assert!(before.as_ref().is_some_and(|identity| identity.unavailable));
+    assert!(
+        cache
+            .latest_workspace_evidence_identity(repo.as_path())
+            .await
             .is_none()
+    );
+    let output = ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: "unavailable-repo".to_string(),
+        output: FunctionCallOutputPayload::from_text("first contents".to_string()),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let canonical: Arc<[ResponseItem]> = Arc::from([
+        ResponseItem::FunctionCall {
+            id: None,
+            name: "functions.exec".to_string(),
+            namespace: None,
+            arguments: "{}".to_string(),
+            call_id: "unavailable-repo".to_string(),
+            internal_chat_message_metadata_passthrough: None,
+        },
+        output.clone(),
+    ]);
+    std::fs::write(repo.join("untracked-0.txt"), "externally changed contents").unwrap();
+    let after = cache.workspace_evidence_identity(repo.as_path()).await;
+    assert!(after.as_ref().is_some_and(|identity| identity.unavailable));
+    // Cover both new explicit failures and old persisted None observations.
+    for captured in [before, None] {
+        let mut state = ToolHistoryState::default();
+        state.register_workspace_evidence(
+            WorkspaceEvidenceObservation::from_response_item(captured, &output, BTreeSet::new())
+                .unwrap(),
+        );
+        let restored: ToolHistoryState =
+            serde_json::from_value(serde_json::to_value(state).unwrap()).unwrap();
+        let projected =
+            restored.project_with_workspace_identity(Arc::clone(&canonical), after.as_ref());
+        let ResponseItem::FunctionCallOutput { output, .. } = &projected.items[1] else {
+            panic!("projected tool output");
+        };
+        let text = output.text_content().expect("text output");
+        assert!(text.contains("\"stale_workspace_evidence\":true"));
+        assert!(!text.contains("first contents"));
+    }
+}
+
+#[tokio::test]
+async fn workspace_discovery_distinguishes_non_git_from_failure() {
+    let temp = TempDir::new().unwrap();
+    let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
+    assert_eq!(capture_workspace_evidence_identity(temp.path()).await, None);
+    assert_eq!(cache.workspace_evidence_identity(temp.path()).await, None);
+    let missing = temp.path().join("missing-cwd");
+    assert!(
+        capture_workspace_evidence_identity(&missing)
+            .await
+            .is_some_and(|identity| identity.unavailable)
+    );
+    assert!(
+        cache
+            .workspace_evidence_identity(&missing)
+            .await
+            .is_some_and(|identity| identity.unavailable)
+    );
+    std::fs::write(temp.path().join(".git"), "gitdir: nonexistent-git-dir").unwrap();
+    assert!(
+        capture_workspace_evidence_identity(temp.path())
+            .await
+            .is_some_and(|identity| identity.unavailable)
+    );
+    assert!(
+        cache
+            .workspace_evidence_identity(temp.path())
+            .await
+            .is_some_and(|identity| identity.unavailable)
     );
 }
 
@@ -316,7 +513,9 @@ async fn failed_workspace_refresh_invalidates_the_latest_identity() {
         .await
         .expect("initial identity");
     assert_eq!(
-        cache.latest_workspace_evidence_identity(repo.as_path()),
+        cache
+            .latest_workspace_evidence_identity(repo.as_path())
+            .await,
         Some(identity)
     );
 
@@ -327,7 +526,9 @@ async fn failed_workspace_refresh_invalidates_the_latest_identity() {
         None
     );
     assert_eq!(
-        cache.latest_workspace_evidence_identity(repo.as_path()),
+        cache
+            .latest_workspace_evidence_identity(repo.as_path())
+            .await,
         None
     );
 }
@@ -814,21 +1015,22 @@ fn duplicate_repository_reads_file_state_hashes_the_already_opened_file() {
     let temp_dir = TempDir::new().expect("temp dir");
     let path = temp_dir.path().join("dependency");
     let moved = temp_dir.path().join("opened-dependency");
-    std::fs::write(&path, b"first").expect("write first file");
+    let original = b"first".repeat(8193);
+    std::fs::write(&path, &original).expect("write first file");
     let file = File::open(&path).expect("open first file");
     std::fs::rename(&path, &moved).expect("move opened file");
     std::fs::write(&path, b"replacement").expect("write replacement file");
 
     let state = file_dependency_state(file, true).expect("file state");
-    let expected_digest: [u8; 32] = Sha256::digest(b"first").into();
+    let expected_digest: [u8; 32] = Sha256::digest(&original).into();
 
     assert!(matches!(
         state,
         DependencyState::File {
-            len: 5,
+            len,
             digest: Some(digest),
             ..
-        } if digest == expected_digest
+        } if digest == expected_digest && len == original.len() as u64
     ));
 }
 
@@ -886,11 +1088,27 @@ async fn workspace_evidence_root_resolution_accepts_nested_working_directories()
     let nested = repo.join("nested").join("deeper");
     std::fs::create_dir_all(&nested).expect("create nested cwd");
 
-    let resolved = resolve_workspace_evidence_root(&nested)
+    let cache = GitWorkspaceCache::with_watcher(Some(Arc::new(FileWatcher::noop())));
+    let expected_root = dunce::canonicalize(repo.as_path()).expect("canonical fixture root");
+    let nested_identity = cache
+        .workspace_evidence_identity(&nested)
         .await
-        .expect("resolve repository root");
-
-    assert_eq!(resolved, canonical_workspace_evidence_root(repo.as_path()));
+        .expect("nested working directory belongs to the repository");
+    assert!(!nested_identity.unavailable);
+    assert_eq!(
+        nested_identity.repository_root.as_deref(),
+        Some(expected_root.to_string_lossy().as_ref()),
+    );
+    assert_eq!(
+        cache.workspace_evidence_identity(repo.as_path()).await,
+        Some(nested_identity.clone()),
+    );
+    std::fs::write(repo.join("README.md"), "nested-capture external edit\n")
+        .expect("edit tracked content");
+    let changed = cache.workspace_evidence_identity(&nested).await.expect("changed identity");
+    assert!(!changed.unavailable);
+    assert_eq!(changed.repository_root, nested_identity.repository_root);
+    assert_ne!(changed.worktree_identity, nested_identity.worktree_identity);
 }
 
 #[tokio::test]
@@ -923,7 +1141,7 @@ async fn concurrent_workspace_evidence_capture_coalesces_without_crossing_mutati
         .expect("same-epoch workspace evidence capture should join the in-flight capture");
     assert_eq!(cache.workspace_evidence_capture_count(), 1);
 
-    cache.note_host_workspace_mutation_paths(repo.as_path(), &["README.md".to_string()]);
+    cache.note_host_workspace_mutation_paths(repo.as_path(), &["README.md".to_string()]).await;
     let third_cache = Arc::clone(&cache);
     let third_repo = repo.clone();
     let third = tokio::spawn(async move {
@@ -1054,30 +1272,33 @@ async fn source_path_observation_ignores_unrelated_changes_and_fails_open() {
 
     let observation = cache
         .begin_source_path_change_observation(root.path(), &source, false)
+        .await
         .expect("path observation");
-    cache.note_host_workspace_mutation_paths(root.path(), &["README.md".to_string()]);
+    cache.note_host_workspace_mutation_paths(root.path(), &["README.md".to_string()]).await;
     assert!(cache.source_path_change_observation_is_current(&observation));
 
-    cache.note_host_workspace_mutation_paths(root.path(), &["src/lib.rs".to_string()]);
+    cache.note_host_workspace_mutation_paths(root.path(), &["src/lib.rs".to_string()]).await;
     assert!(!cache.source_path_change_observation_is_current(&observation));
 
     let uncertain = cache
         .begin_source_path_change_observation(root.path(), &source, false)
+        .await
         .expect("refreshed path observation");
     cache.note_host_workspace_mutation();
     assert!(!cache.source_path_change_observation_is_current(&uncertain));
 
     let overflowed = cache
         .begin_source_path_change_observation(root.path(), &source, false)
+        .await
         .expect("overflow path observation");
     for index in 0..=SOURCE_CHANGE_JOURNAL_CAPACITY {
-        cache.note_host_workspace_mutation_paths(root.path(), &[format!("unrelated/{index}.txt")]);
+        cache.note_host_workspace_mutation_paths(root.path(), &[format!("unrelated/{index}.txt")]).await;
     }
     assert!(!cache.source_path_change_observation_is_current(&overflowed));
 }
 
-#[test]
-fn source_path_freshness_uses_the_generation_index() {
+#[tokio::test]
+async fn source_path_freshness_uses_the_generation_index() {
     let root = TempDir::new().expect("source observation root");
     let source = root.path().join("src").join("lib.rs");
     std::fs::create_dir_all(source.parent().expect("source parent")).expect("create src");
@@ -1085,6 +1306,7 @@ fn source_path_freshness_uses_the_generation_index() {
     let cache = GitWorkspaceCache::with_watcher(Some(Arc::new(FileWatcher::noop())));
     let observation = cache
         .begin_source_path_change_observation(root.path(), &source, false)
+        .await
         .expect("path observation");
     let unrelated_paths = (0..1_024)
         .map(|index| root.path().join("unrelated").join(format!("{index}.txt")))
@@ -1096,14 +1318,15 @@ fn source_path_freshness_uses_the_generation_index() {
     assert!(cache.take_source_change_freshness_lookup_count_for_test() < 32);
 }
 
-#[test]
-fn repository_retention_eviction_invalidates_source_observation_and_cached_evidence() {
+#[tokio::test]
+async fn repository_retention_eviction_invalidates_source_observation_and_cached_evidence() {
     let root = TempDir::new().expect("repository retention root");
     let first_repo = root.path().join("repo-0");
     std::fs::create_dir(&first_repo).expect("create first repository");
     let cache = GitWorkspaceCache::with_watcher(Some(Arc::new(FileWatcher::noop())));
     let observation = cache
         .begin_source_path_change_observation(&first_repo, &first_repo, true)
+        .await
         .expect("first repository observation");
     {
         let mut retention = cache
@@ -1125,6 +1348,7 @@ fn repository_retention_eviction_invalidates_source_observation_and_cached_evide
         std::fs::create_dir(&repo).expect("create retained repository");
         cache
             .begin_source_path_change_observation(&repo, &repo, true)
+            .await
             .expect("retained repository observation");
     }
 
@@ -1142,17 +1366,18 @@ fn repository_retention_eviction_invalidates_source_observation_and_cached_evide
     );
 }
 
-#[test]
-fn recursive_source_path_observation_detects_descendant_changes() {
+#[tokio::test]
+async fn recursive_source_path_observation_detects_descendant_changes() {
     let root = TempDir::new().expect("source observation root");
     let source_root = root.path().join("src");
     std::fs::create_dir_all(&source_root).expect("create src");
     let cache = GitWorkspaceCache::with_watcher(Some(Arc::new(FileWatcher::noop())));
     let observation = cache
         .begin_source_path_change_observation(root.path(), &source_root, true)
+        .await
         .expect("recursive path observation");
 
-    cache.note_host_workspace_mutation_paths(root.path(), &["src/nested/lib.rs".to_string()]);
+    cache.note_host_workspace_mutation_paths(root.path(), &["src/nested/lib.rs".to_string()]).await;
 
     assert!(!cache.source_path_change_observation_is_current(&observation));
 }
@@ -1169,4 +1394,250 @@ fn path_relationships_preserve_case_on_case_sensitive_filesystems() {
         Path::new("repo/src/owner.rs"),
         false,
     ));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn host_path_mutation_worker_publishes_invalidation_after_caller_cancellation() {
+    let root = TempDir::new().expect("mutation root");
+    let source = root.path().join("source.txt");
+    let unrelated = root.path().join("unrelated.txt");
+    std::fs::write(&source, "before").expect("initial source");
+    std::fs::write(&unrelated, "unchanged").expect("unrelated source");
+    // The external watcher is quiet so only the normal host mutation API can
+    // invalidate these real filesystem paths.
+    let cache = GitWorkspaceCache::with_watcher(Some(Arc::new(FileWatcher::noop())));
+    let source_observation = cache
+        .begin_source_path_change_observation(root.path(), &source, false)
+        .await
+        .expect("source observation");
+    let unrelated_observation = cache
+        .begin_source_path_change_observation(root.path(), &unrelated, false)
+        .await
+        .expect("unrelated observation");
+    std::fs::write(&source, "after").expect("committed source mutation");
+
+    let runtime_thread = std::thread::current().id();
+    let started = Arc::new(tokio::sync::Notify::new());
+    let worker_started = Arc::clone(&started);
+    let (release, released) = std::sync::mpsc::sync_channel(1);
+    *cache.host_mutation_worker_hook.lock().unwrap() = Some(Box::new(move || {
+        assert_ne!(std::thread::current().id(), runtime_thread);
+        worker_started.notify_one();
+        released
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("release filesystem worker");
+    }));
+    let call_cache = Arc::clone(&cache);
+    let call_root = root.path().to_path_buf();
+    let call = tokio::spawn(async move {
+        call_cache
+            .note_host_workspace_mutation_paths(&call_root, &["source.txt".to_string()])
+            .await;
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(10), started.notified())
+        .await
+        .expect("the current-thread runtime progresses while the filesystem worker is paused");
+    call.abort();
+    assert!(call.await.expect_err("caller was cancelled").is_cancelled());
+    release.send(()).expect("worker still owns mutation inputs");
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while cache.source_path_change_observation_is_current(&source_observation) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("worker publishes invalidation even after caller cancellation");
+    assert!(cache.source_path_change_observation_is_current(&unrelated_observation));
+    assert_eq!(std::fs::read_to_string(&source).unwrap(), "after");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn git_watch_worker_cancellation_and_cache_drop_retire_native_owners() {
+    let root = TempDir::new().expect("watch root");
+    let cache = GitWorkspaceCache::with_watcher(Some(Arc::new(
+        FileWatcher::new().expect("native watcher"),
+    )));
+    let probe = Arc::clone(&cache.watcher_worker.as_ref().expect("watch worker").probe);
+    let (started, release) = GitWatchWorkerProbe::arm(&probe.before_reply);
+    let pending_cache = Arc::clone(&cache);
+    let path = root.path().to_path_buf();
+    let pending = tokio::spawn(async move {
+        pending_cache
+            .begin_source_path_change_observation(&path, &path, true)
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(10), started)
+        .await
+        .expect("registration must reach worker reply")
+        .expect("worker alive");
+    assert_eq!(probe.registered.load(Ordering::Acquire), 1);
+    assert_eq!(probe.retired.load(Ordering::Acquire), 0);
+    assert_ne!(
+        *probe.thread.lock().unwrap(),
+        Some(std::thread::current().id())
+    );
+    pending.abort();
+    assert!(pending.await.expect_err("aborted request").is_cancelled());
+    assert!(
+        cache
+            .repository_retention
+            .try_lock()
+            .expect("registration must not hold retention lock")
+            .source_watch_registrations
+            .is_empty()
+    );
+    release.send(()).expect("release worker reply");
+    probe.wait_for(1, false).await;
+    assert!(
+        cache
+            .repository_retention
+            .lock()
+            .unwrap()
+            .source_watch_registrations
+            .is_empty()
+    );
+
+    let observation = cache
+        .begin_source_path_change_observation(root.path(), root.path(), true)
+        .await
+        .expect("normal retry must register");
+    assert!(cache.source_path_change_observation_is_current(&observation));
+    tokio::fs::write(
+        root.path().join("changed-after-retry.txt"),
+        "new source content",
+    )
+    .await
+    .expect("write watched dependency");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while cache.source_path_change_observation_is_current(&observation) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("native watcher must invalidate the retained dependency after a real write");
+    assert_eq!(probe.registered.load(Ordering::Acquire), 2);
+    drop(cache);
+    probe.wait_for(2, true).await;
+    assert_eq!(probe.retired.load(Ordering::Acquire), 2);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn git_watch_worker_eviction_invalidates_before_native_retirement() {
+    let (_repo_temp, repo) = create_clean_git_repo().await;
+    let other_roots = TempDir::new().expect("other roots");
+    let cache = GitWorkspaceCache::with_watcher(Some(Arc::new(
+        FileWatcher::new().expect("native watcher"),
+    )));
+    let probe = Arc::clone(&cache.watcher_worker.as_ref().expect("watch worker").probe);
+    let original = cache
+        .begin_source_path_change_observation(repo.as_path(), repo.as_path(), true)
+        .await
+        .expect("original watch");
+    let identity = cache
+        .workspace_evidence_identity(repo.as_path())
+        .await
+        .expect("normal identity");
+    assert!(!identity.unavailable);
+    assert_eq!(
+        cache
+            .latest_workspace_evidence_identity(repo.as_path())
+            .await,
+        Some(identity)
+    );
+    let (started, release) = GitWatchWorkerProbe::arm(&probe.before_retire);
+    let mut newest = None;
+    for index in 0..RETAINED_REPOSITORY_CAPACITY {
+        let path = other_roots.path().join(format!("repo-{index}"));
+        tokio::fs::create_dir(&path).await.expect("other root");
+        newest = cache
+            .begin_source_path_change_observation(&path, &path, true)
+            .await;
+        assert!(newest.is_some());
+    }
+    tokio::time::timeout(Duration::from_secs(10), started)
+        .await
+        .expect("eviction must reach worker retirement")
+        .expect("worker alive");
+    assert_eq!(probe.retired.load(Ordering::Acquire), 0);
+    assert_ne!(
+        *probe.thread.lock().unwrap(),
+        Some(std::thread::current().id())
+    );
+    assert!(!cache.source_path_change_observation_is_current(&original));
+    assert!(cache.source_path_change_observation_is_current(newest.as_ref().unwrap()));
+    assert_eq!(
+        cache
+            .latest_workspace_evidence_identity(repo.as_path())
+            .await,
+        None
+    );
+    assert_eq!(
+        cache
+            .repository_retention
+            .try_lock()
+            .expect("native retirement must not hold cache lock")
+            .source_watch_registrations
+            .len(),
+        RETAINED_REPOSITORY_CAPACITY
+    );
+    release.send(()).expect("release native retirement");
+    probe.wait_for(1, false).await;
+    let renewed = cache
+        .begin_source_path_change_observation(repo.as_path(), repo.as_path(), true)
+        .await
+        .expect("re-register evicted root");
+    assert_ne!(
+        original.registration_generation,
+        renewed.registration_generation
+    );
+    assert!(!cache.source_path_change_observation_is_current(&original));
+    assert!(cache.source_path_change_observation_is_current(&renewed));
+    let registered = probe.registered.load(Ordering::Acquire);
+    assert_eq!(registered, RETAINED_REPOSITORY_CAPACITY + 2);
+    drop(cache);
+    probe.wait_for(registered, true).await;
+    assert_eq!(probe.retired.load(Ordering::Acquire), registered);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn git_watch_worker_root_replacement_retires_only_previous_registration() {
+    let (_repo_temp, repo) = create_clean_git_repo().await;
+    let cache = GitWorkspaceCache::with_watcher(Some(Arc::new(
+        FileWatcher::new().expect("native watcher"),
+    )));
+    let probe = Arc::clone(&cache.watcher_worker.as_ref().expect("watch worker").probe);
+    let first = cache.snapshot(&local_snapshot(repo.clone(), 1).await).await;
+    assert_eq!(first.entries.len(), 1);
+    assert_eq!(probe.registered.load(Ordering::Acquire), 1);
+    let (started, release) = GitWatchWorkerProbe::arm(&probe.before_retire);
+    let second = cache.snapshot(&local_snapshot(repo.clone(), 2).await).await;
+    tokio::time::timeout(Duration::from_secs(10), started)
+        .await
+        .expect("replacement must reach worker retirement")
+        .expect("worker alive");
+    assert_eq!(second.environment_generation, 2);
+    assert_eq!(second.entries[0].repo_root, first.entries[0].repo_root);
+    assert_eq!(probe.registered.load(Ordering::Acquire), 2);
+    assert_eq!(probe.retired.load(Ordering::Acquire), 0);
+    assert_eq!(
+        cache
+            .state
+            .try_lock()
+            .expect("retirement must not hold cache state")
+            .root
+            .as_ref()
+            .expect("current root entry")
+            .key
+            .environment_generation,
+        2
+    );
+    release
+        .send(())
+        .expect("release previous native registration");
+    probe.wait_for(1, false).await;
+    assert_eq!(probe.retired.load(Ordering::Acquire), 1);
+    drop(first);
+    drop(second);
+    drop(cache);
+    probe.wait_for(2, true).await;
 }

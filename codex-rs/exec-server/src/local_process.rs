@@ -132,6 +132,37 @@ impl AcceptedStdinWriteIds {
 
 struct ProcessStart;
 
+// Release the exact provisional entry if a connection disappears during spawn.
+// Capture the runtime at admission: an already-polled start future can be
+// dropped outside an entered runtime. Cleanup still requires that runtime alive.
+struct ProcessStartReservation {
+    inner: Arc<Inner>,
+    process_id: ProcessId,
+    start: Arc<ProcessStart>,
+    runtime: tokio::runtime::Handle,
+    active: bool,
+}
+
+impl Drop for ProcessStartReservation {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let inner = Arc::clone(&self.inner);
+        let process_id = self.process_id.clone();
+        let start = Arc::clone(&self.start);
+        self.runtime.spawn(async move {
+            let mut processes = inner.processes.lock().await;
+            if matches!(
+                processes.get(&process_id),
+                Some(ProcessEntry::Starting(current)) if Arc::ptr_eq(current, &start)
+            ) {
+                processes.remove(&process_id);
+            }
+        });
+    }
+}
+
 enum ProcessEntry {
     Starting(Arc<ProcessStart>),
     Running(Box<RunningProcess>),
@@ -239,6 +270,13 @@ impl LocalProcess {
         let sandbox = prepared.sandbox;
 
         let start = Arc::new(ProcessStart);
+        let mut reservation = ProcessStartReservation {
+            inner: Arc::clone(&self.inner),
+            process_id: process_id.clone(),
+            start: Arc::clone(&start),
+            runtime: tokio::runtime::Handle::current(),
+            active: false,
+        };
         {
             let mut process_map = self.inner.processes.lock().await;
             if process_map.contains_key(&process_id) {
@@ -250,6 +288,7 @@ impl LocalProcess {
                 process_id.clone(),
                 ProcessEntry::Starting(Arc::clone(&start)),
             );
+            reservation.active = true;
         }
 
         let spawned_result = prepared.spawn(params.tty, params.pipe_stdin).await;
@@ -263,6 +302,7 @@ impl LocalProcess {
                 ) {
                     process_map.remove(&process_id);
                 }
+                reservation.active = false;
                 return Err(internal_error(err.to_string()));
             }
         };
@@ -281,6 +321,7 @@ impl LocalProcess {
             ) {
                 drop(process_map);
                 let _ = spawned.session.terminate();
+                reservation.active = false;
                 return Err(invalid_request(format!(
                     "process {process_id} start was cancelled"
                 )));
@@ -309,6 +350,7 @@ impl LocalProcess {
                     sandbox_denied: false,
                 })),
             );
+            reservation.active = false;
         }
         tokio::spawn(stream_output(
             process_id.clone(),
@@ -1050,6 +1092,61 @@ mod tests {
             .map(|attribute| attribute.value.as_str().into_owned())
             .collect::<Vec<_>>();
         assert_eq!(results, vec![expected.to_string()]);
+    }
+
+    #[test]
+    fn cancelled_start_cleanup_preserves_replacement_outside_runtime_context() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let backend = runtime.block_on(async { LocalProcess::default() });
+        for replace in [false, true] {
+            let process_id = ProcessId::from("replacement-reservation");
+            let original = Arc::new(ProcessStart);
+            let replacement = Arc::new(ProcessStart);
+            let guard = ProcessStartReservation {
+                inner: Arc::clone(&backend.inner),
+                process_id: process_id.clone(),
+                start: Arc::clone(&original),
+                runtime: runtime.handle().clone(),
+                active: true,
+            };
+            let cleanup_finished = Arc::downgrade(&original);
+            let mut held = runtime.block_on(backend.inner.processes.lock());
+            held.insert(process_id.clone(), ProcessEntry::Starting(original));
+            // No runtime is entered here. Drop uses the admission-time handle.
+            drop(guard);
+            if replace {
+                // An explicit cancellation and new admission can reuse this ID
+                // while the old cleanup is queued behind the real map lock.
+                held.insert(
+                    process_id.clone(),
+                    ProcessEntry::Starting(Arc::clone(&replacement)),
+                );
+            }
+            drop(held);
+            runtime.block_on(async {
+                // The old identity is retained by cleanup until its real map
+                // operation ends, so this also proves that cleanup actually ran.
+                timeout(Duration::from_secs(2), async {
+                    while cleanup_finished.upgrade().is_some() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("old reservation cleanup finished");
+                let processes = backend.inner.processes.lock().await;
+                if replace {
+                    assert!(matches!(
+                        processes.get(&process_id),
+                        Some(ProcessEntry::Starting(current)) if Arc::ptr_eq(current, &replacement)
+                    ));
+                } else {
+                    assert!(!processes.contains_key(&process_id));
+                }
+            });
+        }
     }
 
     #[tokio::test]

@@ -519,6 +519,7 @@ impl ThreadRequestProcessor {
         skills_watcher: Arc<SkillsWatcher>,
         initial_config_warnings: Vec<ConfigWarningNotification>,
     ) -> Self {
+        let background_tasks = thread_goal_processor.background_tasks.clone();
         Self {
             auth_manager,
             thread_manager,
@@ -534,7 +535,7 @@ impl ThreadRequestProcessor {
             thread_goal_processor,
             state_db,
             log_db,
-            background_tasks: TaskTracker::new(),
+            background_tasks,
             skills_watcher,
             initial_config_warnings: Arc::new(initial_config_warnings),
             handled_thread_creation_instances: Arc::new(std::sync::Mutex::new(
@@ -562,22 +563,35 @@ impl ThreadRequestProcessor {
         request_id: ConnectionRequestId,
         params: ThreadArchiveParams,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
-        match self.thread_archive_inner(params).await {
-            Ok((response, archived_thread_ids)) => {
-                self.outgoing
-                    .send_response(request_id.clone(), response)
-                    .await;
-                for thread_id in archived_thread_ids {
-                    self.outgoing
-                        .send_server_notification(ServerNotification::ThreadArchived(
-                            ThreadArchivedNotification { thread_id },
-                        ))
-                        .await;
+        let processor = self.clone();
+        // A committed archive owns shutdown, teardown, and notifications even if
+        // its originating connection cancels the request while those awaits run.
+        self.background_tasks
+            .spawn(
+                async move {
+                    match processor.thread_archive_inner(params).await {
+                        Ok((response, archived_thread_ids)) => {
+                            processor
+                                .outgoing
+                                .send_response(request_id.clone(), response)
+                                .await;
+                            for thread_id in archived_thread_ids {
+                                processor
+                                    .outgoing
+                                    .send_server_notification(ServerNotification::ThreadArchived(
+                                        ThreadArchivedNotification { thread_id },
+                                    ))
+                                    .await;
+                            }
+                            Ok(None)
+                        }
+                        Err(error) => Err(error),
+                    }
                 }
-                Ok(None)
-            }
-            Err(error) => Err(error),
-        }
+                .instrument(tracing::Span::current()),
+            )
+            .await
+            .map_err(|error| internal_error(format!("archive task failed: {error}")))?
     }
 
     pub(crate) async fn thread_set_name(
@@ -1727,39 +1741,31 @@ impl ThreadRequestProcessor {
 
         let (thread_id, thread) = self.load_thread(&thread_id).await?;
 
-        let request = request_id.clone();
-
-        let rollback_already_in_progress = {
+        let reservation = {
             let thread_state = self.thread_state_manager.thread_state(thread_id).await;
-            let mut thread_state = thread_state.lock().await;
-            if thread_state.pending_rollbacks.is_some() {
-                true
-            } else {
-                thread_state.pending_rollbacks = Some(request.clone());
-                false
-            }
+            let reservation = thread_state
+                .lock()
+                .await
+                .reserve_rollback(request_id.clone());
+            reservation
         };
-        if rollback_already_in_progress {
+        let Some(reservation) = reservation else {
             return Err(invalid_request(
                 "rollback already in progress for this thread",
             ));
-        }
+        };
 
-        if let Err(err) = self
-            .submit_core_op(
-                request_id,
-                thread.as_ref(),
-                Op::ThreadRollback { num_turns },
-            )
-            .await
-        {
-            // No ThreadRollback event will arrive if an error occurs.
-            // Clean up and reply immediately.
-            let thread_state = self.thread_state_manager.thread_state(thread_id).await;
-            thread_state.lock().await.pending_rollbacks = None;
-
-            return Err(internal_error(format!("failed to start rollback: {err}")));
-        }
+        self.submit_core_op(
+            request_id,
+            thread.as_ref(),
+            Op::ThreadRollback { num_turns },
+        )
+        .await
+        .map_err(|err| internal_error(format!("failed to start rollback: {err}")))?;
+        // Core enqueue is the last suspension in submit_core_op. Transfer the
+        // reservation to the rollback event owner in the same poll; cancelling
+        // earlier instead invalidates it synchronously through the drop guard.
+        reservation.disarm();
         Ok(())
     }
 

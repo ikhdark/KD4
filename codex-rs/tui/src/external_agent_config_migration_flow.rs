@@ -1,11 +1,11 @@
 use crate::app_server_session::AppServerSession;
 use crate::app_server_session::EXTERNAL_AGENT_CONFIG_IMPORT_IN_PROGRESS_MESSAGE;
 use crate::external_agent_config_migration::ExternalAgentConfigMigrationOutcome;
+use crate::external_agent_config_migration::ExternalAgentConfigMigrationTerminal;
 use crate::external_agent_config_migration::run_external_agent_config_migration_prompt;
 use crate::external_agent_config_migration_model::external_agent_config_migration_item_count;
 use crate::external_agent_config_migration_model::external_agent_config_migration_type_label;
 use crate::legacy_core::config::Config;
-use crate::tui;
 use codex_app_server_protocol::ExternalAgentConfigDetectParams;
 use codex_app_server_protocol::ExternalAgentConfigImportCompletedNotification;
 use codex_app_server_protocol::ExternalAgentConfigMigrationItem;
@@ -197,7 +197,7 @@ fn remaining_items_handoff(remaining_item_count: usize) -> Option<String> {
 }
 
 pub(crate) async fn handle_external_agent_config_migration_prompt(
-    tui: &mut tui::Tui,
+    tui: &mut impl ExternalAgentConfigMigrationTerminal,
     app_server: &mut AppServerSession,
     config: &Config,
 ) -> Result<ExternalAgentConfigMigrationFlowOutcome, String> {
@@ -245,6 +245,7 @@ pub(crate) async fn handle_external_agent_config_migration_prompt(
             error.as_deref(),
         )
         .await
+        .map_err(|err| format!("Could not display the Claude Code import prompt: {err}"))?
         {
             ExternalAgentConfigMigrationOutcome::Proceed(items) => {
                 selected_items = items.clone();

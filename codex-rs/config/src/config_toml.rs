@@ -779,12 +779,19 @@ impl ConfigToml {
                     } else {
                         NetworkSandboxPolicy::Restricted
                     };
-                    PermissionProfile::workspace_write_with(
-                        writable_roots,
-                        network_policy,
-                        *exclude_tmpdir_env_var,
-                        *exclude_slash_tmp,
-                    )
+                    let writable_roots = writable_roots.clone();
+                    let exclude_tmpdir_env_var = *exclude_tmpdir_env_var;
+                    let exclude_slash_tmp = *exclude_slash_tmp;
+                    tokio::task::spawn_blocking(move || {
+                        PermissionProfile::workspace_write_with(
+                            &writable_roots,
+                            network_policy,
+                            exclude_tmpdir_env_var,
+                            exclude_slash_tmp,
+                        )
+                    })
+                    .await
+                    .expect("permission profile projection worker panicked")
                 }
                 None => PermissionProfile::workspace_write(),
             },
@@ -1171,5 +1178,95 @@ deterministic_continuation = "low"
         let message = err.to_string();
         assert!(message.contains("TOML list of strings"));
         assert!(message.contains("comma-separated strings are not supported"));
+    }
+
+    #[test]
+    fn derive_explicit_workspace_permissions_yields_and_protects_git_metadata() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let temp = tempfile::tempdir().expect("create fixture");
+        let worktree = temp.path().join("worktree");
+        let ordinary_repo = temp.path().join("ordinary");
+        let gitdir = worktree.join("private-git");
+        let cwd = temp.path().join("cwd");
+        std::fs::create_dir_all(&gitdir).expect("create pointed-to gitdir");
+        std::fs::create_dir_all(ordinary_repo.join(".git")).expect("create ordinary gitdir");
+        std::fs::create_dir_all(&cwd).expect("create cwd");
+        std::fs::write(worktree.join(".git"), "gitdir: private-git\n")
+            .expect("write real git pointer");
+        std::fs::write(worktree.join("work.txt"), "work").expect("write work file");
+        std::fs::write(gitdir.join("config"), "metadata").expect("write git metadata");
+        let config = ConfigToml {
+            sandbox_mode: Some(SandboxMode::WorkspaceWrite),
+            sandbox_workspace_write: Some(SandboxWorkspaceWrite {
+                writable_roots: vec![
+                    AbsolutePathBuf::from_absolute_path(&worktree).expect("absolute worktree"),
+                    AbsolutePathBuf::from_absolute_path(&ordinary_repo).expect("absolute repo"),
+                ],
+                network_access: false,
+                exclude_tmpdir_env_var: true,
+                exclude_slash_tmp: true,
+            }),
+            ..ConfigToml::default()
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .expect("build dedicated runtime");
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let blocker = runtime.spawn_blocking(move || {
+            started_tx.send(()).expect("signal occupied blocking pool");
+            // Dropping release_tx also unblocks this worker on a test panic.
+            release_rx.recv_timeout(Duration::from_secs(30))
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("blocking worker started");
+
+        let profile = runtime.block_on(async {
+            let derive = config.derive_permission_profile(
+                None,
+                WindowsSandboxLevel::RestrictedToken,
+                None,
+                None,
+            );
+            tokio::pin!(derive);
+            assert!(
+                futures::poll!(derive.as_mut()).is_pending(),
+                "filesystem projection must wait for the occupied blocking pool"
+            );
+            tokio::select! {
+                biased;
+                _ = &mut derive => panic!("projection completed while the blocking pool was held"),
+                _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+            }
+            release_tx.send(()).expect("release blocking worker");
+            blocker
+                .await
+                .expect("join blocking worker")
+                .expect("watchdog did not expire");
+            tokio::time::timeout(Duration::from_secs(10), &mut derive)
+                .await
+                .expect("projection completes after the pool is released")
+        });
+
+        let PermissionProfile::Managed {
+            file_system,
+            network,
+        } = profile
+        else {
+            panic!("explicit workspace settings must produce a managed policy");
+        };
+        assert_eq!(network, NetworkSandboxPolicy::Restricted);
+        let policy = file_system.to_sandbox_policy();
+        assert!(policy.can_write_path_with_cwd(&worktree.join("work.txt"), &cwd));
+        assert!(policy.can_write_path_with_cwd(&ordinary_repo.join("work.txt"), &cwd));
+        assert!(!policy.can_write_path_with_cwd(&worktree.join(".git"), &cwd));
+        assert!(!policy.can_write_path_with_cwd(&gitdir.join("config"), &cwd));
+        assert!(!policy.can_write_path_with_cwd(&ordinary_repo.join(".git/config"), &cwd));
+        assert!(!policy.can_write_path_with_cwd(&temp.path().join("outside.txt"), &cwd));
     }
 }

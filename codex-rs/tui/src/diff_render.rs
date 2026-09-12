@@ -316,7 +316,7 @@ impl Renderable for FileChange {
     fn desired_height(&self, width: u16) -> u16 {
         let mut lines = vec![];
         render_change(self, &mut lines, width as usize, /*lang*/ None);
-        lines.len() as u16
+        u16::try_from(lines.len()).unwrap_or(u16::MAX)
     }
 }
 
@@ -1320,6 +1320,22 @@ mod tests {
     use ratatui::widgets::Paragraph;
     use ratatui::widgets::WidgetRef;
     use ratatui::widgets::Wrap;
+
+    #[test]
+    fn oversized_added_file_reserves_height_and_renders_visible_rows() {
+        let change = FileChange::Add {
+            content: "x\n".repeat(65_536),
+        };
+        let height = Renderable::desired_height(&change, 20);
+        assert_eq!(height, u16::MAX);
+        let area = Rect::new(0, 0, 20, height.min(3));
+        let mut buf = Buffer::empty(area);
+        Renderable::render(&change, area, &mut buf);
+        for y in 0..3 {
+            let line: String = (0..20).map(|x| buf[(x, y)].symbol()).collect();
+            assert_eq!(line.trim(), format!("{} +x", y + 1));
+        }
+    }
 
     #[test]
     fn ansi16_add_style_uses_foreground_only() {

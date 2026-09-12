@@ -3,30 +3,58 @@ use codex_extension_api::ToolCallSource as ExtensionToolCallSource;
 use codex_extension_api::ToolFinishInput;
 use codex_extension_api::ToolStartInput;
 use codex_tools::ToolName;
+use futures::FutureExt;
+use std::panic::AssertUnwindSafe;
 
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use crate::tools::context::ToolCallSource;
 use crate::tools::context::ToolInvocation;
 
-pub(crate) async fn notify_tool_start(invocation: &ToolInvocation) {
+pub(crate) async fn notify_tool_start(
+    invocation: &ToolInvocation,
+) -> Result<(), crate::FunctionCallError> {
+    let mut first_panic = None;
     for contributor in invocation
         .session
         .services
         .extensions
         .tool_lifecycle_contributors()
     {
-        contributor
-            .on_tool_start(ToolStartInput {
-                session_store: &invocation.session.services.session_extension_data,
-                thread_store: &invocation.session.services.thread_extension_data,
-                turn_store: invocation.step_context.turn.extension_data.as_ref(),
-                turn_id: invocation.step_context.turn.sub_id.as_str(),
-                call_id: invocation.call_id.as_str(),
-                tool_name: &invocation.tool_name,
-                source: extension_tool_call_source(invocation.source.clone()),
-            })
-            .await;
+        let result = AssertUnwindSafe(async {
+            contributor
+                .on_tool_start(ToolStartInput {
+                    session_store: &invocation.session.services.session_extension_data,
+                    thread_store: &invocation.session.services.thread_extension_data,
+                    turn_store: invocation.step_context.turn.extension_data.as_ref(),
+                    turn_id: invocation.step_context.turn.sub_id.as_str(),
+                    call_id: invocation.call_id.as_str(),
+                    tool_name: &invocation.tool_name,
+                    source: extension_tool_call_source(invocation.source.clone()),
+                })
+                .await;
+        })
+        .catch_unwind()
+        .await;
+        if let Err(panic) = result {
+            first_panic.get_or_insert_with(|| {
+                panic
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| {
+                        panic
+                            .downcast_ref::<&str>()
+                            .map(|message| (*message).to_string())
+                    })
+                    .unwrap_or_else(|| "non-string panic".to_string())
+            });
+        }
+    }
+    match first_panic {
+        Some(message) => Err(crate::FunctionCallError::Fatal(format!(
+            "tool lifecycle start callback panicked: {message}"
+        ))),
+        None => Ok(()),
     }
 }
 
@@ -69,18 +97,25 @@ async fn notify_tool_finish_parts(
     outcome: ToolCallOutcome,
 ) {
     for contributor in session.services.extensions.tool_lifecycle_contributors() {
-        contributor
-            .on_tool_finish(ToolFinishInput {
-                session_store: &session.services.session_extension_data,
-                thread_store: &session.services.thread_extension_data,
-                turn_store: turn.extension_data.as_ref(),
-                turn_id: turn.sub_id.as_str(),
-                call_id,
-                tool_name,
-                source: extension_tool_call_source(source.clone()),
-                outcome,
-            })
-            .await;
+        let result = AssertUnwindSafe(async {
+            contributor
+                .on_tool_finish(ToolFinishInput {
+                    session_store: &session.services.session_extension_data,
+                    thread_store: &session.services.thread_extension_data,
+                    turn_store: turn.extension_data.as_ref(),
+                    turn_id: turn.sub_id.as_str(),
+                    call_id,
+                    tool_name,
+                    source: extension_tool_call_source(source.clone()),
+                    outcome,
+                })
+                .await;
+        })
+        .catch_unwind()
+        .await;
+        if result.is_err() {
+            tracing::warn!(call_id, "tool lifecycle finish callback panicked");
+        }
     }
 }
 

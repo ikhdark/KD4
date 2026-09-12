@@ -13,7 +13,16 @@ fn status_notification_is_the_canonical_response_payload() {
     let disable = RemoteControlDisableResponse(status.clone());
     let read = RemoteControlStatusReadResponse(status.clone());
 
-    let expected = serde_json::to_value(status).expect("serialize canonical status");
+    let expected = json!({
+        "status": "connected",
+        "serverName": "remote.example.test",
+        "installationId": "installation-1",
+        "environmentId": "environment-1",
+    });
+    assert_eq!(
+        serde_json::to_value(status).expect("serialize canonical status"),
+        expected
+    );
     assert_eq!(
         serde_json::to_value(enable).expect("serialize enable"),
         expected

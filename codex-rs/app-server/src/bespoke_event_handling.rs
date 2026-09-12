@@ -456,10 +456,20 @@ pub(crate) async fn apply_bespoke_event_handling(
                 parsed_cmd,
                 ..
             } = ev;
+            let has_foreign_cwd = cwd_uri
+                .as_ref()
+                .is_some_and(|uri| uri.to_abs_path().is_err());
             let command_actions = parsed_cmd
                 .iter()
                 .cloned()
-                .map(|parsed| V2ParsedCommand::from_core_with_cwd(parsed, &cwd))
+                .map(|parsed| match parsed {
+                    codex_protocol::parse_command::ParsedCommand::Read { cmd, .. }
+                        if has_foreign_cwd =>
+                    {
+                        V2ParsedCommand::Unknown { command: cmd }
+                    }
+                    parsed => V2ParsedCommand::from_core_with_cwd(parsed, &cwd),
+                })
                 .collect::<Vec<_>>();
             let completion_cwd = cwd_uri.unwrap_or_else(|| PathUri::from_abs_path(&cwd));
             let presentation = if let Some(network_approval_context) =
@@ -967,7 +977,7 @@ pub(crate) async fn apply_bespoke_event_handling(
         EventMsg::ThreadRolledBack(_rollback_event) => {
             let pending = {
                 let mut state = thread_state.lock().await;
-                state.pending_rollbacks.take()
+                state.take_pending_rollback()
             };
 
             if let Some(request_id) = pending {
@@ -1427,7 +1437,7 @@ async fn handle_thread_rollback_failed(
     thread_state: &Arc<Mutex<ThreadState>>,
     outgoing: &ThreadScopedOutgoingMessageSender,
 ) {
-    let pending_rollback = thread_state.lock().await.pending_rollbacks.take();
+    let pending_rollback = thread_state.lock().await.take_pending_rollback();
 
     if let Some(request_id) = pending_rollback {
         outgoing
@@ -1463,7 +1473,7 @@ async fn respond_to_pending_interrupts(
 ) {
     let pending = {
         let mut state = thread_state.lock().await;
-        std::mem::take(&mut state.pending_interrupts)
+        state.take_pending_interrupts()
     };
 
     for request_id in pending {
@@ -3289,6 +3299,136 @@ mod tests {
                 additional_details: None,
             })
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn exec_approval_foreign_cwd_does_not_fabricate_host_read_paths() -> Result<()> {
+        let server = core_test_support::responses::start_mock_server().await;
+        let model_catalog = codex_models_manager::bundled_models_response()?;
+        let test = core_test_support::test_codex::test_codex()
+            .with_config(move |config| config.model_catalog = Some(model_catalog))
+            .build(&server)
+            .await?;
+        let conversation_id = ThreadId::from(test.session_configured.session_id);
+        let conversation = Arc::clone(&test.codex);
+        let thread_manager = Arc::clone(&test.thread_manager);
+        let host_cwd = test.config.cwd.clone();
+        let foreign_cwd: PathUri = "file:///remote/workspace".parse()?;
+        assert!(foreign_cwd.to_abs_path().is_err());
+        let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let sender = Arc::new(OutgoingMessageSender::new(
+            tx,
+            codex_analytics::AnalyticsEventsClient::disabled(),
+        ));
+        sender
+            .connection_opened(ConnectionId(1), Arc::new(AtomicBool::new(true)))
+            .await;
+        let outgoing =
+            ThreadScopedOutgoingMessageSender::new(sender, vec![ConnectionId(1)], conversation_id);
+        for (case, cwd_uri) in [
+            ("foreign", Some(foreign_cwd)),
+            ("local-uri", Some(PathUri::from_abs_path(&host_cwd))),
+            ("legacy-local", None),
+        ] {
+            let command = "cat notes.txt";
+            let expected_cwd = if case == "foreign" {
+                "/remote/workspace".to_string()
+            } else {
+                host_cwd.to_string_lossy().into_owned()
+            };
+            let expected_actions = vec![if case == "foreign" {
+                V2ParsedCommand::Unknown {
+                    command: command.to_string(),
+                }
+            } else {
+                V2ParsedCommand::Read {
+                    command: command.to_string(),
+                    name: "notes.txt".to_string(),
+                    path: host_cwd.join("notes.txt"),
+                }
+            }];
+            apply_bespoke_event_handling(
+                Event {
+                    id: case.to_string(),
+                    msg: EventMsg::ExecApprovalRequest(ExecApprovalRequestEvent {
+                        call_id: case.to_string(),
+                        approval_id: None,
+                        turn_id: case.to_string(),
+                        environment_id: None,
+                        started_at_ms: 42,
+                        command: vec!["cat".to_string(), "notes.txt".to_string()],
+                        cwd: host_cwd.clone(),
+                        cwd_uri,
+                        reason: None,
+                        network_approval_context: None,
+                        proposed_execpolicy_amendment: None,
+                        proposed_network_policy_amendments: None,
+                        additional_permissions: None,
+                        available_decisions: None,
+                        parsed_cmd: vec![codex_protocol::parse_command::ParsedCommand::Read {
+                            cmd: command.to_string(),
+                            name: "notes.txt".to_string(),
+                            path: std::path::PathBuf::from("notes.txt"),
+                        }],
+                    }),
+                },
+                conversation_id,
+                Arc::clone(&conversation),
+                Arc::clone(&thread_manager),
+                outgoing.clone(),
+                new_thread_state(),
+                ThreadWatchManager::new(),
+                Arc::new(tokio::sync::Semaphore::new(1)),
+                "test-provider".to_string(),
+            )
+            .await;
+            let item = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                recv_broadcast_message(&mut rx),
+            )
+            .await??;
+            let OutgoingMessage::AppServerNotification(ServerNotification::ItemStarted(payload)) =
+                item
+            else {
+                bail!("unexpected item message: {item:?}");
+            };
+            let ThreadItem::CommandExecution {
+                id,
+                command: item_command,
+                cwd,
+                command_actions,
+                ..
+            } = payload.item
+            else {
+                bail!("expected command execution item");
+            };
+            assert_eq!(id, case);
+            assert_eq!(item_command, command);
+            assert_eq!(cwd.as_str(), expected_cwd);
+            assert_eq!(command_actions, expected_actions);
+            let request = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                recv_broadcast_message(&mut rx),
+            )
+            .await??;
+            let OutgoingMessage::Request(ServerRequest::CommandExecutionRequestApproval {
+                params,
+                ..
+            }) = request
+            else {
+                bail!("unexpected approval message: {request:?}");
+            };
+            assert_eq!(params.item_id, case);
+            assert_eq!(params.command.as_deref(), Some(command));
+            assert_eq!(
+                params.cwd.as_ref().map(LegacyAppPathString::as_str),
+                Some(expected_cwd.as_str())
+            );
+            assert_eq!(params.command_actions, Some(expected_actions));
+        }
+        outgoing.abort_pending_server_requests().await;
+        conversation.shutdown_and_wait().await?;
         Ok(())
     }
 

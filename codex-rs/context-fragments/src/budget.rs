@@ -31,10 +31,15 @@ impl ModelContextBudget {
 
     /// Admit a whole item. Use this for structured fragments that must not be split.
     pub fn try_take(&mut self, text: &str) -> bool {
-        if text.len() > self.remaining_bytes {
+        self.try_take_bytes(text.len())
+    }
+
+    /// Charge an already-measured model-visible cost, including message envelopes.
+    pub fn try_take_bytes(&mut self, bytes: usize) -> bool {
+        if bytes > self.remaining_bytes {
             return false;
         }
-        self.remaining_bytes -= text.len();
+        self.remaining_bytes -= bytes;
         true
     }
 

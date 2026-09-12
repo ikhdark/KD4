@@ -39,9 +39,6 @@ use codex_protocol::protocol::GranularApprovalConfig;
 use codex_protocol::protocol::McpInvocation;
 use codex_protocol::protocol::SessionSource;
 use codex_rollout_trace::ThreadStartedTraceMetadata;
-use codex_rollout_trace::ToolDispatchInvocation;
-use codex_rollout_trace::ToolDispatchPayload;
-use codex_rollout_trace::ToolDispatchRequester;
 use codex_rollout_trace::replay_bundle;
 use codex_utils_path_uri::PathUri;
 use core_test_support::apps_test_server::AppsTestServer;
@@ -358,59 +355,99 @@ fn prompt_options(
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn execute_mcp_tool_call_records_replayable_correlation() -> anyhow::Result<()> {
     let temp = tempdir()?;
-    let (mut session, turn_context) = make_session_and_context().await;
-    attach_trace_bundle(&mut session, &turn_context, temp.path())?;
-
-    let dispatch_trace = session
-        .services
-        .rollout_thread_trace
-        .start_tool_dispatch_trace(|| {
-            Some(ToolDispatchInvocation {
-                thread_id: session.thread_id.to_string(),
-                codex_turn_id: turn_context.sub_id.clone(),
-                tool_call_id: "mcp-call".to_string(),
-                tool_name: "search".to_string(),
-                tool_namespace: Some("mcp__docs__".to_string()),
-                requester: ToolDispatchRequester::Model {
-                    model_visible_call_id: "mcp-call".to_string(),
+    let server = start_mock_server().await;
+    AppsTestServer::mount(&server).await?;
+    let (mut session, turn_context, rx_event) = make_session_and_context_with_rx().await;
+    attach_trace_bundle(
+        Arc::get_mut(&mut session).expect("test session has one owner before registration"),
+        &turn_context,
+        temp.path(),
+    )?;
+    let (step_context, startup_cancellation_token) =
+        step_context_with_live_apps(&turn_context, &server.uri()).await;
+    let tools = step_context.mcp.manager().list_all_tools().await;
+    let sampled_tool = tools
+        .iter()
+        .find(|tool| tool.tool.name.as_ref() == "calendar_list_events")
+        .cloned()
+        .expect("backend catalog advertises the read-only calendar tool");
+    step_context.seed_mcp_tools_for_test(tools).await;
+    let tool_name = sampled_tool.canonical_tool_name();
+    let runtime = runtime_for_sampled_mcp_tool(
+        Arc::clone(&session),
+        Arc::clone(&step_context),
+        sampled_tool,
+    );
+    let call_id = "mcp-call";
+    let response = tokio::time::timeout(
+        Duration::from_secs(5),
+        runtime.handle_tool_call(
+            ToolCall {
+                tool_name,
+                call_id: call_id.to_string(),
+                payload: ToolPayload::Function {
+                    arguments: serde_json::json!({ "query": "trace" }).to_string(),
                 },
-                payload: ToolDispatchPayload::Function {
-                    arguments: r#"{"query":"trace"}"#.to_string(),
-                },
-            })
-        });
-    assert!(dispatch_trace.is_enabled());
-    let turn_context = Arc::new(turn_context);
-    let step_context = StepContext::for_test(Arc::clone(&turn_context));
-
-    let result = execute_mcp_tool_call(
-        &session,
-        step_context.as_ref(),
-        "mcp-call",
-        &McpInvocation {
-            server: "docs".to_string(),
-            tool: "search".to_string(),
-            arguments: Some(serde_json::json!({ "query": "trace" })),
-        },
-        /*rewritten_arguments*/ None,
-        /*metadata*/ None,
-        /*request_meta*/ None,
+            },
+            CancellationToken::new(),
+        ),
     )
-    .await;
-    assert!(
-        result.is_err(),
-        "the synthetic backend is absent; only trace emission matters",
+    .await
+    .expect("registered MCP invocation completes")
+    .expect("real backend returns a model response");
+    let codex_protocol::models::ResponseInputItem::FunctionCallOutput { output, .. } = response
+    else {
+        panic!("registered MCP call must return its function output");
+    };
+    assert_eq!(output.success, Some(true));
+    let started = recv_mcp_item_started(&rx_event, call_id).await;
+    assert_eq!(started.status, McpToolCallStatus::InProgress);
+    let (completed, unexpected_approvals) = recv_mcp_item_completed(&rx_event, call_id).await;
+    assert_eq!(unexpected_approvals, 0);
+    assert_eq!(completed.status, McpToolCallStatus::Completed);
+    let result = completed
+        .result
+        .expect("completed item preserves the actual backend result");
+    assert_eq!(
+        result.content[0]["text"],
+        "called calendar_list_events for  at  with "
     );
 
+    let calls = recorded_apps_tool_calls(&server).await;
+    assert_eq!(
+        calls.len(),
+        1,
+        "one registered invocation issues one backend request"
+    );
+    assert_eq!(
+        calls[0].pointer("/params/name").and_then(JsonValue::as_str),
+        Some("calendar_list_events")
+    );
+    assert_eq!(
+        calls[0]
+            .pointer("/params/arguments/query")
+            .and_then(JsonValue::as_str),
+        Some("trace")
+    );
+    let backend_correlation = calls[0]
+        .pointer("/params/_meta/codex_bridge_mcp_call_id")
+        .and_then(JsonValue::as_str)
+        .expect("actual backend request carries rollout correlation");
+    uuid::Uuid::parse_str(backend_correlation).expect("backend correlation is a concrete UUID");
+    session.terminal_tasks.close();
+    tokio::time::timeout(Duration::from_secs(5), session.terminal_tasks.wait())
+        .await
+        .expect("all tracked trace writes finish before replay");
     let replayed = replay_bundle(single_bundle_dir(temp.path())?)?;
-    assert!(
-        replayed.tool_calls["mcp-call"].mcp_call_id.is_some(),
-        "the real MCP execution path should emit a reducer-visible correlation ID",
+    assert_eq!(
+        replayed.tool_calls[call_id].mcp_call_id.as_deref(),
+        Some(backend_correlation),
+        "replayed registered dispatch and actual backend request share the same correlation"
     );
-
+    startup_cancellation_token.cancel();
     Ok(())
 }
 

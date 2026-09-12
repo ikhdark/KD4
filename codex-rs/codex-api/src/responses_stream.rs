@@ -590,7 +590,7 @@ fn try_parse_retry_after(error: &Error) -> Option<Duration> {
     let value = captures.get(1)?.as_str().parse::<f64>().ok()?;
     let unit = captures.get(2)?.as_str().to_ascii_lowercase();
     if unit == "s" || unit.starts_with("second") {
-        Some(Duration::from_secs_f64(value))
+        Duration::try_from_secs_f64(value).ok()
     } else if unit == "ms" {
         Some(Duration::from_millis(value as u64))
     } else {
@@ -791,6 +791,33 @@ mod tests {
         assert!(
             matches!(events.as_slice(), [ResponseEvent::OutputTextDelta(delta)] if delta == "hello")
         );
+    }
+
+    #[test]
+    fn interpreter_preserves_rate_limit_error_with_overflowing_retry_delay() {
+        for seconds in ["18446744073709551616".to_string(), "9".repeat(400)] {
+            let message = format!("Please try again in {seconds} seconds.");
+            let payload = json!({
+                "type": "response.failed",
+                "response": { "error": {
+                    "code": "rate_limit_exceeded",
+                    "message": message,
+                } },
+            });
+            let mut interpreter =
+                ResponsesEventInterpreter::new(&ResponsesStreamMetadata::default(), None);
+
+            let error = interpreter
+                .process_payload(&payload.to_string())
+                .unwrap_err();
+
+            assert!(
+                matches!(error, ResponsesEventError::Api(ApiError::Retryable {
+                delay: None,
+                message: actual,
+            }) if actual == message)
+            );
+        }
     }
 
     #[test]

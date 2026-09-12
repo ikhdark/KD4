@@ -37,6 +37,37 @@ async fn process_compacted_history_with_test_session(
     (refreshed, initial_context)
 }
 
+fn assert_regenerated_initial_context(actual: &[ResponseItem], mut expected: Vec<ResponseItem>) {
+    assert!(!expected.is_empty(), "initial context must be injected");
+    assert_eq!(actual.len(), expected.len());
+    let mut generated_ids = std::collections::HashSet::new();
+    for (actual, expected) in actual.iter().zip(&mut expected) {
+        let (
+            ResponseItem::Message {
+                id: Some(actual_id),
+                ..
+            },
+            ResponseItem::Message {
+                id: Some(expected_id),
+                ..
+            },
+        ) = (actual, expected)
+        else {
+            panic!("initial context must contain messages with trusted provenance IDs");
+        };
+        for id in [&*expected_id, actual_id] {
+            assert!(id.as_str().starts_with("msg_sctx_"));
+            assert!(
+                generated_ids.insert(id.to_string()),
+                "context IDs must be unique"
+            );
+        }
+        // Independent renders generate fresh IDs. Compare every other field exactly.
+        *expected_id = actual_id.clone();
+    }
+    assert_eq!(actual, expected.as_slice());
+}
+
 #[tokio::test]
 async fn compaction_reuses_a_generation_workspace_identity_without_recapturing_git() {
     let (session, turn_context) = crate::session::tests::make_session_and_context().await;
@@ -214,7 +245,13 @@ fn collect_user_messages_extracts_user_text_only() {
 
     let collected = collect_user_messages(&items);
 
-    assert_eq!(vec![compacted_user_message("first")], collected);
+    assert_eq!(
+        vec![CompactedUserMessage {
+            source_item_id: Some("msg_user".to_string()),
+            ..compacted_user_message("first")
+        }],
+        collected
+    );
 }
 
 #[test]
@@ -1272,7 +1309,7 @@ async fn process_compacted_history_replaces_developer_messages() {
         /*previous_turn_settings*/ None,
     )
     .await;
-    assert_eq!(refreshed, expected);
+    assert_regenerated_initial_context(&refreshed, expected);
 }
 
 #[tokio::test]
@@ -1291,7 +1328,7 @@ async fn process_compacted_history_reinjects_full_initial_context() {
         /*previous_turn_settings*/ None,
     )
     .await;
-    assert_eq!(refreshed, expected);
+    assert_regenerated_initial_context(&refreshed, expected);
 }
 
 #[tokio::test]
@@ -1361,7 +1398,7 @@ keep me updated
         /*previous_turn_settings*/ None,
     )
     .await;
-    assert_eq!(refreshed, expected);
+    assert_regenerated_initial_context(&refreshed, expected);
 }
 
 #[tokio::test]
@@ -1383,7 +1420,7 @@ async fn process_compacted_history_drops_legacy_warnings() {
         /*previous_turn_settings*/ None,
     )
     .await;
-    assert_eq!(refreshed, initial_context);
+    assert_regenerated_initial_context(&refreshed, initial_context);
 }
 
 #[tokio::test]
@@ -1415,7 +1452,7 @@ async fn process_compacted_history_inserts_context_before_last_real_user_message
         /*previous_turn_settings*/ None,
     )
     .await;
-    assert_eq!(refreshed, initial_context);
+    assert_regenerated_initial_context(&refreshed, initial_context);
 }
 
 #[tokio::test]
@@ -1449,7 +1486,7 @@ async fn process_compacted_history_reinjects_model_switch_message() {
     };
     assert!(text.contains("<model_switch>"));
 
-    assert_eq!(refreshed, initial_context);
+    assert_regenerated_initial_context(&refreshed, initial_context);
 }
 
 #[test]

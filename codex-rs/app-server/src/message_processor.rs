@@ -1464,7 +1464,7 @@ impl MessageProcessor {
             }
             ClientRequest::CommandExecWrite { params, .. } => {
                 self.command_exec_processor
-                    .command_exec_write(request_id.clone(), params)
+                    .command_exec_write(request_id.clone(), params, &rpc_gate)
                     .await
             }
             ClientRequest::CommandExecResize { params, .. } => {
@@ -1484,7 +1484,7 @@ impl MessageProcessor {
                 .map(|()| None),
             ClientRequest::ProcessWriteStdin { params, .. } => {
                 self.process_exec_processor
-                    .process_write_stdin(request_id.clone(), params)
+                    .process_write_stdin(request_id.clone(), params, &rpc_gate)
                     .await
             }
             ClientRequest::ProcessKill { params, .. } => {

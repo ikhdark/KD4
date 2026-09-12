@@ -133,6 +133,8 @@ mod tests {
     impl EnvVarGuard {
         fn set(key: &str, value: impl AsRef<OsStr>) -> Self {
             let original = std::env::var_os(key);
+            // SAFETY: Windows environment access is thread-safe; serial test guards
+            // additionally isolate the values observed by participating tests.
             unsafe {
                 std::env::set_var(key, value.as_ref());
             }
@@ -146,10 +148,12 @@ mod tests {
     impl Drop for EnvVarGuard {
         fn drop(&mut self) {
             if let Some(value) = &self.original {
+                // SAFETY: Windows environment mutation is thread-safe.
                 unsafe {
                     std::env::set_var(&self.key, value);
                 }
             } else {
+                // SAFETY: Windows environment mutation is thread-safe.
                 unsafe {
                     std::env::remove_var(&self.key);
                 }

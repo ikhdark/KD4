@@ -238,40 +238,34 @@ mod catalog_id_tests {
     }
 
     #[test]
-    fn skill_metadata_uses_shared_protocol_types() {
-        fn accept_shared(
-            interface: codex_protocol::protocol::SkillInterface,
-            dependencies: codex_protocol::protocol::SkillDependencies,
-        ) -> (
-            codex_protocol::protocol::SkillInterface,
-            codex_protocol::protocol::SkillDependencies,
-        ) {
-            (interface, dependencies)
-        }
+    fn skill_metadata_deserializes_shared_fields_and_tool_type() {
+        let interface: codex_protocol::protocol::SkillInterface =
+            noyalib::compat::serde_yaml::from_str("display_name: Example\n")
+                .expect("interface metadata should deserialize");
+        assert_eq!(interface.display_name.as_deref(), Some("Example"));
+        assert_eq!(interface.short_description, None);
+        assert_eq!(interface.default_prompt, None);
 
-        let interface = SkillInterface {
-            display_name: Some("Example".to_string()),
-            short_description: None,
-            icon_small: None,
-            icon_large: None,
-            brand_color: None,
-            default_prompt: None,
-        };
-        let dependencies = SkillDependencies {
-            tools: vec![SkillToolDependency {
+        let dependencies: codex_protocol::protocol::SkillDependencies =
+            noyalib::compat::serde_yaml::from_str("tools:\n  - type: mcp\n    value: example\n")
+                .expect("tool dependency metadata should deserialize");
+        assert_eq!(
+            dependencies.tools,
+            vec![SkillToolDependency {
                 r#type: "mcp".to_string(),
                 value: "example".to_string(),
                 description: None,
                 transport: None,
                 command: None,
                 url: None,
-            }],
-        };
-
-        let (shared_interface, shared_dependencies) =
-            accept_shared(interface.clone(), dependencies.clone());
-        assert_eq!(shared_interface, interface);
-        assert_eq!(shared_dependencies, dependencies);
+            }]
+        );
+        assert!(
+            noyalib::compat::serde_yaml::from_str::<SkillDependencies>(
+                "tools:\n  - value: missing-type\n"
+            )
+            .is_err()
+        );
     }
 
     fn skill(name: &str, path: &str, scope: SkillScope, plugin_id: Option<&str>) -> SkillMetadata {

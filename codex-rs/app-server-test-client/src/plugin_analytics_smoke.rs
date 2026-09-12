@@ -82,7 +82,12 @@ pub(super) fn run(
         /*enabled*/ true,
     )?;
 
-    wait_for_plugin_usage(&mut client, &capture_path, &expected)?;
+    wait_for_plugin_usage(
+        &mut client,
+        &capture_path,
+        &expected,
+        Instant::now() + PLUGIN_READY_TIMEOUT,
+    )?;
 
     let events = wait_for_plugin_events(&capture_path, plugin_id)?;
     let validated = validate_plugin_events(events, &expected)?;
@@ -127,15 +132,29 @@ fn wait_for_plugin_usage(
     client: &mut CodexClient,
     capture_path: &Path,
     expected: &ExpectedPlugin,
+    deadline: Instant,
 ) -> Result<()> {
-    let deadline = Instant::now() + PLUGIN_READY_TIMEOUT;
+    client.with_stdio_deadline(deadline, |client| {
+        wait_for_plugin_usage_until(client, capture_path, expected, deadline)
+    })
+}
+
+fn wait_for_plugin_usage_until(
+    client: &mut CodexClient,
+    capture_path: &Path,
+    expected: &ExpectedPlugin,
+    deadline: Instant,
+) -> Result<()> {
     let mut attempts = 0;
     loop {
+        if Instant::now() >= deadline {
+            bail!("plugin usage deadline expired before another turn attempt");
+        }
         attempts += 1;
         let turn_id = run_plugin_turn(client, expected)?;
         // Turn completion is queued after plugin usage, so its captured event is the
         // barrier that tells us whether this attempt resolved the plugin.
-        let events = wait_for_turn_analytics(capture_path, &turn_id)?;
+        let events = wait_for_turn_analytics(capture_path, &turn_id, deadline)?;
         if events.iter().any(|event| {
             event["event_type"] == "codex_plugin_used"
                 && event["event_params"]["turn_id"].as_str() == Some(turn_id.as_str())
@@ -152,7 +171,9 @@ fn wait_for_plugin_usage(
                 expected.plugin_id
             );
         }
-        thread::sleep(PLUGIN_READY_RETRY_INTERVAL);
+        thread::sleep(
+            PLUGIN_READY_RETRY_INTERVAL.min(deadline.saturating_duration_since(Instant::now())),
+        );
     }
 }
 
@@ -350,9 +371,16 @@ fn wait_for_plugin_events(path: &Path, plugin_id: &str) -> Result<Vec<Value>> {
     }
 }
 
-fn wait_for_turn_analytics(path: &Path, turn_id: &str) -> Result<Vec<Value>> {
-    let deadline = Instant::now() + CAPTURE_TIMEOUT;
+fn wait_for_turn_analytics(
+    path: &Path,
+    turn_id: &str,
+    operation_deadline: Instant,
+) -> Result<Vec<Value>> {
+    let deadline = operation_deadline.min(Instant::now() + CAPTURE_TIMEOUT);
     loop {
+        if Instant::now() >= deadline {
+            bail!("turn analytics deadline expired for `{turn_id}`");
+        }
         let events = read_capture_events(path)?;
         if events.iter().any(|event| {
             event["event_type"] == "codex_turn_event"
@@ -366,7 +394,9 @@ fn wait_for_turn_analytics(path: &Path, turn_id: &str) -> Result<Vec<Value>> {
                 path.display()
             );
         }
-        thread::sleep(CAPTURE_POLL_INTERVAL);
+        thread::sleep(
+            CAPTURE_POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now())),
+        );
     }
 }
 
@@ -500,5 +530,175 @@ impl TemporaryConfigFile {
 impl Drop for TemporaryConfigFile {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
+    }
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+
+    #[test]
+    fn smoke_deadline_bounds_nested_turn_rpc_and_forbids_expired_retry() {
+        let temp = tempfile::tempdir().expect("peer log root");
+        let log = temp.path().join("requests.jsonl");
+        let mut client = crate::tests::smoke_deadline_client(&log, "Start-Sleep -Seconds 5");
+        let expected = ExpectedPlugin {
+            plugin_id: "fixture-plugin".to_string(),
+            remote_plugin_id: "fixture-remote".to_string(),
+            plugin_name: "Fixture Plugin".to_string(),
+            marketplace_name: "fixture-marketplace".to_string(),
+        };
+        let capture = temp.path().join("capture.jsonl");
+        std::fs::write(&capture, "").expect("real empty capture");
+        let start = Instant::now();
+        let deadline = start + Duration::from_millis(200);
+        let error = wait_for_plugin_usage(&mut client, &capture, &expected, deadline)
+            .expect_err("nested thread/start cannot exceed the overall smoke budget");
+        assert!(error.to_string().contains("deadline"), "{error:#}");
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "must not wait for the five-second peer stall"
+        );
+        let requests = std::fs::read_to_string(&log).expect("actual nested request");
+        let requests = requests
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("RPC JSON"))
+            .collect::<Vec<_>>();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["method"], "thread/start");
+        wait_for_plugin_usage(&mut client, &capture, &expected, deadline)
+            .expect_err("expired budget rejects before retrying any RPC");
+        assert_eq!(
+            std::fs::read_to_string(&log)
+                .expect("unchanged request log")
+                .lines()
+                .count(),
+            1
+        );
+        let super::super::ClientTransport::Stdio { child, .. } = &client.transport else {
+            panic!("owned stdio transport")
+        };
+        assert!(
+            child
+                .lock()
+                .expect("child handle")
+                .try_wait()
+                .expect("reaped child status")
+                .is_some(),
+            "deadline must terminate and reap the stalled child, not detach work"
+        );
+    }
+
+    #[test]
+    fn smoke_deadline_capture_uses_remaining_budget_and_preserves_success() {
+        let temp = tempfile::tempdir().expect("capture root");
+        let capture = temp.path().join("capture.jsonl");
+        std::fs::write(&capture, "").expect("real empty capture");
+        let start = Instant::now();
+        let error =
+            wait_for_turn_analytics(&capture, "expected-turn", start + Duration::from_millis(40))
+                .expect_err(
+                    "nested capture cannot reset the remaining total budget to ten seconds",
+                );
+        assert!(error.to_string().contains("deadline"), "{error:#}");
+        assert!(start.elapsed() < Duration::from_secs(1));
+        let event =
+            json!({"event_type":"codex_turn_event", "event_params":{"turn_id":"expected-turn"}});
+        std::fs::write(&capture, json!({"events":[event.clone()]}).to_string())
+            .expect("actual capture event");
+        let events = wait_for_turn_analytics(
+            &capture,
+            "expected-turn",
+            Instant::now() + Duration::from_secs(1),
+        )
+        .expect("matching captured turn completes within budget");
+        assert_eq!(events, vec![event]);
+    }
+    #[test]
+    fn smoke_deadline_reaches_turn_stream_and_capture_through_normal_usage() {
+        for (complete_turn, capture_usage) in [(false, false), (true, false), (true, true)] {
+            let temp = tempfile::tempdir().expect("normal usage peer root");
+            let log = temp.path().join("requests.jsonl");
+            let thread_result = json!({
+                "thread": {"id":"fixture-thread", "sessionId":"fixture-session", "preview":"", "ephemeral":true,
+                    "modelProvider":MOCK_PROVIDER_ID, "createdAt":0, "updatedAt":0, "status":{"type":"idle"},
+                    "cwd":temp.path(), "cliVersion":"test", "source":"exec", "turns":[]},
+                "model":MOCK_MODEL_SLUG, "modelProvider":MOCK_PROVIDER_ID, "cwd":temp.path(),
+                "approvalPolicy":"never", "approvalsReviewer":"user", "sandbox":{"type":"dangerFullAccess"}
+            });
+            // This is the external peer's wire response; the production client performs its own decode.
+            let _: codex_app_server_protocol::ThreadStartResponse =
+                serde_json::from_value(thread_result.clone())
+                    .expect("independent peer response obeys the public thread/start schema");
+            let turn = json!({"id":"fixture-turn", "items":[], "status":"completed"});
+            let _: codex_app_server_protocol::TurnStartResponse =
+                serde_json::from_value(json!({"turn":turn.clone()}))
+                    .expect("independent peer response obeys the public turn/start schema");
+            let thread_json = thread_result.to_string().replace('\'', "''");
+            let turn_json = json!({"turn":turn.clone()}).to_string().replace('\'', "''");
+            let completion = json!({"jsonrpc":"2.0", "method":"turn/completed", "params":{"threadId":"fixture-thread", "turn":turn}})
+                .to_string().replace('\'', "''");
+            let after_turn = if complete_turn {
+                format!("[Console]::WriteLine('{completion}')")
+            } else {
+                "Start-Sleep -Seconds 5".to_string()
+            };
+            let body = format!(
+                "if ($request.method -eq 'thread/start') {{ $result = '{thread_json}' | ConvertFrom-Json; $response = @{{jsonrpc='2.0'; id=$request.id; result=$result}}; [Console]::WriteLine(($response | ConvertTo-Json -Depth 20 -Compress)) }} elseif ($request.method -eq 'turn/start') {{ $result = '{turn_json}' | ConvertFrom-Json; $response = @{{jsonrpc='2.0'; id=$request.id; result=$result}}; [Console]::WriteLine(($response | ConvertTo-Json -Depth 20 -Compress)); {after_turn} }}"
+            );
+            let mut client = crate::tests::smoke_deadline_client(&log, &body);
+            let expected = ExpectedPlugin {
+                plugin_id: "fixture-plugin".to_string(),
+                remote_plugin_id: "fixture-remote".to_string(),
+                plugin_name: "Fixture Plugin".to_string(),
+                marketplace_name: "fixture-marketplace".to_string(),
+            };
+            let capture = temp.path().join("capture.jsonl");
+            if capture_usage {
+                std::fs::write(&capture, json!({"events":[
+                    {"event_type":"codex_turn_event", "event_params":{"turn_id":"fixture-turn"}},
+                    {"event_type":"codex_plugin_used", "event_params":{"turn_id":"fixture-turn", "plugin_id":"fixture-plugin"}}
+                ]}).to_string()).expect("actual matching capture records");
+            } else {
+                std::fs::write(&capture, "").expect("real empty capture");
+            }
+            let start = Instant::now();
+            let result = wait_for_plugin_usage(
+                &mut client,
+                &capture,
+                &expected,
+                start + Duration::from_millis(800),
+            );
+            if capture_usage {
+                result.expect("normal usage resolves the matching captured turn and plugin");
+                assert_eq!(client.last_turn_status, Some(TurnStatus::Completed));
+            } else {
+                let error =
+                    result.expect_err("one total budget covers both stream and nested capture");
+                assert!(error.to_string().contains("deadline"), "{error:#}");
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(3),
+                "normal usage cannot adopt the peer's five-second or capture's ten-second wait"
+            );
+            let requests = std::fs::read_to_string(log)
+                .expect("normal usage requests")
+                .lines()
+                .map(|line| serde_json::from_str::<Value>(line).expect("RPC request"))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                requests
+                    .iter()
+                    .map(|request| request["method"].as_str().expect("method"))
+                    .collect::<Vec<_>>(),
+                vec!["thread/start", "turn/start"],
+                "expiry must not admit another complete turn attempt"
+            );
+            assert_eq!(requests[1]["params"]["threadId"], "fixture-thread");
+            assert_eq!(
+                requests[1]["params"]["input"][0]["path"],
+                "plugin://fixture-plugin"
+            );
+        }
     }
 }

@@ -6,8 +6,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::sync::atomic::compiler_fence;
-use std::time::SystemTime;
-use std::time::UNIX_EPOCH;
 
 use age::decrypt;
 use age::encrypt;
@@ -226,62 +224,59 @@ fn write_file_atomically_with_replace<F>(path: &Path, contents: &[u8], replace: 
 where
     F: FnOnce(&Path, &Path) -> std::io::Result<()>,
 {
+    write_file_atomically_with_io(
+        path,
+        contents,
+        |file, contents| {
+            file.write_all(contents)?;
+            file.sync_all()
+        },
+        replace,
+    )
+}
+
+fn write_file_atomically_with_io<W, R>(
+    path: &Path,
+    contents: &[u8],
+    write_and_sync: W,
+    replace: R,
+) -> Result<()>
+where
+    W: FnOnce(&mut fs::File, &[u8]) -> std::io::Result<()>,
+    R: FnOnce(&Path, &Path) -> std::io::Result<()>,
+{
     let dir = path.parent().with_context(|| {
         format!(
             "failed to compute parent directory for secrets file at {}",
             path.display()
         )
     })?;
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_nanos());
     let filename = path.file_name().with_context(|| {
         format!(
             "failed to compute filename for secrets file at {}",
             path.display()
         )
     })?;
-    let tmp_path = dir.join(format!(
-        ".{}.tmp-{}-{nonce}",
-        filename.to_string_lossy(),
-        std::process::id()
-    ));
-
-    {
-        let mut tmp_file = fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&tmp_path)
-            .with_context(|| {
-                format!(
-                    "failed to create temp secrets file at {}",
-                    tmp_path.display()
-                )
-            })?;
-        tmp_file.write_all(contents).with_context(|| {
-            format!(
-                "failed to write temp secrets file at {}",
-                tmp_path.display()
-            )
-        })?;
-        tmp_file.sync_all().with_context(|| {
-            format!("failed to sync temp secrets file at {}", tmp_path.display())
-        })?;
-    }
-
-    match replace(&tmp_path, path) {
-        Ok(()) => Ok(()),
-        Err(initial_error) => {
-            let _ = fs::remove_file(&tmp_path);
-            Err(initial_error).with_context(|| {
-                format!(
-                    "failed to atomically replace secrets file at {} with {}",
-                    path.display(),
-                    tmp_path.display()
-                )
-            })
-        }
-    }
+    let mut tmp_file = tempfile::Builder::new()
+        .prefix(&format!(".{}.tmp-", filename.to_string_lossy()))
+        .tempfile_in(dir)
+        .with_context(|| format!("failed to create temp secrets file in {}", dir.display()))?;
+    write_and_sync(tmp_file.as_file_mut(), contents).with_context(|| {
+        format!(
+            "failed to write or sync temp secrets file at {}",
+            tmp_file.path().display()
+        )
+    })?;
+    // Close the Windows file handle before replacement, retaining cleanup ownership
+    // on every error path until the target has been atomically replaced.
+    let tmp_path = tmp_file.into_temp_path();
+    replace(&tmp_path, path).with_context(|| {
+        format!(
+            "failed to atomically replace secrets file at {} with {}",
+            path.display(),
+            tmp_path.display()
+        )
+    })
 }
 
 fn generate_passphrase() -> Result<SecretString> {
@@ -476,6 +471,73 @@ mod tests {
             filenames,
             vec![std::ffi::OsString::from(LOCAL_SECRETS_FILENAME)]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn preparation_failure_preserves_store_and_removes_temporary_files() -> Result<()> {
+        let codex_home = tempfile::tempdir().expect("tempdir");
+        let keyring = Arc::new(MockKeyringStore::default());
+        let backend = LocalSecretsBackend::new(codex_home.path().to_path_buf(), keyring.clone());
+        let scope = SecretScope::Global;
+        let name = SecretName::new("TEST_SECRET")?;
+        backend.set(&scope, &name, "original")?;
+        let path = backend.secrets_path();
+        let original_ciphertext = fs::read(&path)?;
+        let mut replacement_file = backend.load_file()?;
+        replacement_file
+            .secrets
+            .insert(scope.canonical_key(&name), "replacement".to_string());
+        let plaintext = serde_json::to_vec(&replacement_file)?;
+        let passphrase = backend.load_or_create_passphrase()?;
+        let replacement_ciphertext = encrypt_with_passphrase(&plaintext, &passphrase)?;
+
+        for fail_during_sync in [false, true] {
+            let mut replacement_attempted = false;
+            let error = write_file_atomically_with_io(
+                &path,
+                &replacement_ciphertext,
+                |file, contents| {
+                    let written_len = if fail_during_sync {
+                        contents.len()
+                    } else {
+                        contents.len() / 2
+                    };
+                    file.write_all(&contents[..written_len])?;
+                    assert_eq!(file.metadata()?.len(), written_len as u64);
+                    Err(std::io::Error::other(if fail_during_sync {
+                        "injected sync failure"
+                    } else {
+                        "injected write failure"
+                    }))
+                },
+                |from, to| {
+                    replacement_attempted = true;
+                    fs::rename(from, to)
+                },
+            )
+            .expect_err("preparation must fail before replacement");
+            assert!(error.chain().any(|cause| {
+                cause.to_string()
+                    == if fail_during_sync {
+                        "injected sync failure"
+                    } else {
+                        "injected write failure"
+                    }
+            }));
+            assert!(!replacement_attempted);
+            assert_eq!(fs::read(&path)?, original_ciphertext);
+            let reopened =
+                LocalSecretsBackend::new(codex_home.path().to_path_buf(), keyring.clone());
+            assert_eq!(reopened.get(&scope, &name)?, Some("original".to_string()));
+            let filenames = fs::read_dir(backend.secrets_dir())?
+                .map(|entry| entry.map(|entry| entry.file_name()))
+                .collect::<std::io::Result<Vec<_>>>()?;
+            assert_eq!(
+                filenames,
+                vec![std::ffi::OsString::from(LOCAL_SECRETS_FILENAME)]
+            );
+        }
         Ok(())
     }
 

@@ -4,7 +4,9 @@ use crate::phase1;
 use crate::phase2;
 use crate::runtime::MemoryStartupContext;
 use crate::start_memories_startup_task;
+use codex_config::LoaderOverrides;
 use codex_config::types::MemoriesConfig;
+use codex_core::config::ConfigBuilder;
 use codex_features::Feature;
 use codex_git_utils::diff_since_latest_init;
 use codex_git_utils::reset_git_repository;
@@ -65,7 +67,18 @@ async fn memories_startup_creates_memory_root() -> anyhow::Result<()> {
 async fn memories_startup_phase2_tracks_workspace_diff_across_runs() -> anyhow::Result<()> {
     let server = start_mock_server().await;
     let home = Arc::new(TempDir::new()?);
-    let test = build_test_codex(&server, home.clone()).await?;
+    let mut test = build_test_codex(&server, home.clone()).await?;
+    for feature in [
+        Feature::SpawnCsv,
+        Feature::Collab,
+        Feature::MemoryTool,
+        Feature::Apps,
+        Feature::Plugins,
+        Feature::Personality,
+        Feature::SkillMcpDependencyInstall,
+    ] {
+        test.config.features.enable(feature)?;
+    }
     let db = test
         .codex
         .state_db()
@@ -120,6 +133,26 @@ async fn memories_startup_phase2_tracks_workspace_diff_across_runs() -> anyhow::
     trigger_memories_startup(&test).await;
 
     let request = wait_for_single_request(&phase2).await;
+    let request_body = request.body_json();
+    let tools = request_body["tools"]
+        .as_array()
+        .expect("startup consolidation request tools");
+    assert!(
+        tools
+            .iter()
+            .chain(
+                tools
+                    .iter()
+                    .filter_map(|tool| tool["tools"].as_array())
+                    .flatten()
+            )
+            .all(|tool| {
+                !matches!(
+                    tool["name"].as_str(),
+                    Some("spawn_agent" | "spawn_agents_on_csv")
+                )
+            })
+    );
     let prompt = phase2_prompt_text(&request);
     assert!(
         prompt.contains("phase2_workspace_diff.md"),
@@ -379,6 +412,106 @@ async fn memories_startup_phase1_provider_default_drives_request_model() -> anyh
 }
 
 #[tokio::test]
+async fn memories_startup_phase2_rejects_required_worker_capabilities_before_side_effects()
+-> anyhow::Result<()> {
+    for feature in [
+        Feature::SpawnCsv,
+        Feature::Collab,
+        Feature::MemoryTool,
+        Feature::Apps,
+        Feature::Plugins,
+        Feature::Personality,
+        Feature::SkillMcpDependencyInstall,
+    ] {
+        let server = start_mock_server().await;
+        let home = Arc::new(TempDir::new()?);
+        let test = build_test_codex(&server, Arc::clone(&home)).await?;
+        let db = test.codex.state_db().expect("memory startup state db");
+        seed_stage1_output(
+            db.as_ref(),
+            home.path(),
+            chrono::Utc::now(),
+            "new raw memory that must not be synced",
+            "new summary that must not be synced",
+            "required-capability",
+        )
+        .await?;
+
+        let requirements_path = home.path().join("requirements.toml");
+        tokio::fs::write(
+            &requirements_path,
+            format!("[features]\n{} = true\n", feature.key()),
+        )
+        .await?;
+        let required_config = ConfigBuilder::default()
+            .codex_home(home.path().to_path_buf())
+            .fallback_cwd(Some(home.path().to_path_buf()))
+            .loader_overrides(LoaderOverrides::with_system_requirements_path_for_tests(
+                requirements_path,
+            ))
+            .build()
+            .await?;
+        assert!(required_config.features.enabled(feature), "{feature:?}");
+        let provider = create_model_provider(
+            test.config.model_provider.clone(),
+            Some(test.thread_manager.auth_manager()),
+        );
+        let (context, config) = memory_startup_context_with_provider(&test, provider).await;
+        let mut config = (*config).clone();
+        config.features = required_config.features;
+        let root = memory_root(&config.codex_home);
+        tokio::fs::create_dir_all(root.join("rollout_summaries")).await?;
+        tokio::fs::write(root.join("raw_memories.md"), "existing raw memory").await?;
+        tokio::fs::write(
+            root.join("rollout_summaries/existing.md"),
+            "existing summary",
+        )
+        .await?;
+        let threads_before = test.thread_manager.list_thread_created_ids().await;
+
+        phase2::run(context, Arc::new(config)).await;
+
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("raw_memories.md")).await?,
+            "existing raw memory",
+            "{feature:?} must reject before input sync"
+        );
+        assert_eq!(
+            read_rollout_summary_bodies(&root).await?,
+            vec!["existing summary".to_string()],
+            "{feature:?} must preserve existing summaries"
+        );
+        assert!(
+            !root.join("phase2_workspace_diff.md").exists(),
+            "{feature:?}"
+        );
+        assert_eq!(
+            test.thread_manager.list_thread_created_ids().await,
+            threads_before,
+            "{feature:?} must not create a consolidation thread"
+        );
+        assert_eq!(
+            db.memories()
+                .try_claim_global_phase2_job(ThreadId::new(), 60)
+                .await?,
+            codex_state::Phase2JobClaimOutcome::SkippedRetryUnavailable,
+            "{feature:?} must record failure and release the running job"
+        );
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|request| { !request.url.path().ends_with("/responses") }),
+            "{feature:?} must not request consolidation"
+        );
+        shutdown_test_codex(&test).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn memories_startup_phase2_provider_default_drives_request_model() -> anyhow::Result<()> {
     let server = start_mock_server().await;
     let home = Arc::new(TempDir::new()?);
@@ -393,6 +526,26 @@ async fn memories_startup_phase2_provider_default_drives_request_model() -> anyh
     assert_eq!(
         request.body_json()["instructions"].as_str(),
         Some(crate::stage_two::BASE_INSTRUCTIONS.trim())
+    );
+    let body = request.body_json();
+    let tools = body["tools"]
+        .as_array()
+        .expect("consolidation request tools");
+    assert!(
+        tools
+            .iter()
+            .chain(
+                tools
+                    .iter()
+                    .filter_map(|tool| tool["tools"].as_array())
+                    .flatten()
+            )
+            .all(|tool| {
+                !matches!(
+                    tool["name"].as_str(),
+                    Some("spawn_agent" | "spawn_agents_on_csv")
+                )
+            })
     );
 
     Ok(())
@@ -424,7 +577,17 @@ async fn memories_phase2_agent_uses_dedicated_prompt_context() -> anyhow::Result
     assert!(!config.include_skill_instructions);
     assert!(!config.include_environment_context);
     assert!(!config.memories.use_memories);
-    assert!(!config.features.enabled(Feature::Personality));
+    for feature in [
+        Feature::SpawnCsv,
+        Feature::Collab,
+        Feature::MemoryTool,
+        Feature::Apps,
+        Feature::Plugins,
+        Feature::Personality,
+        Feature::SkillMcpDependencyInstall,
+    ] {
+        assert!(!config.features.enabled(feature), "{feature:?}");
+    }
 
     shutdown_test_codex(&test).await?;
     Ok(())
@@ -540,12 +703,35 @@ async fn run_memory_phase_two_model_request_test(
     .await;
 
     let (context, config) = memory_startup_context_with_provider(&test, provider).await;
+    let mut config = (*config).clone();
+    for feature in [
+        Feature::SpawnCsv,
+        Feature::Collab,
+        Feature::MemoryTool,
+        Feature::Apps,
+        Feature::Plugins,
+        Feature::Personality,
+        Feature::SkillMcpDependencyInstall,
+    ] {
+        config.features.enable(feature)?;
+    }
     let root = memory_root(&config.codex_home);
     tokio::fs::create_dir_all(&root).await?;
     seed_extension_instructions(&root).await?;
-    phase2::run(context, config).await;
+    phase2::run(context, Arc::new(config)).await;
     let request = wait_for_single_request(&response).await;
     wait_for_phase2_workspace_reset(&home.path().join("memories")).await?;
+    assert!(
+        tokio::fs::read_to_string(root.join("raw_memories.md"))
+            .await?
+            .contains("raw memory for phase two")
+    );
+    assert!(
+        read_rollout_summary_bodies(&root)
+            .await?
+            .iter()
+            .any(|summary| summary.contains("rollout summary for phase two"))
+    );
     shutdown_test_codex(&test).await?;
     Ok(request)
 }

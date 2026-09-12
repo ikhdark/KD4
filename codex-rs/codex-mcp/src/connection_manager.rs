@@ -183,6 +183,7 @@ pub struct McpConnectionManager {
     elicitation_requests: ElicitationRequestManager,
     client_reuse_context: ClientReuseContext,
     shutdown_started: AtomicBool,
+    shutdown_complete: tokio::sync::watch::Sender<bool>,
 }
 
 #[derive(Clone)]
@@ -213,6 +214,15 @@ impl ClientReuseContext {
 struct CachedToolCatalog {
     revision: u64,
     tools: Arc<Vec<ToolInfo>>,
+}
+
+struct ShutdownCompletion(tokio::sync::watch::Sender<bool>);
+
+impl Drop for ShutdownCompletion {
+    fn drop(&mut self) {
+        // Every terminal task outcome, including panic, releases all shutdown waiters.
+        self.0.send_replace(true);
+    }
 }
 
 async fn shutdown_clients_with_deadline<T, G, GFut, F, FFut>(
@@ -450,10 +460,15 @@ impl McpConnectionManager {
                 });
             let shares_codex_apps_tools_cache =
                 should_share_codex_apps_tools_cache(&server_name, uses_env_bearer_token);
-            let codex_apps_tools_cache_context = shares_codex_apps_tools_cache.then(|| {
-                codex_apps_tools_cache
-                    .context(codex_home.clone(), codex_apps_tools_cache_key.clone())
-            });
+            let codex_apps_tools_cache_context = if shares_codex_apps_tools_cache {
+                Some(
+                    codex_apps_tools_cache
+                        .context(codex_home.clone(), codex_apps_tools_cache_key.clone())
+                        .await,
+                )
+            } else {
+                None
+            };
             // The reserved Codex Apps registration follows the shared
             // AuthManager across refreshes. In the hosted-plugin path, this
             // is the ChatGPT /ps/mcp connection. User-configured MCP
@@ -490,7 +505,8 @@ impl McpConnectionManager {
                 client_elicitation_capability.clone(),
                 supports_openai_form_elicitation,
                 Arc::clone(&tool_catalog_revision),
-            );
+            )
+            .await;
             clients.insert(server_name.clone(), async_managed_client.clone());
             let tx_event = tx_event.clone();
             let submit_id = startup_submit_id.clone();
@@ -546,6 +562,7 @@ impl McpConnectionManager {
             elicitation_requests: elicitation_requests.clone(),
             client_reuse_context,
             shutdown_started: AtomicBool::new(false),
+            shutdown_complete: tokio::sync::watch::channel(false).0,
         };
         tokio::spawn(async move {
             let outcomes = join_set.join_all().await;
@@ -659,6 +676,7 @@ impl McpConnectionManager {
                 supports_openai_form_elicitation: false,
             },
             shutdown_started: AtomicBool::new(false),
+            shutdown_complete: tokio::sync::watch::channel(false).0,
         }
     }
 
@@ -683,12 +701,16 @@ impl McpConnectionManager {
 
     /// Stop all MCP clients with one manager-wide grace period before forcing process trees.
     pub async fn shutdown(&self) {
+        let mut completion = self.shutdown_complete.subscribe();
         if self.shutdown_started.swap(true, Ordering::AcqRel) {
+            let _ = completion.wait_for(|finished| *finished).await;
             return;
         }
         let clients = self.clients.values().cloned().collect::<Vec<_>>();
+        let completion = ShutdownCompletion(self.shutdown_complete.clone());
         // Keep cleanup alive if an interrupt cancels the refresh that requested it.
         let shutdown_task = tokio::spawn(async move {
+            let _completion = completion;
             shutdown_clients_with_deadline(
                 clients,
                 Duration::from_secs(2),
@@ -700,6 +722,11 @@ impl McpConnectionManager {
         if let Err(error) = shutdown_task.await {
             warn!("MCP client shutdown task failed: {error}");
         }
+    }
+
+    /// Whether the owned shutdown task has reached a terminal outcome.
+    pub fn shutdown_finished(&self) -> bool {
+        *self.shutdown_complete.borrow()
     }
 
     pub fn server_origin(&self, server_name: &str) -> Option<&str> {
@@ -945,16 +972,18 @@ impl McpConnectionManager {
             format!("failed to refresh tools for MCP server '{CODEX_APPS_MCP_SERVER_NAME}'")
         })?;
 
-        let tools =
-            match (
-                managed_client.codex_apps_tools_cache_context.as_ref(),
-                fetch_ticket,
-            ) {
-                (Some(cache_context), Some(fetch_ticket)) => cache_context
-                    .publish_if_newest_accepted(fetch_ticket, &managed_client.server_info, tools),
-                (None, None) => tools,
-                _ => unreachable!("Codex Apps fetch ticket requires cache context"),
-            };
+        let tools = match (
+            managed_client.codex_apps_tools_cache_context.as_ref(),
+            fetch_ticket,
+        ) {
+            (Some(cache_context), Some(fetch_ticket)) => {
+                cache_context
+                    .publish_if_newest_accepted(fetch_ticket, &managed_client.server_info, tools)
+                    .await
+            }
+            (None, None) => tools,
+            _ => unreachable!("Codex Apps fetch ticket requires cache context"),
+        };
         emit_duration(
             MCP_TOOLS_LIST_DURATION_METRIC,
             list_start.elapsed(),

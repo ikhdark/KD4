@@ -128,16 +128,208 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
+    #[test]
     #[serial]
-    async fn with_restored_runs_callback_with_fixed_keep_raw_policy() -> std::io::Result<()> {
-        let mut tui = super::test_support::make_test_tui()?;
+    fn with_restored_runs_callback_with_fixed_keep_raw_policy() -> std::io::Result<()> {
+        use std::sync::Arc;
+        use std::time::Duration;
+        use windows_sys::Win32::System::Console::*;
 
-        let output = tui.with_restored(|| async { "completed" }).await;
-        let _ = super::restore_after_exit();
-
-        assert_eq!(output, "completed");
+        const CHILD: &str = "CODEX_TEST_NATIVE_TERMINAL_HANDOFF";
+        const TEST: &str = "tui::tests::with_restored_runs_callback_with_fixed_keep_raw_policy";
+        const VT_INPUT: u32 = 0x0200;
+        fn input_mode() -> u32 {
+            let mut mode = 0;
+            assert_ne!(
+                unsafe { GetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), &mut mode) },
+                0
+            );
+            mode
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        if let Some(marker) = std::env::var_os(CHILD) {
+            // The parent launches this test inside a real ConPTY, isolated from its console.
+            assert_ne!(
+                unsafe { SetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), input_mode() | VT_INPUT) },
+                0
+            );
+            super::set_modes()?;
+            assert_eq!(input_mode() & VT_INPUT, 0);
+            runtime.block_on(async {
+                let mut tui = super::test_support::make_test_tui().expect("native test terminal");
+                let mut events = tui.event_stream();
+                // Start the real crossterm reader before relinquishing it.
+                assert!(tokio::time::timeout(Duration::from_millis(20), futures::StreamExt::next(&mut events)).await.is_err());
+                let broker = Arc::clone(&tui.event_broker);
+                let broker_guard = broker.lock_state_for_test();
+                let mode_guard = super::windows_console::lock_input_modes_for_test();
+                let (entered_tx, mut entered_rx) = tokio::sync::oneshot::channel();
+                let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+                let handoff = tui.with_restored(|| async {
+                    assert_eq!(input_mode() & VT_INPUT, VT_INPUT, "external program sees restored VT input");
+                    assert!(crossterm::terminal::is_raw_mode_enabled().expect("raw mode"));
+                    entered_tx.send(()).expect("callback entered");
+                    release_rx.await.expect("release external program");
+                    "completed"
+                });
+                tokio::pin!(handoff);
+                // These are actual production mutexes; no handoff or mode behavior is replaced.
+                assert!(tokio::time::timeout(Duration::from_millis(20), &mut handoff).await.is_err());
+                assert!(matches!(entered_rx.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)));
+                drop(broker_guard);
+                assert!(tokio::time::timeout(Duration::from_millis(20), &mut handoff).await.is_err());
+                assert!(matches!(entered_rx.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)));
+                drop(mode_guard);
+                tokio::select! {
+                    result = &mut entered_rx => result.expect("external callback starts after restore"),
+                    _ = &mut handoff => panic!("handoff returned before external program finished"),
+                    _ = tokio::time::sleep(Duration::from_secs(2)) => panic!("external callback did not start"),
+                }
+                let mode_guard = super::windows_console::lock_input_modes_for_test();
+                release_tx.send(()).expect("finish external program");
+                assert!(tokio::time::timeout(Duration::from_millis(20), &mut handoff).await.is_err());
+                let broker_guard = broker.lock_state_for_test();
+                drop(mode_guard);
+                assert!(tokio::time::timeout(Duration::from_millis(20), &mut handoff).await.is_err());
+                assert_eq!(input_mode() & VT_INPUT, 0, "TUI input mode restored before events resume");
+                drop(broker_guard);
+                assert_eq!(tokio::time::timeout(Duration::from_secs(2), &mut handoff).await.expect("handoff resumes"), "completed");
+                // The same consumer must receive a real native input record after resume.
+                let record = INPUT_RECORD {
+                    EventType: KEY_EVENT as u16,
+                    Event: INPUT_RECORD_0 { KeyEvent: KEY_EVENT_RECORD {
+                        bKeyDown: 1, wRepeatCount: 1, wVirtualKeyCode: 0x58, wVirtualScanCode: 0,
+                        uChar: KEY_EVENT_RECORD_0 { UnicodeChar: b'x' as u16 }, dwControlKeyState: 0,
+                    } },
+                };
+                let mut written = 0;
+                assert_ne!(unsafe { WriteConsoleInputW(GetStdHandle(STD_INPUT_HANDLE), &record, 1, &mut written) }, 0);
+                assert_eq!(written, 1);
+                let event = tokio::time::timeout(Duration::from_secs(2), futures::StreamExt::next(&mut events)).await.expect("native event after handoff").expect("event stream remains open");
+                assert!(matches!(event, super::TuiEvent::Key(key) if key.code == crossterm::event::KeyCode::Char('x')));
+            });
+            super::restore_after_exit()?;
+            assert_eq!(
+                input_mode() & VT_INPUT,
+                VT_INPUT,
+                "original mode survives balanced handoff"
+            );
+            std::fs::write(marker, b"native handoff and runtime progress verified")?;
+            return Ok(());
+        }
+        let fixture = tempfile::tempdir()?;
+        let marker = fixture.path().join("native-handoff.txt");
+        runtime.block_on(async {
+            let mut env = std::env::vars().collect::<std::collections::HashMap<_, _>>();
+            env.insert(CHILD.to_owned(), marker.to_string_lossy().into_owned());
+            let mut child = codex_utils_pty::spawn_pty_process(
+                std::env::current_exe()
+                    .expect("test executable")
+                    .to_str()
+                    .expect("UTF-8 executable"),
+                &[
+                    "--exact".to_owned(),
+                    TEST.to_owned(),
+                    "--nocapture".to_owned(),
+                    "--test-threads=1".to_owned(),
+                ],
+                &std::env::current_dir().expect("working directory"),
+                &env,
+                &None,
+                codex_utils_pty::TerminalSize::default(),
+            )
+            .await
+            .expect("native console child");
+            let mut output = Vec::new();
+            let result = tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    tokio::select! {
+                        code = &mut child.exit_rx => break code.expect("native child exit"),
+                        Some(bytes) = child.stdout_rx.recv() => output.extend(bytes),
+                    }
+                }
+            })
+            .await;
+            if result.is_err() {
+                child
+                    .session
+                    .terminate()
+                    .expect("terminate stuck native child");
+            }
+            assert_eq!(
+                result.expect("native handoff deadline"),
+                0,
+                "{}",
+                String::from_utf8_lossy(&output)
+            );
+        });
+        assert_eq!(
+            std::fs::read(marker)?,
+            b"native handoff and runtime progress verified"
+        );
         Ok(())
+    }
+
+    #[test]
+    fn pending_history_retry_does_not_duplicate_completed_batches() {
+        use super::PendingHistoryLines;
+        use super::Tui;
+        use crate::insert_history::HistoryLineWrapPolicy;
+        use crate::terminal_hyperlinks::HyperlinkLine;
+        use ratatui::text::Line;
+
+        for (failed_text, expected_pending, expected_before_retry) in [
+            ("FIRST", vec!["FIRST", "SECOND", "THIRD"], vec![]),
+            ("SECOND", vec!["SECOND", "THIRD"], vec!["FIRST"]),
+        ] {
+            let mut terminal =
+                CustomTerminal::with_options(VT100Backend::new(12, 8)).expect("terminal");
+            let viewport = Rect::new(0, 7, 12, 1);
+            terminal.set_viewport_area(viewport);
+            terminal
+                .backend_mut()
+                .fail_next_write_of(failed_text.as_bytes());
+            let mut pending = ["FIRST", "SECOND", "THIRD"]
+                .into_iter()
+                .map(|text| PendingHistoryLines {
+                    lines: vec![HyperlinkLine::new(Line::from(text))],
+                    wrap_policy: HistoryLineWrapPolicy::PreWrap,
+                })
+                .collect::<Vec<_>>();
+
+            let error = Tui::flush_pending_history_lines(&mut terminal, &mut pending)
+                .expect_err("the actual history write must report its external failure");
+            assert_eq!(error.kind(), std::io::ErrorKind::Other);
+            assert_eq!(error.to_string(), "injected terminal write failure");
+            assert_eq!(
+                pending
+                    .iter()
+                    .map(|batch| batch.lines[0].line.to_string())
+                    .collect::<Vec<_>>(),
+                expected_pending
+            );
+            let visible_history = |terminal: &CustomTerminal<VT100Backend>| {
+                terminal
+                    .backend()
+                    .vt100()
+                    .screen()
+                    .rows(0, 12)
+                    .filter(|row| !row.trim().is_empty())
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(visible_history(&terminal), expected_before_retry);
+            assert_eq!(terminal.viewport_area, viewport);
+
+            Tui::flush_pending_history_lines(&mut terminal, &mut pending)
+                .expect("retry after the external failure clears");
+            assert!(pending.is_empty());
+            assert_eq!(visible_history(&terminal), ["FIRST", "SECOND", "THIRD"]);
+            assert_eq!(terminal.viewport_area, viewport);
+            Tui::flush_pending_history_lines(&mut terminal, &mut pending).expect("empty flush");
+            assert_eq!(visible_history(&terminal), ["FIRST", "SECOND", "THIRD"]);
+        }
     }
 
     #[test]
@@ -415,6 +607,8 @@ pub enum TuiEvent {
 }
 
 pub struct Tui {
+    #[cfg(test)]
+    pub(crate) thread_switch_clear_error: Option<std::io::ErrorKind>,
     frame_requester: FrameRequester,
     draw_tx: broadcast::Sender<()>,
     event_broker: Arc<EventBroker>,
@@ -464,6 +658,8 @@ impl Tui {
             draw_tx,
             event_broker: Arc::new(EventBroker::new()),
             terminal,
+            #[cfg(test)]
+            thread_switch_clear_error: None,
             pending_history_lines: vec![],
             ambient_pet_image_state: crate::pets::PetImageRenderState::default(),
             pet_picker_preview_image_state: crate::pets::PetImageRenderState::default(),
@@ -475,6 +671,23 @@ impl Tui {
             notification_condition: NotificationCondition::default(),
             alt_screen_enabled: true,
         }
+    }
+
+    pub(crate) fn clear_for_thread_switch(&mut self) -> Result<()> {
+        #[cfg(test)]
+        if let Some(kind) = self.thread_switch_clear_error.take() {
+            return Err(std::io::Error::new(
+                kind,
+                "thread-switch terminal clear failed",
+            ));
+        }
+        self.terminal.clear_scrollback_and_visible_screen_ansi()?;
+        let mut area = self.terminal.viewport_area;
+        if area.y > 0 {
+            area.y = 0;
+            self.terminal.set_viewport_area(area);
+        }
+        Ok(())
     }
 
     /// Set whether alternate screen is enabled. When false, enter_alt_screen() becomes a no-op.
@@ -503,17 +716,6 @@ impl Tui {
         self.alt_screen_active.load(Ordering::Relaxed)
     }
 
-    // Drop crossterm EventStream to avoid stdin conflicts with other processes.
-    pub fn pause_events(&mut self) {
-        self.event_broker.pause_events();
-    }
-
-    // Resume crossterm EventStream to resume stdin polling.
-    // Inverse of `pause_events`.
-    pub fn resume_events(&mut self) {
-        self.event_broker.resume_events();
-    }
-
     /// Temporarily restore terminal state to run an external interactive program `f`.
     ///
     /// This pauses crossterm's stdin polling by dropping the underlying event stream, restores
@@ -525,7 +727,10 @@ impl Tui {
         Fut: Future<Output = R>,
     {
         // Pause crossterm events to avoid stdin conflicts with external program `f`.
-        self.pause_events();
+        let broker = Arc::clone(&self.event_broker);
+        tokio::task::spawn_blocking(move || broker.pause_events())
+            .await
+            .expect("terminal input pause worker panicked");
 
         // Leave alt screen if active to avoid conflicts with external program `f`.
         let was_alt_screen = self.is_alt_screen_active();
@@ -533,22 +738,32 @@ impl Tui {
             let _ = self.leave_alt_screen();
         }
 
-        if let Err(err) = restore_keep_raw() {
+        if let Err(err) = tokio::task::spawn_blocking(restore_keep_raw)
+            .await
+            .unwrap_or_else(|err| Err(std::io::Error::other(err)))
+        {
             tracing::warn!("failed to restore terminal modes before external program: {err}");
         }
         let output = f().await;
 
-        if let Err(err) = set_modes() {
-            tracing::warn!("failed to re-enable terminal modes after external program: {err}");
-        }
-        // After the external program `f` finishes, reset terminal state and flush any buffered keypresses.
-        flush_terminal_input_buffer();
+        tokio::task::spawn_blocking(|| {
+            if let Err(err) = set_modes() {
+                tracing::warn!("failed to re-enable terminal modes after external program: {err}");
+            }
+            // Clear keys buffered while the external program owned the terminal.
+            flush_terminal_input_buffer();
+        })
+        .await
+        .expect("terminal mode resume worker panicked");
 
         if was_alt_screen {
             let _ = self.enter_alt_screen();
         }
 
-        self.resume_events();
+        let broker = Arc::clone(&self.event_broker);
+        tokio::task::spawn_blocking(move || broker.resume_events())
+            .await
+            .expect("terminal input resume worker panicked");
         output
     }
 
@@ -709,20 +924,30 @@ impl Tui {
     }
 
     /// Write any buffered history lines above the viewport and clear the buffer.
-    fn flush_pending_history_lines(
-        terminal: &mut Terminal,
+    fn flush_pending_history_lines<B>(
+        terminal: &mut CustomTerminal<B>,
         pending_history_lines: &mut Vec<PendingHistoryLines>,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        B: Backend + Write,
+    {
         if pending_history_lines.is_empty() {
             return Ok(());
         }
 
-        for batch in pending_history_lines.iter() {
-            crate::insert_history::insert_history_hyperlink_lines_with_wrap_policy(
-                terminal,
-                batch.lines.clone(),
-                batch.wrap_policy,
-            )?;
+        for (completed, batch) in pending_history_lines.iter().enumerate() {
+            if let Err(error) =
+                crate::insert_history::insert_history_hyperlink_lines_with_wrap_policy(
+                    terminal,
+                    batch.lines.clone(),
+                    batch.wrap_policy,
+                )
+            {
+                // Completed batches must not be inserted twice on retry. The failed
+                // batch may have partially written, so retain it and every later batch.
+                drop(pending_history_lines.drain(..completed));
+                return Err(error);
+            }
         }
         pending_history_lines.clear();
         Ok(())

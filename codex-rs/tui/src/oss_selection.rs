@@ -386,20 +386,34 @@ async fn check_ollama_status() -> ProviderStatus {
 }
 
 async fn check_port_status(port: u16) -> io::Result<bool> {
-    let client = codex_http_client::HttpClientBuilder::new()
-        .build_direct()
-        .map_err(io::Error::other)?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let client = tokio::time::timeout_at(
+        deadline,
+        tokio::task::spawn_blocking(|| codex_http_client::HttpClientBuilder::new().build_direct()),
+    )
+    .await
+    .map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            "OSS provider client construction timed out",
+        )
+    })?
+    .map_err(io::Error::other)?
+    .map_err(io::Error::other)?;
+
+    // Client construction can finish after the deadline before this task is polled again.
+    // Do not start a request when construction has already consumed the probe budget.
+    if tokio::time::Instant::now() >= deadline {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "OSS provider client construction timed out",
+        ));
+    }
 
     let url = format!("http://localhost:{port}");
-
-    match client
-        .get(&url)
-        .timeout(Duration::from_secs(2))
-        .send()
-        .await
-    {
-        Ok(response) => Ok(response.status().is_success()),
-        Err(_) => Ok(false), // Connection failed = not running
+    match tokio::time::timeout_at(deadline, client.get(&url).send()).await {
+        Ok(Ok(response)) => Ok(response.status().is_success()),
+        Ok(Err(_)) | Err(_) => Ok(false), // Connection failed = not running
     }
 }
 
@@ -425,12 +439,211 @@ mod tests {
 
     #[tokio::test]
     async fn check_port_status_uses_shared_http_client_for_loopback_probe() {
+        for (status, expected_running) in [(204, true), (500, false)] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .respond_with(ResponseTemplate::new(status))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            assert_eq!(
+                check_port_status(server.address().port()).await.unwrap(),
+                expected_running
+            );
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].method.as_str(), "GET");
+            assert_eq!(requests[0].url.path(), "/");
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn check_port_status_bounds_configured_ca_construction() -> anyhow::Result<()> {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::windows::named_pipe::ServerOptions;
+
+        const CASE_ENV: &str = "CODEX_TUI_CA_PROBE_TEST_CASE";
+        const TEST_NAME: &str =
+            "oss_selection::tests::check_port_status_bounds_configured_ca_construction";
+        let Ok(case) = std::env::var(CASE_ENV) else {
+            let fixtures = tempfile::tempdir()?;
+            let invalid_ca = fixtures.path().join("invalid-selected-ca.pem");
+            std::fs::write(&invalid_ca, b"not a PEM certificate")?;
+            for case in [
+                "valid-204",
+                "valid-500",
+                "invalid",
+                "caller-timeout",
+                "internal-timeout",
+                "shared-deadline",
+            ] {
+                let selected_ca = if case == "invalid" {
+                    invalid_ca.clone()
+                } else {
+                    std::path::PathBuf::from(format!(
+                        r"\\.\pipe\codex-oss-ca-{}",
+                        uuid::Uuid::new_v4()
+                    ))
+                };
+                let mut command = tokio::process::Command::new(std::env::current_exe()?);
+                command
+                    .arg("--exact")
+                    .arg(TEST_NAME)
+                    .arg("--nocapture")
+                    .arg("--test-threads=1")
+                    .env_remove("CODEX_CA_CERTIFICATE")
+                    .env_remove("SSL_CERT_FILE")
+                    .env("CODEX_CA_CERTIFICATE", selected_ca)
+                    // The selected Codex CA must win over this invalid fallback.
+                    .env("SSL_CERT_FILE", &invalid_ca)
+                    .env(CASE_ENV, case)
+                    .kill_on_drop(true);
+                let output =
+                    tokio::time::timeout(Duration::from_secs(20), command.output()).await??;
+                assert!(
+                    output.status.success(),
+                    "{case} failed\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            return Ok(());
+        };
+
         let server = MockServer::start().await;
+        let status = if case == "valid-500" { 500 } else { 204 };
+        let response = if case == "shared-deadline" {
+            ResponseTemplate::new(status).set_delay(Duration::from_millis(1_500))
+        } else {
+            ResponseTemplate::new(status)
+        };
         Mock::given(method("GET"))
-            .respond_with(ResponseTemplate::new(204))
+            .respond_with(response)
             .mount(&server)
             .await;
+        let port = server.address().port();
+        if case == "invalid" {
+            let error = check_port_status(port)
+                .await
+                .expect_err("the selected invalid CA must reject construction before any GET");
+            assert!(error.to_string().contains("invalid-selected-ca.pem"));
+            assert!(server.received_requests().await.unwrap().is_empty());
+            return Ok(());
+        }
 
-        assert!(check_port_status(server.address().port()).await.unwrap());
+        let ca_path = std::env::var("CODEX_CA_CERTIFICATE")?;
+        let mut ca_pipe = ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(ca_path)?;
+        let (read_started_tx, read_started_rx) = tokio::sync::oneshot::channel();
+        let (release_ca_tx, release_ca_rx) = tokio::sync::oneshot::channel();
+        let pipe_task = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_secs(5), ca_pipe.connect()).await??;
+            let _ = read_started_tx.send(());
+            // This watchdog runs outside the probe's current-thread runtime.
+            // Even an unfixed blocking CA read is released so the test can fail.
+            let released = tokio::time::timeout(Duration::from_secs(5), release_ca_rx).await;
+            ca_pipe
+                .write_all(include_bytes!(
+                    "../../http-client/tests/fixtures/test-ca.pem"
+                ))
+                .await?;
+            tokio::task::spawn_blocking(move || {
+                use std::os::windows::io::AsRawHandle;
+                // The owned pipe stays alive until its bytes have been read;
+                // closing an unread Windows pipe can discard its buffered data.
+                // SAFETY: ca_pipe owns this live handle for the entire call.
+                let flushed = unsafe {
+                    windows_sys::Win32::Storage::FileSystem::FlushFileBuffers(
+                        ca_pipe.as_raw_handle(),
+                    )
+                };
+                if flushed == 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                drop(ca_pipe);
+                Ok(())
+            })
+            .await??;
+            released??;
+            Ok::<(), anyhow::Error>(())
+        });
+        let probe_case = case.clone();
+        let probe_thread = std::thread::spawn(move || -> anyhow::Result<()> {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            let result = runtime.block_on(async move {
+                let mut probe = Box::pin(check_port_status(port));
+                tokio::select! {
+                    biased;
+                    result = &mut probe => {
+                        anyhow::bail!("probe finished before selected CA bytes were released: {result:?}");
+                    }
+                    result = read_started_rx => result?,
+                }
+                // The pipe connection proves the real process CA file was opened.
+                // This timer must progress while fs::read is still waiting for bytes.
+                tokio::time::timeout(
+                    Duration::from_secs(1),
+                    tokio::time::sleep(Duration::from_millis(20)),
+                )
+                .await?;
+                match probe_case.as_str() {
+                    "valid-204" | "valid-500" => {
+                        let _ = release_ca_tx.send(());
+                        assert_eq!(probe.await?, probe_case == "valid-204");
+                    }
+                    "shared-deadline" => {
+                        // A successful but slow CA read consumes half the total
+                        // budget; the HTTP response cannot receive a new two seconds.
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        let _ = release_ca_tx.send(());
+                        assert!(!probe.await?, "construction and GET must share one deadline");
+                    }
+                    "caller-timeout" => {
+                        tokio::time::timeout(Duration::from_millis(100), &mut probe)
+                            .await
+                            .expect_err("the caller deadline must include blocked construction");
+                        drop(probe);
+                        let _ = release_ca_tx.send(());
+                    }
+                    "internal-timeout" => {
+                        let error = tokio::time::timeout(Duration::from_secs(3), &mut probe)
+                            .await?
+                            .expect_err("the internal probe deadline must include CA construction");
+                        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+                        drop(probe);
+                        let _ = release_ca_tx.send(());
+                    }
+                    other => anyhow::bail!("unexpected isolated CA case: {other}"),
+                }
+                Ok(())
+            });
+            // Wait for any abandoned client-construction worker to finish before
+            // the outer runtime checks whether it sent a late HTTP request.
+            drop(runtime);
+            result
+        });
+        let probe_result = tokio::task::spawn_blocking(move || probe_thread.join())
+            .await?
+            .expect("probe thread panicked");
+        let pipe_result = pipe_task.await?;
+        probe_result?;
+        pipe_result?;
+        let requests = server.received_requests().await.unwrap();
+        if case.starts_with("valid-") || case == "shared-deadline" {
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].method.as_str(), "GET");
+            assert_eq!(requests[0].url.path(), "/");
+        } else {
+            assert!(
+                requests.is_empty(),
+                "a timed-out construction must never send a late GET"
+            );
+        }
+        Ok(())
     }
 }

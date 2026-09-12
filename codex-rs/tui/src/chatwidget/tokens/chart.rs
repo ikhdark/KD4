@@ -314,7 +314,10 @@ fn bar_caption(view: TokenActivityView, values: &[i64]) -> Line<'static> {
             "Each column = 1 week · tallest ",
             weeks.iter().copied().max().unwrap_or(/*default*/ 0),
         ),
-        TokenActivityView::Cumulative => ("Running total · top ", weeks.iter().sum::<i64>()),
+        TokenActivityView::Cumulative => (
+            "Running total · top ",
+            weeks.iter().copied().fold(0, i64::saturating_add),
+        ),
         TokenActivityView::Daily => ("", 0),
     };
     if peak <= 0 {
@@ -395,7 +398,8 @@ fn daily_values(
         if date < start || date >= end || date > today {
             continue;
         }
-        *by_date.entry(date).or_insert(/*default*/ 0) += bucket.tokens.max(/*other*/ 0);
+        let total = by_date.entry(date).or_insert(0_i64);
+        *total = total.saturating_add(bucket.tokens.max(/*other*/ 0));
     }
     (0..CELL_COUNT)
         .map(|offset| {
@@ -414,8 +418,8 @@ fn levels_for_view(values: &[i64], view: TokenActivityView) -> Vec<usize> {
         TokenActivityView::Cumulative => {
             let cumulative = weekly_totals(values)
                 .into_iter()
-                .scan(/*initial_state*/ 0, |sum, value| {
-                    *sum += value;
+                .scan(/*initial_state*/ 0_i64, |sum, value| {
+                    *sum = sum.saturating_add(value);
                     Some(*sum)
                 })
                 .collect::<Vec<_>>();
@@ -428,7 +432,7 @@ fn graded_levels(values: &[i64]) -> Vec<usize> {
     let max = values.iter().copied().max().unwrap_or(/*default*/ 0);
     values
         .iter()
-        .map(|value| match (*value, max) {
+        .map(|value| match (i128::from(*value), i128::from(max)) {
             (0, _) | (_, 0) => 0,
             (value, max) if value * 4 > max * 3 => 4,
             (value, max) if value * 2 > max => 3,
@@ -441,7 +445,7 @@ fn graded_levels(values: &[i64]) -> Vec<usize> {
 fn weekly_totals(values: &[i64]) -> Vec<i64> {
     values
         .chunks(DAY_COUNT)
-        .map(|week| week.iter().sum())
+        .map(|week| week.iter().copied().fold(0, i64::saturating_add))
         .collect()
 }
 
@@ -453,7 +457,8 @@ fn bar_levels(totals: &[i64]) -> Vec<usize> {
             let height = if *value <= 0 || max <= 0 {
                 0
             } else {
-                ((*value * DAY_COUNT as i64 + max - 1) / max) as usize
+                ((i128::from(*value) * DAY_COUNT as i128 + i128::from(max) - 1) / i128::from(max))
+                    as usize
             };
             (0..DAY_COUNT).map(move |row| if DAY_COUNT - row <= height { 4 } else { 0 })
         })

@@ -176,7 +176,9 @@ pub async fn determine_streamable_http_auth_status(
         env_http_headers,
         store_mode,
         keyring_backend_kind,
-    )? {
+    )
+    .await?
+    {
         AuthStatusCheck::Complete(status) => return Ok(status),
         AuthStatusCheck::Discover(default_headers) => default_headers,
     };
@@ -211,7 +213,9 @@ pub async fn determine_streamable_http_auth_status_with_http_client(
         env_http_headers,
         store_mode,
         keyring_backend_kind,
-    )? {
+    )
+    .await?
+    {
         AuthStatusCheck::Complete(status) => return Ok(status),
         AuthStatusCheck::Discover(default_headers) => default_headers,
     };
@@ -230,7 +234,7 @@ pub async fn determine_streamable_http_auth_status_with_http_client(
 // These arguments mirror the persisted MCP configuration fields and are kept
 // separate so callers do not need to construct a second public configuration type.
 #[allow(clippy::too_many_arguments)]
-fn auth_status_before_discovery(
+async fn auth_status_before_discovery(
     codex_home: &Path,
     server_name: &str,
     url: &str,
@@ -249,13 +253,22 @@ fn auth_status_before_discovery(
         return Ok(AuthStatusCheck::Complete(McpAuthState::BearerToken));
     }
 
-    match oauth_token_status(
-        codex_home,
-        server_name,
-        url,
-        store_mode,
-        keyring_backend_kind,
-    )? {
+    let codex_home = codex_home.to_path_buf();
+    let server_name = server_name.to_owned();
+    let url = url.to_owned();
+    // Credential reads can wait on a cross-process file lock or the OS keyring.
+    // Keep those waits off the executor used by both discovery entrypoints.
+    let status = tokio::task::spawn_blocking(move || {
+        oauth_token_status(
+            &codex_home,
+            &server_name,
+            &url,
+            store_mode,
+            keyring_backend_kind,
+        )
+    })
+    .await??;
+    match status {
         StoredOAuthTokenStatus::Usable => {
             return Ok(AuthStatusCheck::Complete(McpAuthState::OAuth));
         }
@@ -322,14 +335,14 @@ async fn discover_streamable_http_oauth_with_headers(
 ) -> Result<Option<StreamableHttpOAuthDiscovery>> {
     // Use no_proxy to avoid a bug in the system-configuration crate that
     // can result in a panic. See #8912.
+    let default_headers = default_headers.clone();
+    let http_client =
+        tokio::task::spawn_blocking(move || DiscoveryHttpClient::new(default_headers)).await??;
     let authorization_manager = AuthorizationManager::new_with_oauth_http_client(
         url,
         Arc::new(
-            OAuthHttpClientAdapter::new(
-                Arc::new(DiscoveryHttpClient::new(default_headers.clone())?),
-                HeaderMap::new(),
-            )
-            .with_buffered_responses(),
+            OAuthHttpClientAdapter::new(Arc::new(http_client), HeaderMap::new())
+                .with_buffered_responses(),
         ),
     )
     .await?;
@@ -441,6 +454,8 @@ mod tests {
     impl EnvVarGuard {
         fn set(key: &str, value: &str) -> Self {
             let original = std::env::var_os(key);
+            // SAFETY: Windows environment access is thread-safe; serial test guards
+            // additionally isolate the values observed by participating tests.
             unsafe {
                 std::env::set_var(key, value);
             }
@@ -454,15 +469,92 @@ mod tests {
     impl Drop for EnvVarGuard {
         fn drop(&mut self) {
             if let Some(value) = &self.original {
+                // SAFETY: Windows environment mutation is thread-safe.
                 unsafe {
                     std::env::set_var(&self.key, value);
                 }
             } else {
+                // SAFETY: Windows environment mutation is thread-safe.
                 unsafe {
                     std::env::remove_var(&self.key);
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    #[serial(auth_status_env)]
+    async fn auth_status_yields_while_the_credential_store_is_locked() -> Result<()> {
+        let codex_home = tempfile::tempdir()?;
+        let tokens = serde_json::from_value::<crate::StoredOAuthTokens>(serde_json::json!({
+            "server_name": "locked-server",
+            "url": "http://127.0.0.1:1/mcp",
+            "client_id": "client",
+            "token_response": { "access_token": "stored-token", "token_type": "bearer" },
+            "expires_at": null
+        }))?;
+        crate::save_oauth_tokens(
+            codex_home.path(),
+            &tokens.server_name,
+            &tokens,
+            OAuthCredentialsStoreMode::File,
+            AuthKeyringBackendKind::Direct,
+        )?;
+        let credentials_path = codex_home.path().join(".credentials.json");
+        let original_credentials = std::fs::read(&credentials_path)?;
+
+        for provided_http_client in [false, true] {
+            let lock = std::fs::File::options()
+                .read(true)
+                .write(true)
+                .open(codex_home.path().join("mcp-oauth-locks/file-store.lock"))?;
+            lock.lock()?;
+            let (release, released) = std::sync::mpsc::channel();
+            let holder = std::thread::spawn(move || {
+                // Bound a regression's synchronous first poll, even if the executor stalls.
+                let _ = released.recv_timeout(Duration::from_secs(2));
+                drop(lock);
+            });
+            let mut status = if provided_http_client {
+                determine_streamable_http_auth_status_with_http_client(
+                    codex_home.path(),
+                    &tokens.server_name,
+                    &tokens.url,
+                    None,
+                    None,
+                    None,
+                    OAuthCredentialsStoreMode::File,
+                    AuthKeyringBackendKind::Direct,
+                    Arc::new(DiscoveryHttpClient::new(HeaderMap::new())?),
+                )
+                .boxed()
+            } else {
+                determine_streamable_http_auth_status(
+                    codex_home.path(),
+                    &tokens.server_name,
+                    &tokens.url,
+                    None,
+                    None,
+                    None,
+                    OAuthCredentialsStoreMode::File,
+                    AuthKeyringBackendKind::Direct,
+                )
+                .boxed()
+            };
+            let first_poll = std::future::poll_fn(|context| {
+                std::task::Poll::Ready(std::future::Future::poll(status.as_mut(), context))
+            })
+            .await;
+            let _ = release.send(());
+            holder.join().expect("lock holder should exit");
+            assert!(
+                first_poll.is_pending(),
+                "credential lookup must yield without waiting for the store lock"
+            );
+            assert_eq!(status.await?, McpAuthState::OAuth);
+            assert_eq!(std::fs::read(&credentials_path)?, original_credentials);
+        }
+        Ok(())
     }
 
     #[tokio::test]

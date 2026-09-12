@@ -401,8 +401,11 @@ fn canonicalize_snapshot_text(text: &str) -> String {
         } else {
             String::new()
         };
-        if let (Some(cwd_start), Some(cwd_end)) = (text.find("<cwd>"), text.find("</cwd>")) {
-            let cwd = &text[cwd_start + "<cwd>".len()..cwd_end];
+        if let Some(cwd) = text
+            .split_once("<cwd>")
+            .and_then(|(_, rest)| rest.split_once("</cwd>"))
+            .map(|(cwd, _)| cwd)
+        {
             return if cwd.ends_with("PRETURN_CONTEXT_DIFF_CWD") {
                 format!("<ENVIRONMENT_CONTEXT:cwd=PRETURN_CONTEXT_DIFF_CWD{subagents_suffix}>")
             } else {
@@ -674,6 +677,34 @@ mod tests {
         let rendered = format_response_items_snapshot(&items, &ContextSnapshotOptions::default());
 
         assert_eq!(rendered, "00:message/user:<input_image:image_url>");
+    }
+
+    #[test]
+    fn environment_context_cwd_tags_are_parsed_in_order() {
+        for (text, expected) in [
+            (
+                "<environment_context><cwd>/work/PRETURN_CONTEXT_DIFF_CWD</cwd></environment_context>",
+                "00:message/user:<ENVIRONMENT_CONTEXT:cwd=PRETURN_CONTEXT_DIFF_CWD>",
+            ),
+            (
+                "<environment_context><cwd>/work/🦀</cwd></environment_context>",
+                "00:message/user:<ENVIRONMENT_CONTEXT:cwd=<CWD>>",
+            ),
+            (
+                "<environment_context></cwd><cwd>x</environment_context>",
+                "00:message/user:<ENVIRONMENT_CONTEXT>",
+            ),
+        ] {
+            let items = vec![json!({
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": text }],
+            })];
+            assert_eq!(
+                format_response_items_snapshot(&items, &ContextSnapshotOptions::default()),
+                expected,
+            );
+        }
     }
 
     #[test]

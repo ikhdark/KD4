@@ -1042,6 +1042,18 @@ impl ThreadHistoryBuilder {
         &mut self,
         payload: &codex_protocol::protocol::CollabWaitingEndEvent,
     ) {
+        // Modern item events carry an explicit terminal outcome that this legacy
+        // event cannot represent (for example, a failed wait with no receivers).
+        // A terminal snapshot also covers waits reconciled by TurnAborted.
+        if self.current_turn.as_ref().is_some_and(|turn| {
+            turn.items.iter().any(|item| matches!(
+                item,
+                ThreadItem::CollabAgentToolCall { id, tool: CollabAgentTool::Wait, status, .. }
+                    if id == &payload.call_id && *status != CollabAgentToolCallStatus::InProgress
+            ))
+        }) {
+            return;
+        }
         let status = if payload
             .statuses
             .values()
@@ -1257,7 +1269,9 @@ impl ThreadHistoryBuilder {
             // Prefer an exact ID match so we interrupt the turn explicitly targeted by the event.
             if let Some(turn) = self.current_turn.as_mut().filter(|turn| turn.id == turn_id) {
                 let changed_turn = apply_abort(turn);
+                let aborted_turn_id = turn.id.clone();
                 self.record_changed_turn(changed_turn);
+                self.fail_running_wait_items(&aborted_turn_id);
                 return;
             }
 
@@ -1268,7 +1282,9 @@ impl ThreadHistoryBuilder {
                 turn.timing = payload.timing.clone();
                 turn.surfaced_result = None;
                 let changed_turn = ThreadHistoryTurnChange::from_turn(turn);
+                let aborted_turn_id = turn.id.clone();
                 self.record_changed_turn(changed_turn);
+                self.fail_running_wait_items(&aborted_turn_id);
                 return;
             }
         }
@@ -1276,7 +1292,39 @@ impl ThreadHistoryBuilder {
         // If the event has no ID (or refers to an unknown turn), fall back to the active turn.
         if let Some(turn) = self.current_turn.as_mut() {
             let changed_turn = apply_abort(turn);
+            let aborted_turn_id = turn.id.clone();
             self.record_changed_turn(changed_turn);
+            self.fail_running_wait_items(&aborted_turn_id);
+        }
+    }
+
+    fn fail_running_wait_items(&mut self, turn_id: &str) {
+        let tracking_changes = self.is_tracking_changes();
+        let items = if let Some(turn) = self.current_turn.as_mut().filter(|turn| turn.id == turn_id)
+        {
+            &mut turn.items
+        } else if let Some(turn) = self.turns.iter_mut().find(|turn| turn.id == turn_id) {
+            &mut turn.items
+        } else {
+            return;
+        };
+        let mut changed_items = Vec::new();
+        for item in items {
+            if let ThreadItem::CollabAgentToolCall {
+                tool: CollabAgentTool::Wait,
+                status,
+                ..
+            } = item
+                && *status == CollabAgentToolCallStatus::InProgress
+            {
+                *status = CollabAgentToolCallStatus::Failed;
+                if tracking_changes {
+                    changed_items.push(item.clone());
+                }
+            }
+        }
+        for item in changed_items {
+            self.record_changed_item(turn_id.to_string(), item);
         }
     }
 
@@ -5292,5 +5340,233 @@ mod tests {
                 removed_turn_ids: vec!["turn-a".into()],
             }
         );
+    }
+    fn wait_history_test_thread_id() -> ThreadId {
+        ThreadId::from_string("00000000-0000-7000-8000-000000000081").expect("fixture thread ID")
+    }
+
+    fn wait_history_test_item(
+        id: &str,
+        status: codex_protocol::items::CollabAgentToolCallStatus,
+    ) -> CoreTurnItem {
+        CoreTurnItem::CollabAgentToolCall(codex_protocol::items::CollabAgentToolCallItem {
+            id: id.to_string(),
+            tool: codex_protocol::items::CollabAgentTool::Wait,
+            status,
+            sender_thread_id: wait_history_test_thread_id(),
+            receiver_thread_ids: Vec::new(),
+            receiver_agents: Vec::new(),
+            prompt: None,
+            model: None,
+            reasoning_effort: None,
+            agents_states: HashMap::new(),
+        })
+    }
+
+    fn wait_history_test_start_turn(builder: &mut ThreadHistoryBuilder, id: &str) {
+        builder.handle_event(&EventMsg::TurnStarted(TurnStartedEvent {
+            turn_id: id.to_string(),
+            trace_id: None,
+            started_at: None,
+            model_context_window: None,
+            collaboration_mode_kind: Default::default(),
+        }));
+    }
+
+    #[test]
+    fn modern_wait_failure_survives_legacy_end_projection() {
+        use codex_protocol::items::CollabAgentToolCallStatus as CoreWaitStatus;
+        use codex_protocol::protocol::HasLegacyEvent;
+
+        let mut builder = ThreadHistoryBuilder::new();
+        wait_history_test_start_turn(&mut builder, "wait-turn");
+        let started = EventMsg::ItemStarted(ItemStartedEvent {
+            thread_id: wait_history_test_thread_id(),
+            turn_id: "wait-turn".to_string(),
+            item: wait_history_test_item("wait-call", CoreWaitStatus::InProgress),
+            started_at_ms: 1,
+        });
+        builder.handle_event(&started);
+        for legacy in started.as_legacy_events(false) {
+            builder.handle_event(&legacy);
+        }
+        let completed = EventMsg::ItemCompleted(ItemCompletedEvent {
+            thread_id: wait_history_test_thread_id(),
+            turn_id: "wait-turn".to_string(),
+            item: wait_history_test_item("wait-call", CoreWaitStatus::Failed),
+            completed_at_ms: 2,
+        });
+        builder.handle_event(&completed);
+        let legacy = completed.as_legacy_events(false);
+        assert!(
+            matches!(legacy.as_slice(), [EventMsg::CollabWaitingEnd(end)] if end.statuses.is_empty())
+        );
+        for event in legacy {
+            let changes = builder.handle_event_with_changes(&event);
+            assert!(
+                changes.changed_items.is_empty(),
+                "lossy legacy replay must not republish a different terminal item"
+            );
+        }
+        let turns = builder.finish();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].items.len(), 1);
+        assert!(
+            matches!(&turns[0].items[0], ThreadItem::CollabAgentToolCall {
+            id, tool: CollabAgentTool::Wait, status: CollabAgentToolCallStatus::Failed, ..
+        } if id == "wait-call")
+        );
+    }
+
+    #[test]
+    fn legacy_wait_end_retains_status_derivation_without_modern_terminal() {
+        use codex_protocol::items::CollabAgentToolCallStatus as CoreWaitStatus;
+        use codex_protocol::protocol::HasLegacyEvent;
+
+        for failed in [false, true] {
+            let mut builder = ThreadHistoryBuilder::new();
+            wait_history_test_start_turn(&mut builder, "legacy-turn");
+            let started = EventMsg::ItemStarted(ItemStartedEvent {
+                thread_id: wait_history_test_thread_id(),
+                turn_id: "legacy-turn".to_string(),
+                item: wait_history_test_item("legacy-wait", CoreWaitStatus::InProgress),
+                started_at_ms: 1,
+            });
+            for legacy in started.as_legacy_events(false) {
+                builder.handle_event(&legacy);
+            }
+            let mut item = wait_history_test_item("legacy-wait", CoreWaitStatus::Completed);
+            if failed && let CoreTurnItem::CollabAgentToolCall(item) = &mut item {
+                item.agents_states.insert(
+                    ThreadId::new(),
+                    AgentStatus::Errored("child failed".to_string()),
+                );
+            }
+            let completed = EventMsg::ItemCompleted(ItemCompletedEvent {
+                thread_id: wait_history_test_thread_id(),
+                turn_id: "legacy-turn".to_string(),
+                item,
+                completed_at_ms: 2,
+            });
+            for legacy in completed.as_legacy_events(false) {
+                builder.handle_event(&legacy);
+            }
+            let turns = builder.finish();
+            assert_eq!(turns[0].items.len(), 1);
+            let ThreadItem::CollabAgentToolCall { status, .. } = &turns[0].items[0] else {
+                panic!("legacy wait item");
+            };
+            assert_eq!(
+                *status,
+                if failed {
+                    CollabAgentToolCallStatus::Failed
+                } else {
+                    CollabAgentToolCallStatus::Completed
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn aborted_wait_items_publish_targeted_history_changes() {
+        use codex_protocol::items::CollabAgentToolCallStatus as CoreWaitStatus;
+
+        for (close_target, explicit_target) in [(false, true), (true, true), (false, false)] {
+            let mut builder = ThreadHistoryBuilder::new();
+            wait_history_test_start_turn(&mut builder, "target-turn");
+            for id in ["pending-wait", "settled-wait", "other-tool"] {
+                let mut item = wait_history_test_item(id, CoreWaitStatus::InProgress);
+                if id == "other-tool"
+                    && let CoreTurnItem::CollabAgentToolCall(item) = &mut item
+                {
+                    item.tool = codex_protocol::items::CollabAgentTool::SpawnAgent;
+                }
+                builder.handle_event(&EventMsg::ItemStarted(ItemStartedEvent {
+                    thread_id: wait_history_test_thread_id(),
+                    turn_id: "target-turn".to_string(),
+                    item,
+                    started_at_ms: 1,
+                }));
+            }
+            builder.handle_event(&EventMsg::ItemCompleted(ItemCompletedEvent {
+                thread_id: wait_history_test_thread_id(),
+                turn_id: "target-turn".to_string(),
+                item: wait_history_test_item("settled-wait", CoreWaitStatus::Completed),
+                completed_at_ms: 2,
+            }));
+            if close_target {
+                wait_history_test_start_turn(&mut builder, "unrelated-turn");
+                builder.handle_event(&EventMsg::ItemStarted(ItemStartedEvent {
+                    thread_id: wait_history_test_thread_id(),
+                    turn_id: "unrelated-turn".to_string(),
+                    item: wait_history_test_item("unrelated-wait", CoreWaitStatus::InProgress),
+                    started_at_ms: 1,
+                }));
+            }
+            let abort = EventMsg::TurnAborted(TurnAbortedEvent {
+                turn_id: explicit_target.then(|| "target-turn".to_string()),
+                reason: TurnAbortReason::Interrupted,
+                completed_at: None,
+                duration_ms: None,
+                timing: None,
+            });
+            let changes = builder.handle_event_with_changes(&abort);
+            assert_eq!(
+                changes.changed_items.len(),
+                1,
+                "only the interrupted running wait changes"
+            );
+            assert_eq!(changes.changed_items[0].turn_id, "target-turn");
+            assert!(
+                matches!(&changes.changed_items[0].item, ThreadItem::CollabAgentToolCall {
+                id, status: CollabAgentToolCallStatus::Failed, ..
+            } if id == "pending-wait")
+            );
+            assert!(
+                builder
+                    .handle_event_with_changes(&abort)
+                    .changed_items
+                    .is_empty(),
+                "duplicate terminal events must not duplicate item completion"
+            );
+            let turns = builder.finish();
+            let target = turns
+                .iter()
+                .find(|turn| turn.id == "target-turn")
+                .expect("target turn");
+            assert_eq!(target.status, TurnStatus::Interrupted);
+            let statuses = target
+                .items
+                .iter()
+                .map(|item| match item {
+                    ThreadItem::CollabAgentToolCall { id, status, .. } => {
+                        (id.as_str(), status.clone())
+                    }
+                    _ => panic!("expected collaboration item"),
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                statuses,
+                vec![
+                    ("pending-wait", CollabAgentToolCallStatus::Failed),
+                    ("settled-wait", CollabAgentToolCallStatus::Completed),
+                    ("other-tool", CollabAgentToolCallStatus::InProgress),
+                ]
+            );
+            if close_target {
+                let unrelated = turns
+                    .iter()
+                    .find(|turn| turn.id == "unrelated-turn")
+                    .expect("unrelated turn");
+                assert_eq!(unrelated.status, TurnStatus::InProgress);
+                assert!(matches!(
+                    &unrelated.items[0],
+                    ThreadItem::CollabAgentToolCall {
+                        status: CollabAgentToolCallStatus::InProgress,
+                        ..
+                    }
+                ));
+            }
+        }
     }
 }

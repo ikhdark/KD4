@@ -28,4 +28,6 @@ uuid = { workspace = true, features = ["v4"] }
 doctest = false
 
 [dev-dependencies]
+codex-utils-cargo-bin = { workspace = true }
 pretty_assertions = { workspace = true }
+tempfile = { workspace = true }

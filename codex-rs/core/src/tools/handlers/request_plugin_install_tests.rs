@@ -228,43 +228,86 @@ async fn requested_mcp_servers_are_refreshed_before_install_completion() -> anyh
     Ok(())
 }
 
-#[tokio::test]
-async fn verified_plugin_install_completed_requires_installed_plugin() {
-    let codex_home = tempdir().expect("tempdir should succeed");
-    let curated_root = curated_plugins_repo_path(codex_home.path());
-    write_openai_curated_marketplace(&curated_root, &["sample"]);
-    write_curated_plugin_sha(codex_home.path());
-    write_plugins_feature_config(codex_home.path());
+#[test]
+fn verified_plugin_install_completed_requires_installed_plugin() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let codex_home = tempdir().expect("tempdir should succeed");
+        let curated_root = curated_plugins_repo_path(codex_home.path());
+        write_openai_curated_marketplace(&curated_root, &["sample"]);
+        write_curated_plugin_sha(codex_home.path());
+        write_plugins_feature_config(codex_home.path());
 
-    let config = load_plugins_config(codex_home.path()).await;
-    let plugins_manager = PluginsManager::new(codex_home.path().to_path_buf());
+        let config = load_plugins_config(codex_home.path()).await;
+        let plugins_manager = Arc::new(PluginsManager::new(codex_home.path().to_path_buf()));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocker = tokio::task::spawn_blocking(move || {
+            started_tx.send(()).expect("signal occupied worker");
+            release_rx.recv_timeout(std::time::Duration::from_secs(2))
+        });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("blocking worker should start");
+        let verify = verified_plugin_install_completed(
+            "sample@openai-curated",
+            &config,
+            Arc::clone(&plugins_manager),
+        );
+        tokio::pin!(verify);
+        assert!(
+            futures::poll!(verify.as_mut()).is_pending(),
+            "marketplace discovery must use the occupied blocking worker"
+        );
+        tokio::select! {
+            biased;
+            _ = &mut verify => panic!("verification finished while the filesystem worker was held"),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => {}
+        }
+        release_tx.send(()).expect("release filesystem worker");
+        blocker
+            .await
+            .expect("worker should join")
+            .expect("watchdog should not expire");
+        assert!(!verify.await, "catalog presence alone is not installation");
 
-    assert!(!verified_plugin_install_completed(
-        "sample@openai-curated",
-        &config,
-        &plugins_manager,
-    ));
+        plugins_manager
+            .install_plugin(
+                &config.config_layer_stack,
+                PluginInstallRequest {
+                    plugin_name: "sample".to_string(),
+                    marketplace_path: AbsolutePathBuf::try_from(
+                        curated_root.join(".agents/plugins/marketplace.json"),
+                    )
+                    .expect("marketplace path"),
+                },
+            )
+            .await
+            .expect("plugin should install");
 
-    plugins_manager
-        .install_plugin(
-            &config.config_layer_stack,
-            PluginInstallRequest {
-                plugin_name: "sample".to_string(),
-                marketplace_path: AbsolutePathBuf::try_from(
-                    curated_root.join(".agents/plugins/marketplace.json"),
-                )
-                .expect("marketplace path"),
-            },
-        )
-        .await
-        .expect("plugin should install");
-
-    let refreshed_config = load_plugins_config(codex_home.path()).await;
-    assert!(verified_plugin_install_completed(
-        "sample@openai-curated",
-        &refreshed_config,
-        &plugins_manager,
-    ));
+        let refreshed_config = load_plugins_config(codex_home.path()).await;
+        assert!(
+            verified_plugin_install_completed(
+                "sample@openai-curated",
+                &refreshed_config,
+                Arc::clone(&plugins_manager),
+            )
+            .await
+        );
+        assert!(
+            !verified_plugin_install_completed(
+                "other@openai-curated",
+                &refreshed_config,
+                plugins_manager,
+            )
+            .await,
+            "an installed plugin must not satisfy a different requested identity"
+        );
+    });
 }
 
 #[test]
@@ -293,7 +336,10 @@ fn recommended_plugin_install_args_accept_legacy_tool_id() {
     }))
     .expect("legacy arguments should deserialize");
 
-    assert_eq!(current, legacy);
+    for decoded in [current, legacy] {
+        assert_eq!(decoded.plugin_id, "google-drive@openai-curated-remote");
+        assert_eq!(decoded.suggest_reason, "Use Google Drive for this request");
+    }
 }
 
 #[test]

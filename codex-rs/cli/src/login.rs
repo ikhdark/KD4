@@ -516,7 +516,7 @@ async fn load_config_or_exit(cli_config_overrides: CliConfigOverrides) -> Config
 }
 
 fn safe_format_key(key: &str) -> String {
-    if key.len() <= 13 {
+    if key.len() <= 13 || !key.is_ascii() {
         return "***".to_string();
     }
     let prefix = &key[..8];
@@ -574,5 +574,7 @@ mod tests {
     fn short_key_returns_stars() {
         let key = "sk-proj-12345";
         assert_eq!(safe_format_key(key), "***");
+        assert_eq!(safe_format_key("1234567é123456789"), "***");
+        assert_eq!(safe_format_key("sk-proj-123456éabcd"), "***");
     }
 }

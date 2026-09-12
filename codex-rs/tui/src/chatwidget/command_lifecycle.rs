@@ -334,6 +334,7 @@ impl ChatWidget {
             aggregated_output,
             exit_code,
             duration_ms,
+            status,
             ..
         } = item
         else {
@@ -345,7 +346,6 @@ impl ChatWidget {
             .map(codex_app_server_protocol::CommandAction::into_core)
             .collect();
         let duration = Duration::from_millis(duration_ms.unwrap_or_default().max(0) as u64);
-        let exit_code = exit_code.unwrap_or_default();
         let aggregated_output = aggregated_output.unwrap_or_default();
 
         let running = self.running_commands.remove(&id);
@@ -376,9 +376,9 @@ impl ChatWidget {
         // Unified exec interaction rows intentionally hide command output text in the exec cell and
         // instead render the interaction-specific content elsewhere in the UI.
         let output = if is_unified_exec_interaction {
-            CommandOutput::from_shared_output(exit_code, String::new())
+            CommandOutput::from_app_server_output(status, exit_code, String::new())
         } else {
-            CommandOutput::from_shared_output(exit_code, aggregated_output)
+            CommandOutput::from_app_server_output(status, exit_code, aggregated_output)
         };
 
         match end_target {

@@ -641,6 +641,13 @@ impl TurnContext {
             .then_some(file_system_sandbox_policy)
     }
 
+    pub(crate) async fn to_turn_context_item_async(self: &Arc<Self>) -> TurnContextItem {
+        let turn = Arc::clone(self);
+        tokio::task::spawn_blocking(move || turn.to_turn_context_item())
+            .await
+            .expect("turn context projection worker panicked")
+    }
+
     pub(crate) fn to_turn_context_item(&self) -> TurnContextItem {
         let workspace_roots = self.effective_workspace_roots();
         let cwd = self.cwd().clone();
@@ -901,50 +908,18 @@ impl Session {
         if updates.is_empty() {
             return Ok(self.state.lock().await.session_configuration.clone());
         }
-        let Ok(_refresh_guard) = self.managed_network_proxy_refresh_lock.acquire().await else {
-            unreachable!("managed network proxy refresh semaphore is never closed");
-        };
-        let notify_config_contributors = !self.services.extensions.config_contributors().is_empty();
-        let update_result: CodexResult<_> = {
-            let mut state = self.state.lock().await;
-            match state.session_configuration.clone().apply(updates) {
-                Ok(next) => {
-                    let previous_session_configuration = state.session_configuration.clone();
-                    let previous_permission_profile =
-                        state.session_configuration.permission_profile();
-                    let next_permission_profile = next.permission_profile();
-                    let permission_profile_changed =
-                        previous_permission_profile != next_permission_profile;
-                    let previous_config = notify_config_contributors.then(|| {
-                        Self::build_effective_session_config(&state.session_configuration)
-                    });
-                    let new_config = notify_config_contributors
-                        .then(|| Self::build_effective_session_config(&next));
-                    state.session_configuration = next.clone();
-                    Ok((
-                        next,
-                        permission_profile_changed,
-                        previous_config,
-                        new_config,
-                        previous_session_configuration,
-                        updates.environments.is_some(),
-                    ))
-                }
-                Err(err) => Err(CodexErr::InvalidRequest(err.to_string())),
-            }
-        };
-
-        let (
-            session_configuration,
-            permission_profile_changed,
-            previous_config,
-            new_config,
-            previous_session_configuration,
-            environments_changed,
-        ) = match update_result {
-            Ok(update) => update,
+        match self
+            .update_settings_and_get(updates, /*serialize_turn*/ true)
+            .await
+        {
+            Ok(configuration) => Ok(configuration),
             Err(err) => {
-                let message = err.to_string();
+                let message = match err {
+                    codex_config::ConstraintError::UpdateRejected { reason } => {
+                        format!("managed network policy update failed: {reason}")
+                    }
+                    err => err.to_string(),
+                };
                 self.send_event_raw(Event {
                     id: sub_id.to_string(),
                     msg: EventMsg::Error(ErrorEvent {
@@ -953,37 +928,9 @@ impl Session {
                     }),
                 })
                 .await;
-                return Err(CodexErr::InvalidRequest(message));
+                Err(CodexErr::InvalidRequest(message))
             }
-        };
-
-        if permission_profile_changed
-            && let Err(error) = self
-                .refresh_managed_network_proxy_for_current_permission_profile()
-                .await
-        {
-            self.state.lock().await.session_configuration = previous_session_configuration;
-            let message = format!("managed network policy update failed: {error}");
-            self.send_event_raw(Event {
-                id: sub_id.to_string(),
-                msg: EventMsg::Error(ErrorEvent {
-                    message: message.clone(),
-                    codex_error_info: Some(CodexErrorInfo::BadRequest),
-                }),
-            })
-            .await;
-            return Err(CodexErr::InvalidRequest(message));
         }
-        if environments_changed {
-            let mut state_owner = self.state.lock().await;
-            self.services
-                .turn_environments
-                .update_selections(session_configuration.environment_selections());
-            self.services.advance_planning_generation(&mut state_owner);
-        }
-        self.emit_config_changed_contributors(previous_config.as_ref(), new_config.as_ref());
-
-        Ok(session_configuration)
     }
 
     pub(crate) async fn new_turn_from_configuration(

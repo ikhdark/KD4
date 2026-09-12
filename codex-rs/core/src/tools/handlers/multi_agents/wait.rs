@@ -302,7 +302,10 @@ impl Handler {
                     tool: CollabAgentTool::Wait,
                     status: CollabAgentToolCallStatus::Completed,
                     sender_thread_id: session.thread_id,
-                    receiver_thread_ids: statuses_by_id.keys().copied().collect(),
+                    receiver_thread_ids: receiver_thread_ids
+                        .into_iter()
+                        .filter(|thread_id| statuses_by_id.contains_key(thread_id))
+                        .collect(),
                     receiver_agents: wait_receiver_agents(&statuses_by_id, &receiver_agents),
                     prompt: None,
                     model: None,

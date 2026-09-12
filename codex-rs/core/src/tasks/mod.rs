@@ -285,6 +285,11 @@ struct TerminalFinalization {
     outcome: TurnTerminalOutcome,
     permit: Option<TurnTerminalPermit>,
     worker_failure_reported: bool,
+    selected_terminal_event: Option<EventMsg>,
+    published_terminal_event: Option<EventMsg>,
+    terminal_post_dispatch_completed: bool,
+    terminal_lifecycle_dispatched: bool,
+    restart_for_pending_input: bool,
 }
 
 struct WorkerDoneNotifier {
@@ -486,14 +491,11 @@ impl Session {
             .await
             .clear_turn(&turn_context.sub_id);
 
-        let reservation_is_current = {
-            let mut active = self.active_turn.lock().await;
-            active.as_mut().is_some_and(|turn| {
-                turn.task.is_none()
-                    && turn.terminal.is_none()
-                    && Arc::ptr_eq(&turn.turn_state, &turn_state)
-            })
-        };
+        turn_state.lock().await.token_usage_at_turn_start = token_usage_at_turn_start.clone();
+        let reservation_is_current = self
+            .input_queue
+            .transfer_pending_input_to_turn_state(&self.active_turn, &turn_state)
+            .await;
         if !reservation_is_current {
             self.recover_cancelled_taskless_placeholder(&turn_state)
                 .await;
@@ -502,12 +504,6 @@ impl Session {
                 "turn start reservation was lost before task installation".to_string(),
             ));
         }
-        let pending_items = self.input_queue.get_pending_input(&self.active_turn).await;
-        turn_state.lock().await.token_usage_at_turn_start = token_usage_at_turn_start.clone();
-        self.input_queue
-            .restore_transferred_input_for_turn_state(turn_state.as_ref(), pending_items)
-            .await;
-
         let start_tx = {
             let mut active = self.active_turn.lock().await;
             let reservation_is_current = active.as_ref().is_some_and(|turn| {
@@ -643,7 +639,7 @@ impl Session {
     }
 
     pub(crate) async fn clear_taskless_placeholder(
-        &self,
+        self: &Arc<Self>,
         expected_turn_state: &Arc<tokio::sync::Mutex<TurnState>>,
     ) {
         self.recover_cancelled_taskless_placeholder(expected_turn_state)
@@ -655,43 +651,48 @@ impl Session {
         reason = "taskless placeholder identity and pending input extraction must remain atomic"
     )]
     async fn recover_cancelled_taskless_placeholder(
-        &self,
+        self: &Arc<Self>,
         expected_turn_state: &Arc<tokio::sync::Mutex<TurnState>>,
     ) {
-        let recovered_input = {
+        let recovered = {
             let mut active_turn = self.active_turn.lock().await;
             if active_turn.as_ref().is_some_and(|active_turn| {
                 active_turn.task.is_none()
                     && active_turn.terminal.is_none()
                     && Arc::ptr_eq(&active_turn.turn_state, expected_turn_state)
             }) {
-                let recovered_input = self
+                let recovered_work = self
                     .input_queue
-                    .take_pending_input_for_turn_state(expected_turn_state.as_ref())
+                    .recover_pending_input_for_turn_state(expected_turn_state.as_ref())
                     .await;
                 *active_turn = None;
-                Some(recovered_input)
+                Some((recovered_work, true))
             } else if active_turn.as_ref().is_some_and(|active_turn| {
                 Arc::ptr_eq(&active_turn.turn_state, expected_turn_state)
             }) {
                 None
             } else {
-                Some(
+                Some((
                     self.input_queue
-                        .take_pending_input_for_turn_state(expected_turn_state.as_ref())
+                        .recover_pending_input_for_turn_state(expected_turn_state.as_ref())
                         .await,
-                )
+                    false,
+                ))
             }
         };
-        let Some(recovered_input) = recovered_input else {
+        let Some((recovered_work, cleared_placeholder)) = recovered else {
             return;
         };
-        let recovered_work = !recovered_input.is_empty();
-        self.input_queue
-            .restore_transferred_startup_input(recovered_input)
-            .await;
-        if !recovered_work {
-            self.emit_thread_idle_lifecycle_if_idle().await;
+        if cleared_placeholder && !recovered_work {
+            // Startup callers may hold admission and extension transaction permits.
+            // Idle contributors can start another turn and reacquire those permits,
+            // so their notification must not be awaited by the recovering caller.
+            // Only the owner that removed this placeholder publishes the transition;
+            // a stale startup guard may recover input but must not notify again.
+            let session = Arc::clone(self);
+            self.terminal_tasks.spawn(async move {
+                session.emit_thread_idle_lifecycle_if_idle().await;
+            });
         }
     }
 
@@ -874,6 +875,11 @@ impl Session {
                         outcome,
                         permit: Some(permit),
                         worker_failure_reported: false,
+                        selected_terminal_event: None,
+                        published_terminal_event: None,
+                        terminal_post_dispatch_completed: false,
+                        terminal_lifecycle_dispatched: false,
+                        restart_for_pending_input: false,
                     };
                     if AssertUnwindSafe(session.finalize_turn_terminal(&mut finalization))
                         .catch_unwind()
@@ -1062,6 +1068,54 @@ impl Session {
         finalization.worker_failure_reported = true;
     }
 
+    async fn dispatch_terminal_lifecycle(&self, finalization: &mut TerminalFinalization) {
+        if finalization.terminal_lifecycle_dispatched {
+            return;
+        }
+        // A panic after an observer accepted its callback must not replay that callback.
+        finalization.terminal_lifecycle_dispatched = true;
+        let turn_context = &finalization.task.turn_context;
+        if let Some(reason) = finalization.outcome.abort_reason() {
+            self.emit_turn_abort_lifecycle(reason, turn_context.extension_data.as_ref())
+                .await;
+        } else {
+            self.emit_turn_stop_lifecycle(turn_context.extension_data.as_ref())
+                .await;
+        }
+    }
+
+    async fn publish_terminal_outcome(
+        &self,
+        finalization: &mut TerminalFinalization,
+        event: EventMsg,
+    ) {
+        let turn_context = Arc::clone(&finalization.task.turn_context);
+        // Only a retry can have an earlier append from this terminal owner.
+        let recovering_publication = finalization.selected_terminal_event.is_some();
+        // Preserve the original outcome even if publication panics before live acceptance.
+        let event = finalization
+            .selected_terminal_event
+            .get_or_insert(event)
+            .clone();
+        let published_event = self
+            .publish_terminal_event(
+                turn_context.as_ref(),
+                event,
+                &mut finalization.published_terminal_event,
+                recovering_publication,
+            )
+            .await;
+        #[cfg(test)]
+        finalization
+            .coordinator
+            .panic_after_terminal_publication_if_requested();
+        if !finalization.terminal_post_dispatch_completed {
+            finalization.terminal_post_dispatch_completed = self
+                .finish_terminal_event_dispatch(turn_context.as_ref(), &published_event)
+                .await;
+        }
+    }
+
     async fn finalize_turn_terminal(self: &Arc<Self>, finalization: &mut TerminalFinalization) {
         let turn_context = Arc::clone(&finalization.task.turn_context);
         turn_context
@@ -1115,15 +1169,9 @@ impl Session {
         self.services
             .code_mode_service
             .finish_turn(&turn_context.sub_id);
-        if let Err(err) = self
-            .persist_missing_call_outputs_durable(&turn_context)
-            .await
-        {
-            warn!(
-                turn_id = %turn_context.sub_id,
-                "failed to persist missing tool outputs before terminal event: {err}"
-            );
-        }
+        // Accepted tool completions can still own context extraction and identity
+        // preparation after the sampling worker stops. Let their ordered commits
+        // finish before synthesizing outputs for calls that truly have none.
         if let Err(err) = self
             .flush_rollout_after_ordered_commits(&turn_context)
             .await
@@ -1131,6 +1179,15 @@ impl Session {
             warn!(
                 turn_id = %turn_context.sub_id,
                 "failed to flush rollout before terminal event: {err}"
+            );
+        }
+        if let Err(err) = self
+            .persist_missing_call_outputs_durable(&turn_context)
+            .await
+        {
+            warn!(
+                turn_id = %turn_context.sub_id,
+                "failed to persist missing tool outputs before terminal event: {err}"
             );
         }
         turn_context.turn_timing_state.begin_finalization();
@@ -1156,33 +1213,21 @@ impl Session {
             );
         }
 
-        let restart_for_pending_input = if requires_abort_cleanup {
+        finalization.restart_for_pending_input = if requires_abort_cleanup {
             self.input_queue
                 .clear_pending_for_turn_state(finalization.turn_state.as_ref())
                 .await;
             false
         } else {
-            let pending_input = self
-                .input_queue
-                .take_pending_input_for_turn_state(finalization.turn_state.as_ref())
-                .await;
-            let restart = !pending_input.is_empty();
             self.input_queue
-                .restore_transferred_startup_input(pending_input)
-                .await;
-            restart
+                .recover_pending_input_for_turn_state(finalization.turn_state.as_ref())
+                .await
         };
 
         if abort_reason == Some(TurnAbortReason::Interrupted) {
             run_turn_interrupt_hooks(self, &turn_context).await;
         }
-        if let Some(reason) = abort_reason.as_ref() {
-            self.emit_turn_abort_lifecycle(reason.clone(), turn_context.extension_data.as_ref())
-                .await;
-        } else {
-            self.emit_turn_stop_lifecycle(turn_context.extension_data.as_ref())
-                .await;
-        }
+        self.dispatch_terminal_lifecycle(finalization).await;
 
         let (turn_had_memory_citation, turn_tool_calls, token_usage_at_turn_start) = {
             let state = finalization.turn_state.lock().await;
@@ -1290,7 +1335,7 @@ impl Session {
         };
 
         let cleared_active_turn = self.detach_terminal_turn(finalization).await;
-        self.send_event(turn_context.as_ref(), event).await;
+        self.publish_terminal_outcome(finalization, event).await;
         self.services
             .command_execution
             .persist_cache_after_terminal()
@@ -1328,7 +1373,7 @@ impl Session {
             && (abort_reason == Some(TurnAbortReason::Interrupted)
                 || required_tool_terminal.is_some()
                 || defer_pending_input
-                || restart_for_pending_input)
+                || finalization.restart_for_pending_input)
         {
             self.maybe_start_turn_for_pending_work().await;
         }
@@ -1352,6 +1397,22 @@ impl Session {
         turn_context
             .turn_metadata_state
             .cancel_git_enrichment_task();
+        if !matches!(
+            finalization.outcome,
+            TurnTerminalOutcome::Aborted(_) | TurnTerminalOutcome::WorkerJoinFailed(_)
+        ) {
+            finalization.restart_for_pending_input |= self
+                .input_queue
+                .recover_pending_input_for_turn_state(finalization.turn_state.as_ref())
+                .await;
+        }
+        if AssertUnwindSafe(self.dispatch_terminal_lifecycle(finalization))
+            .catch_unwind()
+            .await
+            .is_err()
+        {
+            warn!(turn_id = %turn_context.sub_id, "turn lifecycle observer panicked during fail-safe cleanup");
+        }
         turn_context.turn_timing_state.begin_finalization();
         let timing_snapshot = turn_context.turn_timing_state.complete_snapshot();
         let timing = timing_snapshot.protocol_timing();
@@ -1381,7 +1442,7 @@ impl Session {
             })
         };
         let cleared_active_turn = self.detach_terminal_turn(finalization).await;
-        self.send_event(turn_context.as_ref(), event).await;
+        self.publish_terminal_outcome(finalization, event).await;
         self.input_queue
             .clear_pending_for_turn_state(finalization.turn_state.as_ref())
             .await;
@@ -1393,6 +1454,18 @@ impl Session {
         let _ = self.flush_rollout().await;
         if cleared_active_turn {
             self.emit_thread_idle_lifecycle_if_idle().await;
+        }
+        let restart_for_terminal_outcome = match &finalization.outcome {
+            TurnTerminalOutcome::Aborted(TurnAbortReason::Interrupted) => true,
+            TurnTerminalOutcome::Completed { result } => {
+                result.required_tool_terminal.is_some() || result.defer_pending_input
+            }
+            _ => false,
+        };
+        if cleared_active_turn
+            && (finalization.restart_for_pending_input || restart_for_terminal_outcome)
+        {
+            self.maybe_start_turn_for_pending_work().await;
         }
     }
 

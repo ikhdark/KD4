@@ -981,14 +981,61 @@ mod tests {
     #[test]
     fn rustls_config_uses_custom_ca_bundle_when_configured() {
         let temp_dir = TempDir::new().expect("tempdir");
-        let cert_path = write_cert_file(&temp_dir, "ca.pem", TEST_CERT);
+        let rcgen::CertifiedKey { cert, signing_key } =
+            rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+                .expect("generate server certificate");
+        let cert_path = write_cert_file(&temp_dir, "ca.pem", &cert.pem());
         let env = map_env(&[(CODEX_CA_CERT_ENV, cert_path.to_string_lossy().as_ref())]);
-
         let config = maybe_build_rustls_client_config_with_env(&env)
             .expect("rustls config")
             .expect("custom CA config should be present");
+        let server_config = Arc::new(
+            rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(
+                    vec![cert.der().clone()],
+                    rustls_pki_types::PrivateKeyDer::Pkcs8(signing_key.serialize_der().into()),
+                )
+                .expect("server config"),
+        );
+        let handshake = |config| -> Result<(), rustls::Error> {
+            let mut client = rustls::ClientConnection::new(
+                config,
+                "localhost".try_into().expect("server name"),
+            )?;
+            let mut server = rustls::ServerConnection::new(Arc::clone(&server_config))?;
+            for _ in 0..10 {
+                let mut records = Vec::new();
+                client
+                    .write_tls(&mut records)
+                    .expect("write client records");
+                server
+                    .read_tls(&mut records.as_slice())
+                    .expect("read client records");
+                server.process_new_packets()?;
+                records.clear();
+                server
+                    .write_tls(&mut records)
+                    .expect("write server records");
+                client
+                    .read_tls(&mut records.as_slice())
+                    .expect("read server records");
+                client.process_new_packets()?;
+                if !client.is_handshaking() && !server.is_handshaking() {
+                    return Ok(());
+                }
+            }
+            panic!("TLS handshake failed to finish within ten record exchanges");
+        };
 
-        assert!(config.enable_sni);
+        handshake(config).expect("loaded custom CA must authenticate the server");
+        let default_config = build_rustls_client_config(None).expect("default config");
+        assert!(matches!(
+            handshake(default_config),
+            Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::UnknownIssuer
+            ))
+        ));
     }
 
     #[test]

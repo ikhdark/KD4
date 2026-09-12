@@ -39,6 +39,21 @@ pub(crate) fn repository_identity(repo_root: &Path) -> StoreResult<RepositoryIde
     })
 }
 
+pub(crate) async fn repository_identity_async(repo_root: &Path) -> StoreResult<RepositoryIdentity> {
+    let repo_root = repo_root.to_path_buf();
+    tokio::task::spawn_blocking(move || repository_identity(&repo_root))
+        .await
+        .map_err(|error| StoreError::CorruptData(format!("repository task failed: {error}")))?
+}
+
+pub(crate) async fn normalize_repo_path_async(repo_root: &Path, path: &str) -> StoreResult<String> {
+    let repo_root = repo_root.to_path_buf();
+    let path = path.to_string();
+    tokio::task::spawn_blocking(move || normalize_repo_path(&repo_root, &path))
+        .await
+        .map_err(|error| StoreError::CorruptData(format!("path normalization task failed: {error}")))?
+}
+
 /// Stable repository-lineage identity shared by the coordination store and its callers.
 ///
 /// Linked worktrees resolve to the same lineage through Git's common directory, while

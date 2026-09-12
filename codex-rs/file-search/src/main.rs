@@ -10,7 +10,6 @@ use codex_file_search::FileSearchOptions;
 use codex_file_search::FileSearchResults;
 use codex_file_search::run;
 use serde_json::json;
-use tokio::process::Command;
 
 /// Fuzzy matches filenames under a directory.
 #[derive(Parser)]
@@ -78,13 +77,10 @@ async fn run_main(
         None => {
             reporter.warn_no_search_pattern(&search_directory);
 
-            Command::new("cmd")
-                .arg("/c")
-                .arg(search_directory)
-                .stdout(std::process::Stdio::inherit())
-                .stderr(std::process::Stdio::inherit())
-                .status()
-                .await?;
+            let mut entries = tokio::fs::read_dir(search_directory).await?;
+            while let Some(entry) = entries.next_entry().await? {
+                println!("{}", entry.file_name().to_string_lossy());
+            }
             return Ok(());
         }
     };

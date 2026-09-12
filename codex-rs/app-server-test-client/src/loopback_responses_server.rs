@@ -108,7 +108,10 @@ fn read_http_request(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
         }
     };
     let content_length = parse_content_length(&request[..header_end]);
-    while request.len() < header_end + content_length {
+    let request_end = header_end.checked_add(content_length).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "HTTP request length overflow")
+    })?;
+    while request.len() < request_end {
         let read = stream.read(&mut buffer)?;
         if read == 0 {
             break;
@@ -142,4 +145,36 @@ fn write_http_response(
         body.len()
     )?;
     stream.flush()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn http_request_rejects_overflowing_length_and_reads_valid_body() -> io::Result<()> {
+        for content_length in [usize::MAX, 2] {
+            let listener = TcpListener::bind("127.0.0.1:0")?;
+            let mut client = TcpStream::connect(listener.local_addr()?)?;
+            write!(
+                client,
+                "POST /responses HTTP/1.1\r\nContent-Length: {content_length}\r\n\r\n{{}}"
+            )?;
+            client.shutdown(std::net::Shutdown::Write)?;
+            let (mut server, _) = listener.accept()?;
+            server.set_read_timeout(Some(Duration::from_secs(1)))?;
+            let result = read_http_request(&mut server);
+            if content_length == usize::MAX {
+                let error = result.expect_err("overflowing body length must be rejected");
+                assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+                assert_eq!(error.to_string(), "HTTP request length overflow");
+            } else {
+                assert_eq!(
+                    result?,
+                    b"POST /responses HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}"
+                );
+            }
+        }
+        Ok(())
+    }
 }

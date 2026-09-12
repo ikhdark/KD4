@@ -623,7 +623,8 @@ mod tests {
     use super::load_plugin_manifest;
     use codex_exec_server::EnvironmentManager;
     use codex_exec_server::LOCAL_ENVIRONMENT_ID;
-    use codex_plugin::ResolvedPlugin;
+    use codex_plugin::PluginResourceLocator;
+    use codex_plugin::ResolvedPluginLocation;
     use codex_plugin::manifest::PluginManifest as GenericPluginManifest;
     use codex_plugin::manifest::PluginManifestHooks;
     use codex_plugin::manifest::PluginManifestInterface;
@@ -972,24 +973,40 @@ mod tests {
             .await
             .expect("resolve executor plugin")
             .expect("plugin descriptor");
-        let manifest_path = plugin_root_uri
-            .join(".codex-plugin/plugin.json")
-            .expect("manifest URI");
-        let manifest_contents =
-            fs::read_to_string(plugin_root.join(".codex-plugin/plugin.json")).expect("manifest");
-        let expected_manifest =
-            super::parse_plugin_manifest_uri(&plugin_root_uri, &manifest_path, &manifest_contents)
-                .expect("URI manifest");
-        let expected_plugin = ResolvedPlugin::from_environment(
-            "selected-demo".to_string(),
-            LOCAL_ENVIRONMENT_ID.to_string(),
-            plugin_root_uri,
-            manifest_path,
-            expected_manifest,
-        )
-        .expect("valid expected descriptor");
+        let host_manifest = load_plugin_manifest(plugin_root.as_path()).expect("host manifest");
+        assert_eq!(host_manifest.name, "demo-plugin");
+        assert_eq!(host_manifest.version.as_deref(), Some("1.2.3"));
+        let host_interface = host_manifest.interface.expect("host interface");
+        assert_eq!(host_interface.display_name.as_deref(), Some("Demo Plugin"));
+        assert_eq!(
+            host_interface.composer_icon,
+            Some(plugin_root.join("assets/icon.svg"))
+        );
 
-        assert_eq!(executor_plugin.plugin(), &expected_plugin);
+        let plugin = executor_plugin.plugin();
+        assert_eq!(plugin.selected_root_id(), "selected-demo");
+        assert_eq!(
+            plugin.location(),
+            &ResolvedPluginLocation::Environment {
+                environment_id: LOCAL_ENVIRONMENT_ID.to_string(),
+                root: plugin_root_uri.clone(),
+            }
+        );
+        assert_eq!(plugin.manifest().name, "demo-plugin");
+        assert_eq!(plugin.manifest().version.as_deref(), Some("1.2.3"));
+        let interface = plugin
+            .manifest()
+            .interface
+            .as_ref()
+            .expect("executor interface");
+        assert_eq!(interface.display_name.as_deref(), Some("Demo Plugin"));
+        assert_eq!(
+            interface.composer_icon,
+            Some(PluginResourceLocator::Environment {
+                environment_id: LOCAL_ENVIRONMENT_ID.to_string(),
+                path: plugin_root_uri.join("assets/icon.svg").expect("icon URI"),
+            })
+        );
     }
 
     #[test]

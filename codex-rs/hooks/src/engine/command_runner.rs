@@ -96,6 +96,8 @@ async fn run_command_with_reservation(
     #[cfg(windows)]
     command.creation_flags(WINDOWS_CREATE_SUSPENDED);
     #[cfg(unix)]
+    // SAFETY: the callback only invokes the async-signal-safe setsid/setpgid
+    // syscalls before exec and captures no state from the parent process.
     unsafe {
         command.pre_exec(codex_utils_pty::process_group::detach_from_tty);
     }
@@ -162,6 +164,11 @@ async fn run_command_with_reservation(
             );
         }
     };
+
+    // Tokio's kill_on_drop only kills the root. Keep the Unix process group
+    // alive as an owned cleanup obligation while this future can be cancelled.
+    #[cfg(unix)]
+    let mut cancellation_guard = HookProcessGroupGuard(child.id());
 
     #[cfg(windows)]
     {
@@ -241,15 +248,18 @@ async fn run_command_with_reservation(
         }
     };
     let wait_for_output = async {
-        let ((), status, stdout, stderr) = tokio::try_join!(
+        let ((), stdout, stderr) = tokio::try_join!(
             async { write_stdin.await.map_err(CommandRunError::Stdin) },
-            async { child.wait().await.map_err(CommandRunError::Wait) },
             async { capture_output(stdout).await.map_err(CommandRunError::Wait) },
             async { capture_output(stderr).await.map_err(CommandRunError::Wait) },
         )?;
+        // Keep the root unreaped while pipe I/O can still suspend. On Unix this
+        // reserves its process-group ID until cancellation cleanup is disarmed,
+        // even if the root exits before a descendant closes the inherited pipes.
+        let status = child.wait().await.map_err(CommandRunError::Wait)?;
         Ok::<_, CommandRunError>((status, stdout, stderr))
     };
-    match timeout_at(timeout_deadline, wait_for_output).await {
+    let result = match timeout_at(timeout_deadline, wait_for_output).await {
         Ok(Ok((status, stdout, stderr))) => {
             let exit_code = status.code();
             // A successful hook's stdout can be structured JSON, so never parse a
@@ -300,6 +310,27 @@ async fn run_command_with_reservation(
         Err(_) => {
             terminate_command_tree(&mut child, &managed).await;
             finish_timeout(started_at, started, handler.timeout_sec)
+        }
+    };
+    #[cfg(unix)]
+    {
+        cancellation_guard.0 = None;
+    }
+    result
+}
+
+#[cfg(unix)]
+struct HookProcessGroupGuard(Option<u32>);
+
+#[cfg(unix)]
+impl Drop for HookProcessGroupGuard {
+    fn drop(&mut self) {
+        if let Some(process_group_id) = self.0
+            && let Err(err) = codex_utils_pty::process_group::kill_process_group(process_group_id)
+        {
+            tracing::warn!(
+                "failed to kill cancelled hook process group {process_group_id}: {err:?}"
+            );
         }
     }
 }

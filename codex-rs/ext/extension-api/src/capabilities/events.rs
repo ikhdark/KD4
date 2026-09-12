@@ -1,3 +1,4 @@
+use codex_protocol::ThreadId;
 use codex_protocol::protocol::Event;
 
 /// Host-provided fire-and-forget sink for extension-generated events.
@@ -8,6 +9,12 @@ use codex_protocol::protocol::Event;
 pub trait ExtensionEventSink: Send + Sync {
     /// Queue one protocol event for host-owned delivery.
     fn emit(&self, event: Event);
+
+    /// Queue a thread-scoped event without treating its callback correlation id
+    /// as a thread id. Existing sinks retain their original delivery behavior.
+    fn emit_for_thread(&self, _thread_id: ThreadId, event: Event) {
+        self.emit(event);
+    }
 }
 
 /// Event sink used when the host does not expose extension event emission.

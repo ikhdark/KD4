@@ -183,17 +183,19 @@ impl PagerView {
     }
 
     fn render_content(&self, area: Rect, buf: &mut Buffer) {
-        let mut y = -(self.scroll_offset as isize);
+        // Keep chunk positions local to the content rectangle. i128 also holds
+        // every usize offset on supported targets without a signed narrowing.
+        let mut y = -(self.scroll_offset as i128);
         let mut drawn_bottom = area.y;
         for renderable in &self.renderables {
             let top = y;
-            let height = renderable.desired_height(area.width) as isize;
+            let height = renderable.desired_height(area.width) as i128;
             y += height;
             let bottom = y;
-            if bottom < area.y as isize {
+            if bottom <= 0 {
                 continue;
             }
-            if top > area.y as isize + area.height as isize {
+            if top >= i128::from(area.height) {
                 break;
             }
             if top < 0 {
@@ -244,6 +246,9 @@ impl PagerView {
         };
         let pct_text = format!(" {percent}% ");
         let pct_w = pct_text.chars().count() as u16;
+        if pct_w >= sep_rect.width {
+            return;
+        }
         let pct_x = sep_rect.x + sep_rect.width - pct_w - 1;
         Span::from(pct_text)
             .dim()
@@ -919,7 +924,7 @@ fn render_offset_content(
         0,
         0,
         area.width,
-        height.min(area.height + scroll_offset),
+        height.min(area.height.saturating_add(scroll_offset)),
     ));
     renderable.render(*tall_buf.area(), &mut tall_buf);
     let copy_height = area
@@ -1008,6 +1013,23 @@ mod tests {
             scroll_offset,
             default_pager_keymap(),
         )
+    }
+
+    #[test]
+    fn pager_footer_handles_narrow_viewports() {
+        for width in (0..=8).chain([20]) {
+            let area = Rect::new(0, 0, width, 5);
+            let mut buf = Buffer::empty(area);
+            let mut pager = pager_view(Vec::new(), "empty", 0);
+            pager.render(area, &mut buf);
+            let footer = (0..width).map(|x| buf[(x, 4)].symbol()).collect::<String>();
+            let expected = if width <= 6 {
+                "─".repeat(usize::from(width))
+            } else {
+                format!("{} 100% ─", "─".repeat(usize::from(width - 7)))
+            };
+            assert_eq!(footer, expected, "width {width}");
+        }
     }
 
     #[test]
@@ -1561,5 +1583,77 @@ mod tests {
             pv.is_scrolled_to_bottom(),
             "expected view to report at bottom after scrolling to end"
         );
+    }
+
+    #[test]
+    fn pager_content_uses_local_rows_in_off_origin_viewports() {
+        for area in [Rect::new(3, 4, 10, 8), Rect::new(3, u16::MAX - 8, 10, 8)] {
+            for (offset, expected_rows, expected_offset) in [
+                (0, ["a0", "a1", "b0"], 0),
+                (1, ["a1", "b0", "b1"], 1),
+                (usize::MAX, ["b3", "c0", "c1"], 5),
+            ] {
+                let outer = Rect::new(0, area.y, 16, area.height);
+                let mut buf = Buffer::empty(outer);
+                for cell in &mut buf.content {
+                    cell.set_symbol("!");
+                }
+                let mut overlay = StaticOverlay::with_renderables(
+                    vec![
+                        paragraph_block("a", 2),
+                        paragraph_block("b", 4),
+                        paragraph_block("c", 2),
+                    ],
+                    "T".to_string(),
+                    default_pager_keymap(),
+                );
+                overlay.view.scroll_offset = offset;
+                overlay.render(area, &mut buf);
+                assert_eq!(overlay.view.scroll_offset, expected_offset);
+                for (row, expected) in expected_rows.into_iter().enumerate() {
+                    let y = area.y + 1 + row as u16;
+                    let actual = (area.x..area.right())
+                        .map(|x| buf[(x, y)].symbol())
+                        .collect::<String>();
+                    assert_eq!(
+                        actual,
+                        format!("{expected:<10}"),
+                        "area {area:?}, offset {offset}"
+                    );
+                }
+                for y in area.y..area.bottom() {
+                    for x in (0..area.x).chain(area.right()..outer.right()) {
+                        assert_eq!(
+                            buf[(x, y)].symbol(),
+                            "!",
+                            "pager must not write outside its viewport"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pager_clipped_tall_chunk_preserves_tail_and_following_rows() {
+        let area = Rect::new(0, 0, 8, 8);
+        let mut buf = Buffer::empty(area);
+        let mut overlay = StaticOverlay::with_renderables(
+            vec![
+                paragraph_block("r", usize::from(u16::MAX)),
+                paragraph_block("z", 3),
+            ],
+            "T".to_string(),
+            default_pager_keymap(),
+        );
+        overlay.view.scroll_offset = usize::from(u16::MAX - 1);
+        overlay.render(area, &mut buf);
+        assert_eq!(overlay.view.scroll_offset, usize::from(u16::MAX - 1));
+        for (row, expected) in ["r65534  ", "z0      ", "z1      "].into_iter().enumerate() {
+            let actual = (0..area.width)
+                .map(|x| buf[(x, 1 + row as u16)].symbol())
+                .collect::<String>();
+            assert_eq!(actual, expected);
+        }
     }
 }

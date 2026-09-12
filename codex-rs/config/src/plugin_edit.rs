@@ -47,7 +47,9 @@ pub async fn apply_user_plugin_config_edits(
         .map_err(|err| std::io::Error::other(format!("config persistence task panicked: {err}")))?
 }
 
-fn apply_user_plugin_config_edits_blocking(
+/// Persist plugin edits from a blocking context, including callers that own a
+/// larger filesystem transaction that must remain intact until this write ends.
+pub fn apply_user_plugin_config_edits_blocking(
     codex_home: &Path,
     edits: Vec<PluginConfigEdit>,
 ) -> std::io::Result<()> {

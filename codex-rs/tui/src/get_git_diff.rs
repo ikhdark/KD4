@@ -109,13 +109,38 @@ pub(crate) async fn get_git_diff(
     let fallback_deadline = tokio::time::Instant::now() + DIFF_COMMAND_TIMEOUT;
     let mut untracked_budget_used = 0_u64;
     for file in files_to_diff {
-        match runner.has_local_filesystem().then(|| {
-            render_local_untracked_file(
-                cwd,
-                file,
-                MAX_UNTRACKED_TOTAL_BYTES.saturating_sub(untracked_budget_used),
-            )
-        }) {
+        if tokio::time::Instant::now() >= fallback_deadline {
+            untracked_diff.push_str("# Remaining untracked file diffs omitted after deadline\n");
+            break;
+        }
+        let local_result = if runner.has_local_filesystem() {
+            let root = cwd.to_path_buf();
+            let path = file.clone();
+            let remaining_budget = MAX_UNTRACKED_TOTAL_BYTES.saturating_sub(untracked_budget_used);
+            let mut read =
+                tokio_util::task::AbortOnDropHandle::new(tokio::task::spawn_blocking(move || {
+                    render_local_untracked_file(&root, &path, remaining_budget)
+                }));
+            match tokio::time::timeout_at(fallback_deadline, &mut read).await {
+                Ok(result) => Some(
+                    result
+                        .map_err(std::io::Error::other)
+                        .and_then(|result| result),
+                ),
+                Err(_) => {
+                    // Cancel work still queued in the blocking pool. A filesystem call
+                    // already running is read-only and can finish independently; its
+                    // result must never start another Git fallback after this deadline.
+                    read.abort();
+                    untracked_diff
+                        .push_str("# Remaining untracked file diffs omitted after deadline\n");
+                    break;
+                }
+            }
+        } else {
+            None
+        };
+        match local_result {
             Some(Ok(Some((diff, bytes)))) => {
                 untracked_budget_used = untracked_budget_used.saturating_add(bytes);
                 untracked_diff.push_str(&diff);
@@ -1452,6 +1477,124 @@ mod tests {
         assert!(result.0);
         assert_eq!(runner.commands().len(), 5);
         assert_eq!(result.1.matches("diff --git").count(), 32);
+    }
+
+    #[test]
+    fn local_untracked_deadline_includes_waiting_for_filesystem_worker() {
+        let directory = tempfile::tempdir().expect("isolated diff directory");
+        let cwd = directory.path().to_path_buf();
+        let original = b"complete local diff contents\n";
+        fs::write(cwd.join("pending.txt"), original).expect("real untracked file");
+        let runner = FakeRunner::new(vec![
+            response(
+                git_command(
+                    FsmonitorOverride::Disabled,
+                    &["rev-parse", "--is-inside-work-tree"],
+                ),
+                0,
+                "true\n",
+            ),
+            response(
+                git_probe_command(&["config", "--null", "--get", "core.fsmonitor"]),
+                1,
+                "",
+            ),
+            response(
+                git_command(
+                    FsmonitorOverride::Disabled,
+                    &[
+                        "config",
+                        "--null",
+                        "--name-only",
+                        "--get-regexp",
+                        EXECUTABLE_FILTER_CONFIG_PATTERN,
+                    ],
+                ),
+                1,
+                "",
+            ),
+            response(
+                git_command(
+                    FsmonitorOverride::Disabled,
+                    &[
+                        "diff",
+                        "--no-textconv",
+                        "--no-ext-diff",
+                        "--submodule=short",
+                        "--ignore-submodules=dirty",
+                        "--color",
+                    ],
+                ),
+                0,
+                "",
+            ),
+            response(
+                git_command(
+                    FsmonitorOverride::Disabled,
+                    &[
+                        "-c",
+                        "core.quotePath=true",
+                        "ls-files",
+                        "--others",
+                        "--exclude-standard",
+                    ],
+                ),
+                0,
+                "pending.txt\n",
+            ),
+        ]);
+
+        let runner = FakeRunner {
+            has_local_filesystem: true,
+            ..runner
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .expect("single filesystem worker");
+        runtime.block_on(async {
+            let (started, ready) = tokio::sync::oneshot::channel();
+            let (release, blocked) = std::sync::mpsc::channel();
+            let occupied = tokio::task::spawn_blocking(move || {
+                started.send(()).expect("worker acquired");
+                let _ = blocked.recv_timeout(Duration::from_secs(5));
+            });
+            ready.await.expect("blocking pool occupied");
+            tokio::time::pause();
+            let mut diff = Box::pin(get_git_diff(&runner, &cwd));
+            assert!(
+                futures::poll!(diff.as_mut()).is_pending(),
+                "normal local read waits for worker"
+            );
+            // Advance strictly beyond the deadline: the timer wheel can round an
+            // exact boundary up one tick, and this occupied worker inhibits
+            // automatic virtual-time advancement while it waits.
+            tokio::time::advance(DIFF_COMMAND_TIMEOUT + Duration::from_secs(1)).await;
+            let result = tokio::time::timeout(Duration::from_millis(1), diff)
+                .await
+                .expect("untracked deadline bounds queued local read")
+                .expect("timeout is an explicit omission, not an unrelated git error");
+            assert_eq!(
+                result,
+                (
+                    true,
+                    "# Remaining untracked file diffs omitted after deadline\n".to_string()
+                )
+            );
+            assert_eq!(
+                runner.commands().len(),
+                5,
+                "expired local work must not launch per-file Git fallback"
+            );
+            release.send(()).expect("release external worker");
+            occupied.await.expect("external worker exits");
+            tokio::time::resume();
+        });
+        assert_eq!(
+            fs::read(cwd.join("pending.txt")).expect("original remains"),
+            original
+        );
     }
 
     fn git_command(fsmonitor: FsmonitorOverride, args: &[&str]) -> Vec<String> {

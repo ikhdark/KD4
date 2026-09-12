@@ -39,27 +39,30 @@ pub async fn build_prompt_input(
 
     let thread_store = thread_store_from_config(&config, state_db.clone());
     let installation_id = resolve_installation_id(&config.codex_home).await?;
-    let thread_manager = ThreadManager::new(
-        &config,
-        Arc::clone(&auth_manager),
-        SessionSource::Exec,
-        Arc::new(
-            EnvironmentManager::from_codex_home(
-                config.codex_home.clone(),
-                Some(local_runtime_paths),
-            )
+    let environment_manager = Arc::new(
+        EnvironmentManager::from_codex_home(config.codex_home.clone(), Some(local_runtime_paths))
             .await
             .map_err(|err| CodexErr::Fatal(err.to_string()))?,
-        ),
-        empty_extension_registry(),
-        user_instructions_provider,
-        /*analytics_events_client*/ None,
-        thread_store,
-        crate::local_agent_graph_store_from_state_db(state_db.as_ref()),
-        installation_id,
-        /*attestation_provider*/ None,
-        /*external_time_provider*/ None,
     );
+    let (thread_manager, config) = tokio::task::spawn_blocking(move || {
+        let thread_manager = ThreadManager::new(
+            &config,
+            auth_manager,
+            SessionSource::Exec,
+            environment_manager,
+            empty_extension_registry(),
+            user_instructions_provider,
+            /*analytics_events_client*/ None,
+            thread_store,
+            crate::local_agent_graph_store_from_state_db(state_db.as_ref()),
+            installation_id,
+            /*attestation_provider*/ None,
+            /*external_time_provider*/ None,
+        );
+        (thread_manager, config)
+    })
+    .await
+    .map_err(|err| CodexErr::Fatal(format!("prompt debug manager construction failed: {err}")))?;
     let thread = thread_manager.start_thread(config).await?;
 
     let output = build_prompt_input_from_session(&thread.thread.codex.session, input).await;

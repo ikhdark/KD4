@@ -129,6 +129,9 @@ fn parse_release_version(version: &str) -> Option<(u64, u64, u64)> {
     let major = parts.next()?.parse::<u64>().ok()?;
     let minor = parts.next()?.parse::<u64>().ok()?;
     let patch = parts.next()?.parse::<u64>().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
     Some((major, minor, patch))
 }
 
@@ -318,6 +321,13 @@ mod tests {
         assert_eq!(is_newer_version(" 1.2.3 ", "1.2.2"), Some(true));
         assert!(is_source_build_version("0.0.0"));
         assert!(!is_source_build_version("0.1.0"));
+        for invalid in ["1.2.3.4", "1.2.3.", "1.2.3.extra"] {
+            assert_eq!(is_newer_version(invalid, "1.2.2"), None, "{invalid}");
+            assert_eq!(is_newer_version("1.2.4", invalid), None, "{invalid}");
+        }
+        for invalid in ["0.0.0.1", "0.0.0.", "0.0.0.extra"] {
+            assert!(!is_source_build_version(invalid), "{invalid}");
+        }
     }
 
     #[test]

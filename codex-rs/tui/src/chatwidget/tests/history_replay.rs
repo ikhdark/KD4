@@ -11,6 +11,142 @@ use codex_protocol::permissions::NetworkSandboxPolicy;
 use pretty_assertions::assert_eq;
 
 #[tokio::test]
+async fn dynamic_tool_results_render_through_live_notifications_and_resumed_turns() {
+    for replay_kind in [
+        None,
+        Some(ReplayKind::ResumeInitialMessages),
+        Some(ReplayKind::ThreadSnapshot),
+    ] {
+        let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(None).await;
+        chat.show_welcome_banner = false;
+        let _ = drain_insert_history(&mut rx);
+        let items: Vec<AppServerThreadItem> = serde_json::from_value(json!([
+            {
+                "type": "dynamicToolCall", "id": "lookup-1", "namespace": "catalog",
+                "tool": "lookup", "arguments": {"sku": "123"}, "status": "completed",
+                "contentItems": [
+                    {"type": "inputText", "text": "Found item\nAvailable: 2"},
+                    {"type": "inputImage", "imageUrl": "data:image/png;base64,not-transcript-text"},
+                    {"type": "inputText", "text": "End of result"}
+                ], "success": true, "error": null, "durationMs": 5
+            },
+            {
+                "type": "dynamicToolCall", "id": "lookup-2", "namespace": null,
+                "tool": "lookup", "arguments": {}, "status": "failed",
+                "contentItems": [{"type": "inputText", "text": "Partial result"}],
+                "success": false, "error": "Catalog unavailable", "durationMs": 2
+            },
+            {
+                "type": "dynamicToolCall", "id": "lookup-3", "namespace": null,
+                "tool": "legacy_lookup", "arguments": {}, "status": "completed",
+                "contentItems": null, "success": false, "error": "Request rejected",
+                "durationMs": null
+            }
+        ]))
+        .expect("normal app-server dynamic tool items");
+
+        if let Some(replay_kind) = replay_kind {
+            chat.replay_thread_turns(
+                vec![AppServerTurn {
+                    id: "turn-1".to_string(),
+                    items_view: codex_app_server_protocol::TurnItemsView::Full,
+                    items,
+                    status: AppServerTurnStatus::Completed,
+                    error: None,
+                    started_at: None,
+                    completed_at: None,
+                    duration_ms: None,
+                    timing: None,
+                    surfaced_result: None,
+                    reasoning_policy_history: None,
+                }],
+                replay_kind,
+            );
+        } else {
+            for item in items {
+                let mut started = item.clone();
+                let AppServerThreadItem::DynamicToolCall {
+                    status,
+                    content_items,
+                    success,
+                    error,
+                    ..
+                } = &mut started
+                else {
+                    unreachable!()
+                };
+                *status = codex_app_server_protocol::DynamicToolCallStatus::InProgress;
+                *content_items = None;
+                *success = None;
+                *error = None;
+                chat.handle_server_notification(
+                    ServerNotification::ItemStarted(ItemStartedNotification {
+                        thread_id: "thread-1".to_string(),
+                        turn_id: "turn-1".to_string(),
+                        started_at_ms: 0,
+                        item: started,
+                    }),
+                    None,
+                );
+                chat.handle_server_notification(
+                    ServerNotification::ItemCompleted(ItemCompletedNotification {
+                        thread_id: "thread-1".to_string(),
+                        turn_id: "turn-1".to_string(),
+                        completed_at_ms: 5,
+                        item,
+                    }),
+                    None,
+                );
+            }
+        }
+
+        let cells = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|event| match event {
+                AppEvent::InsertHistoryCell(cell) => Some(cell),
+                other => {
+                    assert!(
+                        !matches!(other, AppEvent::SubmitThreadOp { .. }),
+                        "rendering must not execute a tool"
+                    );
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        let expected = [
+            "• Called catalog.lookup\n  Found item\n  Available: 2\n  [Image output]\n  End of result\n",
+            "• Failed lookup\n  Partial result\n  Error: Catalog unavailable\n",
+            "• Failed legacy_lookup\n  Error: Request rejected\n",
+        ];
+        assert_eq!(
+            cells.len(),
+            expected.len(),
+            "one terminal result per tool call"
+        );
+        for (cell, expected) in cells.iter().zip(expected) {
+            assert_eq!(lines_to_single_string(&cell.display_lines(80)), expected);
+            assert_eq!(lines_to_single_string(&cell.transcript_lines(80)), expected);
+            let narrow = cell.display_lines(20);
+            assert!(narrow.iter().all(|line| line.width() <= 20));
+            assert_eq!(
+                lines_to_single_string(&narrow)
+                    .chars()
+                    .filter(|c| !c.is_whitespace())
+                    .collect::<String>(),
+                expected
+                    .chars()
+                    .filter(|c| !c.is_whitespace())
+                    .collect::<String>(),
+                "narrow terminals must wrap the output without losing text"
+            );
+        }
+        assert!(
+            op_rx.try_recv().is_err(),
+            "live and replay rendering must not execute tools"
+        );
+    }
+}
+
+#[tokio::test]
 async fn resumed_initial_messages_render_history() {
     let (mut chat, mut rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
 

@@ -110,7 +110,11 @@ mod tests {
         .unwrap();
 
         assert_eq!(frames.len(), 2);
-        assert!(frames[0].exists());
-        assert!(frames[1].exists());
+        let first = image::open(&frames[0]).unwrap().to_rgba8();
+        let second = image::open(&frames[1]).unwrap().to_rgba8();
+        assert_eq!(first.dimensions(), (1, 1));
+        assert_eq!(second.dimensions(), (1, 1));
+        assert_eq!(first.get_pixel(0, 0), &Rgba([255, 0, 0, 255]));
+        assert_eq!(second.get_pixel(0, 0), &Rgba([0, 255, 0, 255]));
     }
 }

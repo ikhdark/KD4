@@ -62,7 +62,6 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 use serde::de::DeserializeOwned;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
-use tokio::time::timeout;
 use toml::Value as TomlValue;
 use tracing::warn;
 
@@ -92,6 +91,12 @@ pub mod legacy_core {
 }
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[cfg(test)]
+tokio::task_local! {
+    // Scheduling control only: the real worker still owns its runtime and queue.
+    static TEST_WORKER_PAUSE: Arc<tokio::sync::Notify>;
+}
 
 /// Raw app-server request result for typed in-process requests.
 ///
@@ -615,7 +620,13 @@ impl InProcessAppServerClient {
         let (command_tx, mut command_rx) = mpsc::channel::<ClientCommand>(channel_capacity);
         let (event_tx, event_rx) = mpsc::channel::<InProcessServerEvent>(channel_capacity);
 
+        #[cfg(test)]
+        let worker_pause = TEST_WORKER_PAUSE.try_with(Arc::clone).ok();
         let worker_handle = tokio::spawn(async move {
+            #[cfg(test)]
+            if let Some(pause) = worker_pause {
+                pause.notified().await;
+            }
             let mut event_stream_enabled = true;
             let mut skipped_events = 0usize;
             loop {
@@ -866,25 +877,35 @@ impl InProcessAppServerClient {
         // and getting aborted with the runtime still attached.
         drop(event_rx);
         let (response_tx, response_rx) = oneshot::channel();
-        if command_tx
-            .send(ClientCommand::Shutdown { response_tx })
-            .await
-            .is_ok()
-            && let Ok(command_result) = timeout(SHUTDOWN_TIMEOUT, response_rx).await
-        {
-            command_result.map_err(|_| {
+        let deadline = tokio::time::Instant::now() + SHUTDOWN_TIMEOUT;
+        // Queue admission is part of graceful shutdown too. A live worker may
+        // stop draining before this command reaches it.
+        let shutdown_result = tokio::time::timeout_at(deadline, async {
+            if command_tx
+                .send(ClientCommand::Shutdown { response_tx })
+                .await
+                .is_err()
+            {
+                return Ok(());
+            }
+            response_rx.await.map_err(|_| {
                 IoError::new(
                     ErrorKind::BrokenPipe,
                     "in-process app-server shutdown channel is closed",
                 )
-            })??;
-        }
+            })?
+        })
+        .await;
 
-        if let Err(_elapsed) = timeout(SHUTDOWN_TIMEOUT, &mut worker_handle).await {
+        // Retire the owner even when graceful shutdown returned an error.
+        if tokio::time::timeout_at(deadline, &mut worker_handle)
+            .await
+            .is_err()
+        {
             worker_handle.abort();
             let _ = worker_handle.await;
         }
-        Ok(())
+        shutdown_result.unwrap_or(Ok(()))
     }
 }
 
@@ -1741,6 +1762,25 @@ mod tests {
         let client = RemoteAppServerClient::connect(test_remote_connect_args(websocket_url))
             .await
             .expect("remote client should connect");
+
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStringExt;
+
+            let invalid_path = std::path::PathBuf::from(std::ffi::OsString::from_wide(&[0xd800]));
+            let error = client
+                .request(ClientRequest::ThreadResume {
+                    request_id: RequestId::Integer(99),
+                    params: codex_app_server_protocol::ThreadResumeParams {
+                        thread_id: "thread-1".to_string(),
+                        path: Some(invalid_path),
+                        ..Default::default()
+                    },
+                })
+                .await
+                .expect_err("unencodable request must return an error without reaching the server");
+            assert_eq!(error.kind(), ErrorKind::InvalidInput);
+        }
 
         assert_eq!(client.server_version(), Some("9.8.7-test"));
         assert_eq!(client.codex_home(), Some(r"C:\server\.codex"));
@@ -2743,6 +2783,47 @@ mod tests {
                 },
                 additional_warning,
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_deadline_includes_full_command_queue_admission() {
+        let pause = Arc::new(tokio::sync::Notify::new());
+        let client = TEST_WORKER_PAUSE
+            .scope(
+                pause,
+                start_test_client_with_capacity(SessionSource::Cli, 1),
+            )
+            .await;
+        let request_handle = client.request_handle();
+        let worker = client.worker_handle.abort_handle();
+        let request = || ClientRequest::GetAccount {
+            request_id: RequestId::Integer(701),
+            params: codex_app_server_protocol::GetAccountParams {
+                refresh_token: false,
+            },
+        };
+        let mut queued_request = std::pin::pin!(request_handle.request(request()));
+        assert!(futures::poll!(&mut queued_request).is_pending());
+        assert_eq!(client.command_tx.capacity(), 0);
+
+        timeout(SHUTDOWN_TIMEOUT + Duration::from_secs(2), client.shutdown())
+            .await
+            .expect("a full command queue must not escape the shutdown deadline")
+            .expect("forced shutdown should complete");
+
+        assert!(worker.is_finished(), "shutdown must retire the actual worker");
+        assert_eq!(
+            queued_request.await.expect_err("queued request is abandoned").kind(),
+            ErrorKind::BrokenPipe
+        );
+        assert_eq!(
+            request_handle
+                .request(request())
+                .await
+                .expect_err("retained handles cannot send to a retired worker")
+                .kind(),
+            ErrorKind::BrokenPipe
         );
     }
 

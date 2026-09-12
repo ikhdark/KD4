@@ -356,7 +356,13 @@ async fn same_size_same_metadata_rewrite_refreshes_project_instructions() {
         .expect("second load");
 
     assert_eq!(filesystem.target_stream_calls(), 2);
-    assert_eq!(second.text(), "version two");
+    assert_eq!(
+        second.text(),
+        format!(
+            "## AGENTS.md instructions from {}\n\nversion two",
+            agents_path.display()
+        )
+    );
     assert!(!Arc::ptr_eq(&first, &second));
 }
 
@@ -479,10 +485,28 @@ async fn overlapping_refreshes_publish_in_request_order() {
         .expect("second refresh task should succeed")
         .expect("second refresh should return its instructions");
 
-    assert_eq!(first_loaded.text(), "version one");
-    assert_eq!(second_loaded.text(), "version two");
+    assert_eq!(
+        first_loaded.text(),
+        format!(
+            "## AGENTS.md instructions from {}\n\nversion one",
+            agents_path.display()
+        )
+    );
+    assert_eq!(
+        second_loaded.text(),
+        format!(
+            "## AGENTS.md instructions from {}\n\nversion two",
+            agents_path.display()
+        )
+    );
     let loaded = manager.get_loaded().await.expect("latest instructions");
-    assert_eq!(loaded.text(), "version two");
+    assert_eq!(
+        loaded.text(),
+        format!(
+            "## AGENTS.md instructions from {}\n\nversion two",
+            agents_path.display()
+        )
+    );
     let cache = manager.cache.lock().await;
     assert_eq!(cache.key.as_ref(), Some(&second_key));
 }
@@ -558,7 +582,13 @@ async fn same_key_read_failure_retains_last_successful_instructions_and_recovers
     );
     let retained = retained_observation.loaded.expect("retained load");
     assert!(Arc::ptr_eq(&first, &retained));
-    assert_eq!(retained.text(), "version one");
+    assert_eq!(
+        retained.text(),
+        format!(
+            "## AGENTS.md instructions from {}\n\nversion one",
+            agents_path.display()
+        )
+    );
 
     fs::write(&agents_path, "version two recovered").expect("write recovered AGENTS.md");
     let recovered_observation = manager.refresh_and_observe(&config, &environments).await;
@@ -568,7 +598,13 @@ async fn same_key_read_failure_retains_last_successful_instructions_and_recovers
     );
     let recovered = recovered_observation.loaded.expect("recovered load");
     assert!(!Arc::ptr_eq(&retained, &recovered));
-    assert_eq!(recovered.text(), "version two recovered");
+    assert_eq!(
+        recovered.text(),
+        format!(
+            "## AGENTS.md instructions from {}\n\nversion two recovered",
+            agents_path.display()
+        )
+    );
 }
 
 #[tokio::test]
@@ -588,14 +624,26 @@ async fn content_and_missing_higher_precedence_file_invalidate_cache() {
     manager.refresh(&config, &environments).await;
     let changed = manager.get_loaded().await.expect("changed load");
     assert!(!Arc::ptr_eq(&first, &changed));
-    assert_eq!(changed.text(), "version two");
+    assert_eq!(
+        changed.text(),
+        format!(
+            "## AGENTS.md instructions from {}\n\nversion two",
+            agents.display()
+        )
+    );
     assert_ne!(first.semantic_digest(), changed.semantic_digest());
 
     fs::write(&override_path, "local override").expect("create override");
     manager.refresh(&config, &environments).await;
     let overridden = manager.get_loaded().await.expect("override load");
     assert!(!Arc::ptr_eq(&changed, &overridden));
-    assert_eq!(overridden.text(), "local override");
+    assert_eq!(
+        overridden.text(),
+        format!(
+            "## AGENTS.md instructions from {}\n\nlocal override",
+            override_path.display()
+        )
+    );
 }
 
 #[tokio::test]
@@ -612,19 +660,25 @@ async fn names_and_limits_are_cache_dependencies() {
     config.project_doc_fallback_filenames = vec!["WORKFLOW.md".to_string()];
     manager.refresh(&config, &environments).await;
     let fallback = manager.get_loaded().await.expect("fallback load");
-    assert_eq!(fallback.text(), "fallback instructions");
+    let fallback_path = root.path().join("WORKFLOW.md");
+    assert_eq!(
+        fallback.text(),
+        format!(
+            "## AGENTS.md instructions from {}\n\nfallback instructions",
+            fallback_path.display()
+        )
+    );
 
     config.project_doc_max_bytes = 8;
     manager.refresh(&config, &environments).await;
     let truncated = manager.get_loaded().await.expect("truncated fallback load");
-    assert!(
-        truncated
-            .text()
-            .starts_with("fallback\n\n[Project documentation truncation notice: source path:")
+    assert_eq!(
+        truncated.text(),
+        format!(
+            "## AGENTS.md instructions from {path}\n\nfallback\n\n[Project documentation truncation notice: source path: {path}; original byte count: 21; retained byte count: 8; omitted byte count: 13.]",
+            path = fallback_path.display()
+        )
     );
-    assert!(truncated.text().contains("original byte count: 21"));
-    assert!(truncated.text().contains("retained byte count: 8"));
-    assert!(truncated.text().contains("omitted byte count: 13"));
 }
 
 #[tokio::test]
@@ -656,12 +710,25 @@ async fn effective_marker_configuration_invalidates_cached_discovery() {
 
     manager.refresh(&default_config, &environments).await;
     let nested_only = manager.get_loaded().await.expect("nested load");
-    assert_eq!(nested_only.text(), "nested instructions");
+    assert_eq!(
+        nested_only.text(),
+        format!(
+            "## AGENTS.md instructions from {}\n\nnested instructions",
+            nested.join("AGENTS.md").display()
+        )
+    );
 
     manager.refresh(&marker_config, &environments).await;
     let with_root = manager.get_loaded().await.expect("root-aware load");
     assert!(!Arc::ptr_eq(&nested_only, &with_root));
-    assert_eq!(with_root.text(), "root instructions\n\nnested instructions");
+    assert_eq!(
+        with_root.text(),
+        format!(
+            "## AGENTS.md instructions from {}\n\nroot instructions\n\n## AGENTS.md instructions from {}\n\nnested instructions",
+            root.path().join("AGENTS.md").display(),
+            nested.join("AGENTS.md").display()
+        )
+    );
 }
 
 #[tokio::test]

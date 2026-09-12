@@ -1,6 +1,5 @@
 use crate::acl::add_deny_write_ace;
 use crate::acl::path_mask_allows;
-use crate::cap::cap_sid_file;
 use crate::cap::load_or_create_cap_sids;
 use crate::cap::workspace_write_cap_sid_for_root;
 use crate::cap::workspace_write_root_contains_path;
@@ -292,9 +291,7 @@ fn apply_capability_denies_for_world_writable_for_permissions(
         return Ok(());
     }
     std::fs::create_dir_all(codex_home)?;
-    let cap_path = cap_sid_file(codex_home);
     let caps = load_or_create_cap_sids(codex_home)?;
-    std::fs::write(&cap_path, serde_json::to_string(&caps)?)?;
     if !permissions.is_enforceable_by_windows_sandbox() {
         return Ok(());
     }
@@ -354,6 +351,55 @@ mod tests {
     use anyhow::anyhow;
     use std::collections::HashMap;
     use std::fs;
+
+    #[test]
+    fn applying_audit_denies_reuses_persisted_capabilities_without_rewriting() -> anyhow::Result<()>
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Foundation::HLOCAL;
+        use windows_sys::Win32::Foundation::LocalFree;
+        use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+
+        let home = tempfile::tempdir()?;
+        let flagged = tempfile::tempdir()?;
+        let caps = crate::cap::load_or_create_cap_sids(home.path())?;
+        let sid = crate::token::LocalSid::from_string(&caps.readonly)?;
+        let has_deny = || -> anyhow::Result<bool> {
+            // SAFETY: the temporary directory exists and LocalSid owns a valid SID.
+            // The descriptor is released after the borrowed DACL has been inspected.
+            unsafe {
+                let (dacl, descriptor) = crate::acl::fetch_dacl_handle(flagged.path())?;
+                let present = crate::acl::dacl_has_write_deny_for_sid(dacl, sid.as_ptr());
+                LocalFree(descriptor as HLOCAL);
+                Ok(present)
+            }
+        };
+        assert!(!has_deny()?);
+        let cap_path = crate::cap::cap_sid_file(home.path());
+        let before = fs::read(&cap_path)?;
+        let _locked = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(&cap_path)?;
+        let permissions = crate::resolved_permissions::ResolvedWindowsSandboxPermissions::
+            try_from_permission_profile(&codex_protocol::models::PermissionProfile::read_only())?;
+
+        super::apply_capability_denies_for_world_writable_for_permissions(
+            home.path(),
+            &[flagged.path().to_path_buf()],
+            &permissions,
+            flagged.path(),
+            &HashMap::new(),
+            None,
+        )?;
+
+        assert!(
+            has_deny()?,
+            "the flagged path must receive its capability deny"
+        );
+        assert_eq!(fs::read(&cap_path)?, before);
+        Ok(())
+    }
 
     #[test]
     fn gathers_path_entries_by_list_separator() {

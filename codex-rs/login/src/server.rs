@@ -158,10 +158,27 @@ impl ShutdownHandle {
 
 /// Starts a local callback server and returns the browser auth URL.
 pub fn run_login_server(opts: ServerOptions) -> io::Result<LoginServer> {
+    let server = bind_server(opts.port)?;
+    start_login_server(opts, server)
+}
+
+/// Starts a callback server without blocking the async caller during port retries.
+///
+/// Only binding runs in the blocking pool. If this future is cancelled, the
+/// returned tiny_http server is dropped before callback workers or a browser
+/// can be started.
+pub async fn run_login_server_async(opts: ServerOptions) -> io::Result<LoginServer> {
+    let port = opts.port;
+    let server = tokio::task::spawn_blocking(move || bind_server(port))
+        .await
+        .map_err(|err| io::Error::other(format!("login server bind task failed: {err}")))??;
+    start_login_server(opts, server)
+}
+
+fn start_login_server(opts: ServerOptions, server: Server) -> io::Result<LoginServer> {
     let pkce = generate_pkce();
     let state = opts.force_state.clone().unwrap_or_else(generate_state);
 
-    let server = bind_server(opts.port)?;
     let actual_port = match server.server_addr().to_ip() {
         Some(addr) => addr.port(),
         None => {

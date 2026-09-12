@@ -680,3 +680,113 @@ async fn cancels_previous_login_server_when_port_is_in_use() -> Result<()> {
         .expect_err("second login server should report cancellation");
     Ok(())
 }
+
+#[test]
+fn async_login_startup_keeps_runtime_responsive_and_cleans_cancelled_binding() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    for cancel_startup in [false, true] {
+        let home = tempdir()?;
+        let listener = TcpListener::bind(("127.0.0.1", 0))?;
+        let port = listener.local_addr()?.port();
+        let occupied = tiny_http::Server::from_listener(listener, None)
+            .map_err(|error| anyhow::anyhow!("create occupied-port fixture: {error}"))?;
+        let (cancel_seen_tx, cancel_seen_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let fixture = thread::spawn(move || -> Result<()> {
+            let request = occupied
+                .recv_timeout(Duration::from_secs(5))?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("startup did not attempt occupied-port cancellation")
+                })?;
+            assert_eq!(request.url(), "/cancel");
+            let _ = cancel_seen_tx.send(());
+            // An external dependency is gated, not the behavior under test.
+            // Only the async caller can release this response after its timer runs.
+            release_rx.recv_timeout(Duration::from_secs(5))?;
+            request.respond(tiny_http::Response::empty(200))?;
+            Ok(())
+        });
+        let mut opts = ServerOptions::new(
+            home.path().to_path_buf(),
+            codex_login::CLIENT_ID.to_string(),
+            None,
+            AuthCredentialsStoreMode::File,
+            AuthKeyringBackendKind::Direct,
+            codex_login::test_support::transport_default_auth_route_config(),
+        );
+        opts.port = port;
+        opts.open_browser = false;
+        opts.force_state = Some("async-boundary-state".to_string());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let result: Result<()> = runtime.block_on(async move {
+            let mut startup = Box::pin(codex_login::run_login_server_async(opts));
+            tokio::select! {
+                biased;
+                result = &mut startup => {
+                    if let Ok(server) = result {
+                        server.cancel();
+                        let _ = server.block_until_done().await;
+                    }
+                    anyhow::bail!("startup completed while the occupied-port response was gated");
+                }
+                result = cancel_seen_rx => result?,
+            }
+            // This timer and the cancellation signal must both run on the
+            // current-thread executor while bind_server is still blocked.
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                tokio::time::sleep(Duration::from_millis(20)),
+            )
+            .await?;
+            if cancel_startup {
+                drop(startup);
+                release_tx.send(())?;
+            } else {
+                release_tx.send(())?;
+                let server = tokio::time::timeout(Duration::from_secs(5), startup).await??;
+                assert_eq!(server.actual_port, port);
+                let url = Url::parse(&server.auth_url)?;
+                let redirect_uri = url
+                    .query_pairs()
+                    .find(|(name, _)| name == "redirect_uri")
+                    .map(|(_, value)| value.into_owned());
+                assert_eq!(
+                    redirect_uri,
+                    Some(format!("http://localhost:{port}/auth/callback"))
+                );
+                server.cancel();
+                tokio::time::timeout(Duration::from_secs(2), server.block_until_done())
+                    .await?
+                    .expect_err("explicit cancellation must terminate the callback server");
+            }
+            Ok(())
+        });
+        // Runtime shutdown drains the actual blocking pool. This is the
+        // completion barrier for a binding operation whose caller was dropped;
+        // rebinding immediately after dropping the caller would be too early.
+        drop(runtime);
+        let fixture_result = fixture.join().expect("occupied-port fixture panicked");
+        result?;
+        fixture_result?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let _rebound = loop {
+            match TcpListener::bind(("127.0.0.1", port)) {
+                Ok(listener) => break listener,
+                Err(error)
+                    if error.kind() == io::ErrorKind::AddrInUse
+                        && std::time::Instant::now() < deadline =>
+                {
+                    // tiny_http wakes its accept thread on Drop; wait only for
+                    // that thread to release the socket, after the bind barrier.
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => return Err(error.into()),
+            }
+        };
+        assert!(!home.path().join("auth.json").exists());
+    }
+    Ok(())
+}

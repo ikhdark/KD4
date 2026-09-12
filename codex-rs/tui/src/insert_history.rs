@@ -139,7 +139,12 @@ where
             .sum::<usize>();
         wrapped.extend(line_wrapped);
     }
-    let wrapped_lines = wrapped_rows as u16;
+    let wrapped_lines = u16::try_from(wrapped_rows).unwrap_or(u16::MAX);
+    if wrapped_lines > 0 {
+        // Raw history writes can overlap the viewport without changing its geometry.
+        // Invalidate before writing so partial failures also require a full repaint.
+        terminal.invalidate_viewport();
+    }
     {
         let writer = terminal.backend_mut();
         let cursor_top = if area.bottom() < screen_size.height {
@@ -233,7 +238,7 @@ fn write_history_line<W: Write>(
     line: &HyperlinkLine,
     wrap_width: usize,
 ) -> io::Result<()> {
-    let physical_rows = line.width().max(1).div_ceil(wrap_width) as u16;
+    let physical_rows = line.width().max(1).div_ceil(wrap_width);
     if physical_rows > 1 {
         queue!(writer, SavePosition)?;
         for _ in 1..physical_rows {
@@ -428,6 +433,97 @@ mod tests {
     use crate::test_backend::VT100Backend;
     use ratatui::layout::Rect;
     use ratatui::style::Color;
+
+    #[test]
+    fn history_insertion_repaints_unchanged_blank_viewport() {
+        for (viewport, expected_history_rows) in
+            [(Rect::new(0, 0, 4, 3), 0), (Rect::new(0, 2, 4, 1), 1)]
+        {
+            let mut term = crate::custom_terminal::Terminal::with_options(VT100Backend::new(4, 3))
+                .expect("terminal");
+            term.set_viewport_area(viewport);
+            term.draw(|_| {}).expect("initial blank frame");
+            insert_history_lines(
+                &mut term,
+                vec![Line::from(Span::styled(
+                    "X",
+                    ratatui::style::Style::default()
+                        .fg(Color::Red)
+                        .bg(Color::Blue),
+                ))],
+            )
+            .expect("insert real history");
+            assert_eq!(term.viewport_area, viewport);
+            assert_eq!(term.visible_history_rows(), expected_history_rows);
+            let raw_cell = term.backend().vt100().screen().cell(1, 0).unwrap();
+            assert_eq!(
+                raw_cell.contents(),
+                "X",
+                "raw history must reach the screen"
+            );
+            let history_fg = raw_cell.fgcolor();
+            let history_bg = raw_cell.bgcolor();
+            assert_ne!(history_fg, vt100::Color::Default);
+            assert_ne!(history_bg, vt100::Color::Default);
+
+            // Draw the identical logical frame through the normal renderer.
+            // Only history insertion may request invalidation for this case.
+            term.draw(|_| {}).expect("redraw unchanged blank frame");
+            assert_eq!(term.viewport_area, viewport);
+            assert_eq!(term.visible_history_rows(), expected_history_rows);
+            let screen = term.backend().vt100().screen();
+            for row in viewport.top()..viewport.bottom() {
+                for column in viewport.left()..viewport.right() {
+                    let cell = screen.cell(row, column).unwrap();
+                    assert!(
+                        cell.contents().trim().is_empty(),
+                        "stale content at ({row}, {column}) in {viewport:?}"
+                    );
+                    assert_eq!(cell.fgcolor(), vt100::Color::Default);
+                    assert_eq!(cell.bgcolor(), vt100::Color::Default);
+                }
+            }
+            if expected_history_rows > 0 {
+                let history = screen.cell(1, 0).unwrap();
+                assert_eq!(history.contents(), "X", "redraw must preserve history");
+                assert_eq!(history.fgcolor(), history_fg);
+                assert_eq!(history.bgcolor(), history_bg);
+            }
+        }
+    }
+
+    #[test]
+    fn large_history_insertion_moves_viewport_and_keeps_visible_tail() {
+        let backend = VT100Backend::new(2, 8);
+        let mut term = crate::custom_terminal::Terminal::with_options(backend).expect("terminal");
+        term.set_viewport_area(Rect::new(0, 1, 2, 1));
+        let text = format!("{}XY", "ab".repeat(65_535));
+
+        insert_history_lines_with_wrap_policy(
+            &mut term,
+            vec![Line::from(text)],
+            HistoryLineWrapPolicy::Terminal,
+        )
+        .expect("insert 65,536 physical rows");
+
+        assert_eq!(term.viewport_area, Rect::new(0, 7, 2, 1));
+        let rows: Vec<String> = term.backend().vt100().screen().rows(0, 2).collect();
+        assert!(rows.iter().any(|row| row == "XY"), "missing tail: {rows:?}");
+    }
+
+    #[test]
+    fn very_long_history_line_clears_every_continuation_row() {
+        let line = HyperlinkLine::new(Line::from("x".repeat(65_536)));
+        let mut output = Vec::new();
+
+        write_history_line(&mut output, &line, 1).expect("write long history line");
+
+        let output = String::from_utf8(output).expect("UTF-8 terminal output");
+        assert_eq!(output.matches("\x1b[1B").count(), 65_535);
+        // Clear each continuation row and the initial row before writing the text.
+        assert_eq!(output.matches("\x1b[K").count(), 65_536);
+        assert!(output.contains(&"x".repeat(65_536)));
+    }
 
     #[test]
     fn writes_bold_then_regular_spans() {

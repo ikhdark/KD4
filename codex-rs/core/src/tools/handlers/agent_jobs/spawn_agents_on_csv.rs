@@ -220,9 +220,14 @@ pub async fn handle(
         }
         Err(err) => {
             let error_message = err.to_string();
-            let _ = db
+            if let Err(persistence_error) = db
                 .mark_agent_job_failed(job_id.as_str(), error_message.as_str())
-                .await;
+                .await
+            {
+                return Err(FunctionCallError::RespondToModel(format!(
+                    "agent job {job_id} failed: {err}; failed to persist job failure: {persistence_error}"
+                )));
+            }
             return Err(err);
         }
     };
@@ -236,6 +241,7 @@ pub async fn handle(
                     ))
                 })?;
         }
+        let mut active_items = HashMap::new();
         if let Err(err) = run_agent_job_loop(
             session.clone(),
             turn.clone(),
@@ -243,25 +249,33 @@ pub async fn handle(
             job_id.clone(),
             options,
             cancellation_token,
+            &mut active_items,
         )
         .await
         {
             let error_message = format!("job runner failed: {err}");
-            let cancelled = db
-                .is_agent_job_cancelled(job_id.as_str())
-                .await
-                .unwrap_or(false);
+            let mut failure_details = String::new();
+            let cancelled = match db.is_agent_job_cancelled(job_id.as_str()).await {
+                Ok(cancelled) => cancelled,
+                Err(error) => {
+                    failure_details
+                        .push_str(&format!("; failed to load job cancellation: {error}"));
+                    false
+                }
+            };
             if !cancelled {
-                let _ = db
+                if let Err(error) = db
                     .mark_agent_job_failed(job_id.as_str(), error_message.as_str())
-                    .await;
+                    .await
+                {
+                    failure_details.push_str(&format!("; failed to persist job failure: {error}"));
+                }
             }
             let cleanup_reason = if cancelled {
                 "job cancelled before worker completion"
             } else {
                 error_message.as_str()
             };
-            let mut active_items = HashMap::new();
             let cleanup_error = terminate_agent_job_workers(
                 session.clone(),
                 db.clone(),
@@ -283,7 +297,7 @@ pub async fn handle(
                 (None, None) => String::new(),
             };
             return Err(FunctionCallError::RespondToModel(format!(
-                "agent job {job_id} failed: {err}{cleanup_details}"
+                "agent job {job_id} failed: {err}{failure_details}{cleanup_details}"
             )));
         }
     }
@@ -324,7 +338,11 @@ pub async fn handle(
                 Some(5),
             )
             .await
-            .unwrap_or_default();
+            .map_err(|error| {
+                FunctionCallError::RespondToModel(format!(
+                    "failed to load failed-item details for agent job {job_id}: {error}"
+                ))
+            })?;
         let summaries: Vec<_> = items
             .into_iter()
             .filter_map(|item| {

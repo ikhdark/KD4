@@ -283,17 +283,26 @@ async fn tool_history_persistence_queue_batches_mutations_without_dropping_them(
     }
 
     drop(held_io_gate);
-    queue.drain().await;
+    queue
+        .drain()
+        .await
+        .expect("every queued mutation must become durable");
 
     let persisted =
         crate::tool_history::load_tool_history_state(codex_home.path(), &thread_id.to_string())
             .await;
     let (persisted, warning) = persisted.into_state_and_warning();
     assert_eq!(warning, None);
-    let persisted = serde_json::to_string(&persisted).expect("serialize persisted history");
-    for index in 0..32 {
-        assert!(persisted.contains(&format!("snapshot-{index}")));
-    }
+    let persisted = serde_json::to_value(persisted).expect("serialize persisted history");
+    let mut expected_calls = (0..32)
+        .map(|index| format!("snapshot-{index}"))
+        .collect::<Vec<_>>();
+    expected_calls.sort();
+    assert_eq!(
+        persisted["non_workspace_code_mode_calls"],
+        json!(expected_calls),
+        "reload must contain exactly the calls submitted through the queue",
+    );
     assert!(
         queue.persisted_batch_count() <= 2,
         "the worker may persist one in-flight mutation and one accumulated batch"
@@ -329,15 +338,21 @@ async fn tool_history_registration_waits_without_blocking_or_partially_mutating(
     session
         .register_non_workspace_code_mode_call(&codex_home, "persisted-call".to_string())
         .await;
-    session.flush_tool_history_persistence().await;
+    session
+        .flush_tool_history_persistence()
+        .await
+        .expect("completed-tool history must be durable before reload");
     let (persisted, warning) =
         crate::tool_history::load_tool_history_state(&codex_home, &session.thread_id.to_string())
             .await
             .into_state_and_warning();
     assert_eq!(warning, None);
-    let persisted = serde_json::to_string(&persisted).expect("serialize persisted history");
-    assert!(persisted.contains("persisted-call"));
-    assert!(!persisted.contains("cancelled-call"));
+    let persisted = serde_json::to_value(persisted).expect("serialize persisted history");
+    assert_eq!(
+        persisted["non_workspace_code_mode_calls"],
+        json!(["persisted-call"]),
+        "only the registration that completed may survive reload",
+    );
 }
 
 #[tokio::test]
@@ -374,15 +389,131 @@ async fn tool_history_persistence_queue_does_not_acknowledge_a_failed_write() {
     failure.release();
     tokio::time::timeout(std::time::Duration::from_secs(5), drain)
         .await
-        .expect("the durable full-state retry should unblock the drain");
+        .expect("the durable full-state fallback should unblock the drain")
+        .expect("snapshot fallback must durably preserve the failed journal mutation");
 
     let persisted =
         crate::tool_history::load_tool_history_state(codex_home.path(), &thread_id.to_string())
             .await;
     let (persisted, warning) = persisted.into_state_and_warning();
     assert_eq!(warning, None);
-    let persisted = serde_json::to_string(&persisted).expect("serialize persisted history");
-    assert!(persisted.contains("must-survive-restart"));
+    let persisted = serde_json::to_value(persisted).expect("serialize persisted history");
+    assert_eq!(
+        persisted["non_workspace_code_mode_calls"],
+        json!(["must-survive-restart"]),
+    );
+}
+
+#[tokio::test]
+async fn tool_history_persistence_queue_reports_failure_and_recovers_all_mutations() {
+    let codex_home = tempfile::tempdir().expect("create codex home");
+    let blocked_directory = codex_home.path().join("tool-history");
+    tokio::fs::write(&blocked_directory, b"filesystem obstruction")
+        .await
+        .expect("block the ledger directory with a regular file");
+    let thread_id = ThreadId::new();
+    let io_gate = Arc::new(Semaphore::new(/*permits*/ 1));
+    let held_io_gate = io_gate.acquire().await.expect("acquire I/O gate");
+    let queue = super::session::ToolHistoryPersistenceQueue::new(
+        Arc::clone(&io_gate),
+        codex_home.path().to_path_buf(),
+        thread_id,
+        crate::tool_history::ToolHistoryState::default(),
+    );
+    {
+        let mut writer = queue.writer().await;
+        for call_id in ["before-failure-a", "before-failure-b"] {
+            writer
+                .enqueue_mutation(
+                    crate::tool_history::ToolHistoryMutation::RegisterNonWorkspaceCodeModeCall {
+                        call_id: call_id.to_string(),
+                    },
+                    "test failed completed-tool history persistence",
+                )
+                .expect("register both mutations while persistence is blocked");
+        }
+    }
+    drop(held_io_gate);
+
+    let error = timeout(Duration::from_secs(5), queue.drain())
+        .await
+        .expect("permanent filesystem failure must terminate the drain")
+        .expect_err("neither failed mutation may be acknowledged as durable");
+    assert!(
+        matches!(
+            error,
+            super::session::ToolHistoryPersistenceError::Persistence(ref message)
+                if message.contains("failed to create tool-history ledger directory:")
+        ),
+        "the failed durability barrier must identify the failed snapshot: {error}",
+    );
+    assert_eq!(queue.persisted_batch_count(), 0);
+    assert_eq!(
+        tokio::fs::read(&blocked_directory)
+            .await
+            .expect("the failed write must leave the existing file intact"),
+        b"filesystem obstruction",
+    );
+
+    let released_io_gate = timeout(Duration::from_secs(5), io_gate.acquire())
+        .await
+        .expect("a failed persistence cycle must release its I/O gate")
+        .expect("the I/O gate remains open");
+    drop(released_io_gate);
+    let error = timeout(Duration::from_secs(5), queue.checkpoint())
+        .await
+        .expect("an explicit checkpoint must terminate while the obstruction remains")
+        .expect_err("a failed explicit checkpoint must not acknowledge the old mutations");
+    assert!(matches!(
+        error,
+        super::session::ToolHistoryPersistenceError::Persistence(_)
+    ));
+    assert_eq!(queue.persisted_batch_count(), 0);
+
+    let held_io_gate = timeout(Duration::from_secs(5), io_gate.acquire())
+        .await
+        .expect("the failed checkpoint must also release its I/O gate")
+        .expect("the I/O gate remains open");
+    tokio::fs::remove_file(&blocked_directory)
+        .await
+        .expect("repair the filesystem obstruction");
+    queue
+        .enqueue_mutation(
+            crate::tool_history::ToolHistoryMutation::RegisterNonWorkspaceCodeModeCall {
+                call_id: "after-repair".to_string(),
+            },
+            "test mutation after repairing completed-tool history persistence",
+        )
+        .await
+        .expect("the failed worker must still accept new work");
+    let mut checkpoint = Box::pin(queue.checkpoint());
+    assert!(
+        timeout(Duration::from_millis(25), checkpoint.as_mut())
+            .await
+            .is_err(),
+        "recovery must await its own write rather than returning stale failure or success",
+    );
+    drop(held_io_gate);
+    timeout(Duration::from_secs(5), checkpoint)
+        .await
+        .expect("a repaired filesystem must allow the explicit checkpoint to finish")
+        .expect("the recovery checkpoint must make all mutations durable");
+    queue
+        .drain()
+        .await
+        .expect("successful recovery must satisfy the queued durability barrier");
+
+    let (persisted, warning) =
+        crate::tool_history::load_tool_history_state(codex_home.path(), &thread_id.to_string())
+            .await
+            .into_state_and_warning();
+    assert_eq!(warning, None);
+    let persisted = serde_json::to_value(persisted).expect("serialize reloaded tool history");
+    assert_eq!(
+        persisted["non_workspace_code_mode_calls"],
+        json!(["after-repair", "before-failure-a", "before-failure-b"]),
+        "recovery must persist both failed mutations and the newly queued mutation",
+    );
 }
 
 #[tokio::test]
@@ -423,7 +554,7 @@ async fn tool_history_persistence_queue_rejects_mutations_after_worker_closes() 
 }
 
 #[tokio::test]
-async fn tool_history_persistence_checkpoint_does_not_acknowledge_after_worker_closes() {
+async fn tool_history_persistence_checkpoint_reports_worker_closed() {
     let codex_home = tempfile::tempdir().expect("create codex home");
     let io_gate = Arc::new(Semaphore::new(/*permits*/ 0));
     io_gate.close();
@@ -444,11 +575,199 @@ async fn tool_history_persistence_checkpoint_does_not_acknowledge_after_worker_c
         .expect("the first mutation wakes the worker");
     queue.wait_until_worker_closed_for_test().await;
 
+    let checkpoint_error = timeout(Duration::from_secs(5), queue.checkpoint())
+        .await
+        .expect("a closed worker must return a checkpoint failure promptly")
+        .expect_err("a closed worker must not acknowledge checkpoint durability");
+    assert!(matches!(
+        checkpoint_error,
+        super::session::ToolHistoryPersistenceError::WorkerClosed
+    ));
+    let drain_error = timeout(Duration::from_secs(5), queue.drain())
+        .await
+        .expect("a closed worker must return a drain failure promptly")
+        .expect_err("the mutation queued before closure must remain unacknowledged");
+    assert!(matches!(
+        drain_error,
+        super::session::ToolHistoryPersistenceError::WorkerClosed
+    ));
+    assert_eq!(queue.persisted_batch_count(), 0);
+}
+
+#[tokio::test]
+async fn tool_history_queue_drop_stops_worker_waiting_for_io_without_writing() {
+    let codex_home = tempfile::tempdir().expect("create codex home");
+    let io_gate = Arc::new(Semaphore::new(1));
+    let held_permit = io_gate.acquire().await.expect("hold I/O gate");
+    let thread_id = ThreadId::new();
+    let queue = super::session::ToolHistoryPersistenceQueue::new(
+        Arc::clone(&io_gate),
+        codex_home.path().to_path_buf(),
+        thread_id,
+        crate::tool_history::ToolHistoryState::default(),
+    );
+    queue
+        .enqueue_mutation(
+            crate::tool_history::ToolHistoryMutation::RegisterNonWorkspaceCodeModeCall {
+                call_id: "abandoned-before-write".to_string(),
+            },
+            "test ownership",
+        )
+        .await
+        .expect("enqueue mutation");
+    let worker = queue.worker_handle_for_test();
+    drop(queue);
+    timeout(Duration::from_secs(5), async {
+        while !worker.is_finished() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("dropping the final owner must stop a gate-waiting worker");
+    drop(held_permit);
     assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(25), queue.checkpoint())
+        !tokio::fs::try_exists(codex_home.path().join("tool-history"))
+            .await
+            .expect("inspect storage")
+    );
+}
+
+#[tokio::test]
+async fn tool_history_queue_drop_keeps_active_write_owned_until_completion() {
+    let codex_home = tempfile::tempdir().expect("create codex home");
+    let io_gate = Arc::new(Semaphore::new(1));
+    let thread_id = ThreadId::new();
+    let pause =
+        crate::tool_history::pause_next_tool_history_persistence_for_test(&thread_id.to_string());
+    let queue = super::session::ToolHistoryPersistenceQueue::new(
+        Arc::clone(&io_gate),
+        codex_home.path().to_path_buf(),
+        thread_id,
+        crate::tool_history::ToolHistoryState::default(),
+    );
+    queue
+        .enqueue_mutation(
+            crate::tool_history::ToolHistoryMutation::RegisterNonWorkspaceCodeModeCall {
+                call_id: "owned-write".to_string(),
+            },
+            "test ownership",
+        )
+        .await
+        .expect("enqueue mutation");
+    pause.wait_until_reached().await;
+    let worker = queue.worker_handle_for_test();
+    drop(queue);
+    assert!(
+        !worker.is_finished(),
+        "the active persistence operation remains owned"
+    );
+    assert!(
+        io_gate.try_acquire().is_err(),
+        "the write still owns its I/O permit"
+    );
+    pause.release();
+    let permit = timeout(Duration::from_secs(5), io_gate.acquire())
+        .await
+        .expect("completed write releases the gate")
+        .expect("gate remains open");
+    timeout(Duration::from_secs(5), async {
+        while !worker.is_finished() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("worker exits after its active operation completes");
+    drop(permit);
+    let (persisted, warning) =
+        crate::tool_history::load_tool_history_state(codex_home.path(), &thread_id.to_string())
+            .await
+            .into_state_and_warning();
+    assert_eq!(warning, None);
+    let persisted = serde_json::to_value(persisted).expect("serialize actual persisted history");
+    assert_eq!(
+        persisted["non_workspace_code_mode_calls"],
+        json!(["owned-write"])
+    );
+}
+
+#[tokio::test]
+async fn shutdown_reports_failed_tool_history_checkpoint_before_completion() {
+    let codex_home = tempfile::tempdir().expect("create codex home");
+    let (mut session, _turn_context, rx_event) =
+        make_session_and_context_with_auth_config_home_and_rx(
+            CodexAuth::from_api_key("Test API Key"),
+            Vec::new(),
+            codex_home.path(),
+            |config| config.completed_tool_history_projection = true,
+        )
+        .await;
+    attach_thread_persistence(Arc::get_mut(&mut session).expect("unique session")).await;
+    tokio::fs::write(
+        codex_home.path().join("tool-history"),
+        b"blocked ledger directory",
+    )
+    .await
+    .expect("obstruct actual filesystem persistence");
+    session
+        .register_non_workspace_code_mode_call(codex_home.path(), "undurable-call".to_string())
+        .await;
+    session
+        .tool_history_persistence
+        .drain()
+        .await
+        .expect_err("write must fail");
+    assert!(
+        timeout(
+            Duration::from_secs(5),
+            handlers::shutdown(&session, "shutdown-failure".to_string())
+        )
+        .await
+        .expect("failed checkpoint must not stall cleanup")
+    );
+    let mut observed_error = false;
+    let mut observed_completion = false;
+    while let Ok(event) = rx_event.try_recv() {
+        if event.id != "shutdown-failure" {
+            continue;
+        }
+        match event.msg {
+            EventMsg::Error(error) => {
+                assert!(
+                    error
+                        .message
+                        .contains("completed-tool history checkpoint failed")
+                );
+                assert!(
+                    !observed_completion,
+                    "durability failure must precede shutdown completion"
+                );
+                observed_error = true;
+            }
+            EventMsg::ShutdownComplete => {
+                assert!(
+                    observed_error,
+                    "shutdown must expose the failed durability barrier"
+                );
+                observed_completion = true;
+            }
+            _ => {}
+        }
+    }
+    assert!(observed_error && observed_completion);
+    assert_eq!(
+        tokio::fs::read(codex_home.path().join("tool-history"))
+            .await
+            .expect("obstruction retained"),
+        b"blocked ledger directory"
+    );
+    assert!(
+        session
+            .live_thread()
+            .expect("real thread persistence")
+            .flush()
             .await
             .is_err(),
-        "a closed persistence worker must not falsely acknowledge the checkpoint"
+        "normal thread storage cleanup still runs after the history failure"
     );
 }
 
@@ -5008,6 +5327,13 @@ async fn wait_for_thread_rollback_failed(rx: &async_channel::Receiver<Event>) ->
 }
 
 pub(crate) async fn attach_thread_persistence(session: &mut Session) -> PathBuf {
+    attach_thread_persistence_with_materialization(session, true).await
+}
+
+async fn attach_thread_persistence_with_materialization(
+    session: &mut Session,
+    materialize: bool,
+) -> PathBuf {
     let config = session.get_config().await;
     let live_thread = LiveThread::create(
         Arc::clone(&session.services.thread_store),
@@ -5040,11 +5366,13 @@ pub(crate) async fn attach_thread_persistence(session: &mut Session) -> PathBuf 
     .await
     .expect("create thread persistence");
     session.services.live_thread = Some(live_thread);
-    session.ensure_rollout_materialized().await;
-    session
-        .flush_rollout()
-        .await
-        .expect("attached rollout should flush");
+    if materialize {
+        session.ensure_rollout_materialized().await;
+        session
+            .flush_rollout()
+            .await
+            .expect("attached rollout should flush");
+    }
     session
         .current_rollout_path()
         .await
@@ -6025,6 +6353,267 @@ async fn session_update_settings_does_not_rewrite_sticky_environment_cwds() {
 }
 
 #[tokio::test]
+async fn proxy_settings_commit_preserves_concurrent_updates() -> anyhow::Result<()> {
+    for turn_settings in [false, true] {
+        assert_proxy_settings_atomicity(turn_settings, ProxySettingsOutcome::Commit).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn proxy_settings_failure_preserves_concurrent_updates() -> anyhow::Result<()> {
+    for turn_settings in [false, true] {
+        assert_proxy_settings_atomicity(turn_settings, ProxySettingsOutcome::Failure).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn proxy_settings_cancellation_preserves_concurrent_updates() -> anyhow::Result<()> {
+    for turn_settings in [false, true] {
+        assert_proxy_settings_atomicity(turn_settings, ProxySettingsOutcome::Cancel).await?;
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum ProxySettingsOutcome {
+    Commit,
+    Failure,
+    Cancel,
+}
+
+async fn assert_proxy_settings_atomicity(
+    turn_settings: bool,
+    outcome: ProxySettingsOutcome,
+) -> anyhow::Result<()> {
+    let initial_profile = PermissionProfile::workspace_write();
+    let spec = crate::config::NetworkProxySpec::from_config_and_constraints(
+        NetworkProxyConfig::default(),
+        None,
+        &initial_profile,
+    )?;
+    let (session, rx_event) = make_session_with_config_and_rx(|config| {
+        config
+            .permissions
+            .set_permission_profile(initial_profile.clone())
+            .expect("test permission profile");
+        config.permissions.network = Some(spec);
+    })
+    .await?;
+    let original_proxy = session.services.network_proxy.load_full().expect("proxy");
+    // Session initialization resolves project-root permissions to this cwd.
+    let initial_profile = session
+        .state
+        .lock()
+        .await
+        .session_configuration
+        .permission_profile();
+    let original_cwd = session
+        .state
+        .lock()
+        .await
+        .session_configuration
+        .cwd()
+        .clone();
+    let new_workspace = tempfile::tempdir()?;
+    let new_cwd = new_workspace.path().abs();
+    let original_tier = session
+        .state
+        .lock()
+        .await
+        .session_configuration
+        .service_tier
+        .clone();
+    let original_generation = session.services.planning_generation();
+    if matches!(outcome, ProxySettingsOutcome::Failure) {
+        // Exercise the real proxy builder's error path, after the scheduling
+        // gate, without relying on port allocation or background listener races.
+        let invalid_spec = crate::config::NetworkProxySpec::from_config_and_constraints(
+            NetworkProxyConfig {
+                // Loose nonempty addresses intentionally fall back to loopback.
+                // A missing host is rejected by the production runtime parser.
+                proxy_url: String::new(),
+                ..Default::default()
+            },
+            None,
+            &initial_profile,
+        )?;
+        let mut state = session.state.lock().await;
+        Arc::make_mut(&mut state.session_configuration.original_config_do_not_use)
+            .permissions
+            .network = Some(invalid_spec);
+    }
+    let start_guard = session.managed_network_proxy_start_gate.acquire().await?;
+    let updates = SessionSettingsUpdate {
+        sandbox_policy: Some(SandboxPolicy::DangerFullAccess),
+        service_tier: Some(Some("priority".to_string())),
+        environments: Some(TurnEnvironmentSelections::new(
+            new_cwd.clone(),
+            vec![local(new_cwd.clone())],
+        )),
+        ..Default::default()
+    };
+    let update_session = Arc::clone(&session);
+    let update = tokio::spawn(async move {
+        if turn_settings {
+            update_session
+                .apply_turn_settings("proxy-settings", &updates)
+                .await
+                .map(|_| ())
+                .map_err(|err| err.to_string())
+        } else {
+            update_session
+                .update_settings(updates.clone())
+                .await
+                .map_err(|err| err.to_string())
+        }
+    });
+    // The update may first await filesystem projection. Keep driving it until
+    // the real proxy-start boundary reports that the state lock was released.
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        session.managed_network_proxy_start_entered.notified(),
+    )
+    .await
+    .expect("settings update reaches the held proxy-start gate");
+    assert!(
+        !update.is_finished(),
+        "proxy startup remains blocked at its gate"
+    );
+    assert_eq!(
+        session
+            .managed_network_proxy_refresh_lock
+            .available_permits(),
+        0
+    );
+
+    session
+        .update_settings(SessionSettingsUpdate {
+            personality: Some(Personality::Pragmatic),
+            ..Default::default()
+        })
+        .await?;
+    let visible = session
+        .apply_turn_settings("during-refresh", &SessionSettingsUpdate::default())
+        .await?;
+    assert_eq!(visible.permission_profile(), initial_profile);
+    assert_eq!(visible.cwd(), &original_cwd);
+    assert_eq!(visible.service_tier, original_tier);
+    assert_eq!(visible.personality, Some(Personality::Pragmatic));
+    assert!(Arc::ptr_eq(
+        &session.services.network_proxy.load_full().expect("proxy"),
+        &original_proxy,
+    ));
+
+    if matches!(outcome, ProxySettingsOutcome::Cancel) {
+        update.abort();
+        assert!(
+            update
+                .await
+                .expect_err("cancel the pending proxy update")
+                .is_cancelled(),
+            "the actual update task must be cancelled before releasing startup"
+        );
+        drop(start_guard);
+    } else {
+        drop(start_guard);
+        let result = update.await.expect("proxy update task must not panic");
+        if matches!(outcome, ProxySettingsOutcome::Failure) {
+            let error = result.expect_err("invalid proxy address must reject settings");
+            assert!(
+                error.contains("failed to start managed network proxy"),
+                "{error}"
+            );
+            if turn_settings {
+                let event = rx_event.recv().await?;
+                assert_eq!(event.id, "proxy-settings");
+                assert!(matches!(
+                    event.msg,
+                    EventMsg::Error(ErrorEvent {
+                        codex_error_info: Some(CodexErrorInfo::BadRequest),
+                        ..
+                    })
+                ));
+            }
+        } else {
+            result.expect("valid proxy settings should commit");
+        }
+    }
+    assert!(
+        rx_event.try_recv().is_err(),
+        "no extra or success events on failure"
+    );
+    if matches!(outcome, ProxySettingsOutcome::Commit) {
+        assert!(session.services.planning_generation() > original_generation);
+    } else {
+        assert_eq!(session.services.planning_generation(), original_generation);
+    }
+    let committed_tier = session
+        .state
+        .lock()
+        .await
+        .session_configuration
+        .service_tier
+        .clone();
+    let next_turn = session.new_default_turn().await;
+    assert_eq!(next_turn.personality, Some(Personality::Pragmatic));
+    if matches!(outcome, ProxySettingsOutcome::Commit) {
+        assert_eq!(next_turn.cwd(), &new_cwd);
+        assert_eq!(next_turn.permission_profile(), PermissionProfile::Disabled);
+        assert_eq!(committed_tier.as_deref(), Some("priority"));
+        assert!(next_turn.network.is_none());
+        assert!(!Arc::ptr_eq(
+            &session
+                .services
+                .network_proxy
+                .load_full()
+                .expect("replacement proxy"),
+            &original_proxy,
+        ));
+    } else {
+        assert_eq!(next_turn.cwd(), &original_cwd);
+        assert_eq!(next_turn.permission_profile(), initial_profile);
+        assert_eq!(committed_tier, original_tier);
+        assert!(next_turn.network.is_some());
+        assert!(Arc::ptr_eq(
+            &session
+                .services
+                .network_proxy
+                .load_full()
+                .expect("preserved proxy"),
+            &original_proxy,
+        ));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn nonempty_turn_settings_wait_for_proxy_refresh() {
+    let (session, _turn_context) = make_session_and_context().await;
+    let refresh_guard = session
+        .managed_network_proxy_refresh_lock
+        .acquire()
+        .await
+        .expect("proxy refresh semaphore remains open");
+    let updates = SessionSettingsUpdate {
+        personality: Some(Personality::Pragmatic),
+        ..Default::default()
+    };
+    let mut update = Box::pin(session.apply_turn_settings("serialized-turn", &updates));
+    assert!(futures::poll!(update.as_mut()).is_pending());
+    drop(refresh_guard);
+    let configuration = update
+        .await
+        .expect("turn settings should apply after refresh");
+    assert_eq!(configuration.personality, Some(Personality::Pragmatic));
+    assert_eq!(
+        session.new_default_turn().await.personality,
+        Some(Personality::Pragmatic)
+    );
+}
+
+#[tokio::test]
 async fn unrelated_settings_update_does_not_wait_for_proxy_refresh_lock() {
     let (session, _turn_context) = make_session_and_context().await;
     let refresh_guard = session
@@ -6044,7 +6633,72 @@ async fn unrelated_settings_update_does_not_wait_for_proxy_refresh_lock() {
     .expect("an unrelated settings update must not wait for proxy refresh serialization")
     .expect("personality update should succeed");
 
+    assert_eq!(
+        session.state.lock().await.session_configuration.personality,
+        Some(Personality::Pragmatic)
+    );
+
     drop(refresh_guard);
+}
+
+#[tokio::test]
+async fn workspace_roots_update_serializes_with_proxy_refresh() -> anyhow::Result<()> {
+    let initial_profile = PermissionProfile::workspace_write();
+    let spec = crate::config::NetworkProxySpec::from_config_and_constraints(
+        NetworkProxyConfig::default(),
+        None,
+        &initial_profile,
+    )?;
+    let (session, _rx_event) = make_session_with_config_and_rx(|config| {
+        config
+            .permissions
+            .set_permission_profile(initial_profile)
+            .expect("test permission profile");
+        config.permissions.network = Some(spec);
+    })
+    .await?;
+    let original_proxy = session.services.network_proxy.load_full().expect("proxy");
+    let original_profile = session
+        .state
+        .lock()
+        .await
+        .session_configuration
+        .permission_profile();
+    let new_workspace = tempfile::tempdir()?;
+    let new_root = new_workspace.path().abs();
+    let refresh_guard = session.managed_network_proxy_refresh_lock.acquire().await?;
+
+    // Project-root materialization makes this update change the effective
+    // permission profile, so it must serialize with other proxy refreshes.
+    let mut update = Box::pin(session.update_settings(SessionSettingsUpdate {
+        workspace_roots: Some(vec![new_root.clone()]),
+        ..Default::default()
+    }));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), update.as_mut())
+            .await
+            .is_err(),
+        "a workspace-roots update must wait for proxy refresh serialization"
+    );
+    assert!(Arc::ptr_eq(
+        &session.services.network_proxy.load_full().expect("proxy"),
+        &original_proxy,
+    ));
+    drop(refresh_guard);
+    update.await?;
+
+    let committed = session.state.lock().await.session_configuration.clone();
+    assert_eq!(committed.workspace_roots, vec![new_root]);
+    assert_ne!(committed.permission_profile(), original_profile);
+    assert!(!Arc::ptr_eq(
+        &session
+            .services
+            .network_proxy
+            .load_full()
+            .expect("replacement proxy"),
+        &original_proxy,
+    ));
+    Ok(())
 }
 
 #[tokio::test]
@@ -6288,6 +6942,7 @@ async fn record_granted_request_permissions_for_turn_uses_originating_turn() {
             },
             approval_scope_id,
             Some(&originating_turn_state),
+            &CancellationToken::new(),
         )
         .await;
 
@@ -6333,6 +6988,7 @@ async fn request_permission_grants_are_approval_scope_keyed() {
             },
             "remote-scope",
             Some(&originating_turn_state),
+            &CancellationToken::new(),
         )
         .await;
 
@@ -6354,6 +7010,7 @@ async fn request_permission_grants_are_approval_scope_keyed() {
             },
             "remote-scope",
             /*originating_turn_state*/ None,
+            &CancellationToken::new(),
         )
         .await;
 
@@ -6389,6 +7046,7 @@ async fn enable_strict_auto_review_for_turn_uses_originating_turn() {
             },
             codex_exec_server::LOCAL_ENVIRONMENT_ID,
             Some(&originating_turn_state),
+            &CancellationToken::new(),
         )
         .await;
 
@@ -6427,6 +7085,332 @@ fn strict_auto_review_session_scope_grants_no_permissions() {
             strict_auto_review: false,
         }
     );
+}
+
+#[tokio::test]
+async fn dropped_permission_request_releases_registration_before_or_after_delivery() {
+    for block_delivery in [true, false] {
+        let (mut session, mut turn) = make_session_and_context().await;
+        let (events, received) = async_channel::bounded(1);
+        session.tx_event = events;
+        turn.approval_policy
+            .set(AskForApproval::OnRequest)
+            .expect("allow permission request");
+        let active = ActiveTurn::default();
+        let origin = Arc::clone(&active.turn_state);
+        *session.active_turn.lock().await = Some(active);
+        let environment = turn
+            .environments
+            .primary()
+            .expect("primary environment")
+            .selection();
+        let scope_id = turn
+            .environments
+            .primary()
+            .expect("primary environment")
+            .environment
+            .approval_scope_id()
+            .to_string();
+        if block_delivery {
+            session
+                .tx_event
+                .try_send(Event {
+                    id: "occupied-channel".to_string(),
+                    msg: EventMsg::Warning(codex_protocol::protocol::WarningEvent {
+                        message: "hold delivery".to_string(),
+                    }),
+                })
+                .expect("occupy real event channel");
+        }
+        let session = Arc::new(session);
+        let turn = Arc::new(turn);
+        let permissions = RequestPermissionProfile {
+            network: Some(codex_protocol::models::NetworkPermissions {
+                enabled: Some(true),
+            }),
+            ..Default::default()
+        };
+        let mut request = Box::pin(session.request_permissions_for_environment(
+            &turn,
+            "dropped-registry-request".to_string(),
+            codex_protocol::request_permissions::RequestPermissionsArgs {
+                environment_id: None,
+                reason: Some("direct registry lifetime proof".to_string()),
+                permissions: permissions.clone(),
+            },
+            environment,
+            CancellationToken::new(),
+        ));
+        assert!(futures::poll!(&mut request).is_pending());
+        assert!(
+            origin
+                .lock()
+                .await
+                .has_pending_request_permissions("dropped-registry-request"),
+            "normal request must actually register before cancellation"
+        );
+        assert!(*session.services.elicitations.subscribe().borrow());
+        if !block_delivery {
+            let event = received.recv().await.expect("actual permission event");
+            assert!(
+                matches!(event.msg, EventMsg::RequestPermissions(event) if event.call_id == "dropped-registry-request")
+            );
+        }
+        // This simulates a forced caller drop while either real send_event or
+        // the response receive is pending; no local cancellation branch is polled.
+        drop(request);
+        session.terminal_tasks.close();
+        timeout(Duration::from_secs(5), session.terminal_tasks.wait())
+            .await
+            .expect("owned registry cleanup");
+        assert!(
+            !origin
+                .lock()
+                .await
+                .has_pending_request_permissions("dropped-registry-request")
+        );
+        assert!(!*session.services.elicitations.subscribe().borrow());
+        if block_delivery {
+            assert_eq!(
+                received.recv().await.expect("original occupied slot").id,
+                "occupied-channel"
+            );
+            assert!(
+                received.try_recv().is_err(),
+                "canceled blocked delivery must not publish later"
+            );
+        }
+        session
+            .notify_request_permissions_response(
+                "dropped-registry-request",
+                codex_protocol::request_permissions::RequestPermissionsResponse {
+                    permissions,
+                    scope: PermissionGrantScope::Session,
+                    strict_auto_review: false,
+                },
+            )
+            .await;
+        assert_eq!(session.granted_turn_permissions(&scope_id).await, None);
+        assert_eq!(session.granted_session_permissions(&scope_id).await, None);
+        assert!(!session.strict_auto_review_enabled_for_turn().await);
+    }
+}
+
+#[tokio::test]
+async fn cancelled_permission_request_preserves_replacement_in_same_or_new_turn() {
+    for cancellation_kind in 0..3 {
+        for replace_turn in [false, true] {
+            if cancellation_kind == 2 && replace_turn {
+                continue;
+            }
+            let (session, mut turn_context, rx) = make_session_and_context_with_rx().await;
+            *session.active_turn.lock().await = Some(ActiveTurn::default());
+            let originating_turn = Arc::clone(
+                &session
+                    .active_turn
+                    .lock()
+                    .await
+                    .as_ref()
+                    .unwrap()
+                    .turn_state,
+            );
+            Arc::get_mut(&mut turn_context)
+                .expect("single settings reference")
+                .approval_policy
+                .set(AskForApproval::OnRequest)
+                .expect("approval policy");
+            let environment = turn_context.environments.primary().unwrap().selection();
+            let approval_scope_id = turn_context
+                .environments
+                .primary()
+                .unwrap()
+                .environment
+                .approval_scope_id()
+                .to_string();
+            let permissions = RequestPermissionProfile {
+                network: Some(codex_protocol::models::NetworkPermissions {
+                    enabled: Some(true),
+                }),
+                ..Default::default()
+            };
+            let args = codex_protocol::request_permissions::RequestPermissionsArgs {
+                environment_id: None,
+                reason: Some("need network".to_string()),
+                permissions: permissions.clone(),
+            };
+            let session = Arc::new(session);
+            let turn_context = Arc::new(turn_context);
+            let cancelled = CancellationToken::new();
+            let mut first = Box::pin(session.request_permissions_for_environment(
+                &turn_context,
+                "reused-call".to_string(),
+                args.clone(),
+                environment.clone(),
+                cancelled.clone(),
+            ));
+            assert!(futures::poll!(first.as_mut()).is_pending());
+            assert!(matches!(
+                rx.recv().await.unwrap().msg,
+                EventMsg::RequestPermissions(_)
+            ));
+            if replace_turn {
+                *session.active_turn.lock().await = Some(ActiveTurn::default());
+            }
+            let mut replacement = Box::pin(session.request_permissions_for_environment(
+                &turn_context,
+                "reused-call".to_string(),
+                args,
+                environment,
+                CancellationToken::new(),
+            ));
+            assert!(futures::poll!(replacement.as_mut()).is_pending());
+            assert!(matches!(
+                rx.recv().await.unwrap().msg,
+                EventMsg::RequestPermissions(_)
+            ));
+            if cancellation_kind == 1 {
+                drop(first);
+            } else if cancellation_kind == 2 {
+                assert_eq!(
+                    timeout(Duration::from_secs(2), first)
+                        .await
+                        .expect("superseded permission waiter closes before replacement response"),
+                    None
+                );
+            } else {
+                cancelled.cancel();
+                assert_eq!(first.await, None);
+            }
+            let response = codex_protocol::request_permissions::RequestPermissionsResponse {
+                permissions: permissions.clone(),
+                scope: PermissionGrantScope::Turn,
+                strict_auto_review: false,
+            };
+            session
+                .notify_request_permissions_response("reused-call", response.clone())
+                .await;
+            assert_eq!(replacement.await, Some(response));
+            assert_eq!(
+                session.granted_turn_permissions(&approval_scope_id).await,
+                Some(permissions.into())
+            );
+            assert!(!*session.services.elicitations.subscribe().borrow());
+            session.terminal_tasks.close();
+            timeout(Duration::from_secs(5), session.terminal_tasks.wait())
+                .await
+                .expect("both registry owners finish");
+            assert!(
+                !originating_turn
+                    .lock()
+                    .await
+                    .has_pending_request_permissions("reused-call")
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn cancelled_permission_requests_cannot_store_late_grants() {
+    for (scope, response_waits_for_storage) in [
+        (PermissionGrantScope::Turn, false),
+        (PermissionGrantScope::Session, false),
+        (PermissionGrantScope::Session, true),
+    ] {
+        let (session, mut turn_context, rx) = make_session_and_context_with_rx().await;
+        *session.active_turn.lock().await = Some(ActiveTurn::default());
+        Arc::get_mut(&mut turn_context)
+            .expect("single thread settings ref")
+            .approval_policy
+            .set(AskForApproval::OnRequest)
+            .expect("approval policy");
+        let approval_scope_id = turn_context
+            .environments
+            .primary()
+            .expect("primary environment")
+            .environment
+            .approval_scope_id()
+            .to_string();
+        let environment = turn_context
+            .environments
+            .primary()
+            .expect("primary environment")
+            .selection();
+        let session = Arc::new(session);
+        let turn_context = Arc::new(turn_context);
+        let request = tokio::spawn({
+            let session = Arc::clone(&session);
+            let turn_context = Arc::clone(&turn_context);
+            async move {
+                session
+                    .request_permissions_for_environment(
+                        &turn_context,
+                        "cancelled-permission".to_string(),
+                        codex_protocol::request_permissions::RequestPermissionsArgs {
+                            environment_id: None,
+                            reason: Some("need network".to_string()),
+                            permissions: RequestPermissionProfile {
+                                network: Some(codex_protocol::models::NetworkPermissions {
+                                    enabled: Some(true),
+                                }),
+                                ..Default::default()
+                            },
+                        },
+                        environment,
+                        CancellationToken::new(),
+                    )
+                    .await
+            }
+        });
+        let event = tokio::time::timeout(StdDuration::from_secs(1), rx.recv())
+            .await
+            .expect("request event timeout")
+            .expect("request event");
+        let EventMsg::RequestPermissions(event) = event.msg else {
+            panic!("expected permission request");
+        };
+        let response = codex_protocol::request_permissions::RequestPermissionsResponse {
+            permissions: event.permissions,
+            strict_auto_review: matches!(scope, PermissionGrantScope::Turn),
+            scope,
+        };
+        let storage_lock = if response_waits_for_storage {
+            Some(session.state.lock().await)
+        } else {
+            None
+        };
+        let mut notification =
+            Box::pin(session.notify_request_permissions_response(&event.call_id, response.clone()));
+        if response_waits_for_storage {
+            assert!(futures::poll!(notification.as_mut()).is_pending());
+        }
+
+        request.abort();
+        assert!(
+            request
+                .await
+                .expect_err("request was cancelled")
+                .is_cancelled()
+        );
+        drop(storage_lock);
+        notification.await;
+        // A duplicate late response is inert after the pending entry was consumed too.
+        session
+            .notify_request_permissions_response(&event.call_id, response)
+            .await;
+
+        assert_eq!(
+            session.granted_turn_permissions(&approval_scope_id).await,
+            None
+        );
+        assert_eq!(
+            session
+                .granted_session_permissions(&approval_scope_id)
+                .await,
+            None
+        );
+        assert!(!session.strict_auto_review_enabled_for_turn().await);
+        assert!(!*session.services.elicitations.subscribe().borrow());
+    }
 }
 
 #[tokio::test]
@@ -7529,6 +8513,25 @@ async fn completed_tool_consumption_does_not_wait_for_persistence() {
     .await;
     let call_id = "completed-tool-persistence-barrier";
     let bounded_model_output = "bounded completed tool output".to_string();
+    let canonical =
+        codex_tools::CanonicalToolResult::bytes(bounded_model_output.as_bytes().to_vec());
+    let artifact = crate::tools::command_output_artifact::create_canonical_output_artifact(
+        codex_home.path(),
+        &session.thread_id.to_string(),
+        &canonical,
+    )
+    .await;
+    assert!(artifact.complete, "canonical artifact must be fully stored");
+    let artifact_id = artifact.artifact_id().expect("stored canonical artifact");
+    crate::tools::command_output_artifact::protect_active_tool_history_artifact(
+        codex_home.path(),
+        &session.thread_id.to_string(),
+        &artifact_id,
+        canonical.exact_bytes,
+        &canonical.sha256,
+    )
+    .await
+    .expect("protect canonical artifact for history reload");
     session
         .register_tool_history_candidate(
             codex_home.path(),
@@ -7539,9 +8542,9 @@ async fn completed_tool_consumption_does_not_wait_for_persistence() {
                 successful: true,
                 source_dependencies: std::collections::BTreeSet::new(),
                 source_dependencies_current: true,
-                artifact_id: "artifact-completion-barrier".to_string(),
-                artifact_bytes: bounded_model_output.len() as u64,
-                artifact_sha256: crate::tool_history::sha256(b"canonical artifact"),
+                artifact_id,
+                artifact_bytes: canonical.exact_bytes,
+                artifact_sha256: canonical.sha256,
                 original_output_sha256: crate::tool_history::sha256(
                     bounded_model_output.as_bytes(),
                 ),
@@ -7557,7 +8560,10 @@ async fn completed_tool_consumption_does_not_wait_for_persistence() {
             },
         )
         .await;
-    session.flush_tool_history_persistence().await;
+    session
+        .flush_tool_history_persistence()
+        .await
+        .expect("completed-tool history must be durable before reload");
 
     let persistence_pause = crate::tool_history::pause_next_tool_history_persistence_for_test(
         &session.thread_id.to_string(),
@@ -7590,8 +8596,49 @@ async fn completed_tool_consumption_does_not_wait_for_persistence() {
         .await
         .expect("turn completion must not wait for completed-tool persistence")
         .expect("consumption task should not panic");
+    let expected_generation = serde_json::json!({
+        "turn_id": "turn-completion-barrier",
+        "ordinal": 1,
+    });
+    let in_memory = serde_json::to_value(session.state.lock().await.tool_history_state())
+        .expect("serialize consumed history");
+    assert_eq!(
+        in_memory["candidates"][call_id]["consumed_by_generation"],
+        expected_generation,
+    );
+    let (before_flush, warning) = crate::tool_history::load_tool_history_state(
+        codex_home.path(),
+        &session.thread_id.to_string(),
+    )
+    .await
+    .into_state_and_warning();
+    assert_eq!(warning, None);
+    let before_flush = serde_json::to_value(before_flush).expect("serialize stored history");
+    assert!(
+        before_flush["candidates"].get(call_id).is_some(),
+        "reload must retain the candidate backed by its canonical artifact",
+    );
+    assert_eq!(
+        before_flush["candidates"][call_id]["consumed_by_generation"],
+        serde_json::Value::Null,
+    );
     persistence_pause.release();
-    session.flush_tool_history_persistence().await;
+    session
+        .flush_tool_history_persistence()
+        .await
+        .expect("completed-tool history must be durable before reload");
+    let (persisted, warning) = crate::tool_history::load_tool_history_state(
+        codex_home.path(),
+        &session.thread_id.to_string(),
+    )
+    .await
+    .into_state_and_warning();
+    assert_eq!(warning, None);
+    let persisted = serde_json::to_value(persisted).expect("serialize durable consumed history");
+    assert_eq!(
+        persisted["candidates"][call_id]["consumed_by_generation"],
+        expected_generation,
+    );
 }
 
 #[tokio::test]
@@ -8320,7 +9367,7 @@ where
     .await
 }
 
-async fn make_session_and_context_with_auth_config_home_and_rx<F>(
+pub(crate) async fn make_session_and_context_with_auth_config_home_and_rx<F>(
     auth: CodexAuth,
     dynamic_tools: Vec<DynamicToolSpec>,
     codex_home: &Path,
@@ -8453,6 +9500,7 @@ where
         crate::session::McpRuntimeSnapshot::new_uninitialized_for_test(config.as_ref());
     let services = SessionServices {
         mcp_runtime: Arc::new(arc_swap::ArcSwapOption::from(Some(mcp_runtime))),
+        mcp_shutdown_managers: std::sync::Mutex::new(Vec::new()),
         planning_generation: std::sync::atomic::AtomicU64::new(1),
         mcp_projection_lock: Semaphore::new(1),
         mcp_startup_cancellation_token: Mutex::new(CancellationToken::new()),
@@ -8602,6 +9650,8 @@ where
         tool_history_io_gate,
         tool_history_persistence,
         managed_network_proxy_refresh_lock: Semaphore::new(/*permits*/ 1),
+        managed_network_proxy_start_gate: Semaphore::new(/*permits*/ 1),
+        managed_network_proxy_start_entered: tokio::sync::Notify::new(),
         features: config.features.clone(),
         multi_agent_version: OnceLock::from(config.multi_agent_version_from_features()),
         pending_mcp_server_refresh_config: Mutex::new(None),
@@ -8649,6 +9699,22 @@ pub(crate) async fn make_session_and_context_with_dynamic_tools_and_rx(
 
 // Like make_session_and_context, but returns Arc<Session> and the event receiver
 // so tests can assert on emitted events.
+pub(crate) async fn make_session_and_context_with_event_capacity(
+    capacity: usize,
+) -> (
+    Arc<Session>,
+    Arc<TurnContext>,
+    async_channel::Sender<Event>,
+    async_channel::Receiver<Event>,
+) {
+    let (mut session, turn, _) = make_session_and_context_with_rx().await;
+    let (events_tx, events_rx) = async_channel::bounded(capacity);
+    Arc::get_mut(&mut session)
+        .expect("unique fixture session")
+        .tx_event = events_tx.clone();
+    (session, turn, events_tx, events_rx)
+}
+
 pub(crate) async fn make_session_and_context_with_rx() -> (
     Arc<Session>,
     Arc<TurnContext>,
@@ -8856,9 +9922,737 @@ async fn concurrent_mcp_refresh_does_not_hold_projection_lock_and_discards_stale
     assert!(!Arc::ptr_eq(&step_runtime, &intervening_runtime));
 }
 
+struct CompactionPersistenceFixture {
+    codex_home: tempfile::TempDir,
+    session: Arc<Session>,
+    turn_context: Arc<TurnContext>,
+    _rx_event: async_channel::Receiver<Event>,
+    rollout_path: PathBuf,
+    artifact_path: PathBuf,
+    marker_path: PathBuf,
+}
+
+async fn compaction_persistence_fixture(
+    block_initial_persistence: bool,
+) -> CompactionPersistenceFixture {
+    compaction_persistence_fixture_with_rollout(block_initial_persistence, true).await
+}
+
+async fn compaction_persistence_fixture_with_rollout(
+    block_initial_persistence: bool,
+    materialize_rollout: bool,
+) -> CompactionPersistenceFixture {
+    let codex_home = tempfile::tempdir().expect("create isolated compaction home");
+    let (mut session, turn_context, rx_event) =
+        make_session_and_context_with_auth_config_home_and_rx(
+            CodexAuth::from_api_key("Test API Key"),
+            Vec::new(),
+            codex_home.path(),
+            |config| config.completed_tool_history_projection = true,
+        )
+        .await;
+    let rollout_path = attach_thread_persistence_with_materialization(
+        Arc::get_mut(&mut session).expect("unique fixture session"),
+        materialize_rollout,
+    )
+    .await;
+    if block_initial_persistence {
+        tokio::fs::write(
+            codex_home.path().join("tool-history"),
+            b"filesystem obstruction",
+        )
+        .await
+        .expect("block initial ledger persistence");
+    }
+    let call_id = "compaction-protected-call";
+    let bounded_model_output = "bounded completed tool output".to_string();
+    let canonical =
+        codex_tools::CanonicalToolResult::bytes(bounded_model_output.as_bytes().to_vec());
+    let artifact = crate::tools::command_output_artifact::create_canonical_output_artifact(
+        codex_home.path(),
+        &session.thread_id.to_string(),
+        &canonical,
+    )
+    .await;
+    assert!(artifact.complete, "canonical artifact must be fully stored");
+    let artifact_id = artifact.artifact_id().expect("stored canonical artifact");
+    crate::tools::command_output_artifact::protect_active_tool_history_artifact(
+        codex_home.path(),
+        &session.thread_id.to_string(),
+        &artifact_id,
+        canonical.exact_bytes,
+        &canonical.sha256,
+    )
+    .await
+    .expect("protect canonical artifact for history reload");
+    session
+        .register_tool_history_candidate(
+            codex_home.path(),
+            crate::tool_history::ToolHistoryCandidate {
+                call_id: call_id.to_string(),
+                tool_identity: "functions.exec".to_string(),
+                semantic_class: "tool_output".to_string(),
+                successful: true,
+                source_dependencies: std::collections::BTreeSet::new(),
+                source_dependencies_current: true,
+                artifact_id: artifact_id.clone(),
+                artifact_bytes: canonical.exact_bytes,
+                artifact_sha256: canonical.sha256,
+                original_output_sha256: crate::tool_history::sha256(
+                    bounded_model_output.as_bytes(),
+                ),
+                original_tokens: 100,
+                preserved_non_text_tokens: 0,
+                bounded_model_output: bounded_model_output.clone(),
+                complete: true,
+                projection_eligible: true,
+                proof_identity: None,
+                supersession_identity: None,
+                consumed_by_generation: None,
+                derived: crate::tool_history::ToolHistoryCandidateDerived::default(),
+            },
+        )
+        .await;
+
+    session
+        .record_conversation_items_ordered(
+            &turn_context,
+            &[
+                user_message("original uncompacted user request"),
+                ResponseItem::FunctionCallOutput {
+                    id: None,
+                    call_id: call_id.to_string(),
+                    output: FunctionCallOutputPayload::from_text(bounded_model_output),
+                    internal_chat_message_metadata_passthrough: None,
+                },
+            ],
+        )
+        .await
+        .expect("record original conversation through the session entry point");
+    if materialize_rollout {
+        session
+            .flush_rollout_after_ordered_commits(&turn_context)
+            .await
+            .expect("original rollout must be durable");
+    }
+    if !block_initial_persistence {
+        session
+            .flush_tool_history_persistence()
+            .await
+            .expect("original candidate must be durable");
+    }
+    let artifact_path = codex_home
+        .path()
+        .join("tool-output")
+        .join(session.thread_id.to_string())
+        .join(format!("{artifact_id}.log"));
+    let marker_path = artifact_path.with_extension("active-tool-history");
+    assert_eq!(
+        tokio::fs::read(&marker_path)
+            .await
+            .expect("normal registration installed protection"),
+        b"KD4_ACTIVE_TOOL_HISTORY_ARTIFACT_V1\n"
+    );
+    CompactionPersistenceFixture {
+        codex_home,
+        session,
+        turn_context,
+        _rx_event: rx_event,
+        rollout_path,
+        artifact_path,
+        marker_path,
+    }
+}
+
+fn compaction_test_replacement() -> (Vec<ResponseItem>, CompactedItem) {
+    let mut summary = user_message("committed compaction summary");
+    summary.set_id(Some(ResponseItemId::new("compacted-summary")));
+    (
+        vec![summary],
+        CompactedItem {
+            message: "committed compaction summary".to_string(),
+            replacement_history: None,
+            window_number: None,
+            first_window_id: None,
+            previous_window_id: None,
+            window_id: None,
+        },
+    )
+}
+
+#[tokio::test]
+async fn compacted_history_rejects_failed_initial_drain_without_changing_history_or_protection() {
+    let fixture = compaction_persistence_fixture(/*block_initial_persistence*/ true).await;
+    let session = &fixture.session;
+    let old_history = session.clone_history().await.into_raw_items();
+    let old_tool_history = serde_json::to_value(session.state.lock().await.tool_history_state())
+        .expect("serialize live candidate before compaction");
+    let old_generation = session.services.planning_generation();
+    let old_rollout = tokio::fs::read(&fixture.rollout_path)
+        .await
+        .expect("read old rollout");
+    let old_marker = tokio::fs::read(&fixture.marker_path)
+        .await
+        .expect("read active protection");
+    let (replacement, compacted_item) = compaction_test_replacement();
+
+    let result = timeout(
+        Duration::from_secs(5),
+        session.replace_compacted_history(
+            &fixture.turn_context,
+            replacement,
+            None,
+            None,
+            Vec::new(),
+            compacted_item,
+        ),
+    )
+    .await
+    .expect("a failed initial drain must return without indefinitely retrying");
+    assert!(matches!(result, Err(CodexErr::Fatal(_))));
+    assert_eq!(session.clone_history().await.into_raw_items(), old_history);
+    assert_eq!(session.services.planning_generation(), old_generation);
+    assert_eq!(
+        serde_json::to_value(session.state.lock().await.tool_history_state())
+            .expect("serialize candidate after rejected compaction"),
+        old_tool_history,
+    );
+    assert_eq!(
+        tokio::fs::read(&fixture.rollout_path)
+            .await
+            .expect("read unchanged rollout"),
+        old_rollout
+    );
+    assert_eq!(
+        tokio::fs::read(&fixture.marker_path)
+            .await
+            .expect("protection must remain"),
+        old_marker
+    );
+    assert_eq!(
+        tokio::fs::read(&fixture.artifact_path)
+            .await
+            .expect("canonical artifact must remain"),
+        b"bounded completed tool output"
+    );
+    assert_eq!(
+        tokio::fs::read(fixture.codex_home.path().join("tool-history"))
+            .await
+            .expect("obstruction remains intact"),
+        b"filesystem obstruction"
+    );
+}
+
+#[tokio::test]
+async fn compacted_history_rollout_failure_preserves_live_history_durable_ledger_and_protection() {
+    let fixture = compaction_persistence_fixture(/*block_initial_persistence*/ false).await;
+    let session = &fixture.session;
+    let ledger_path = fixture
+        .codex_home
+        .path()
+        .join("tool-history")
+        .join(format!("{}.json", session.thread_id));
+    let old_history = session.clone_history().await.into_raw_items();
+    let old_generation = session.services.planning_generation();
+    let old_ledger = tokio::fs::read(&ledger_path)
+        .await
+        .expect("read durable original ledger");
+    let old_marker = tokio::fs::read(&fixture.marker_path)
+        .await
+        .expect("read active protection");
+    let old_rollout = tokio::fs::read(&fixture.rollout_path)
+        .await
+        .expect("read original rollout");
+    session
+        .live_thread()
+        .expect("live thread is attached")
+        .shutdown()
+        .await
+        .expect("close external rollout writer");
+    let (replacement, compacted_item) = compaction_test_replacement();
+
+    let result = timeout(
+        Duration::from_secs(5),
+        session.replace_compacted_history(
+            &fixture.turn_context,
+            replacement,
+            None,
+            None,
+            Vec::new(),
+            compacted_item,
+        ),
+    )
+    .await
+    .expect("closed rollout writer must reject compaction promptly");
+    assert!(matches!(result, Err(CodexErr::Fatal(_))));
+    assert_eq!(session.clone_history().await.into_raw_items(), old_history);
+    assert_eq!(session.services.planning_generation(), old_generation);
+    assert_eq!(
+        tokio::fs::read(&fixture.rollout_path)
+            .await
+            .expect("read unchanged rollout"),
+        old_rollout
+    );
+    assert_eq!(
+        tokio::fs::read(&ledger_path)
+            .await
+            .expect("old ledger remains durable"),
+        old_ledger
+    );
+    assert_eq!(
+        tokio::fs::read(&fixture.marker_path)
+            .await
+            .expect("protection must remain"),
+        old_marker
+    );
+    let (persisted, warning) = crate::tool_history::load_tool_history_state(
+        fixture.codex_home.path(),
+        &session.thread_id.to_string(),
+    )
+    .await
+    .into_state_and_warning();
+    assert_eq!(warning, None);
+    let persisted = serde_json::to_value(persisted).expect("serialize reloaded original ledger");
+    assert_eq!(
+        persisted["candidates"]["compaction-protected-call"]["bounded_digest"],
+        json!("bounded completed tool output")
+    );
+    assert_eq!(
+        tokio::fs::read(&fixture.artifact_path)
+            .await
+            .expect("canonical artifact must remain"),
+        b"bounded completed tool output"
+    );
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn compacted_history_prune_failure_keeps_committed_history_and_recovers_checkpoint() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let fixture = compaction_persistence_fixture(/*block_initial_persistence*/ false).await;
+    let session = &fixture.session;
+    let ledger_path = fixture
+        .codex_home
+        .path()
+        .join("tool-history")
+        .join(format!("{}.json", session.thread_id));
+    let old_ledger = tokio::fs::read(&ledger_path)
+        .await
+        .expect("read durable original ledger");
+    let old_marker = tokio::fs::read(&fixture.marker_path)
+        .await
+        .expect("read active protection");
+    let old_generation = session.services.planning_generation();
+    // FILE_SHARE_READ permits independent reload but denies atomic replacement of
+    // this snapshot until this real filesystem obstruction is released.
+    let blocked_snapshot = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(1)
+        .open(&ledger_path)
+        .expect("hold old snapshot readable while denying replacement");
+    let (replacement, compacted_item) = compaction_test_replacement();
+    timeout(
+        Duration::from_secs(5),
+        session.replace_compacted_history(
+            &fixture.turn_context,
+            replacement.clone(),
+            None,
+            None,
+            Vec::new(),
+            compacted_item,
+        ),
+    )
+    .await
+    .expect("post-commit pruning failure must not indefinitely retry")
+    .expect("durably committed compaction succeeds even while pruning needs recovery");
+
+    assert_eq!(session.clone_history().await.into_raw_items(), replacement);
+    assert!(session.services.planning_generation() > old_generation);
+    let prune_error = timeout(
+        Duration::from_secs(5),
+        session.tool_history_persistence.drain(),
+    )
+    .await
+    .expect("queued pruning failure must terminate")
+    .expect_err("snapshot replacement remains blocked");
+    assert!(prune_error.to_string().contains("failed to checkpoint"));
+    // Queue completion requires the real rollout prefix to be flushed before it
+    // can even attempt contraction of the ledger below.
+    let stored = codex_thread_store::ThreadStore::load_history(
+        session.services.thread_store.as_ref(),
+        codex_thread_store::LoadThreadHistoryParams {
+            thread_id: session.thread_id,
+            include_archived: false,
+        },
+    )
+    .await
+    .expect("read committed compacted rollout");
+    let compacted = stored
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            RolloutItem::Compacted(compacted) => Some(compacted),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(compacted.len(), 1);
+    assert_eq!(
+        compacted[0].replacement_history.as_ref(),
+        Some(&replacement)
+    );
+    assert_eq!(
+        tokio::fs::read(&ledger_path)
+            .await
+            .expect("old superset ledger remains readable"),
+        old_ledger
+    );
+    assert_eq!(
+        tokio::fs::read(&fixture.marker_path)
+            .await
+            .expect("old protection remains until prune is durable"),
+        old_marker
+    );
+    let checkpoint_error = timeout(
+        Duration::from_secs(5),
+        session.tool_history_persistence.checkpoint(),
+    )
+    .await
+    .expect("blocked pruning checkpoint must terminate")
+    .expect_err("pruned snapshot cannot yet be installed");
+    assert!(matches!(
+        checkpoint_error,
+        super::session::ToolHistoryPersistenceError::Persistence(_)
+    ));
+    assert_eq!(session.clone_history().await.into_raw_items(), replacement);
+    assert_eq!(
+        tokio::fs::read(&ledger_path)
+            .await
+            .expect("failed retry preserves old ledger"),
+        old_ledger
+    );
+    assert_eq!(
+        tokio::fs::read(&fixture.marker_path)
+            .await
+            .expect("failed retry preserves protection"),
+        old_marker
+    );
+
+    drop(blocked_snapshot);
+    timeout(
+        Duration::from_secs(5),
+        session.tool_history_persistence.checkpoint(),
+    )
+    .await
+    .expect("repair must allow the queue-owned prune obligation to finish")
+    .expect("repaired checkpoint must become durable");
+    assert!(
+        !fixture.marker_path.exists(),
+        "successful queued pruning must release the old protection before any loader reconciliation",
+    );
+    let (persisted, warning) = crate::tool_history::load_tool_history_state(
+        fixture.codex_home.path(),
+        &session.thread_id.to_string(),
+    )
+    .await
+    .into_state_and_warning();
+    assert_eq!(warning, None);
+    let persisted = serde_json::to_value(persisted).expect("serialize reloaded pruned ledger");
+    assert_eq!(persisted["candidates"], json!({}));
+    assert_eq!(session.clone_history().await.into_raw_items(), replacement);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compacted_history_caller_cancellation_preserves_commit_and_prune_ownership() {
+    let fixture = compaction_persistence_fixture(/*block_initial_persistence*/ false).await;
+    let session = &fixture.session;
+    let original = session.clone_history().await.into_raw_items();
+    let commit_blocker = session
+        .durable_history_commit_gate
+        .acquire()
+        .await
+        .expect("open commit gate");
+    let (replacement, compacted_item) = compaction_test_replacement();
+    let mut compaction = Box::pin(session.replace_compacted_history(
+        &fixture.turn_context,
+        replacement.clone(),
+        None,
+        None,
+        Vec::new(),
+        compacted_item,
+    ));
+    assert!(futures::poll!(compaction.as_mut()).is_pending());
+    drop(compaction);
+    let mut terminal_flush =
+        Box::pin(session.flush_rollout_after_ordered_commits(&fixture.turn_context));
+    assert!(
+        futures::poll!(terminal_flush.as_mut()).is_pending(),
+        "terminal flush must await the accepted compaction after caller cancellation"
+    );
+    assert_eq!(session.clone_history().await.into_raw_items(), original);
+    assert!(
+        fixture.marker_path.exists(),
+        "queued commit cannot release prior protection early"
+    );
+    drop(commit_blocker);
+    timeout(Duration::from_secs(5), terminal_flush)
+        .await
+        .expect("owned compaction must finish")
+        .expect("flush committed rollout");
+    timeout(
+        Duration::from_secs(5),
+        session.tool_history_persistence.drain(),
+    )
+    .await
+    .expect("owned prune must finish")
+    .expect("prune must be durable");
+    assert_eq!(session.clone_history().await.into_raw_items(), replacement);
+    assert!(
+        !fixture.marker_path.exists(),
+        "queue must complete cleanup without its original caller"
+    );
+    let stored = codex_thread_store::ThreadStore::load_history(
+        session.services.thread_store.as_ref(),
+        codex_thread_store::LoadThreadHistoryParams {
+            thread_id: session.thread_id,
+            include_archived: false,
+        },
+    )
+    .await
+    .expect("load caller-independent compaction");
+    let compacted = stored
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            RolloutItem::Compacted(item) => Some(item),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(compacted.len(), 1);
+    assert_eq!(
+        compacted[0].replacement_history.as_ref(),
+        Some(&replacement)
+    );
+    let ledger: serde_json::Value = serde_json::from_slice(
+        &tokio::fs::read(
+            fixture
+                .codex_home
+                .path()
+                .join("tool-history")
+                .join(format!("{}.json", session.thread_id)),
+        )
+        .await
+        .expect("read durable pruned ledger"),
+    )
+    .expect("valid ledger");
+    assert_eq!(ledger["state"]["candidates"], json!({}));
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn compacted_history_cleanup_failure_retains_obligation_until_recovery() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let fixture = compaction_persistence_fixture(/*block_initial_persistence*/ false).await;
+    let session = &fixture.session;
+    let marker_blocker = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(1)
+        .open(&fixture.marker_path)
+        .expect("keep obsolete marker readable but deny deletion");
+    let (replacement, compacted_item) = compaction_test_replacement();
+    session
+        .replace_compacted_history(
+            &fixture.turn_context,
+            replacement.clone(),
+            None,
+            None,
+            Vec::new(),
+            compacted_item,
+        )
+        .await
+        .expect("required rollout commit succeeds before cleanup");
+    let failed_cleanup = timeout(
+        Duration::from_secs(5),
+        session.tool_history_persistence.drain(),
+    )
+    .await
+    .expect("cleanup failure must finish")
+    .expect_err("cleanup is not complete");
+    assert!(failed_cleanup.to_string().contains("artifact cleanup"));
+    assert_eq!(session.clone_history().await.into_raw_items(), replacement);
+    assert!(fixture.marker_path.exists());
+    session
+        .tool_history_persistence
+        .enqueue_mutation(
+            crate::tool_history::ToolHistoryMutation::RegisterNonWorkspaceCodeModeCall {
+                call_id: "after-cleanup-failure".to_string(),
+            },
+            "mutation after failed cleanup",
+        )
+        .await
+        .expect("failed cleanup must keep accepting recoverable work");
+    timeout(
+        Duration::from_secs(5),
+        session.tool_history_persistence.drain(),
+    )
+    .await
+    .expect("later cycle must terminate")
+    .expect_err("a successful later snapshot cannot bypass failed cleanup");
+    drop(marker_blocker);
+    timeout(
+        Duration::from_secs(5),
+        session.tool_history_persistence.checkpoint(),
+    )
+    .await
+    .expect("cleanup recovery terminates")
+    .expect("recovery finishes retained cleanup and later mutation");
+    assert!(!fixture.marker_path.exists());
+    let ledger: serde_json::Value = serde_json::from_slice(
+        &tokio::fs::read(
+            fixture
+                .codex_home
+                .path()
+                .join("tool-history")
+                .join(format!("{}.json", session.thread_id)),
+        )
+        .await
+        .expect("read recovered ledger"),
+    )
+    .expect("valid ledger");
+    assert_eq!(ledger["state"]["candidates"], json!({}));
+    assert_eq!(
+        ledger["state"]["non_workspace_code_mode_calls"],
+        json!(["after-cleanup-failure"])
+    );
+}
+
+#[tokio::test]
+async fn compacted_history_rollout_flush_failure_retains_prune_until_physical_recovery() {
+    let fixture = compaction_persistence_fixture_with_rollout(false, false).await;
+    let session = &fixture.session;
+    assert!(
+        !fixture.rollout_path.exists(),
+        "ordered fixture history must still be buffered"
+    );
+    let ledger_path = fixture
+        .codex_home
+        .path()
+        .join("tool-history")
+        .join(format!("{}.json", session.thread_id));
+    let old_ledger = tokio::fs::read(&ledger_path)
+        .await
+        .expect("original ledger is durable");
+    let old_marker = tokio::fs::read(&fixture.marker_path)
+        .await
+        .expect("original protection is durable");
+    // A directory at the exact deferred rollout file path rejects both ordinary
+    // materialization attempts without substituting a fake writer or queue.
+    tokio::fs::create_dir_all(&fixture.rollout_path)
+        .await
+        .expect("block rollout file materialization");
+    let (replacement, compacted_item) = compaction_test_replacement();
+    session
+        .replace_compacted_history(
+            &fixture.turn_context,
+            replacement.clone(),
+            None,
+            None,
+            Vec::new(),
+            compacted_item,
+        )
+        .await
+        .expect("the authoritative writer accepts the ordered compaction");
+    let barrier_error = timeout(
+        Duration::from_secs(5),
+        session.tool_history_persistence.drain(),
+    )
+    .await
+    .expect("failed rollout flush terminates its persistence cycle")
+    .expect_err("pruning requires the accepted rollout to become durable");
+    assert!(
+        barrier_error
+            .to_string()
+            .contains("failed to flush compacted rollout")
+    );
+    assert_eq!(session.clone_history().await.into_raw_items(), replacement);
+    assert_eq!(tokio::fs::read(&ledger_path).await.unwrap(), old_ledger);
+    assert_eq!(
+        tokio::fs::read(&fixture.marker_path).await.unwrap(),
+        old_marker
+    );
+    assert!(fixture.rollout_path.is_dir());
+    session
+        .register_non_workspace_code_mode_call(
+            fixture.codex_home.path(),
+            "after-rollout-barrier-failure".to_string(),
+        )
+        .await;
+    timeout(
+        Duration::from_secs(5),
+        session.tool_history_persistence.drain(),
+    )
+    .await
+    .expect("later cycle terminates")
+    .expect_err("later mutations cannot bypass the failed rollout barrier");
+    assert_eq!(tokio::fs::read(&ledger_path).await.unwrap(), old_ledger);
+    assert_eq!(
+        tokio::fs::read(&fixture.marker_path).await.unwrap(),
+        old_marker
+    );
+
+    tokio::fs::remove_dir(&fixture.rollout_path)
+        .await
+        .expect("remove the empty filesystem obstruction");
+    timeout(
+        Duration::from_secs(5),
+        session.tool_history_persistence.checkpoint(),
+    )
+    .await
+    .expect("physical recovery terminates")
+    .expect("the retained rollout prefix must flush before pruning completes");
+    assert!(fixture.rollout_path.is_file());
+    assert!(!fixture.marker_path.exists());
+    let stored = codex_thread_store::ThreadStore::load_history(
+        session.services.thread_store.as_ref(),
+        codex_thread_store::LoadThreadHistoryParams {
+            thread_id: session.thread_id,
+            include_archived: false,
+        },
+    )
+    .await
+    .expect("load real recovered rollout");
+    let compacted = stored
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            RolloutItem::Compacted(item) => Some(item),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(compacted.len(), 1);
+    assert_eq!(
+        compacted[0].replacement_history.as_ref(),
+        Some(&replacement)
+    );
+    assert!(stored.items.iter().any(|item| matches!(item,
+        RolloutItem::ResponseItem(ResponseItem::FunctionCallOutput { call_id, .. }) if call_id == "compaction-protected-call"
+    )), "the same flush must retain the earlier accepted conversation prefix");
+    let ledger: serde_json::Value =
+        serde_json::from_slice(&tokio::fs::read(&ledger_path).await.unwrap()).unwrap();
+    assert_eq!(ledger["state"]["candidates"], json!({}));
+    assert_eq!(
+        ledger["state"]["non_workspace_code_mode_calls"],
+        json!(["after-rollout-barrier-failure"])
+    );
+    assert_eq!(
+        tokio::fs::read(&fixture.artifact_path).await.unwrap(),
+        b"bounded completed tool output"
+    );
+}
+
 #[tokio::test]
 async fn compacted_history_replacement_advances_planning_generation() {
-    let (session, turn_context) = make_session_and_context().await;
+    let (session, turn_context, _rx_event) = make_session_and_context_with_rx().await;
     let planning_generation = session.services.planning_generation();
 
     session
@@ -8877,7 +10671,8 @@ async fn compacted_history_replacement_advances_planning_generation() {
                 window_id: None,
             },
         )
-        .await;
+        .await
+        .expect("normal compaction must commit successfully");
 
     assert!(session.services.planning_generation() > planning_generation);
     assert!(session.clone_history().await.into_raw_items().is_empty());
@@ -9660,6 +11455,104 @@ async fn prepared_context_update_polls_contributors_once_across_planning_and_com
 }
 
 #[tokio::test]
+async fn extension_prompt_budget_charges_message_envelopes_and_ignores_empty_separate_messages() {
+    struct EnvelopeBudgetContributor;
+    impl codex_extension_api::ContextContributor for EnvelopeBudgetContributor {
+        fn contribute_turn_context<'a>(
+            &'a self,
+            _input: codex_extension_api::TurnContextContributionInput<'a>,
+        ) -> codex_extension_api::ExtensionFuture<'a, Vec<codex_extension_api::PromptFragment>>
+        {
+            Box::pin(async {
+                let mut fragments = (0..20_000)
+                    .map(|_| codex_extension_api::PromptFragment::separate_developer(""))
+                    .collect::<Vec<_>>();
+                fragments.push(codex_extension_api::PromptFragment::developer_policy(
+                    "useful envelope-budget contribution",
+                ));
+                fragments.extend(
+                    (0..20_000)
+                        .map(|_| codex_extension_api::PromptFragment::separate_developer("x")),
+                );
+                fragments
+            })
+        }
+    }
+
+    let (mut session, turn_context) = make_session_and_context().await;
+    let mut builder = codex_extension_api::ExtensionRegistryBuilder::new();
+    builder.prompt_contributor(Arc::new(EnvelopeBudgetContributor));
+    session.services.extensions = Arc::new(builder.build());
+    let turn_context = Arc::new(turn_context);
+    let step_context = StepContext::for_test(Arc::clone(&turn_context));
+    let world_state = session.build_world_state_for_step(&step_context).await;
+    let built = session
+        .build_initial_context_with_world_state_and_mcp(turn_context.as_ref(), &world_state, false)
+        .await;
+
+    assert!(developer_input_texts(&built.items).contains(&"useful envelope-budget contribution"));
+    assert!(built.turn_context_items.len() > 1);
+    assert!(built.turn_context_items.iter().all(|item| matches!(
+        item,
+        ResponseItem::Message { role, content, .. }
+            if role == "developer" && matches!(
+                content.as_slice(),
+                [ContentItem::InputText { text }] if !text.is_empty()
+            )
+    )));
+    assert_eq!(
+        developer_input_texts(&built.turn_context_items)[0],
+        "useful envelope-budget contribution"
+    );
+    assert!(
+        developer_input_texts(&built.turn_context_items)[1..]
+            .iter()
+            .all(|text| *text == "x")
+    );
+    let serialized_bytes: usize = built
+        .turn_context_items
+        .iter()
+        .map(|item| {
+            serde_json::to_vec(item)
+                .expect("serialize actual context message")
+                .len()
+        })
+        .sum();
+    // Independent serialized output measurement includes every item envelope.
+    assert!(
+        serialized_bytes <= 40_000,
+        "actual context bytes: {serialized_bytes}"
+    );
+    let initial_separate_items = built
+        .items
+        .iter()
+        .filter(|item| {
+            matches!(
+                item,
+                ResponseItem::Message { role, content, .. }
+                    if role == "developer" && matches!(
+                        content.as_slice(),
+                        [ContentItem::InputText { text }] if text == "x"
+                    )
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        initial_separate_items.len(),
+        built.turn_context_items.len() - 1
+    );
+    assert!(
+        initial_separate_items
+            .iter()
+            .map(|item| serde_json::to_vec(item)
+                .expect("serialize initial message")
+                .len())
+            .sum::<usize>()
+            <= 40_000
+    );
+}
+
+#[tokio::test]
 async fn extension_prompt_contributors_share_one_hard_budget() {
     let max_bytes = codex_utils_string::approx_bytes_for_tokens(
         codex_context_fragments::MAX_MODEL_CONTEXT_TOKENS,
@@ -9790,6 +11683,165 @@ async fn turn_context_refresh_omits_stalled_contributors_after_shared_deadline()
     assert_eq!(
         developer_input_texts(&context_items),
         vec!["ready turn context"]
+    );
+}
+
+#[tokio::test]
+async fn world_state_rejects_unsupported_roles_without_advancing_delivered_snapshot() {
+    const SECTION_ID: &str = "role_boundary_test";
+    struct RoleContributor {
+        phase: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl codex_extension_api::ContextContributor for RoleContributor {
+        fn world_state_section_ids(&self) -> &'static [&'static str] {
+            &[SECTION_ID]
+        }
+
+        fn contribute_world_state<'a>(
+            &'a self,
+            _input: codex_extension_api::WorldStateContributionInput<'a>,
+        ) -> codex_extension_api::ExtensionFuture<
+            'a,
+            Vec<codex_extension_api::WorldStateSectionContribution>,
+        > {
+            let (role, revision) = match self.phase.load(std::sync::atomic::Ordering::SeqCst) {
+                0 => ("assistant", 1),
+                1 => ("developer", 1),
+                2 => ("system", 2),
+                _ => ("user", 2),
+            };
+            Box::pin(async move {
+                let snapshot = json!({"role": role, "revision": revision});
+                vec![codex_extension_api::WorldStateSectionContribution::new(
+                    SECTION_ID,
+                    snapshot.clone(),
+                    move |previous| {
+                        if matches!(
+                            previous,
+                            codex_extension_api::PreviousWorldStateSection::Known(previous)
+                                if previous == &snapshot
+                        ) {
+                            return None;
+                        }
+                        Some(codex_extension_api::RenderedWorldStateFragment::new(
+                            role,
+                            ("<role_boundary_test>", "</role_boundary_test>"),
+                            format!("role boundary revision {revision}"),
+                        ))
+                    },
+                )]
+            })
+        }
+    }
+
+    let (mut session, turn_context) = make_session_and_context().await;
+    let phase = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut builder = codex_extension_api::ExtensionRegistryBuilder::new();
+    builder.prompt_contributor(Arc::new(RoleContributor {
+        phase: Arc::clone(&phase),
+    }));
+    session.services.extensions = Arc::new(builder.build());
+    let turn_context = Arc::new(turn_context);
+    let step_context = StepContext::for_test(Arc::clone(&turn_context));
+
+    let rejected_world = session.build_world_state_for_step(&step_context).await;
+    let rejected_initial = session
+        .build_initial_context_with_world_state_and_mcp(
+            turn_context.as_ref(),
+            &rejected_world,
+            false,
+        )
+        .await;
+    assert_eq!(
+        rejected_initial.world_state_snapshot.section(SECTION_ID),
+        None
+    );
+    assert!(rejected_initial.items.iter().all(|item| !matches!(
+        item,
+        ResponseItem::Message { content, .. }
+            if content.iter().any(|content| matches!(
+                content,
+                ContentItem::InputText { text } if text.contains("<role_boundary_test>")
+            ))
+    )));
+
+    phase.store(1, std::sync::atomic::Ordering::SeqCst);
+    let accepted_world = Arc::new(session.build_world_state_for_step(&step_context).await);
+    let accepted_initial = session
+        .build_initial_context_with_world_state_and_mcp(
+            turn_context.as_ref(),
+            accepted_world.as_ref(),
+            false,
+        )
+        .await;
+    assert!(
+        developer_input_texts(&accepted_initial.items)
+            .iter()
+            .any(|text| {
+                text.contains("<role_boundary_test>role boundary revision 1</role_boundary_test>")
+            })
+    );
+    let expected_previous = json!({"role": "developer", "revision": 1});
+    assert_eq!(
+        accepted_initial.world_state_snapshot.section(SECTION_ID),
+        Some(&expected_previous)
+    );
+    let accepted_snapshot = accepted_initial.world_state_snapshot;
+    {
+        let mut state = session.state.lock().await;
+        state.history.record_items(
+            accepted_initial.items.iter(),
+            turn_context.model_info.truncation_policy.into(),
+        );
+        state
+            .history
+            .set_world_state_baseline(accepted_snapshot.clone());
+    }
+    let accepted_items = session.state.lock().await.history.raw_items().to_vec();
+
+    phase.store(2, std::sync::atomic::Ordering::SeqCst);
+    let rejected_update = session
+        .record_step_world_state_if_changed(&accepted_world, &step_context)
+        .await;
+    {
+        let state = session.state.lock().await;
+        assert_eq!(state.history.raw_items(), accepted_items.as_slice());
+        assert_eq!(
+            state.history.world_state_baseline(),
+            Some(accepted_snapshot.clone())
+        );
+        assert!(state.pending_context_baseline().is_none());
+    }
+
+    // Retry the rejected body with an allowed role through the same step boundary.
+    phase.store(3, std::sync::atomic::Ordering::SeqCst);
+    session
+        .record_step_world_state_if_changed(&rejected_update, &step_context)
+        .await;
+    let state = session.state.lock().await;
+    let added_items = &state.history.raw_items()[accepted_items.len()..];
+    assert_eq!(added_items.len(), 1);
+    assert!(matches!(
+        &added_items[0],
+        ResponseItem::Message { role, content, .. }
+            if role == "user" && matches!(
+                content.as_slice(),
+                [ContentItem::InputText { text }]
+                    if text == "<role_boundary_test>role boundary revision 2</role_boundary_test>"
+            )
+    ));
+    let candidate = state
+        .pending_context_baseline()
+        .expect("accepted user update must be staged");
+    assert_eq!(
+        candidate.world_state_snapshot.section(SECTION_ID),
+        Some(&json!({"role": "user", "revision": 2}))
+    );
+    assert!(candidate.world_state_item.is_some());
+    // A physical model attempt has not accepted the new candidate yet.
+    assert_eq!(
+        state.history.world_state_baseline(),
+        Some(accepted_snapshot)
     );
 }
 
@@ -10332,14 +12384,21 @@ async fn turn_context_item_stores_local_cwd() {
     );
 
     let local_cwd = turn_context.cwd().clone();
-    assert_eq!(turn_context.to_turn_context_item().cwd, local_cwd);
+    assert_eq!(
+        Arc::new(turn_context)
+            .to_turn_context_item_async()
+            .await
+            .cwd,
+        local_cwd
+    );
 }
 
 #[tokio::test]
 async fn turn_context_item_omits_legacy_equivalent_file_system_sandbox_policy() {
     let (_session, turn_context) = make_session_and_context().await;
 
-    let item = turn_context.to_turn_context_item();
+    let turn_context = Arc::new(turn_context);
+    let item = turn_context.to_turn_context_item_async().await;
 
     assert_eq!(item.file_system_sandbox_policy, None);
     assert_eq!(
@@ -10358,7 +12417,8 @@ async fn turn_context_item_stores_split_file_system_sandbox_policy_when_differen
         turn_context.network_sandbox_policy(),
     );
 
-    let item = turn_context.to_turn_context_item();
+    let turn_context = Arc::new(turn_context);
+    let item = turn_context.to_turn_context_item_async().await;
 
     assert_eq!(
         item.file_system_sandbox_policy,
@@ -10947,6 +13007,14 @@ async fn attach_in_memory_thread_store(
 ) -> Arc<codex_thread_store::InMemoryThreadStore> {
     let store = Arc::new(codex_thread_store::InMemoryThreadStore::default());
     let thread_store: Arc<dyn codex_thread_store::ThreadStore> = store.clone();
+    attach_thread_store(session, thread_store).await;
+    store
+}
+
+async fn attach_thread_store(
+    session: &mut Session,
+    thread_store: Arc<dyn codex_thread_store::ThreadStore>,
+) {
     let config = session.get_config().await;
     let live_thread = LiveThread::create(
         Arc::clone(&thread_store),
@@ -10980,7 +13048,265 @@ async fn attach_in_memory_thread_store(
     .expect("create thread persistence");
     session.services.thread_store = thread_store;
     session.services.live_thread = Some(live_thread);
-    store
+}
+
+mod terminal_store_fault {
+    use super::*;
+    use codex_thread_store::*;
+    use pretty_assertions::assert_eq;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    // The external store commits, then loses the acknowledgment before LiveThread observes it.
+    struct CommitThenPanicStore {
+        inner: Arc<InMemoryThreadStore>,
+        panic_after_terminal_append: AtomicBool,
+        fail_history_read: AtomicBool,
+        terminal_append_attempts: AtomicUsize,
+        failed_history_reads: AtomicUsize,
+    }
+
+    impl ThreadStore for CommitThenPanicStore {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn append_items(&self, params: AppendThreadItemsParams) -> ThreadStoreFuture<'_, ()> {
+            Box::pin(async move {
+                let is_terminal = params.items.iter().any(|item| {
+                    matches!(
+                        item,
+                        RolloutItem::EventMsg(EventMsg::TurnComplete(_) | EventMsg::TurnAborted(_))
+                    )
+                });
+                if is_terminal {
+                    self.terminal_append_attempts.fetch_add(1, Ordering::AcqRel);
+                }
+                self.inner.append_items(params).await?;
+                if is_terminal
+                    && self
+                        .panic_after_terminal_append
+                        .swap(false, Ordering::AcqRel)
+                {
+                    self.fail_history_read.store(true, Ordering::Release);
+                    panic!("injected lost terminal append acknowledgment after storage commit");
+                }
+                Ok(())
+            })
+        }
+
+        fn load_history(
+            &self,
+            params: LoadThreadHistoryParams,
+        ) -> ThreadStoreFuture<'_, StoredThreadHistory> {
+            if self.fail_history_read.load(Ordering::Acquire) {
+                self.failed_history_reads.fetch_add(1, Ordering::AcqRel);
+                return Box::pin(async {
+                    Err(ThreadStoreError::Internal {
+                        message: "injected unavailable history after ambiguous terminal append"
+                            .to_string(),
+                    })
+                });
+            }
+            self.inner.load_history(params)
+        }
+
+        fn create_thread(&self, params: CreateThreadParams) -> ThreadStoreFuture<'_, ()> {
+            self.inner.create_thread(params)
+        }
+
+        fn resume_thread(&self, params: ResumeThreadParams) -> ThreadStoreFuture<'_, ()> {
+            self.inner.resume_thread(params)
+        }
+
+        fn persist_thread(&self, params: ThreadId) -> ThreadStoreFuture<'_, ()> {
+            self.inner.persist_thread(params)
+        }
+
+        fn flush_thread(&self, params: ThreadId) -> ThreadStoreFuture<'_, ()> {
+            self.inner.flush_thread(params)
+        }
+
+        fn shutdown_thread(&self, params: ThreadId) -> ThreadStoreFuture<'_, ()> {
+            self.inner.shutdown_thread(params)
+        }
+
+        fn discard_thread(&self, params: ThreadId) -> ThreadStoreFuture<'_, ()> {
+            self.inner.discard_thread(params)
+        }
+
+        fn read_thread(&self, params: ReadThreadParams) -> ThreadStoreFuture<'_, StoredThread> {
+            self.inner.read_thread(params)
+        }
+
+        fn read_thread_by_rollout_path(
+            &self,
+            params: ReadThreadByRolloutPathParams,
+        ) -> ThreadStoreFuture<'_, StoredThread> {
+            self.inner.read_thread_by_rollout_path(params)
+        }
+
+        fn list_threads(&self, params: ListThreadsParams) -> ThreadStoreFuture<'_, ThreadPage> {
+            self.inner.list_threads(params)
+        }
+
+        fn update_thread_metadata(
+            &self,
+            params: UpdateThreadMetadataParams,
+        ) -> ThreadStoreFuture<'_, StoredThread> {
+            self.inner.update_thread_metadata(params)
+        }
+
+        fn archive_thread(&self, params: ArchiveThreadParams) -> ThreadStoreFuture<'_, ()> {
+            self.inner.archive_thread(params)
+        }
+
+        fn unarchive_thread(
+            &self,
+            params: ArchiveThreadParams,
+        ) -> ThreadStoreFuture<'_, StoredThread> {
+            self.inner.unarchive_thread(params)
+        }
+
+        fn delete_thread(&self, params: DeleteThreadParams) -> ThreadStoreFuture<'_, ()> {
+            self.inner.delete_thread(params)
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn accepted_terminal_append_with_failed_lookup_is_not_appended_again() {
+        let (mut session, turn_context, events) = make_session_and_context_with_rx().await;
+        let store = Arc::new(CommitThenPanicStore {
+            inner: Arc::new(InMemoryThreadStore::default()),
+            panic_after_terminal_append: AtomicBool::new(true),
+            fail_history_read: AtomicBool::new(false),
+            terminal_append_attempts: AtomicUsize::new(0),
+            failed_history_reads: AtomicUsize::new(0),
+        });
+        let thread_store: Arc<dyn ThreadStore> = store.clone();
+        attach_thread_store(
+            Arc::get_mut(&mut session).expect("fixture session uniquely owned"),
+            thread_store,
+        )
+        .await;
+        session
+            .spawn_task(Arc::clone(&turn_context), Vec::new(), CompletingTask)
+            .await;
+        let published = recv_terminal_event(&events, TerminalEventKind::TurnComplete).await;
+        let EventMsg::TurnComplete(completed) = &published.msg else {
+            panic!("normal completing task must retain its successful outcome");
+        };
+        assert_eq!(completed.turn_id, turn_context.sub_id);
+        assert!(
+            completed.error.is_none(),
+            "recovery must not replace success with finalizer failure"
+        );
+        assert!(completed.last_agent_message.is_none());
+        session.terminal_tasks.close();
+        timeout(Duration::from_secs(5), session.terminal_tasks.wait())
+            .await
+            .expect("real finalizer must finish recovery and release cleanup ownership");
+        assert!(session.active_turn.lock().await.is_none());
+        assert!(!store.panic_after_terminal_append.load(Ordering::Acquire));
+        assert!(
+            store.failed_history_reads.load(Ordering::Acquire) > 0,
+            "recovery must encounter actual ambiguous-history lookup failure"
+        );
+        assert_eq!(
+            store.terminal_append_attempts.load(Ordering::Acquire),
+            1,
+            "an unknown prior append outcome must never cause a second terminal append"
+        );
+        let history = store
+            .inner
+            .load_history(LoadThreadHistoryParams {
+                thread_id: session.thread_id,
+                include_archived: false,
+            })
+            .await
+            .expect("read committed storage independently of failing wrapper");
+        let stored = history
+            .items
+            .into_iter()
+            .filter_map(|item| match item {
+                RolloutItem::EventMsg(
+                    event @ (EventMsg::TurnComplete(_) | EventMsg::TurnAborted(_)),
+                ) => Some(event),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            serde_json::to_value(stored).expect("stored terminal serializes"),
+            serde_json::to_value(vec![published.msg.clone()]).expect("live terminal serializes"),
+        );
+        while let Ok(event) = events.try_recv() {
+            assert!(
+                !matches!(
+                    event.msg,
+                    EventMsg::TurnComplete(_) | EventMsg::TurnAborted(_)
+                ),
+                "recovery must emit only one live terminal event"
+            );
+        }
+        // An ambiguous earlier turn must not suppress the first append of a new
+        // turn while the same store still cannot reload its history.
+        assert!(store.fail_history_read.load(Ordering::Acquire));
+        session.terminal_tasks.reopen();
+        let next_turn = session.new_default_turn().await;
+        assert_ne!(next_turn.sub_id, turn_context.sub_id);
+        session
+            .spawn_task(Arc::clone(&next_turn), Vec::new(), CompletingTask)
+            .await;
+        let next_published = recv_terminal_event(&events, TerminalEventKind::TurnComplete).await;
+        let EventMsg::TurnComplete(next_completed) = &next_published.msg else {
+            panic!("new normal task must publish its successful terminal");
+        };
+        assert_eq!(next_completed.turn_id, next_turn.sub_id);
+        assert!(next_completed.error.is_none());
+        assert!(next_completed.last_agent_message.is_none());
+        session.terminal_tasks.close();
+        timeout(Duration::from_secs(5), session.terminal_tasks.wait())
+            .await
+            .expect("new turn finalizer must release its ownership");
+        assert!(session.active_turn.lock().await.is_none());
+        assert!(store.fail_history_read.load(Ordering::Acquire));
+        assert_eq!(
+            store.terminal_append_attempts.load(Ordering::Acquire),
+            2,
+            "each distinct turn must append its own original terminal exactly once"
+        );
+        let history = store
+            .inner
+            .load_history(LoadThreadHistoryParams {
+                thread_id: session.thread_id,
+                include_archived: false,
+            })
+            .await
+            .expect("read both actual committed terminal events");
+        let stored = history
+            .items
+            .into_iter()
+            .filter_map(|item| match item {
+                RolloutItem::EventMsg(
+                    event @ (EventMsg::TurnComplete(_) | EventMsg::TurnAborted(_)),
+                ) => Some(event),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            serde_json::to_value(stored).expect("both stored terminals serialize"),
+            serde_json::to_value(vec![published.msg, next_published.msg])
+                .expect("both original live terminals serialize"),
+        );
+        while let Ok(event) = events.try_recv() {
+            assert!(
+                !matches!(
+                    event.msg,
+                    EventMsg::TurnComplete(_) | EventMsg::TurnAborted(_)
+                ),
+                "neither turn may produce a duplicate live terminal"
+            );
+        }
+    }
 }
 
 async fn wait_for_flush_count(
@@ -11498,6 +13824,18 @@ async fn turn_complete_is_an_interaction_ready_boundary_for_rollback() {
         user_message("retained turn user"),
         assistant_message("retained turn assistant"),
     ];
+    // CompletingTask supplies only completion; record the normal persisted turn
+    // boundaries so rollback has two distinct user turns to reconstruct.
+    sess.send_event(first_turn.as_ref(), session_trace_turn_started(first_turn.as_ref()))
+        .await;
+    sess.send_event(
+        first_turn.as_ref(),
+        EventMsg::UserMessage(UserMessageEvent {
+            message: "retained turn user".to_string(),
+            ..Default::default()
+        }),
+    )
+    .await;
     sess.record_conversation_items(first_turn.as_ref(), &retained_turn)
         .await;
     sess.spawn_task(Arc::clone(&first_turn), Vec::new(), CompletingTask)
@@ -11520,6 +13858,18 @@ async fn turn_complete_is_an_interaction_ready_boundary_for_rollback() {
         user_message("rollback target user"),
         assistant_message("rollback target assistant"),
     ];
+    // CompletingTask supplies only completion; record the normal persisted turn
+    // boundaries so rollback has two distinct user turns to reconstruct.
+    sess.send_event(rollback_turn.as_ref(), session_trace_turn_started(rollback_turn.as_ref()))
+        .await;
+    sess.send_event(
+        rollback_turn.as_ref(),
+        EventMsg::UserMessage(UserMessageEvent {
+            message: "rollback target user".to_string(),
+            ..Default::default()
+        }),
+    )
+    .await;
     sess.record_conversation_items(rollback_turn.as_ref(), &rollback_target)
         .await;
     let (cache_persist_started, release_cache_persist) = sess
@@ -11620,6 +13970,97 @@ async fn turn_aborted_persists_missing_call_output_before_terminal_event() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ephemeral_durable_history_is_visible_once_without_creating_rollout() -> anyhow::Result<()> {
+    let server = start_mock_server().await;
+    let request = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("ephemeral-response"),
+            core_test_support::responses::ev_assistant_message(
+                "ephemeral-message",
+                "ephemeral answer",
+            ),
+            ev_completed("ephemeral-response"),
+        ]),
+    )
+    .await;
+    let home = tempfile::tempdir()?;
+    let mut config = test_config().await;
+    config.codex_home = home.path().to_path_buf().abs();
+    config.cwd = home.path().to_path_buf().abs();
+    config.ephemeral = true;
+    config.model_provider.base_url = Some(format!("{}/v1", server.uri()));
+    config.model_provider.supports_websockets = false;
+    let manager = crate::ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        home.path().to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+    );
+    let started = manager.start_thread(config).await?;
+    assert!(started.session_configured.rollout_path.is_none());
+    let session = &started.thread.codex.session;
+    assert!(session.live_thread().is_none());
+    let turn = session.new_default_turn().await;
+    let message = ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: vec![ContentItem::InputText {
+            text: "ephemeral accepted history".to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    for _ in 0..2 {
+        session
+            .record_conversation_items_durable(&turn, std::slice::from_ref(&message))
+            .await?;
+    }
+    started
+        .thread
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "read the accepted history".to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await?;
+    let completion = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let event = started.thread.next_event().await?;
+            match event.msg {
+                EventMsg::TurnComplete(completion) => break Ok::<_, anyhow::Error>(completion),
+                EventMsg::Error(error) => anyhow::bail!("ephemeral turn failed: {error:?}"),
+                _ => {}
+            }
+        }
+    })
+    .await??;
+    assert_eq!(
+        completion.last_agent_message.as_deref(),
+        Some("ephemeral answer")
+    );
+    let sent = request.single_request().message_input_texts("user");
+    assert_eq!(
+        sent.iter()
+            .filter(|text| text.as_str() == "ephemeral accepted history")
+            .count(),
+        1
+    );
+    assert!(sent.iter().any(|text| text == "read the accepted history"));
+    started.thread.shutdown_and_wait().await?;
+    assert!(
+        !home.path().join("sessions").exists(),
+        "ephemeral turn and durability calls must not create persisted sessions"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn durable_conversation_commit_survives_caller_cancellation_and_is_idempotent() {
     let (mut sess, tc, _rx) = make_session_and_context_with_rx().await;
     let store = attach_in_memory_thread_store(
@@ -11711,7 +14152,42 @@ async fn durable_conversation_commit_survives_caller_cancellation_and_is_idempot
             .count(),
         1
     );
-    assert_eq!(store.calls().await.flush_thread, initial_flushes + 1);
+    let after_retry = store.calls().await;
+    assert_eq!(after_retry.append_items, calls.append_items);
+    assert_eq!(
+        after_retry.append_items_requests,
+        calls.append_items_requests
+    );
+    assert_eq!(
+        after_retry.flush_thread,
+        initial_flushes + 2,
+        "a durable retry confirms persistence even when its history batch is already committed"
+    );
+    let stored = sess
+        .services
+        .live_thread
+        .as_ref()
+        .expect("attached thread store")
+        .load_history(false)
+        .await
+        .expect("read actual stored rollout items after retry");
+    let stored_outputs = stored
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            RolloutItem::ResponseItem(ResponseItem::FunctionCallOutput {
+                call_id: item_call_id,
+                output,
+                ..
+            }) if item_call_id == &call_id => Some(output.text_content()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        stored_outputs,
+        vec![Some("persisted-first")],
+        "caller cancellation and durable retry must retain one exact stored output"
+    );
 }
 
 #[test]
@@ -12126,46 +14602,63 @@ async fn terminal_barrier_waits_for_cancellation_shielded_ordered_commit() {
         output: FunctionCallOutputPayload::from_text("ordered".to_string()),
         internal_chat_message_metadata_passthrough: None,
     };
-    let commit_session = Arc::clone(&sess);
-    let commit_context = Arc::clone(&tc);
-    let commit = tokio::spawn(async move {
-        commit_session
-            .record_conversation_items_ordered(&commit_context, &[output])
-            .await
-    });
-    tokio::task::yield_now().await;
-
-    let flush_session = Arc::clone(&sess);
-    let flush_context = Arc::clone(&tc);
-    let terminal_flush = tokio::spawn(async move {
-        flush_session
-            .flush_rollout_after_ordered_commits(&flush_context)
-            .await
-    });
-    tokio::task::yield_now().await;
+    let outputs = [output];
+    let mut commit = Box::pin(sess.record_conversation_items_ordered(&tc, &outputs));
     assert!(
-        !terminal_flush.is_finished(),
+        futures::poll!(commit.as_mut()).is_pending(),
+        "accepted commit must wait for the history gate"
+    );
+    // Cancel the awaiting caller after the commit was accepted. Its owned
+    // append must remain part of the terminal barrier's durable prefix.
+    drop(commit);
+    let mut terminal_flush = Box::pin(sess.flush_rollout_after_ordered_commits(&tc));
+    assert!(
+        futures::poll!(terminal_flush.as_mut()).is_pending(),
         "terminal flush must not overtake an accepted shielded commit"
     );
 
     drop(commit_blocker);
-    commit
-        .await
-        .expect("commit task should join")
-        .expect("ordered commit should succeed");
-    terminal_flush
-        .await
-        .expect("flush task should join")
-        .expect("terminal flush should succeed");
+    terminal_flush.await.expect("terminal flush should succeed");
 
     assert_eq!(store.calls().await.flush_thread, 1);
-    assert!(sess.clone_history().await.raw_items().iter().any(|item| {
-        matches!(
-            item,
-            ResponseItem::FunctionCallOutput { call_id, .. }
-                if call_id == "shielded-before-terminal"
-        )
-    }));
+    let stored = codex_thread_store::ThreadStore::load_history(
+        store.as_ref(),
+        codex_thread_store::LoadThreadHistoryParams {
+            thread_id: sess.thread_id,
+            include_archived: false,
+        },
+    )
+    .await
+    .expect("load the flushed cancellation-shielded output");
+    let stored_outputs =
+        stored
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                RolloutItem::ResponseItem(
+                    item @ ResponseItem::FunctionCallOutput { call_id, .. },
+                ) if call_id == "shielded-before-terminal" => Some(item),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+    assert_eq!(stored_outputs.len(), 1);
+    let live = sess.clone_history().await;
+    let live_outputs = live
+        .raw_items()
+        .iter()
+        .filter(|item| {
+            matches!(item, ResponseItem::FunctionCallOutput { call_id, .. }
+            if call_id == "shielded-before-terminal")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(live_outputs, stored_outputs);
+    let ResponseItem::FunctionCallOutput { output, .. } = stored_outputs[0] else {
+        unreachable!("filtered function output");
+    };
+    assert_eq!(
+        output,
+        &FunctionCallOutputPayload::from_text("ordered".to_string())
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -12462,6 +14955,18 @@ async fn panic_after_terminal_claim_uses_fail_safe_terminal_outcome() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fail_safe_terminal_releases_execution_capacity_before_thread_idle_lifecycle() {
+    struct AbortObserver(Arc<std::sync::atomic::AtomicUsize>);
+    impl codex_extension_api::TurnLifecycleContributor for AbortObserver {
+        fn on_turn_abort<'a>(
+            &'a self,
+            input: codex_extension_api::TurnAbortInput<'a>,
+        ) -> codex_extension_api::ExtensionFuture<'a, ()> {
+            Box::pin(async move {
+                assert_eq!(input.reason, TurnAbortReason::Interrupted);
+                self.0.fetch_add(1, Ordering::SeqCst);
+            })
+        }
+    }
     struct ExecutionCapacityProbe {
         control: AgentControl,
         source: SessionSource,
@@ -12502,6 +15007,8 @@ async fn fail_safe_terminal_releases_execution_capacity_before_thread_idle_lifec
         source,
         result_tx,
     }));
+    let abort_callbacks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    builder.turn_lifecycle_contributor(Arc::new(AbortObserver(Arc::clone(&abort_callbacks))));
     session.services.extensions = Arc::new(builder.build());
 
     let session = Arc::new(session);
@@ -12540,6 +15047,11 @@ async fn fail_safe_terminal_releases_execution_capacity_before_thread_idle_lifec
         "the terminal task must release its execution permit before idle lifecycle callbacks"
     );
     assert!(session.active_turn.lock().await.is_none());
+    assert_eq!(
+        abort_callbacks.load(Ordering::SeqCst),
+        1,
+        "early finalizer panic still delivers one registered abort callback"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -12657,56 +15169,77 @@ async fn terminal_task_tracker_waits_for_tracked_work() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn task_finish_restarts_leftover_pending_input_after_terminal_boundary() {
-    let (sess, tc, rx) = make_session_and_context_with_rx().await;
-    let finish = CancellationToken::new();
-    let input = vec![TurnInput::UserInput {
-        content: vec![UserInput::Text {
-            text: "hello".to_string(),
-            text_elements: Vec::new(),
-        }],
-        client_id: None,
-    }];
-    sess.spawn_task(
-        Arc::clone(&tc),
-        input,
-        SignalCompletingTask {
-            finish: finish.clone(),
-        },
-    )
-    .await;
+    struct StopPanic;
+    impl codex_extension_api::TurnLifecycleContributor for StopPanic {
+        fn on_turn_stop<'a>(
+            &'a self,
+            _input: codex_extension_api::TurnStopInput<'a>,
+        ) -> codex_extension_api::ExtensionFuture<'a, ()> {
+            Box::pin(async {
+                panic!("stop failure after accepted pending input");
+            })
+        }
+    }
+    for panic_at_stop in [false, true] {
+        let (mut sess, tc, rx) = make_session_and_context_with_rx().await;
+        if panic_at_stop {
+            let mut extensions = codex_extension_api::ExtensionRegistryBuilder::new();
+            extensions.turn_lifecycle_contributor(Arc::new(StopPanic));
+            Arc::get_mut(&mut sess)
+                .expect("unique fixture session")
+                .services
+                .extensions = Arc::new(extensions.build());
+        }
+        let finish = CancellationToken::new();
+        let input = vec![TurnInput::UserInput {
+            content: vec![UserInput::Text {
+                text: "hello".to_string(),
+                text_elements: Vec::new(),
+            }],
+            client_id: None,
+        }];
+        sess.spawn_task(
+            Arc::clone(&tc),
+            input,
+            SignalCompletingTask {
+                finish: finish.clone(),
+            },
+        )
+        .await;
 
-    while rx.try_recv().is_ok() {}
+        while rx.try_recv().is_ok() {}
 
-    let text_element = codex_protocol::user_input::TextElement::new(
-        codex_protocol::user_input::ByteRange { start: 5, end: 12 },
-        Some("pending marker".to_string()),
-    );
-    let pending_user_input = vec![UserInput::Text {
-        text: "late pending input".to_string(),
-        text_elements: vec![text_element.clone()],
-    }];
-    sess.steer_input(
-        pending_user_input.clone(),
-        /*additional_context*/ Default::default(),
-        Some(&tc.sub_id),
-        /*client_user_message_id*/ None,
-        /*responsesapi_client_metadata*/ None,
-    )
-    .await
-    .expect("steer pending input into active turn");
+        let text_element = codex_protocol::user_input::TextElement::new(
+            codex_protocol::user_input::ByteRange { start: 5, end: 12 },
+            Some("pending marker".to_string()),
+        );
+        let pending_user_input = vec![UserInput::Text {
+            text: "late pending input".to_string(),
+            text_elements: vec![text_element.clone()],
+        }];
+        sess.steer_input(
+            pending_user_input.clone(),
+            /*additional_context*/ Default::default(),
+            Some(&tc.sub_id),
+            /*client_user_message_id*/ None,
+            /*responsesapi_client_metadata*/ None,
+        )
+        .await
+        .expect("steer pending input into active turn");
 
-    finish.cancel();
+        finish.cancel();
 
-    let (original_terminal_seen, fresh_turn_id) = tokio::time::timeout(
+        let (original_terminal_seen, fresh_turn_id) = tokio::time::timeout(
         std::time::Duration::from_secs(2),
         async {
             let mut original_terminal_seen = false;
             loop {
                 let event = rx.recv().await.expect("event channel should remain open");
                 match event.msg {
-                    EventMsg::TurnComplete(TurnCompleteEvent { turn_id, .. })
+                    EventMsg::TurnComplete(TurnCompleteEvent { turn_id, error, .. })
                         if turn_id == tc.sub_id =>
                     {
+                        assert_eq!(error.is_some(), panic_at_stop, "injected stop panic determines original terminal failure");
                         original_terminal_seen = true;
                     }
                     EventMsg::ItemStarted(ItemStartedEvent {
@@ -12729,25 +15262,29 @@ async fn task_finish_restarts_leftover_pending_input_after_terminal_boundary() {
     .await
     .expect("late input should start a fresh turn after the terminal boundary");
 
-    assert!(original_terminal_seen);
-    assert_ne!(fresh_turn_id, tc.sub_id);
+        assert!(original_terminal_seen);
+        assert_ne!(fresh_turn_id, tc.sub_id);
 
-    let history = sess.clone_history().await;
-    let expected = ResponseItem::Message {
-        id: None,
-        role: "user".to_string(),
-        content: vec![ContentItem::InputText {
-            text: "late pending input".to_string(),
-        }],
-        phase: None,
-        internal_chat_message_metadata_passthrough: None,
-    };
-    assert!(
-        strip_response_item_ids(&strip_metadata_from_items(history.raw_items()))
-            .contains(&expected),
-        "expected pending input to be persisted when the fresh turn starts"
-    );
-    sess.abort_all_tasks(TurnAbortReason::Replaced).await;
+        let history = sess.clone_history().await;
+        let expected = ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: "late pending input".to_string(),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        };
+        assert_eq!(
+            strip_response_item_ids(&strip_metadata_from_items(history.raw_items()))
+                .iter()
+                .filter(|item| *item == &expected)
+                .count(),
+            1,
+            "expected pending input to be persisted exactly once when the fresh turn starts"
+        );
+        sess.abort_all_tasks(TurnAbortReason::Replaced).await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -13067,6 +15604,126 @@ async fn try_start_turn_if_idle_rejects_pending_trigger_turn_without_injecting()
 }
 
 #[tokio::test]
+async fn late_idle_start_rejection_and_cancellation_notify_once_without_reentrant_deadlock() {
+    struct GoalIdleContinuation {
+        transaction: Arc<tokio::sync::Semaphore>,
+        session: std::sync::OnceLock<std::sync::Weak<Session>>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl codex_extension_api::ThreadLifecycleContributor<crate::config::Config>
+        for GoalIdleContinuation
+    {
+        fn on_thread_idle<'a>(
+            &'a self,
+            _input: codex_extension_api::ThreadIdleInput<'a>,
+        ) -> codex_extension_api::ExtensionFuture<'a, ()> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // GoalExtension keeps its goal read/start transaction locked while
+                // calling this same automatic-start boundary. Its idle callback
+                // reacquires that transaction before attempting another turn.
+                let _transaction = self.transaction.acquire().await.expect("goal transaction");
+                let session = self
+                    .session
+                    .get()
+                    .and_then(std::sync::Weak::upgrade)
+                    .expect("live session");
+                assert_eq!(session.task_start_gate.available_permits(), 1);
+                let error = session
+                    .try_start_turn_if_idle(vec![user_message("idle callback retry")])
+                    .await
+                    .expect_err("Plan mode must reject the callback retry");
+                assert_eq!(error.reason(), TryStartTurnIfIdleRejectionReason::PlanMode);
+            })
+        }
+    }
+
+    for cancel in [false, true] {
+        let (mut session, _turn) = make_session_and_context().await;
+        let transaction = Arc::new(tokio::sync::Semaphore::new(1));
+        let continuation = Arc::new(GoalIdleContinuation {
+            transaction: Arc::clone(&transaction),
+            session: std::sync::OnceLock::new(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mut builder = codex_extension_api::ExtensionRegistryBuilder::new();
+        builder.thread_lifecycle_contributor(continuation.clone());
+        session.services.extensions = Arc::new(builder.build());
+        let session = Arc::new(session);
+        continuation
+            .session
+            .set(Arc::downgrade(&session))
+            .expect("one session");
+        let outer_transaction = transaction.acquire().await.expect("outer goal transaction");
+
+        // Drive the normal entry point to the actual active-turn lock, then hold
+        // configuration while allowing it to reserve its empty startup slot.
+        let active = session.active_turn.lock().await;
+        let item = user_message("automatic goal continuation");
+        let mut start = Box::pin(session.try_start_turn_if_idle(vec![item.clone()]));
+        assert!(futures::poll!(&mut start).is_pending());
+        assert_eq!(session.task_start_gate.available_permits(), 0);
+        let mut state = session.state.lock().await;
+        drop(active);
+        assert!(futures::poll!(&mut start).is_pending());
+        {
+            let active = session.active_turn.lock().await;
+            let reserved = active
+                .as_ref()
+                .expect("normal startup reserved the active slot");
+            assert!(reserved.task.is_none());
+            assert!(reserved.terminal.is_none());
+        }
+        state.session_configuration.collaboration_mode.mode = ModeKind::Plan;
+        drop(state);
+        if cancel {
+            drop(start);
+        } else {
+            let error = timeout(Duration::from_secs(5), &mut start)
+                .await
+                .expect("late rejection must return while the caller still holds its transaction")
+                .expect_err("late Plan-mode switch must reject startup");
+            assert_eq!(error.reason(), TryStartTurnIfIdleRejectionReason::PlanMode);
+            assert_eq!(error.into_input(), vec![item]);
+            drop(start);
+        }
+        timeout(Duration::from_secs(5), async {
+            while session.active_turn.lock().await.is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("startup owner must clear its placeholder without waiting on the callback");
+        assert_eq!(session.task_start_gate.available_permits(), 1);
+        assert!(
+            session
+                .input_queue
+                .get_pending_input(&session.active_turn)
+                .await
+                .is_empty()
+        );
+        drop(outer_transaction);
+        session.terminal_tasks.close();
+        timeout(Duration::from_secs(5), session.terminal_tasks.wait())
+            .await
+            .expect("owned recovery and the real registered idle callback must finish");
+        assert_eq!(
+            continuation.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert!(session.active_turn.lock().await.is_none());
+        assert!(
+            session
+                .input_queue
+                .get_pending_input(&session.active_turn)
+                .await
+                .is_empty()
+        );
+    }
+}
+
+#[tokio::test]
 async fn try_start_turn_if_idle_rejects_active_review_turn_without_injecting() {
     let (sess, tc, _rx) = make_session_and_context_with_rx().await;
     sess.spawn_task(
@@ -13293,6 +15950,241 @@ async fn steer_input_revokes_spawn_authorization_with_contracted_denial() {
 }
 
 #[tokio::test]
+async fn steer_input_commits_effects_only_after_queue_admission() {
+    use crate::responses_metadata::CodexResponsesRequestKind;
+    use crate::session::input_queue::InputQueueActivity;
+    use codex_protocol::protocol::AdditionalContextEntry;
+    use codex_protocol::protocol::AdditionalContextKind;
+    use indexmap::IndexMap;
+    use std::collections::HashMap;
+
+    for cancel_before_admission in [false, true] {
+        let (sess, mut tc, _rx) = make_session_and_context_with_rx().await;
+        Arc::get_mut(&mut tc)
+            .expect("unique turn context")
+            .multi_agent_version = codex_protocol::protocol::MultiAgentVersion::V2;
+        sess.spawn_task(
+            Arc::clone(&tc),
+            Vec::new(),
+            NeverEndingTask {
+                kind: TaskKind::Regular,
+                listen_to_cancellation_token: true,
+            },
+        )
+        .await;
+        let baseline_context = IndexMap::from([(
+            "stable-source".to_string(),
+            AdditionalContextEntry {
+                value: "original-context".to_string(),
+                kind: AdditionalContextKind::Application,
+            },
+        )]);
+        let baseline_metadata = HashMap::from([(
+            "workspace_kind".to_string(),
+            "original-workspace".to_string(),
+        )]);
+        sess.steer_input(
+            vec![UserInput::Text {
+                text: "Use subagents to inspect the user's code.\nRun focused tests.".to_string(),
+                text_elements: Vec::new(),
+            }],
+            baseline_context,
+            Some(&tc.sub_id),
+            Some("baseline-client".to_string()),
+            Some(baseline_metadata.clone()),
+        )
+        .await
+        .expect("baseline steering should be accepted");
+        // Normal turn construction leaves the optional classifier disabled.
+        assert_eq!(tc.validation_authorization.read().await.revision, 0);
+        assert!(super::multi_agents::spawn_is_authorized(&tc));
+        let baseline_input = sess.input_queue.get_pending_input(&sess.active_turn).await;
+        assert_eq!(baseline_input.len(), 2, "baseline context and user input");
+        let context_before = sess.state.lock().await.additional_context.clone();
+        let metadata = || {
+            tc.turn_metadata_state
+                .to_responses_metadata(
+                    "test-installation".to_string(),
+                    "test-window".to_string(),
+                    CodexResponsesRequestKind::Turn,
+                )
+                .extra
+                .into_iter()
+                .collect::<HashMap<_, _>>()
+        };
+        assert_eq!(metadata(), baseline_metadata);
+        let turn_state = {
+            let active = sess.active_turn.lock().await;
+            Arc::clone(&active.as_ref().expect("active registered task").turn_state)
+        };
+        sess.input_queue
+            .defer_mailbox_delivery_to_next_turn(&sess.active_turn, &tc.sub_id)
+            .await;
+        let communication = InterAgentCommunication::new(
+            AgentPath::try_from("/root/worker").expect("worker path"),
+            AgentPath::root(),
+            Vec::new(),
+            "deferred child result".to_string(),
+            false,
+        );
+        assert!(
+            sess.input_queue
+                .enqueue_mailbox_communication(communication.clone())
+                .await
+        );
+        let (mut activity, _) = sess.input_queue.subscribe_activity(Some(&turn_state)).await;
+        assert!(!activity.has_changed().unwrap());
+        let candidate_context = IndexMap::from([(
+            "candidate-source".to_string(),
+            AdditionalContextEntry {
+                value: "candidate-context".to_string(),
+                kind: AdditionalContextKind::Application,
+            },
+        )]);
+        let candidate_metadata = HashMap::from([(
+            "workspace_kind".to_string(),
+            "candidate-workspace".to_string(),
+        )]);
+        let candidate_text = "Don't use subagents.\nDo not run tests.";
+        if cancel_before_admission {
+            // This is the actual queue lock taken during admission. Polling runs
+            // the caller to its blocked await; dropping it must commit nothing.
+            let held_turn_state = turn_state.lock().await;
+            let mut steering = Box::pin(sess.steer_input(
+                vec![UserInput::Text {
+                    text: candidate_text.to_string(),
+                    text_elements: Vec::new(),
+                }],
+                candidate_context.clone(),
+                Some(&tc.sub_id),
+                Some("cancelled-client".to_string()),
+                Some(candidate_metadata.clone()),
+            ));
+            assert!(futures::poll!(steering.as_mut()).is_pending());
+            assert!(
+                sess.active_turn.try_lock().is_err(),
+                "steering reached its admission scope"
+            );
+            drop(steering);
+            drop(held_turn_state);
+        } else {
+            let error = sess
+                .steer_input(
+                    vec![UserInput::Text {
+                        text: format!("{candidate_text}\n{}", "x".repeat(4 * 1024 * 1024)),
+                        text_elements: Vec::new(),
+                    }],
+                    candidate_context.clone(),
+                    Some(&tc.sub_id),
+                    Some("rejected-client".to_string()),
+                    Some(candidate_metadata.clone()),
+                )
+                .await
+                .expect_err("oversized steering must be rejected by the real queue limit");
+            assert!(matches!(
+                error,
+                SteerInputError::PendingInputLimitExceeded {
+                    max_items: 1_024,
+                    max_bytes: 4_194_304,
+                }
+            ));
+        }
+        assert_eq!(tc.validation_authorization.read().await.revision, 0);
+        assert!(super::multi_agents::spawn_is_authorized(&tc));
+        assert_eq!(sess.state.lock().await.additional_context, context_before);
+        assert_eq!(metadata(), baseline_metadata);
+        assert!(
+            !activity.has_changed().unwrap(),
+            "failed admission must not publish steering activity"
+        );
+        assert!(
+            !turn_state
+                .lock()
+                .await
+                .accepts_mailbox_delivery_for_current_turn()
+        );
+        assert!(
+            sess.input_queue
+                .get_pending_input(&sess.active_turn)
+                .await
+                .is_empty()
+        );
+
+        let accepted_input = vec![UserInput::Text {
+            text: candidate_text.to_string(),
+            text_elements: Vec::new(),
+        }];
+        let turn_id = sess
+            .steer_input(
+                accepted_input.clone(),
+                candidate_context.clone(),
+                Some(&tc.sub_id),
+                Some("accepted-client".to_string()),
+                Some(candidate_metadata.clone()),
+            )
+            .await
+            .expect("small steering should commit after either failed attempt");
+        assert_eq!(turn_id, tc.sub_id);
+        assert_eq!(tc.validation_authorization.read().await.revision, 0);
+        assert!(!super::multi_agents::spawn_is_authorized(&tc));
+        assert_eq!(metadata(), candidate_metadata);
+        assert!(activity.has_changed().unwrap());
+        assert_eq!(*activity.borrow_and_update(), InputQueueActivity::Steer);
+        assert!(
+            turn_state
+                .lock()
+                .await
+                .accepts_mailbox_delivery_for_current_turn()
+        );
+        let pending = sess.input_queue.get_pending_input(&sess.active_turn).await;
+        let [
+            TurnInput::ResponseItem(ResponseItem::Message { role, content, .. }),
+            TurnInput::UserInput {
+                content: actual_input,
+                client_id,
+            },
+            TurnInput::InterAgentCommunication(actual_communication),
+        ] = pending.as_slice()
+        else {
+            panic!(
+                "accepted context, exact user input and deferred mailbox must be queued: {pending:?}"
+            );
+        };
+        assert_eq!(role, "developer");
+        assert_eq!(content, &vec![ContentItem::InputText {
+            text: "<application_context source=\"candidate-source\" kind=\"application\">\ncandidate-context\n</application_context>".to_string(),
+        }]);
+        assert_eq!(actual_input, &accepted_input);
+        assert_eq!(client_id.as_deref(), Some("accepted-client"));
+        assert_eq!(actual_communication, &communication);
+
+        // A second accepted request with identical context must not emit it again:
+        // this observes the committed store through the normal steering boundary.
+        let replay_input = vec![UserInput::Text {
+            text: "Continue the accepted work.".to_string(),
+            text_elements: Vec::new(),
+        }];
+        sess.steer_input(
+            replay_input.clone(),
+            candidate_context,
+            Some(&tc.sub_id),
+            None,
+            None,
+        )
+        .await
+        .expect("accepted context should remain committed");
+        assert_eq!(
+            sess.input_queue.get_pending_input(&sess.active_turn).await,
+            vec![TurnInput::UserInput {
+                content: replay_input,
+                client_id: None
+            },]
+        );
+        sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
+    }
+}
+
+#[tokio::test]
 async fn steer_input_returns_active_turn_id() {
     let (sess, tc, _rx) = make_session_and_context_with_rx().await;
     let input = vec![TurnInput::UserInput {
@@ -13328,7 +16220,8 @@ async fn steer_input_returns_active_turn_id() {
         .expect("steering with matching expected turn id should succeed");
 
     assert_eq!(turn_id, tc.sub_id);
-    assert_eq!(tc.validation_authorization.read().await.revision, 1);
+    // Normal turn construction leaves the optional classifier disabled.
+    assert_eq!(tc.validation_authorization.read().await.revision, 0);
     assert!(sess.input_queue.has_pending_input(&sess.active_turn).await);
 }
 
@@ -13715,6 +16608,320 @@ async fn abort_review_task_emits_exited_then_aborted_and_records_history() {
         }),
         "expected a model-visible turn aborted marker in history after interrupt"
     );
+}
+
+#[tokio::test]
+async fn resumed_legacy_artifact_recovery_enforces_workspace_freshness_at_sampling() {
+    for (case, retained_command, legacy, expect_stale) in [
+        ("legacy_compacted", None, true, true),
+        ("legacy_retained_read", Some("cat source.rs"), true, true),
+        (
+            "current_repository_history",
+            Some("git log -1 --oneline"),
+            false,
+            false,
+        ),
+    ] {
+        let home = tempfile::tempdir().expect("isolated recovery home");
+        let mut config = test_config().await;
+        config.codex_home = home.path().to_path_buf().abs();
+        config.cwd = home.path().to_path_buf().abs();
+        config.completed_tool_history_projection = true;
+        let manager = crate::ThreadManager::with_models_provider_and_home_for_tests(
+            CodexAuth::from_api_key("dummy"),
+            config.model_provider.clone(),
+            home.path().to_path_buf(),
+            Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        );
+        let source = manager
+            .start_thread(config.clone())
+            .await
+            .expect("start source thread");
+        let source_session = Arc::clone(&source.thread.codex.session);
+        let source_turn = source_session.new_default_turn().await;
+        let origin_call_id = "historical-origin";
+        let original_text = format!("exact retained output for {case}\n");
+        let canonical = codex_tools::CanonicalToolResult::text(original_text.clone());
+        let artifact = crate::tools::command_output_artifact::create_canonical_output_artifact(
+            home.path(),
+            &source.thread_id.to_string(),
+            &canonical,
+        )
+        .await;
+        assert!(artifact.complete, "{case}: real artifact must be complete");
+        let artifact_id = artifact.artifact_id().expect("stored artifact identity");
+        crate::tools::command_output_artifact::protect_active_tool_history_artifact(
+            home.path(),
+            &source.thread_id.to_string(),
+            &artifact_id,
+            canonical.exact_bytes,
+            &canonical.sha256,
+        )
+        .await
+        .expect("protect artifact before normal resume reconciliation");
+
+        let mut initial_items = vec![user_message("Recover the retained tool output")];
+        if let Some(command) = retained_command {
+            initial_items.extend([
+                ResponseItem::FunctionCall {
+                    id: None,
+                    name: "exec_command".to_string(),
+                    namespace: None,
+                    arguments: serde_json::json!({"cmd": command}).to_string(),
+                    call_id: origin_call_id.to_string(),
+                    internal_chat_message_metadata_passthrough: None,
+                },
+                ResponseItem::FunctionCallOutput {
+                    id: None,
+                    call_id: origin_call_id.to_string(),
+                    output: FunctionCallOutputPayload::from_text(original_text.clone()),
+                    internal_chat_message_metadata_passthrough: None,
+                },
+            ]);
+        }
+        if retained_command.is_none() {
+            // A compacted history retains a recovery reference but no original
+            // workspace command. Obtain its contents from the real artifact.
+            let prior_recovery = crate::tools::command_output_artifact::read_tool_output_selectors(
+                home.path(),
+                &source.thread_id.to_string(),
+                &artifact_id,
+                vec![
+                    crate::tools::command_output_artifact::ToolOutputSelector::Lines {
+                        start: 1,
+                        end: 1,
+                    },
+                ],
+            )
+            .await
+            .expect("read real retained recovery before saving its history");
+            assert_eq!(
+                prior_recovery.results[0].text.as_deref(),
+                Some(original_text.as_str())
+            );
+            initial_items.extend([
+                ResponseItem::FunctionCall {
+                    id: None,
+                    name: "read_tool_output".to_string(),
+                    namespace: None,
+                    arguments: serde_json::json!({"artifact_id": artifact_id}).to_string(),
+                    call_id: "prior-recovery".to_string(),
+                    internal_chat_message_metadata_passthrough: None,
+                },
+                ResponseItem::FunctionCallOutput {
+                    id: None,
+                    call_id: "prior-recovery".to_string(),
+                    output: FunctionCallOutputPayload::from_text(
+                        serde_json::to_string(&prior_recovery)
+                            .expect("persist exact prior recovery"),
+                    ),
+                    internal_chat_message_metadata_passthrough: None,
+                },
+            ]);
+        }
+        source_session
+            .record_conversation_items_ordered(&source_turn, &initial_items)
+            .await
+            .expect("persist historical conversation");
+        source_session
+            .flush_rollout_after_ordered_commits(&source_turn)
+            .await
+            .expect("materialize source rollout");
+        let rollout_path = source.thread.rollout_path().expect("saved rollout");
+        source
+            .thread
+            .shutdown_and_wait()
+            .await
+            .expect("shutdown source");
+        manager.remove_thread(&source.thread_id).await;
+
+        // Exact ToolHistoryCandidate and ledger V1 shape emitted by df89702c4d^.
+        // This producer predates dependency freshness and workspace observations.
+        let mut candidate = serde_json::json!({
+            "call_id": origin_call_id,
+            "tool_identity": "exec_command",
+            "semantic_class": "tool_output",
+            "artifact_id": artifact_id,
+            "artifact_bytes": canonical.exact_bytes,
+            "artifact_sha256": canonical.sha256,
+            "original_output_sha256": crate::tool_history::sha256(original_text.as_bytes()),
+            "original_tokens": canonical.approximate_tokens,
+            "bounded_digest": original_text,
+            "complete": true,
+            "projection_eligible": true,
+            "proof_identity": null,
+            "supersession_identity": null,
+            "consumed_by_generation": null
+        });
+        if !legacy {
+            let fields = candidate.as_object_mut().expect("candidate object");
+            fields.insert("successful".to_string(), serde_json::json!(true));
+            fields.insert("source_dependencies".to_string(), serde_json::json!([]));
+            fields.insert(
+                "source_dependencies_current".to_string(),
+                serde_json::json!(true),
+            );
+            fields.insert(
+                "preserved_non_text_tokens".to_string(),
+                serde_json::json!(0),
+            );
+        }
+        let ledger = serde_json::json!({
+            "version": 1,
+            "state": {"candidates": {(origin_call_id): candidate}}
+        });
+        let ledger_dir = home.path().join("tool-history");
+        tokio::fs::create_dir_all(&ledger_dir)
+            .await
+            .expect("ledger directory");
+        tokio::fs::write(
+            ledger_dir.join(format!("{}.json", source.thread_id)),
+            serde_json::to_vec(&ledger).expect("serialize historical producer ledger"),
+        )
+        .await
+        .expect("persist historical producer ledger");
+
+        let resumed = manager
+            .resume_thread_from_rollout(config, rollout_path, manager.auth_manager(), None, false)
+            .await
+            .expect("resume through real Session::new and ledger loader");
+        assert!(!resumed.was_already_running);
+        assert_eq!(resumed.thread_id, source.thread_id);
+        let session = Arc::clone(&resumed.thread.codex.session);
+        let turn = session.new_default_turn().await;
+        let loaded = serde_json::to_value(session.state.lock().await.tool_history_state())
+            .expect("inspect normally restored candidate");
+        assert_eq!(
+            loaded["candidates"][origin_call_id]["artifact_id"],
+            artifact_id
+        );
+
+        let recovery_call_id = "registered-recovery";
+        let recovery_call = ResponseItem::FunctionCall {
+            id: None,
+            name: "read_tool_output".to_string(),
+            namespace: None,
+            arguments: serde_json::json!({
+                "artifact_id": artifact_id,
+                "selectors": [{"kind": "lines", "start": 1, "end": 1}]
+            })
+            .to_string(),
+            call_id: recovery_call_id.to_string(),
+            internal_chat_message_metadata_passthrough: None,
+        };
+        let step = StepContext::for_test(Arc::clone(&turn));
+        let router = ToolRouter::from_context(
+            step.as_ref(),
+            crate::tools::router::ToolRouterParams {
+                tool_suggest_candidates: None,
+                deferred_mcp_tools: None,
+                mcp_tools: None,
+                extension_tool_executors: Vec::new(),
+                dynamic_tools: turn.dynamic_tools.as_slice(),
+                exposure_identity: Default::default(),
+            },
+            &Default::default(),
+        );
+        let call = ToolRouter::build_tool_call(recovery_call.clone())
+            .expect("build registered recovery call")
+            .expect("function call");
+        let dispatch = Arc::new(ToolDispatchState::new());
+        assert!(dispatch.try_admit());
+        let recovered = router
+            .dispatch_tool_call_with_terminal_outcome(
+                Arc::clone(&session),
+                step,
+                CancellationToken::new(),
+                Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+                call,
+                ToolCallSource::Direct,
+                dispatch,
+            )
+            .await
+            .expect("registered recovery must read actual artifact");
+        assert!(
+            recovered.success_for_logging(),
+            "{case}: recovery must succeed"
+        );
+        let recovered_item = ResponseItem::from(recovered.response());
+        let ResponseItem::FunctionCallOutput { output, .. } = &recovered_item else {
+            panic!("expected registered function output");
+        };
+        let recovered_text = output.body.to_text().expect("recovery JSON text");
+        let recovered_json: serde_json::Value =
+            serde_json::from_str(&recovered_text).expect("registered recovery JSON");
+        assert_eq!(recovered_json["artifact_id"], artifact_id);
+        assert_eq!(recovered_json["complete"], true);
+        assert_eq!(
+            recovered_json["results"]
+                .as_array()
+                .expect("selector results")
+                .len(),
+            1
+        );
+        assert_eq!(recovered_json["results"][0]["status"], "ok");
+        assert_eq!(recovered_json["results"][0]["text"], original_text);
+        session
+            .record_conversation_items_ordered(&turn, &[recovery_call, recovered_item])
+            .await
+            .expect("record the actual registered recovery result");
+
+        let prompt = super::turn::prepare_sampling_prompt_for_client(
+            session.clone_history().await,
+            &turn,
+            &test_model_client_session(),
+            &session.services.git_workspace,
+        )
+        .await;
+        for (route, items) in [
+            ("sampling", prompt.shared_items()),
+            ("fallback", prompt.shared_fallback_items()),
+        ] {
+            let outputs = items
+                .iter()
+                .filter_map(|item| match item {
+                    ResponseItem::FunctionCallOutput {
+                        call_id, output, ..
+                    } if call_id == recovery_call_id => output.body.to_text(),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                outputs.len(),
+                1,
+                "{case}/{route}: exactly one recovery output"
+            );
+            if expect_stale {
+                let notice: serde_json::Value =
+                    serde_json::from_str(&outputs[0]).expect("sampling freshness notice");
+                assert_eq!(
+                    notice,
+                    serde_json::json!({
+                        "call_id": recovery_call_id,
+                        "stale_workspace_evidence": true,
+                        "reason": "no workspace observation was recorded for this tool result; rerun the tool before relying on it",
+                        "rerun": {"force_fresh": true}
+                    }),
+                    "{case}/{route}: recovered workspace bytes need a fresh observation"
+                );
+                assert!(
+                    !outputs[0].contains(&original_text),
+                    "{case}/{route}: unobserved workspace bytes must not reach sampling"
+                );
+            } else {
+                assert_eq!(
+                    outputs[0], recovered_text,
+                    "{case}/{route}: proven repository-history recovery must remain usable"
+                );
+            }
+        }
+        resumed
+            .thread
+            .shutdown_and_wait()
+            .await
+            .expect("shutdown resumed recovery thread");
+        manager.remove_thread(&resumed.thread_id).await;
+    }
 }
 
 #[tokio::test]
@@ -14209,4 +17416,1375 @@ async fn session_start_hooks_require_project_trust_without_config_toml() -> std:
     }
 
     Ok(())
+}
+
+#[tokio::test]
+async fn runtime_hook_discovery_loads_and_executes_user_hook_file() -> anyhow::Result<()> {
+    let session = make_session_with_config(|config| {
+        config
+            .features
+            .enable(Feature::CodexHooks)
+            .expect("enable hooks");
+        config.bypass_hook_trust = true;
+    })
+    .await?;
+    let codex_home = session.codex_home().await;
+    write_project_hooks(&codex_home)?;
+    // Quoting makes echo emit one argument on both PowerShell and POSIX shells.
+    let hook_file = codex_home.join("hooks.json");
+    let mut hooks: serde_json::Value = serde_json::from_slice(&std::fs::read(&hook_file)?)?;
+    hooks["hooks"]["SessionStart"][0]["hooks"][0]["command"] =
+        serde_json::json!("echo 'hello from hook'");
+    std::fs::write(hook_file, serde_json::to_vec(&hooks)?)?;
+    tokio::fs::write(codex_home.join(CONFIG_TOML_FILE), "").await?;
+
+    session.reload_user_config_layer().await;
+
+    let request = codex_hooks::SessionStartRequest {
+        session_id: session.thread_id,
+        cwd: session.get_config().await.cwd.clone(),
+        transcript_path: None,
+        model: "gpt-5.2".to_string(),
+        permission_mode: "default".to_string(),
+        target: codex_hooks::StartHookTarget::SessionStart {
+            source: codex_hooks::SessionStartSource::Startup,
+        },
+    };
+    let outcome = session
+        .hooks()
+        .run_session_start(request.clone(), None)
+        .await;
+    assert_eq!(outcome.additional_contexts, vec!["hello from hook"]);
+    assert!(!outcome.should_stop);
+    assert_eq!(outcome.hook_events.len(), 1);
+
+    let mut config = (*session.get_config().await).clone();
+    config
+        .features
+        .disable(Feature::CodexHooks)
+        .expect("disable hooks");
+    session
+        .refresh_runtime_config_features(config, &[Feature::CodexHooks])
+        .await;
+    let outcome = session.hooks().run_session_start(request, None).await;
+    assert!(outcome.additional_contexts.is_empty());
+    assert!(outcome.hook_events.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancelled_user_input_response_does_not_fence_the_turn() {
+    for cancel_while_waiting_for_admission in [false, true] {
+        let (session, turn_context, rx) = make_session_and_context_with_rx().await;
+        let terminal = crate::state::TurnTerminalCoordinator::new(turn_context.sub_id.clone());
+        *session.active_turn.lock().await = Some(ActiveTurn {
+            terminal: Some(Arc::clone(&terminal)),
+            ..Default::default()
+        });
+        let args: RequestUserInputArgs = serde_json::from_value(serde_json::json!({
+            "questions": [{"id": "next", "header": "Next", "question": "What next?"}]
+        }))
+        .unwrap();
+        let mut request = Box::pin(session.request_user_input(
+            &turn_context,
+            "cancelled-input".to_string(),
+            args.clone(),
+        ));
+        assert!(futures::poll!(request.as_mut()).is_pending());
+        let EventMsg::RequestUserInput(event) = rx.recv().await.unwrap().msg else {
+            panic!("expected the registered user-input request");
+        };
+        assert_eq!(event.call_id, "cancelled-input");
+        assert_eq!(event.turn_id, turn_context.sub_id);
+        assert_eq!(event.questions, args.questions);
+        let generation = terminal.wake_generation_id();
+        let admission = terminal.acquire_sampling_admission().await.unwrap();
+        let mut notification = Box::pin(session.notify_user_input_response(
+            &turn_context.sub_id,
+            RequestUserInputResponse {
+                answers: Default::default(),
+                interrupted: true,
+            },
+        ));
+        if cancel_while_waiting_for_admission {
+            assert!(futures::poll!(notification.as_mut()).is_pending());
+        }
+        drop(request);
+        drop(admission);
+        notification.await;
+
+        assert!(!terminal.interrupt_pending());
+        assert_eq!(terminal.wake_generation_id(), generation);
+        assert!(terminal.acquire_sampling_admission().await.is_some());
+        assert!(terminal.try_claim().is_some());
+    }
+}
+
+#[tokio::test]
+async fn accepted_user_input_interruption_fences_before_consumer_terminal_admission() {
+    let (session, turn_context, rx) = make_session_and_context_with_rx().await;
+    let terminal = crate::state::TurnTerminalCoordinator::new(turn_context.sub_id.clone());
+    *session.active_turn.lock().await = Some(ActiveTurn {
+        terminal: Some(Arc::clone(&terminal)),
+        ..Default::default()
+    });
+    let args: RequestUserInputArgs = serde_json::from_value(serde_json::json!({
+        "questions": [{"id": "next", "header": "Next", "question": "What next?"}]
+    }))
+    .unwrap();
+    let mut request =
+        Box::pin(session.request_user_input(&turn_context, "accepted-input".to_string(), args));
+    assert!(futures::poll!(request.as_mut()).is_pending());
+    assert!(matches!(
+        rx.recv().await.unwrap().msg,
+        EventMsg::RequestUserInput(event) if event.call_id == "accepted-input"
+    ));
+    let response: RequestUserInputResponse = serde_json::from_value(serde_json::json!({
+        "answers": {"next": {"answers": ["stop here"]}}, "interrupted": true
+    }))
+    .unwrap();
+    let generation = terminal.wake_generation_id();
+    let admission = terminal.acquire_sampling_admission().await.unwrap();
+    let mut notification =
+        Box::pin(session.notify_user_input_response(&turn_context.sub_id, response.clone()));
+    assert!(futures::poll!(notification.as_mut()).is_pending());
+    // A send before acquiring admission would wake this consumer too early.
+    assert!(futures::poll!(request.as_mut()).is_pending());
+    assert!(!terminal.interrupt_pending());
+    drop(admission);
+    let consumer = async {
+        assert_eq!(request.await, Some(response));
+        assert!(terminal.try_claim().is_none());
+        assert!(terminal.acquire_sampling_admission().await.is_none());
+    };
+    tokio::join!(notification, consumer);
+    assert!(terminal.interrupt_pending());
+    assert_ne!(terminal.wake_generation_id(), generation);
+}
+
+#[tokio::test]
+async fn thread_settings_update_preserves_only_matching_profile_roots() {
+    let (session, initial_turn, rx_event) = make_session_and_context_with_rx().await;
+    let profile_directory = tempfile::tempdir().expect("profile workspace");
+    let profile_root = profile_directory.path().abs();
+    let permission_profile = initial_turn.permission_profile();
+    let active_profile = ActivePermissionProfile::new("dev");
+    let workspace_roots = initial_turn.config.workspace_roots.clone();
+    assert!(!workspace_roots.contains(&profile_root));
+
+    for (case, replacement_profile, replacement_roots, keep_root) in [
+        ("omitted", None, None, true),
+        ("same-profile", Some(active_profile.clone()), None, true),
+        ("explicit-clear", None, Some(Vec::new()), false),
+        (
+            "different-profile",
+            Some(ActivePermissionProfile::new("other")),
+            None,
+            false,
+        ),
+    ] {
+        super::handlers::update_thread_settings(
+            &session,
+            format!("initialize-{case}"),
+            ThreadSettingsOverrides {
+                permission_profile: Some(permission_profile.clone()),
+                active_permission_profile: Some(active_profile.clone()),
+                profile_workspace_roots: Some(vec![profile_root.clone()]),
+                ..Default::default()
+            },
+        )
+        .await;
+        let event = rx_event.recv().await.expect("initial settings event");
+        assert_eq!(event.id, format!("initialize-{case}"));
+        let EventMsg::ThreadSettingsApplied(applied) = event.msg else {
+            panic!("expected applied initial settings");
+        };
+        assert_eq!(
+            applied.thread_settings.profile_workspace_roots,
+            Some(vec![profile_root.clone()]),
+        );
+
+        let expected_active_profile = replacement_profile
+            .clone()
+            .unwrap_or_else(|| active_profile.clone());
+        super::handlers::update_thread_settings(
+            &session,
+            case.to_string(),
+            ThreadSettingsOverrides {
+                permission_profile: Some(permission_profile.clone()),
+                active_permission_profile: replacement_profile,
+                profile_workspace_roots: replacement_roots,
+                ..Default::default()
+            },
+        )
+        .await;
+        let event = rx_event.recv().await.expect("updated settings event");
+        assert_eq!(event.id, case);
+        let EventMsg::ThreadSettingsApplied(applied) = event.msg else {
+            panic!("expected applied updated settings");
+        };
+        let expected_profile_roots = if keep_root {
+            vec![profile_root.clone()]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(
+            applied.thread_settings.active_permission_profile,
+            Some(Some(expected_active_profile)),
+        );
+        assert_eq!(
+            applied.thread_settings.profile_workspace_roots,
+            Some(expected_profile_roots.clone()),
+        );
+        assert_eq!(
+            applied.thread_settings.permission_profile,
+            permission_profile
+        );
+        let next_turn = session.new_default_turn().await;
+        let mut expected_workspace_roots = workspace_roots.clone();
+        expected_workspace_roots.extend(expected_profile_roots);
+        assert_eq!(
+            next_turn.effective_workspace_roots(),
+            expected_workspace_roots
+        );
+        assert_eq!(next_turn.permission_profile(), permission_profile);
+        assert!(rx_event.try_recv().is_err());
+    }
+}
+
+fn legacy_projection_test_workspace() -> (
+    tempfile::TempDir,
+    codex_utils_absolute_path::AbsolutePathBuf,
+    codex_utils_absolute_path::AbsolutePathBuf,
+    PermissionProfile,
+) {
+    let home = tempfile::tempdir().expect("projection workspace");
+    let root = home.path().join("checkout");
+    let gitdir = root.join("private-git");
+    std::fs::create_dir_all(&root).expect("checkout directory");
+    std::fs::create_dir_all(&gitdir).expect("git metadata directory");
+    std::fs::write(root.join(".git"), "gitdir: private-git\n").expect("git pointer file");
+    let root = codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(root)
+        .expect("absolute workspace");
+    let gitdir = codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(gitdir)
+        .expect("absolute gitdir");
+    let profile = PermissionProfile::workspace_write_with(
+        std::slice::from_ref(&root),
+        codex_protocol::permissions::NetworkSandboxPolicy::Restricted,
+        true,
+        true,
+    );
+    (home, root, gitdir, profile)
+}
+
+async fn hold_only_projection_test_worker()
+-> (std::sync::mpsc::Sender<()>, tokio::task::JoinHandle<()>) {
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let worker = tokio::task::spawn_blocking(move || {
+        entered_tx.send(()).expect("notify occupied worker");
+        // Bound failed-test teardown even if an assertion panics before release.
+        let _ = release_rx.recv_timeout(std::time::Duration::from_secs(5));
+    });
+    entered_rx.await.expect("blocking worker entered");
+    (release_tx, worker)
+}
+
+#[test]
+fn settings_projection_uses_worker_and_cancelled_update_does_not_commit() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .expect("single-worker runtime");
+    runtime.block_on(async {
+        let (_home, root, gitdir, profile) = legacy_projection_test_workspace();
+        let (session, _turn) = make_session_and_context().await;
+        session
+            .state
+            .lock()
+            .await
+            .session_configuration
+            .set_permission_profile_for_tests(profile.clone())
+            .expect("workspace-write session");
+        let before = session
+            .state
+            .lock()
+            .await
+            .session_configuration
+            .thread_config_snapshot();
+        let desired_personality =
+            if before.personality == Some(codex_protocol::config_types::Personality::Pragmatic) {
+                codex_protocol::config_types::Personality::Friendly
+            } else {
+                codex_protocol::config_types::Personality::Pragmatic
+            };
+        let updates = SessionSettingsUpdate {
+            personality: Some(desired_personality),
+            ..Default::default()
+        };
+        let (release, blocker) = hold_only_projection_test_worker().await;
+        let mut preview = Box::pin(session.preview_settings(&updates));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut preview)
+                .await
+                .is_err(),
+            "normal preview must queue its filesystem projection on the occupied worker"
+        );
+        drop(preview);
+        let mut update = Box::pin(session.update_settings(updates.clone()));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut update)
+                .await
+                .is_err(),
+            "normal update must also await worker computation while the runtime timer advances"
+        );
+        drop(update);
+        let cancelled = session
+            .state
+            .lock()
+            .await
+            .session_configuration
+            .thread_config_snapshot();
+        assert_eq!(cancelled.personality, before.personality);
+        assert_eq!(cancelled.permission_profile, before.permission_profile);
+        assert_eq!(
+            std::fs::read(root.join(".git")).expect("unchanged pointer"),
+            b"gitdir: private-git\n"
+        );
+        release.send(()).expect("release worker");
+        blocker.await.expect("worker released");
+        let preview = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            session.preview_settings(&updates),
+        )
+        .await
+        .expect("preview progresses with one worker")
+        .expect("valid preview");
+        assert_eq!(preview.personality, Some(desired_personality));
+        assert_eq!(
+            preview
+                .permission_profile
+                .file_system_sandbox_policy()
+                .resolve_access_with_cwd(gitdir.as_path(), root.as_path()),
+            FileSystemAccessMode::Read,
+            "worktree metadata remains protected"
+        );
+        assert!(
+            preview
+                .permission_profile
+                .file_system_sandbox_policy()
+                .can_write_path_with_cwd(root.join("work.txt").as_path(), root.as_path())
+        );
+        assert_eq!(
+            session
+                .state
+                .lock()
+                .await
+                .session_configuration
+                .thread_config_snapshot()
+                .personality,
+            before.personality,
+            "completed preview and canceled queued workers cannot publish settings"
+        );
+        session
+            .update_settings(updates)
+            .await
+            .expect("ordinary update retry");
+        assert_eq!(
+            session
+                .state
+                .lock()
+                .await
+                .session_configuration
+                .thread_config_snapshot()
+                .personality,
+            Some(desired_personality)
+        );
+    });
+    runtime.shutdown_timeout(std::time::Duration::from_secs(2));
+}
+
+#[test]
+fn turn_context_projection_uses_one_worker_and_preserves_gitdir_permissions() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .expect("single-worker runtime");
+    runtime.block_on(async {
+        let (_home, root, gitdir, profile) = legacy_projection_test_workspace();
+        let (session, mut turn) = make_session_and_context().await;
+        turn.permission_profile = profile;
+        let expected_turn_id = turn.sub_id.clone();
+        let expected_cwd = turn.cwd().clone();
+        let turn = Arc::new(turn);
+        let (release, blocker) = hold_only_projection_test_worker().await;
+        let mut projection = Box::pin(turn.to_turn_context_item_async());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut projection)
+                .await
+                .is_err(),
+            "context projection must wait for the filesystem worker without blocking the timer"
+        );
+        release.send(()).expect("release worker");
+        blocker.await.expect("worker released");
+        let item = tokio::time::timeout(std::time::Duration::from_secs(5), projection)
+            .await
+            .expect("context projection progresses with one worker");
+        assert_eq!(item.turn_id, Some(expected_turn_id.clone()));
+        assert_eq!(item.cwd, expected_cwd);
+        let policy = item
+            .permission_profile
+            .expect("canonical profile")
+            .file_system_sandbox_policy();
+        assert_eq!(
+            policy.resolve_access_with_cwd(gitdir.as_path(), root.as_path()),
+            FileSystemAccessMode::Read
+        );
+        assert_eq!(
+            policy.resolve_access_with_cwd(root.join(".git").as_path(), root.as_path()),
+            FileSystemAccessMode::Read
+        );
+        assert!(policy.can_write_path_with_cwd(root.join("work.txt").as_path(), root.as_path()));
+        assert_eq!(
+            std::fs::read(root.join(".git")).expect("unchanged pointer"),
+            b"gitdir: private-git\n"
+        );
+        let step = StepContext::for_test(Arc::clone(&turn));
+        assert!(session.reference_context_item().await.is_none());
+        session
+            .record_context_updates_and_set_reference_context_item(&step)
+            .await;
+        commit_test_context_baseline(&session, "worker-projection").await;
+        let recorded = session
+            .reference_context_item()
+            .await
+            .expect("normal context recording publishes the projected baseline");
+        assert_eq!(recorded.turn_id, Some(expected_turn_id));
+        assert_eq!(recorded.cwd, expected_cwd);
+        let recorded_policy = recorded
+            .permission_profile
+            .expect("recorded canonical permissions")
+            .file_system_sandbox_policy();
+        assert_eq!(
+            recorded_policy.resolve_access_with_cwd(gitdir.as_path(), root.as_path()),
+            FileSystemAccessMode::Read
+        );
+        assert!(
+            recorded_policy
+                .can_write_path_with_cwd(root.join("work.txt").as_path(), root.as_path())
+        );
+    });
+    runtime.shutdown_timeout(std::time::Duration::from_secs(2));
+}
+
+#[tokio::test]
+async fn steer_input_validation_wait_preserves_cancellation_and_task_identity() {
+    use crate::responses_metadata::CodexResponsesRequestKind;
+    use codex_protocol::protocol::AdditionalContextEntry;
+    use codex_protocol::protocol::AdditionalContextKind;
+    use indexmap::IndexMap;
+    use std::collections::HashMap;
+
+    for outcome in ["drop", "no_replacement", "new_context", "same_context"] {
+        let (sess, mut tc, rx) = make_session_and_context_with_rx().await;
+        Arc::get_mut(&mut tc)
+            .expect("unique context")
+            .multi_agent_version = codex_protocol::protocol::MultiAgentVersion::V2;
+        let task = NeverEndingTask {
+            kind: TaskKind::Regular,
+            listen_to_cancellation_token: true,
+        };
+        sess.spawn_task(Arc::clone(&tc), Vec::new(), task).await;
+        let baseline_context = IndexMap::from([(
+            "stable-source".to_string(),
+            AdditionalContextEntry {
+                value: "original-context".to_string(),
+                kind: AdditionalContextKind::Application,
+            },
+        )]);
+        let baseline_metadata = HashMap::from([(
+            "workspace_kind".to_string(),
+            "original-workspace".to_string(),
+        )]);
+        sess.steer_input(
+            vec![UserInput::Text {
+                text: "Use subagents to inspect the user's code.".to_string(),
+                text_elements: Vec::new(),
+            }],
+            baseline_context,
+            Some(&tc.sub_id),
+            Some("baseline-client".to_string()),
+            Some(baseline_metadata.clone()),
+        )
+        .await
+        .expect("normal baseline admission");
+        assert!(super::multi_agents::spawn_is_authorized(&tc));
+        assert_eq!(
+            sess.input_queue
+                .get_pending_input(&sess.active_turn)
+                .await
+                .len(),
+            2
+        );
+        let context_before = sess.state.lock().await.additional_context.clone();
+        let metadata = |context: &TurnContext| {
+            context
+                .turn_metadata_state
+                .to_responses_metadata(
+                    "test-installation".to_string(),
+                    "test-window".to_string(),
+                    CodexResponsesRequestKind::Turn,
+                )
+                .extra
+                .into_iter()
+                .collect::<HashMap<_, _>>()
+        };
+        assert_eq!(metadata(&tc), baseline_metadata);
+        let candidate_context = IndexMap::from([(
+            "candidate-source".to_string(),
+            AdditionalContextEntry {
+                value: "candidate-context".to_string(),
+                kind: AdditionalContextKind::Application,
+            },
+        )]);
+        let candidate_metadata = HashMap::from([(
+            "workspace_kind".to_string(),
+            "candidate-workspace".to_string(),
+        )]);
+        let candidate_input = vec![UserInput::Text {
+            text: "Don't use subagents.".to_string(),
+            text_elements: Vec::new(),
+        }];
+        // This is the actual owned lock type retained by validation spawn
+        // lifecycles. It controls scheduling here, without claiming that the
+        // production-disabled optional classifier launches an external process.
+        let held_reader = Arc::clone(&tc.validation_authorization).read_owned().await;
+        let mut steering = Box::pin(sess.steer_input(
+            candidate_input.clone(),
+            candidate_context.clone(),
+            Some(&tc.sub_id),
+            Some("stale-client".to_string()),
+            Some(candidate_metadata.clone()),
+        ));
+        assert!(futures::poll!(steering.as_mut()).is_pending());
+        let mut recipient = Arc::clone(&tc);
+        if outcome == "drop" {
+            drop(steering);
+            drop(held_reader);
+        } else {
+            timeout(Duration::from_secs(2), sess.interrupt_task())
+                .await
+                .expect("interrupt must finish while the validation reader remains held");
+            let event = recv_terminal_event(&rx, TerminalEventKind::TurnAborted).await;
+            assert!(matches!(
+                event.msg,
+                EventMsg::TurnAborted(TurnAbortedEvent {
+                    reason: TurnAbortReason::Interrupted,
+                    ..
+                })
+            ));
+            assert!(sess.active_turn.lock().await.is_none());
+            if outcome == "new_context" {
+                recipient = sess.new_default_turn_with_sub_id(tc.sub_id.clone()).await;
+                Arc::get_mut(&mut recipient)
+                    .expect("unique replacement")
+                    .multi_agent_version = codex_protocol::protocol::MultiAgentVersion::V2;
+                assert!(!Arc::ptr_eq(&tc, &recipient));
+                assert_eq!(recipient.sub_id, tc.sub_id);
+            }
+            if outcome != "no_replacement" {
+                // Same-context replacement exercises generation identity even
+                // when both the public ID and the context Arc are reused.
+                sess.spawn_task(Arc::clone(&recipient), Vec::new(), task)
+                    .await;
+            }
+            drop(held_reader);
+            assert_eq!(
+                steering.await,
+                Err(SteerInputError::NoActiveTurn(candidate_input.clone()))
+            );
+        }
+        assert_eq!(tc.validation_authorization.read().await.revision, 0);
+        assert!(super::multi_agents::spawn_is_authorized(&tc));
+        assert_eq!(metadata(&tc), baseline_metadata);
+        assert_eq!(sess.state.lock().await.additional_context, context_before);
+        assert!(
+            sess.input_queue
+                .get_pending_input(&sess.active_turn)
+                .await
+                .is_empty()
+        );
+        if outcome == "new_context" {
+            assert!(!super::multi_agents::spawn_is_authorized(&recipient));
+            assert!(metadata(&recipient).is_empty());
+        }
+        if outcome == "no_replacement" {
+            sess.spawn_task(Arc::clone(&recipient), Vec::new(), task)
+                .await;
+        }
+        // Fresh steering still commits normally after a dropped or stale waiter.
+        assert_eq!(
+            sess.steer_input(
+                candidate_input.clone(),
+                candidate_context,
+                Some(&recipient.sub_id),
+                Some("accepted-client".to_string()),
+                Some(candidate_metadata.clone()),
+            )
+            .await
+            .expect("fresh steering should be admitted"),
+            recipient.sub_id
+        );
+        assert!(!super::multi_agents::spawn_is_authorized(&recipient));
+        assert_eq!(metadata(&recipient), candidate_metadata);
+        let pending = sess.input_queue.get_pending_input(&sess.active_turn).await;
+        let [
+            TurnInput::ResponseItem(ResponseItem::Message { role, content, .. }),
+            TurnInput::UserInput {
+                content: actual_input,
+                client_id,
+            },
+        ] = pending.as_slice()
+        else {
+            panic!("accepted context and user input must be queued exactly once: {pending:?}")
+        };
+        assert_eq!(role, "developer");
+        assert_eq!(content, &vec![ContentItem::InputText {
+            text: "<application_context source=\"candidate-source\" kind=\"application\">\ncandidate-context\n</application_context>".to_string(),
+        }]);
+        assert_eq!(actual_input, &candidate_input);
+        assert_eq!(client_id.as_deref(), Some("accepted-client"));
+        sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
+    }
+}
+
+fn attach_session_trace_bundle(
+    session: &mut Session,
+    _turn_context: &TurnContext,
+    root: &std::path::Path,
+) -> anyhow::Result<std::path::PathBuf> {
+    session.services.rollout_thread_trace =
+        codex_rollout_trace::ThreadTraceContext::start_root_in_root_for_test(
+            root,
+            codex_rollout_trace::ThreadStartedTraceMetadata {
+                thread_id: session.thread_id.to_string(),
+                agent_path: "/root".to_string(),
+                task_name: None,
+                nickname: None,
+                agent_role: None,
+                session_source: SessionSource::Exec,
+                cwd: root.to_path_buf(),
+                rollout_path: None,
+                model: "trace-test-model".to_string(),
+                provider_name: "trace-test-provider".to_string(),
+                approval_policy: "never".to_string(),
+                sandbox_policy: "danger-full-access".to_string(),
+            },
+        )?;
+    let mut dirs = std::fs::read_dir(root)?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(dirs.len(), 1, "one session creates one actual trace bundle");
+    Ok(dirs.remove(0))
+}
+
+struct SessionTraceWriterGate {
+    release: Option<std::sync::mpsc::Sender<()>>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl SessionTraceWriterGate {
+    fn release(mut self) {
+        self.finish();
+    }
+
+    fn finish(&mut self) {
+        if let Some(release) = self.release.take() {
+            let _ = release.send(());
+        }
+        if let Some(worker) = self.worker.take() {
+            worker.join().expect("trace writer lock holder completes");
+        }
+    }
+}
+
+impl Drop for SessionTraceWriterGate {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
+async fn hold_session_trace_writer(
+    session: &Session,
+    turn_context: &TurnContext,
+) -> SessionTraceWriterGate {
+    struct GatePayload {
+        entered: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        release: std::sync::mpsc::Receiver<()>,
+    }
+    impl serde::Serialize for GatePayload {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            if let Some(entered) = self.entered.lock().expect("gate signal lock").take() {
+                let _ = entered.send(());
+            }
+            // Watchdog makes the old synchronous implementation fail without wedging teardown.
+            let _ = self.release.recv_timeout(std::time::Duration::from_secs(5));
+            serde::Serialize::serialize(&serde_json::json!({"held_real_writer": true}), serializer)
+        }
+    }
+    let context = session
+        .services
+        .rollout_thread_trace
+        .compaction_trace_context(
+            turn_context.sub_id.clone(),
+            "writer-gate",
+            "trace-test-model",
+            "trace-test-provider",
+        );
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        context
+            .start_attempt(&GatePayload {
+                entered: std::sync::Mutex::new(Some(entered_tx)),
+                release: release_rx,
+            })
+            .record_failed("test writer gate released");
+    });
+    let gate = SessionTraceWriterGate {
+        release: Some(release_tx),
+        worker: Some(worker),
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(2), entered_rx)
+        .await
+        .expect("real writer enters serialization with its mutex held")
+        .expect("writer gate signal");
+    gate
+}
+
+fn session_trace_events(bundle: &std::path::Path) -> Vec<codex_rollout_trace::RawTraceEvent> {
+    std::fs::read_to_string(bundle.join("trace.jsonl"))
+        .expect("read actual flushed trace log")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("actual raw trace event"))
+        .collect()
+}
+
+fn session_trace_turn_started(turn_context: &TurnContext) -> EventMsg {
+    EventMsg::TurnStarted(TurnStartedEvent {
+        turn_id: turn_context.sub_id.clone(),
+        trace_id: None,
+        started_at: None,
+        model_context_window: Some(128_000),
+        collaboration_mode_kind: ModeKind::Default,
+    })
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn session_trace_cancelled_send_keeps_accepted_write_owned_without_live_delivery()
+-> anyhow::Result<()> {
+    use codex_rollout_trace::RawTraceEventPayload;
+    let temp = tempfile::tempdir()?;
+    let (mut session, turn_context, rx) = make_session_and_context_with_rx().await;
+    let bundle = attach_session_trace_bundle(
+        Arc::get_mut(&mut session).expect("fixture session has a single owner"),
+        &turn_context,
+        temp.path(),
+    )?;
+    let gate = hold_session_trace_writer(&session, &turn_context).await;
+    let mut send =
+        Box::pin(session.send_event(&turn_context, session_trace_turn_started(&turn_context)));
+    assert!(
+        futures::poll!(send.as_mut()).is_pending(),
+        "real writer lock must not block the executor"
+    );
+    tokio::select! {
+        biased;
+        _ = &mut send => panic!("event cannot finish while the real writer remains locked"),
+        _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => {}
+    }
+    assert!(
+        rx.try_recv().is_err(),
+        "no event delivery before its trace write"
+    );
+    drop(send);
+    session.terminal_tasks.close();
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            session.terminal_tasks.wait()
+        )
+        .await
+        .is_err(),
+        "cancelled waiter must leave the accepted write owned by shutdown"
+    );
+    gate.release();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        session.terminal_tasks.wait(),
+    )
+    .await
+    .expect("accepted real writer operation drains after lock release");
+    let events = session_trace_events(&bundle);
+    assert_eq!(events.iter().filter(|event| matches!(&event.payload,
+        RawTraceEventPayload::CodexTurnStarted { codex_turn_id, thread_id }
+        if codex_turn_id == &turn_context.sub_id && thread_id == &session.thread_id.to_string()
+    )).count(), 1, "the accepted typed event survives caller cancellation exactly once");
+    assert!(
+        !events.iter().any(|event| matches!(
+            event.payload,
+            RawTraceEventPayload::ProtocolEventObserved { .. }
+        )),
+        "cancellation before raw dispatch must not advance to protocol delivery"
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "cancelled sender cannot deliver a late live event"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn session_trace_send_persists_exact_protocol_payload_before_live_delivery()
+-> anyhow::Result<()> {
+    use codex_rollout_trace::RawTraceEventPayload;
+    let temp = tempfile::tempdir()?;
+    let (mut session, turn_context, rx) = make_session_and_context_with_rx().await;
+    let bundle = attach_session_trace_bundle(
+        Arc::get_mut(&mut session).expect("fixture session has a single owner"),
+        &turn_context,
+        temp.path(),
+    )?;
+    let expected = session_trace_turn_started(&turn_context);
+    let expected_json = serde_json::to_value(&expected)?;
+    let sending = {
+        let session = Arc::clone(&session);
+        let turn_context = Arc::clone(&turn_context);
+        tokio::spawn(async move { session.send_event(&turn_context, expected).await })
+    };
+    let live = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+        .await
+        .expect("healthy send delivers event")
+        .expect("event channel remains open");
+    assert_eq!(live.id, turn_context.sub_id);
+    assert_eq!(serde_json::to_value(&live.msg)?, expected_json);
+    // Inspect at the delivery boundary, before joining or draining background work.
+    let events = session_trace_events(&bundle);
+    let typed = events.iter().find(|event| matches!(&event.payload,
+        RawTraceEventPayload::CodexTurnStarted { codex_turn_id, .. } if codex_turn_id == &turn_context.sub_id
+    )).expect("typed turn event precedes delivery");
+    let protocol = events
+        .iter()
+        .find_map(|event| match &event.payload {
+            RawTraceEventPayload::ProtocolEventObserved {
+                event_type,
+                event_payload,
+            } if event_type == "turn_started" => Some((event.seq, event_payload)),
+            _ => None,
+        })
+        .expect("raw turn protocol event persists before live delivery");
+    assert!(typed.seq < protocol.0);
+    let payload: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(bundle.join(&protocol.1.path))?)?;
+    assert_eq!(
+        payload, expected_json,
+        "consumer-visible event matches the real persisted payload"
+    );
+    sending.await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn session_trace_mcp_item_bridge_persists_actual_legacy_begin_and_end() -> anyhow::Result<()>
+{
+    use codex_protocol::items::McpToolCallItem;
+    use codex_protocol::items::McpToolCallStatus;
+    use codex_rollout_trace::RawTraceEventPayload;
+    let temp = tempfile::tempdir()?;
+    let (mut session, turn_context, rx) = make_session_and_context_with_rx().await;
+    let bundle = attach_session_trace_bundle(
+        Arc::get_mut(&mut session).expect("fixture session has a single owner"),
+        &turn_context,
+        temp.path(),
+    )?;
+    let mut item = McpToolCallItem {
+        id: "session-trace-mcp".to_string(),
+        server: "fixture-server".to_string(),
+        tool: "read_document".to_string(),
+        arguments: serde_json::json!({"document": "expected-document"}),
+        connector_id: None,
+        mcp_app_resource_uri: None,
+        link_id: None,
+        app_name: None,
+        template_id: None,
+        action_name: None,
+        plugin_id: None,
+        status: McpToolCallStatus::InProgress,
+        result: None,
+        error: None,
+        duration: None,
+    };
+    session
+        .emit_turn_item_started(&turn_context, &TurnItem::McpToolCall(item.clone()))
+        .await;
+    let started = rx.recv().await?;
+    assert!(matches!(started.msg, EventMsg::ItemStarted(_)));
+    let legacy_begin = rx.recv().await?;
+    let EventMsg::McpToolCallBegin(begin) = legacy_begin.msg else {
+        panic!("normal item bridge emits legacy begin")
+    };
+    assert_eq!(begin.call_id, item.id);
+    assert_eq!(begin.invocation.server, "fixture-server");
+    assert_eq!(begin.invocation.tool, "read_document");
+    assert_eq!(
+        begin.invocation.arguments,
+        Some(serde_json::json!({"document": "expected-document"}))
+    );
+    let begin_events = session_trace_events(&bundle);
+    let (begin_seq, begin_payload) = begin_events
+        .iter()
+        .find_map(|event| match &event.payload {
+            RawTraceEventPayload::ToolCallRuntimeStarted {
+                tool_call_id,
+                runtime_payload,
+            } if tool_call_id == &item.id => Some((event.seq, runtime_payload)),
+            _ => None,
+        })
+        .expect("legacy begin runtime trace is durable at delivery");
+    let persisted_begin: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(bundle.join(&begin_payload.path))?)?;
+    assert_eq!(persisted_begin, serde_json::to_value(&begin)?);
+    item.status = McpToolCallStatus::Completed;
+    item.duration = Some(std::time::Duration::from_millis(13));
+    item.result = Some(codex_protocol::mcp::CallToolResult {
+        content: vec![serde_json::json!({"type":"text", "text":"actual document contents"})],
+        structured_content: None,
+        is_error: Some(false),
+        meta: None,
+    });
+    session
+        .emit_turn_item_completed(&turn_context, TurnItem::McpToolCall(item.clone()))
+        .await;
+    let completed = rx.recv().await?;
+    assert!(matches!(completed.msg, EventMsg::ItemCompleted(_)));
+    let legacy_end = rx.recv().await?;
+    let EventMsg::McpToolCallEnd(end) = legacy_end.msg else {
+        panic!("normal item bridge emits legacy end")
+    };
+    assert_eq!(end.call_id, item.id);
+    assert_eq!(end.duration, std::time::Duration::from_millis(13));
+    assert_eq!(
+        end.result
+            .as_ref()
+            .expect("successful actual legacy result")
+            .content[0]["text"],
+        "actual document contents"
+    );
+    let end_events = session_trace_events(&bundle);
+    let (end_seq, end_payload) = end_events
+        .iter()
+        .find_map(|event| match &event.payload {
+            RawTraceEventPayload::ToolCallRuntimeEnded {
+                tool_call_id,
+                status,
+                runtime_payload,
+            } if tool_call_id == &item.id => {
+                assert_eq!(*status, codex_rollout_trace::ExecutionStatus::Completed);
+                Some((event.seq, runtime_payload))
+            }
+            _ => None,
+        })
+        .expect("legacy completion runtime trace is durable at delivery");
+    assert!(begin_seq < end_seq);
+    let persisted_end: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(bundle.join(&end_payload.path))?)?;
+    assert_eq!(persisted_end, serde_json::to_value(&end)?);
+    assert!(
+        rx.try_recv().is_err(),
+        "one begin/end item produces exactly one legacy begin/end"
+    );
+
+    // The direct protocol entry point also owns runtime trace writing; it must
+    // not rely on the ItemStarted/ItemCompleted compatibility branch above.
+    let mut direct_begin = begin.clone();
+    direct_begin.call_id = "session-trace-direct-mcp".to_string();
+    session
+        .send_event(
+            &turn_context,
+            EventMsg::McpToolCallBegin(direct_begin.clone()),
+        )
+        .await;
+    let delivered = rx.recv().await?;
+    assert_eq!(
+        serde_json::to_value(&delivered.msg)?,
+        serde_json::to_value(EventMsg::McpToolCallBegin(direct_begin.clone()))?
+    );
+    let direct_events = session_trace_events(&bundle);
+    let direct_payload = direct_events
+        .iter()
+        .find_map(|event| match &event.payload {
+            RawTraceEventPayload::ToolCallRuntimeStarted {
+                tool_call_id,
+                runtime_payload,
+            } if tool_call_id == &direct_begin.call_id => Some(runtime_payload),
+            _ => None,
+        })
+        .expect("direct Session event records its runtime payload before delivery");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&std::fs::read(
+            bundle.join(&direct_payload.path)
+        )?)?,
+        serde_json::to_value(&direct_begin)?
+    );
+    let mut direct_end = end.clone();
+    direct_end.call_id = direct_begin.call_id;
+    session
+        .send_event(&turn_context, EventMsg::McpToolCallEnd(direct_end.clone()))
+        .await;
+    let delivered_end = rx.recv().await?;
+    assert_eq!(
+        serde_json::to_value(&delivered_end.msg)?,
+        serde_json::to_value(EventMsg::McpToolCallEnd(direct_end.clone()))?
+    );
+    let terminal_events = session_trace_events(&bundle);
+    let terminal_payload = terminal_events
+        .iter()
+        .find_map(|event| match &event.payload {
+            RawTraceEventPayload::ToolCallRuntimeEnded {
+                tool_call_id,
+                status,
+                runtime_payload,
+            } if tool_call_id == &direct_end.call_id => {
+                assert_eq!(*status, codex_rollout_trace::ExecutionStatus::Completed);
+                Some(runtime_payload)
+            }
+            _ => None,
+        })
+        .expect("direct Session terminal event records the actual result before delivery");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&std::fs::read(
+            bundle.join(&terminal_payload.path)
+        )?)?,
+        serde_json::to_value(&direct_end)?
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "direct protocol entry emits no additional compatibility event"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn shutdown_waits_for_owned_trace_and_finishes_bundle_before_acknowledgment()
+-> anyhow::Result<()> {
+    use codex_rollout_trace::RawTraceEventPayload;
+    use codex_rollout_trace::RolloutStatus;
+
+    let root = tempfile::tempdir()?;
+    let (mut session, turn_context, rx_event) = make_session_and_context_with_rx().await;
+    let bundle = attach_session_trace_bundle(
+        Arc::get_mut(&mut session).expect("session has one owner before starting shutdown"),
+        &turn_context,
+        root.path(),
+    )?;
+    let writer_gate = hold_session_trace_writer(&session, &turn_context).await;
+    let shutdown = tokio::spawn({
+        let session = Arc::clone(&session);
+        async move { handlers::shutdown(&session, "trace-shutdown".to_string()).await }
+    });
+
+    // Normal shutdown first drains earlier terminal work, then owns the final
+    // trace transaction. Pausing the actual writer must keep that transaction
+    // tracked without blocking this current-thread runtime or acknowledging early.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while session.terminal_tasks.is_empty() && !shutdown.is_finished() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("normal shutdown reaches its trace transaction");
+    assert!(
+        !shutdown.is_finished() && !session.terminal_tasks.is_empty(),
+        "shutdown must retain its accepted write while the actual writer is blocked"
+    );
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert!(
+        rx_event.try_recv().is_err(),
+        "consumers must not receive shutdown acknowledgment before final trace writes"
+    );
+    writer_gate.release();
+
+    let event = tokio::time::timeout(Duration::from_secs(2), rx_event.recv())
+        .await
+        .expect("shutdown acknowledges after its writer finishes")?;
+    assert_eq!(event.id, "trace-shutdown");
+    assert!(matches!(event.msg, EventMsg::ShutdownComplete));
+    let events = session_trace_events(&bundle);
+    let terminal = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                &event.payload,
+                RawTraceEventPayload::ProtocolEventObserved { event_type, .. }
+                    if event_type == "shutdown_complete"
+            ) || matches!(
+                &event.payload,
+                RawTraceEventPayload::ThreadEnded { .. }
+                    | RawTraceEventPayload::RolloutEnded { .. }
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        terminal.len(),
+        3,
+        "one shutdown protocol event and both terminal records"
+    );
+    let RawTraceEventPayload::ProtocolEventObserved { event_payload, .. } = &terminal[0].payload
+    else {
+        panic!("the shutdown protocol payload precedes bundle terminal records");
+    };
+    let persisted: EventMsg =
+        serde_json::from_slice(&std::fs::read(bundle.join(&event_payload.path))?)?;
+    assert!(matches!(persisted, EventMsg::ShutdownComplete));
+    assert!(matches!(
+        &terminal[1].payload,
+        RawTraceEventPayload::ThreadEnded { thread_id, status: RolloutStatus::Completed }
+            if thread_id == &session.thread_id.to_string()
+    ));
+    assert!(matches!(
+        &terminal[2].payload,
+        RawTraceEventPayload::RolloutEnded {
+            status: RolloutStatus::Completed
+        }
+    ));
+    assert!(terminal.windows(2).all(|pair| pair[0].seq < pair[1].seq));
+    assert!(shutdown.await?);
+    assert!(session.terminal_tasks.is_empty());
+    Ok(())
+}
+
+
+#[cfg(test)]
+mod abandoned_interactive_registry_tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+
+    async fn request(session: &Session, turn: &TurnContext, kind: u8, expected_reply: bool) {
+        match kind {
+            0 => assert_eq!(
+                session
+                    .request_command_approval(
+                        turn,
+                        "drop-registry".into(),
+                        None,
+                        None,
+                        vec!["echo".into(), "approval".into()],
+                        turn.cwd().clone(),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await,
+                if expected_reply {
+                    ReviewDecision::Approved
+                } else {
+                    ReviewDecision::Abort
+                }
+            ),
+            1 => assert_eq!(
+                session
+                    .request_patch_approval(
+                        turn,
+                        "drop-registry".into(),
+                        HashMap::new(),
+                        None,
+                        None,
+                    )
+                    .await,
+                if expected_reply {
+                    ReviewDecision::Approved
+                } else {
+                    ReviewDecision::Abort
+                }
+            ),
+            2 => {
+                let result = session
+                    .request_mcp_server_elicitation(
+                        turn,
+                        "registry-server".into(),
+                        RequestId::String("drop-registry".into()),
+                        ElicitationRequest::Form {
+                            meta: None,
+                            message: "Approve exact request".into(),
+                            requested_schema: json!({"type":"object","properties":{}}),
+                        },
+                    )
+                    .await;
+                assert!(result.sent);
+                assert_eq!(
+                    result.response,
+                    expected_reply.then(|| ElicitationResponse {
+                        action: ElicitationAction::Accept,
+                        content: Some(json!({"approved":42})),
+                        meta: None,
+                    })
+                );
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    async fn pending(state: &Arc<Mutex<crate::state::TurnState>>, kind: u8) -> bool {
+        let state = state.lock().await;
+        if kind == 2 {
+            state.has_pending_elicitation(
+                "registry-server",
+                &RequestId::String("drop-registry".into()),
+            )
+        } else {
+            state.has_pending_approval("drop-registry")
+        }
+    }
+
+    fn assert_request(event: Event, kind: u8) {
+        match (kind, event.msg) {
+            (0, EventMsg::ExecApprovalRequest(request)) => {
+                assert_eq!(request.call_id, "drop-registry")
+            }
+            (1, EventMsg::ApplyPatchApprovalRequest(request)) => {
+                assert_eq!(request.call_id, "drop-registry")
+            }
+            (2, EventMsg::ElicitationRequest(request)) => {
+                assert_eq!(request.server_name, "registry-server")
+            }
+            (_, event) => panic!("unexpected registry event: {event:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dropped_approval_and_elicitation_requests_retire_before_or_after_delivery() {
+        for kind in 0..3 {
+            for blocked in [true, false] {
+                let (mut session, turn, _) = make_session_and_context_with_rx().await;
+                let (tx, events) = async_channel::bounded(1);
+                Arc::get_mut(&mut session)
+                    .expect("unique fixture session")
+                    .tx_event = tx;
+                let active = ActiveTurn::default();
+                let state = Arc::clone(&active.turn_state);
+                *session.active_turn.lock().await = Some(active);
+                if blocked {
+                    session
+                        .tx_event
+                        .send(Event {
+                            id: "sentinel".into(),
+                            msg: EventMsg::Warning(WarningEvent {
+                                message: "occupied".into(),
+                            }),
+                        })
+                        .await
+                        .unwrap();
+                }
+                let held = session.subscribe_elicitation_pause_state();
+                let mut pending_request = Box::pin(request(&session, &turn, kind, true));
+                assert!(futures::poll!(&mut pending_request).is_pending());
+                assert!(
+                    pending(&state, kind).await,
+                    "normal entry registered before delivery"
+                );
+                assert!(*held.borrow(), "request owns interactive pause");
+                if !blocked {
+                    assert_request(events.recv().await.unwrap(), kind);
+                }
+                drop(pending_request);
+                session.terminal_tasks.close();
+                tokio::time::timeout(Duration::from_secs(2), session.terminal_tasks.wait())
+                    .await
+                    .expect("abandoned request cleanup retires");
+                assert!(
+                    !pending(&state, kind).await,
+                    "closed sender must not remain registered"
+                );
+                assert!(
+                    !*held.borrow(),
+                    "abandoned request releases interactive pause"
+                );
+                if blocked {
+                    assert_eq!(events.recv().await.unwrap().id, "sentinel");
+                }
+                assert!(
+                    events.try_recv().is_err(),
+                    "dropping blocked delivery cannot emit a late request"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn abandoned_approval_and_elicitation_cleanup_preserves_live_replacements() {
+        for kind in 0..3 {
+            for (replace_turn, drop_first) in [(false, true), (false, false), (true, true)] {
+                let (session, turn, events) = make_session_and_context_with_rx().await;
+                let active = ActiveTurn::default();
+                let original_state = Arc::clone(&active.turn_state);
+                *session.active_turn.lock().await = Some(active);
+                let mut first = Box::pin(request(&session, &turn, kind, false));
+                assert!(futures::poll!(&mut first).is_pending());
+                assert_request(events.recv().await.unwrap(), kind);
+                if replace_turn {
+                    *session.active_turn.lock().await = Some(ActiveTurn::default());
+                }
+                let mut replacement = Box::pin(request(&session, &turn, kind, true));
+                assert!(futures::poll!(&mut replacement).is_pending());
+                assert_request(events.recv().await.unwrap(), kind);
+                if drop_first {
+                    drop(first);
+                } else {
+                    tokio::time::timeout(Duration::from_secs(2), first)
+                        .await
+                        .expect("superseded waiter closes before replacement is answered");
+                }
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while session.terminal_tasks.len() != 1 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("old cleanup completes while replacement remains live");
+                if replace_turn {
+                    assert!(!pending(&original_state, kind).await);
+                }
+                if kind == 2 {
+                    session
+                        .resolve_elicitation(
+                            "registry-server".into(),
+                            RequestId::String("drop-registry".into()),
+                            ElicitationResponse {
+                                action: ElicitationAction::Accept,
+                                content: Some(json!({"approved":42})),
+                                meta: None,
+                            },
+                        )
+                        .await
+                        .expect("replacement elicitation receiver remains connected");
+                } else {
+                    session
+                        .notify_approval("drop-registry", ReviewDecision::Approved)
+                        .await;
+                }
+                tokio::time::timeout(Duration::from_secs(2), replacement)
+                    .await
+                    .expect("replacement receives exact independently expected reply");
+                session.terminal_tasks.close();
+                tokio::time::timeout(Duration::from_secs(2), session.terminal_tasks.wait())
+                    .await
+                    .unwrap();
+                assert!(!pending(&original_state, kind).await);
+            }
+        }
+    }
 }

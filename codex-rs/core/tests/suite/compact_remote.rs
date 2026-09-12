@@ -34,6 +34,153 @@ async fn wait_for_turn_complete(codex: &codex_core::CodexThread) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn automatic_compaction_stops_when_replacement_still_exceeds_limit() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let harness = TestCodexHarness::with_builder(
+        test_codex()
+            .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+            .with_config(|config| {
+                config.model_auto_compact_token_limit = Some(200_000);
+                config.model_auto_compact_token_limit_scope =
+                    codex_protocol::config_types::AutoCompactTokenLimitScope::Total;
+            }),
+    )
+    .await?;
+    let codex = harness.test().codex.clone();
+    let requests = responses::mount_sse_sequence(
+        harness.server(),
+        vec![
+            responses::sse(vec![
+                responses::ev_function_call("before-compact", DUMMY_FUNCTION_NAME, "{}"),
+                responses::ev_completed_with_tokens("r1", 500_000),
+            ]),
+            responses::sse(vec![
+                json!({"type": "response.output_item.done", "item": {
+                    "type": "compaction", "encrypted_content": "A".repeat(2_000_000),
+                }}),
+                responses::ev_completed("compact"),
+            ]),
+        ],
+    )
+    .await;
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "continue after the tool".into(),
+                text_elements: vec![],
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await?;
+    let mut error = None;
+    loop {
+        match wait_for_event_with_timeout(&codex, |_| true, REMOTE_COMPACT_TURN_COMPLETE_TIMEOUT)
+            .await
+        {
+            EventMsg::Error(event) => error = Some(event.message),
+            EventMsg::TurnComplete(_) => break,
+            _ => {}
+        }
+    }
+    assert!(
+        requests.requests()[1]
+            .body_json()
+            .to_string()
+            .contains("compaction_trigger")
+    );
+    assert!(
+        error
+            .as_ref()
+            .is_some_and(|message| message.contains("Compaction did not bring")),
+        "ineffective compaction must produce an actionable error: {error:?}; requests={}",
+        requests.requests().len()
+    );
+    assert_eq!(
+        requests.requests().len(),
+        2,
+        "must not sample or compact again"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn oversized_pending_input_stops_after_one_compaction_without_sampling() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let harness = TestCodexHarness::with_builder(
+        test_codex()
+            .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+            .with_config(|config| {
+                config.model_auto_compact_token_limit = Some(50_000);
+                config.model_auto_compact_token_limit_scope =
+                    codex_protocol::config_types::AutoCompactTokenLimitScope::Total;
+                config.model_provider.request_max_retries = Some(0);
+                config.model_provider.stream_max_retries = Some(0);
+            }),
+    )
+    .await?;
+    let requests = responses::mount_sse_once(
+        harness.server(),
+        responses::sse(vec![
+            json!({"type": "response.output_item.done", "item": {
+                "type": "compaction", "encrypted_content": "small replacement",
+            }}),
+            responses::ev_completed("compact"),
+        ]),
+    )
+    .await;
+    let codex = &harness.test().codex;
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "oversized pending input ".repeat(20_000),
+                text_elements: vec![],
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await?;
+    let mut error = None;
+    loop {
+        match wait_for_event_with_timeout(codex, |_| true, REMOTE_COMPACT_TURN_COMPLETE_TIMEOUT)
+            .await
+        {
+            EventMsg::Error(event) => error = Some(event.message),
+            EventMsg::TurnComplete(turn) => {
+                assert!(turn.error.is_some());
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        error
+            .as_ref()
+            .is_some_and(|message| message.contains("prompt still exceeds")),
+        "{error:?}"
+    );
+    let request = requests.single_request();
+    assert!(
+        request
+            .body_json()
+            .to_string()
+            .contains("compaction_trigger")
+    );
+    assert!(
+        !request
+            .body_json()
+            .to_string()
+            .contains("oversized pending input"),
+        "rejected pending input must not be dispatched"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_compact_v2_reuses_compaction_trigger_for_followups() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -173,6 +320,159 @@ async fn remote_compact_v2_reuses_compaction_trigger_for_followups() -> Result<(
 async fn remote_compact_v2_retries_failures_with_stream_retry_budget() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
+    // The child uses the real session startup trace configuration without changing
+    // this test process's environment while other tests may be running.
+    const TRACE_CHILD: &str = "CODEX_COMPACTION_RETRY_TRACE_CHILD";
+    if std::env::var_os(TRACE_CHILD).is_none() {
+        use codex_rollout_trace::ExecutionStatus;
+        use codex_rollout_trace::RawTraceEvent;
+        use codex_rollout_trace::RawTraceEventPayload;
+
+        let trace_root = tempfile::tempdir()?;
+        let output = tokio::process::Command::new(std::env::current_exe()?)
+            .arg("--exact")
+            .arg("suite::compact_remote::remote_compact_v2_retries_failures_with_stream_retry_budget")
+            .arg("--nocapture")
+            .env(TRACE_CHILD, "1")
+            .env(codex_rollout_trace::CODEX_ROLLOUT_TRACE_ROOT_ENV, trace_root.path())
+            .kill_on_drop(true)
+            .output()
+            .await?;
+        assert!(
+            output.status.success(),
+            "trace child failed: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let bundles = std::fs::read_dir(trace_root.path())?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<std::io::Result<Vec<_>>>()?
+            .into_iter()
+            .filter(|path| path.join("trace.jsonl").is_file())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            bundles.len(),
+            1,
+            "the normal child session must produce its trace"
+        );
+        let bundle = &bundles[0];
+        let events = std::fs::read_to_string(bundle.join("trace.jsonl"))?
+            .lines()
+            .map(serde_json::from_str::<RawTraceEvent>)
+            .collect::<serde_json::Result<Vec<_>>>()?;
+        let mut observed = Vec::new();
+        let mut request_ids = Vec::new();
+        let mut compaction_ids = Vec::new();
+        let mut checkpoint_refs = Vec::new();
+        for event in &events {
+            match &event.payload {
+                RawTraceEventPayload::CompactionRequestStarted {
+                    compaction_id,
+                    compaction_request_id,
+                    ..
+                } => {
+                    observed.push("started");
+                    request_ids.push(compaction_request_id.clone());
+                    compaction_ids.push(compaction_id.clone());
+                }
+                RawTraceEventPayload::CompactionRequestFailed {
+                    compaction_id,
+                    compaction_request_id,
+                    ..
+                } => {
+                    observed.push("failed");
+                    assert_eq!(Some(compaction_request_id), request_ids.last());
+                    compaction_ids.push(compaction_id.clone());
+                }
+                RawTraceEventPayload::CompactionRequestCompleted {
+                    compaction_id,
+                    compaction_request_id,
+                    ..
+                } => {
+                    observed.push("completed");
+                    assert_eq!(Some(compaction_request_id), request_ids.last());
+                    compaction_ids.push(compaction_id.clone());
+                }
+                RawTraceEventPayload::CompactionInstalled {
+                    compaction_id,
+                    checkpoint_payload,
+                } => {
+                    observed.push("installed");
+                    compaction_ids.push(compaction_id.clone());
+                    checkpoint_refs.push(checkpoint_payload);
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(
+            observed,
+            [
+                "started",
+                "failed",
+                "started",
+                "failed",
+                "started",
+                "completed",
+                "installed"
+            ]
+        );
+        assert!(compaction_ids.iter().all(|id| id == &compaction_ids[0]));
+        assert_eq!(
+            request_ids
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            3
+        );
+        assert_eq!(checkpoint_refs.len(), 1);
+        let checkpoint: Value =
+            serde_json::from_slice(&std::fs::read(bundle.join(&checkpoint_refs[0].path))?)?;
+        let input = checkpoint["input_history"]
+            .as_array()
+            .expect("input history");
+        assert!(serde_json::to_string(input)?.contains("hello remote compact"));
+        assert!(serde_json::to_string(input)?.contains("FIRST_REMOTE_REPLY"));
+        let replacement = checkpoint["replacement_history"]
+            .as_array()
+            .expect("replacement history");
+        assert!(replacement.iter().any(|item| item["type"] == "compaction"
+            && item["encrypted_content"] == "RETRIED_COMPACT_SUMMARY"));
+        assert!(!serde_json::to_string(replacement)?.contains("FAILED_COMPACT_SUMMARY"));
+        assert!(!serde_json::to_string(replacement)?.contains("hello remote compact"));
+
+        let replay = codex_rollout_trace::replay_bundle(bundle)?;
+        assert_eq!(replay.compactions.len(), 1);
+        assert_eq!(replay.compaction_requests.len(), 3);
+        let installed = replay
+            .compactions
+            .values()
+            .next()
+            .expect("installed checkpoint");
+        assert_eq!(installed.compaction_id, compaction_ids[0]);
+        assert_eq!(
+            installed
+                .request_ids
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            request_ids
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+        );
+        assert_eq!(
+            request_ids
+                .iter()
+                .map(|id| replay.compaction_requests[id].execution.status.clone())
+                .collect::<Vec<_>>(),
+            [
+                ExecutionStatus::Failed,
+                ExecutionStatus::Failed,
+                ExecutionStatus::Completed
+            ]
+        );
+        return Ok(());
+    }
+
     let harness = TestCodexHarness::with_builder(
         test_codex()
             .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
@@ -276,6 +576,14 @@ async fn remote_compact_v2_retries_failures_with_stream_retry_budget() -> Result
         !follow_up_body.contains("FAILED_COMPACT_SUMMARY"),
         "expected failed compaction attempt output to be discarded"
     );
+
+    codex.submit(Op::Shutdown).await?;
+    wait_for_event_with_timeout(
+        &codex,
+        |event| matches!(event, EventMsg::ShutdownComplete),
+        REMOTE_COMPACT_TURN_COMPLETE_TIMEOUT,
+    )
+    .await;
 
     Ok(())
 }

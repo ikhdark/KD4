@@ -26,6 +26,9 @@ use codex_utils_pty::SpawnedProcess;
 use codex_utils_pty::TerminalSize;
 use codex_utils_pty::WindowsTtyInputNormalizer;
 use std::collections::HashMap;
+use std::os::windows::io::FromRawHandle;
+use std::os::windows::io::IntoRawHandle;
+use std::os::windows::io::OwnedHandle;
 use std::path::Path;
 use std::ptr;
 use std::sync::Arc;
@@ -233,6 +236,10 @@ fn terminate_job_or_process(
     Ok(())
 }
 
+fn native_write_request_len(remaining: usize) -> u32 {
+    u32::try_from(remaining).unwrap_or(u32::MAX)
+}
+
 fn write_all_handle(handle: HANDLE, mut bytes: &[u8]) -> Result<()> {
     while !bytes.is_empty() {
         let mut written = 0u32;
@@ -240,7 +247,7 @@ fn write_all_handle(handle: HANDLE, mut bytes: &[u8]) -> Result<()> {
             WriteFile(
                 handle,
                 bytes.as_ptr() as *const _,
-                bytes.len() as u32,
+                native_write_request_len(bytes.len()),
                 &mut written,
                 ptr::null_mut(),
             )
@@ -393,6 +400,59 @@ pub(crate) async fn spawn_windows_sandbox_session_legacy(
     codex_home: &Path,
     command: Vec<String>,
     cwd: &Path,
+    env_map: HashMap<String, String>,
+    timeout_ms: Option<u64>,
+    additional_deny_read_paths: &[AbsolutePathBuf],
+    additional_deny_write_paths: &[AbsolutePathBuf],
+    tty: bool,
+    stdin_open: bool,
+    use_private_desktop: bool,
+) -> Result<SpawnedProcess> {
+    let permission_profile = permission_profile.clone();
+    let workspace_roots = workspace_roots.to_vec();
+    let codex_home = codex_home.to_path_buf();
+    let cwd = cwd.to_path_buf();
+    let additional_deny_read_paths = additional_deny_read_paths.to_vec();
+    let additional_deny_write_paths = additional_deny_write_paths.to_vec();
+    let (spawned_tx, spawned_rx) = oneshot::channel();
+    tokio::task::spawn_blocking(move || {
+        if spawned_tx.is_closed() {
+            return;
+        }
+        // Keep SIDs, token, ACLs and native process admission on one worker;
+        // raw native ownership never crosses the async preparation boundary.
+        let spawned = spawn_windows_sandbox_session_legacy_blocking(
+            &permission_profile,
+            &workspace_roots,
+            &codex_home,
+            command,
+            &cwd,
+            env_map,
+            timeout_ms,
+            &additional_deny_read_paths,
+            &additional_deny_write_paths,
+            tty,
+            stdin_open,
+            use_private_desktop,
+            || spawned_tx.is_closed(),
+        );
+        // Rejected delivery drops SpawnedProcess on this worker, invoking its
+        // existing terminator. After accepted delivery its normal Drop contract
+        // still applies on the receiver's thread.
+        let _ = spawned_tx.send(spawned);
+    });
+    spawned_rx
+        .await
+        .map_err(|error| anyhow::anyhow!("Windows legacy spawn worker stopped: {error}"))?
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_windows_sandbox_session_legacy_blocking(
+    permission_profile: &PermissionProfile,
+    workspace_roots: &[AbsolutePathBuf],
+    codex_home: &Path,
+    command: Vec<String>,
+    cwd: &Path,
     mut env_map: HashMap<String, String>,
     timeout_ms: Option<u64>,
     additional_deny_read_paths: &[AbsolutePathBuf],
@@ -400,6 +460,7 @@ pub(crate) async fn spawn_windows_sandbox_session_legacy(
     tty: bool,
     stdin_open: bool,
     use_private_desktop: bool,
+    cancelled: impl Fn() -> bool,
 ) -> Result<SpawnedProcess> {
     crate::ensure_legacy_delete_child_safety(
         crate::legacy_restricted_token_enforces_delete_child(),
@@ -440,6 +501,9 @@ pub(crate) async fn spawn_windows_sandbox_session_legacy(
         cwd,
         capability_roots,
     )?;
+    // SAFETY: successful preparation transfers one valid owned token to this
+    // operation. Retain it through ACL errors/cancellation until the waiter owns it.
+    let token_owner = unsafe { OwnedHandle::from_raw_handle(security.h_token.cast()) };
     allow_null_device_for_workspace_write(common.uses_write_capabilities);
 
     apply_legacy_session_acl_rules(
@@ -455,6 +519,10 @@ pub(crate) async fn spawn_windows_sandbox_session_legacy(
             write_root_sids: &security.write_root_sids,
         },
     )?;
+
+    if cancelled() {
+        anyhow::bail!("Windows legacy spawn cancelled before process admission");
+    }
 
     let (writer_tx, writer_rx) = mpsc::channel::<Vec<u8>>(128);
     let (stdout_tx, stdout_rx) = mpsc::channel::<Vec<u8>>(256);
@@ -474,7 +542,7 @@ pub(crate) async fn spawn_windows_sandbox_session_legacy(
         mut conpty_owner,
         token_handle,
         desktop,
-    } = match spawn_legacy_process(
+    } = spawn_legacy_process(
         security.h_token,
         &command,
         cwd,
@@ -486,15 +554,9 @@ pub(crate) async fn spawn_windows_sandbox_session_legacy(
         stderr_rx.as_ref().map(|(tx, _rx)| tx.clone()),
         writer_rx,
         common.logs_base_dir.as_deref(),
-    ) {
-        Ok(handles) => handles,
-        Err(err) => {
-            unsafe {
-                CloseHandle(security.h_token);
-            }
-            return Err(err);
-        }
-    };
+    )?;
+    // Successful native spawn transfers this same handle to its waiter below.
+    let _ = token_owner.into_raw_handle();
     let hpc_handle = hpc.map(|hpc| Arc::new(StdMutex::new(Some(hpc))));
 
     let process_handle = Arc::new(StdMutex::new(Some(sendable_handle(pi.hProcess))));

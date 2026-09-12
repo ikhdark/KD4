@@ -10,6 +10,7 @@ use crate::shell_snapshot::ShellSnapshot;
 use crate::skills::SkillError;
 use crate::startup_timing::StartupTimingState;
 use crate::state::ActiveTurn;
+use anyhow::Context;
 use codex_extension_api::ExtensionDataInit;
 use codex_login::auth::AgentIdentityAuthPolicy;
 use codex_protocol::SessionId;
@@ -33,6 +34,10 @@ const TOOL_HISTORY_JOURNAL_COMPACTION_BYTES: u64 = 1024 * 1024;
 enum ToolHistoryPersistenceCommand {
     Mutation(Box<crate::tool_history::ToolHistoryMutation>),
     Checkpoint,
+    ReplaceSnapshot {
+        snapshot: Box<crate::tool_history::ToolHistoryState>,
+        rollout_barrier: Option<LiveThread>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -66,12 +71,62 @@ struct ToolHistoryPersistenceState {
     pending: Vec<PendingToolHistoryPersistence>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum ToolHistoryPersistenceError {
+    SequenceOverflow,
+    WorkerClosed,
+    Persistence(String),
+}
+
+impl std::fmt::Display for ToolHistoryPersistenceError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SequenceOverflow => {
+                formatter.write_str("tool-history persistence sequence overflowed")
+            }
+            Self::WorkerClosed => formatter.write_str("tool-history persistence worker is closed"),
+            Self::Persistence(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for ToolHistoryPersistenceError {}
+
+impl From<ToolHistoryPersistenceEnqueueError> for ToolHistoryPersistenceError {
+    fn from(error: ToolHistoryPersistenceEnqueueError) -> Self {
+        match error {
+            ToolHistoryPersistenceEnqueueError::SequenceOverflow => Self::SequenceOverflow,
+            ToolHistoryPersistenceEnqueueError::WorkerClosed => Self::WorkerClosed,
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct ToolHistoryPersistenceProgress {
+    completed_sequence: u64,
+    failure: Option<(u64, ToolHistoryPersistenceError)>,
+}
+
+struct ToolHistoryPersistenceWorker {
+    shutdown: tokio_util::sync::CancellationToken,
+    // Retain the worker with the queue. Shutdown interrupts idle/gate waits, but
+    // an active file write keeps its permit until the actual operation completes.
+    _task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for ToolHistoryPersistenceWorker {
+    fn drop(&mut self) {
+        self.shutdown.cancel();
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct ToolHistoryPersistenceQueue {
     state: Arc<tokio::sync::Mutex<ToolHistoryPersistenceState>>,
     wake_tx: mpsc::Sender<()>,
-    completed_sequence: watch::Receiver<u64>,
+    progress: watch::Receiver<ToolHistoryPersistenceProgress>,
     mirror: Arc<tokio::sync::Mutex<crate::tool_history::ToolHistoryState>>,
+    _worker: Arc<ToolHistoryPersistenceWorker>,
     #[cfg(test)]
     persisted_batch_count: Arc<std::sync::atomic::AtomicU64>,
 }
@@ -98,36 +153,53 @@ impl ToolHistoryPersistenceQueue {
                 .unwrap_or_default()
                 .as_nanos()
         );
-        // A single wake is enough because the worker drains every queued mutation
-        // in sequence whenever it wakes.
         let (wake_tx, mut wake_rx) = mpsc::channel(/*buffer*/ 1);
-        let (completed_sequence_tx, completed_sequence) = watch::channel(0_u64);
+        let (progress_tx, progress) = watch::channel(ToolHistoryPersistenceProgress::default());
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let worker_shutdown = shutdown.clone();
         #[cfg(test)]
         let persisted_batch_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
         #[cfg(test)]
         let worker_persisted_batch_count = Arc::clone(&persisted_batch_count);
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let mut journal_records = 0_u64;
             let mut journal_bytes = 0_u64;
             let mut journal_sequence = 0_u64;
-            while wake_rx.recv().await.is_some() {
+            let mut checkpoint_required = false;
+            let mut cleanup_required = false;
+            let mut rollout_barrier: Option<LiveThread> = None;
+            let mut progress = ToolHistoryPersistenceProgress::default();
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = worker_shutdown.cancelled() => return,
+                    wake = wake_rx.recv() => if wake.is_none() { return; },
+                }
                 loop {
                     let requests = {
                         let mut state = worker_state.lock().await;
                         std::mem::take(&mut state.pending)
                     };
-                    if requests.is_empty() {
+                    let Some(completed) = requests.last().map(|request| request.sequence) else {
                         break;
-                    }
-                    let completed = requests.last().map(|request| request.sequence).unwrap_or(0);
-                    let Ok(_permit) = Arc::clone(&io_gate).acquire_owned().await else {
-                        tracing::warn!(
-                            "completed-tool history I/O gate closed before queued persistence; queued writes will remain unacknowledged"
-                        );
-                        return;
+                    };
+                    let permit = tokio::select! {
+                        biased;
+                        _ = worker_shutdown.cancelled() => {
+                            progress.failure = Some((completed, ToolHistoryPersistenceError::WorkerClosed));
+                            progress_tx.send_replace(progress);
+                            return;
+                        }
+                        permit = Arc::clone(&io_gate).acquire_owned() => match permit {
+                            Ok(permit) => permit,
+                            Err(_) => {
+                                progress.failure = Some((completed, ToolHistoryPersistenceError::WorkerClosed));
+                                progress_tx.send_replace(progress);
+                                return;
+                            }
+                        },
                     };
                     let mut mutations = Vec::new();
-                    let mut checkpoint_requested = false;
                     let mut description = "completed-tool history metadata";
                     {
                         let mut mirror = worker_mirror.lock().await;
@@ -139,13 +211,39 @@ impl ToolHistoryPersistenceQueue {
                                     mutations.push(*mutation);
                                 }
                                 ToolHistoryPersistenceCommand::Checkpoint => {
-                                    checkpoint_requested = true;
+                                    checkpoint_required = true
+                                }
+                                ToolHistoryPersistenceCommand::ReplaceSnapshot {
+                                    snapshot,
+                                    rollout_barrier: replacement_barrier,
+                                } => {
+                                    *mirror = *snapshot;
+                                    // The latest live-thread barrier covers every accepted
+                                    // ordered prefix, including superseded replacements.
+                                    rollout_barrier = replacement_barrier;
+                                    checkpoint_required = true;
+                                    cleanup_required = true;
                                 }
                             }
                         }
                     }
-                    let mut journal_persist_failed = false;
-                    if !mutations.is_empty() {
+                    // A contracted ledger must not outlive its still-buffered rollout.
+                    // Keep the accepted replacement and barrier for explicit retry; the
+                    // old durable ledger/protections remain intact on flush failure.
+                    let mut failure = None;
+                    if let Some(barrier) = rollout_barrier.as_ref() {
+                        match barrier.flush().await {
+                            Ok(()) => rollout_barrier = None,
+                            Err(error) => {
+                                failure = Some(ToolHistoryPersistenceError::Persistence(format!(
+                                    "failed to flush compacted rollout before tool-history pruning: {error}",
+                                )))
+                            }
+                        }
+                    }
+                    // Once a full checkpoint has failed, the mirror owns the
+                    // unacknowledged mutations. Later deltas cannot bypass them.
+                    if failure.is_none() && !checkpoint_required && !mutations.is_empty() {
                         let sequenced_mutations = mutations
                             .into_iter()
                             .enumerate()
@@ -181,42 +279,14 @@ impl ToolHistoryPersistenceQueue {
                             }
                             Err(err) => {
                                 tracing::warn!("failed to persist {description}: {err}");
-                                journal_persist_failed = true;
+                                checkpoint_required = true;
                             }
                         }
                     }
-                    if journal_persist_failed || checkpoint_requested {
-                        let mirror = worker_mirror.lock().await.clone();
-                        let mut retry_delay = std::time::Duration::from_millis(25);
-                        loop {
-                            match crate::tool_history::persist_tool_history_state(
-                                &codex_home,
-                                &thread_id,
-                                &mirror,
-                            )
-                            .await
-                            {
-                                Ok(()) => {
-                                    journal_records = 0;
-                                    journal_bytes = 0;
-                                    #[cfg(test)]
-                                    worker_persisted_batch_count
-                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    break;
-                                }
-                                Err(err) => {
-                                    tracing::warn!(
-                                        "failed to checkpoint {description}; queued writes remain unacknowledged and will be retried: {err}"
-                                    );
-                                    tokio::time::sleep(retry_delay).await;
-                                    retry_delay = retry_delay
-                                        .saturating_mul(2)
-                                        .min(std::time::Duration::from_secs(1));
-                                }
-                            }
-                        }
-                    } else if journal_records >= TOOL_HISTORY_JOURNAL_COMPACTION_RECORDS
-                        || journal_bytes >= TOOL_HISTORY_JOURNAL_COMPACTION_BYTES
+                    if failure.is_none()
+                        && (checkpoint_required
+                            || journal_records >= TOOL_HISTORY_JOURNAL_COMPACTION_RECORDS
+                            || journal_bytes >= TOOL_HISTORY_JOURNAL_COMPACTION_BYTES)
                     {
                         let mirror = worker_mirror.lock().await.clone();
                         match crate::tool_history::persist_tool_history_state(
@@ -227,26 +297,66 @@ impl ToolHistoryPersistenceQueue {
                         .await
                         {
                             Ok(()) => {
+                                checkpoint_required = false;
+                                if cleanup_required {
+                                    let references = mirror.artifact_references();
+                                    match crate::tools::command_output_artifact::prune_active_tool_history_artifact_protection(
+                                        &codex_home, &thread_id, &references,
+                                    ).await {
+                                        Ok(()) => cleanup_required = false,
+                                        Err(error) => {
+                                            checkpoint_required = true;
+                                            failure = Some(ToolHistoryPersistenceError::Persistence(format!(
+                                                "failed to finish tool-history artifact cleanup: {error}",
+                                            )));
+                                        }
+                                    }
+                                }
                                 journal_records = 0;
                                 journal_bytes = 0;
                                 #[cfg(test)]
                                 worker_persisted_batch_count
                                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             }
+                            Err(err) if checkpoint_required => {
+                                failure = Some(ToolHistoryPersistenceError::Persistence(format!(
+                                    "failed to checkpoint {description}: {err}",
+                                )));
+                            }
                             Err(err) => {
-                                tracing::warn!("failed to checkpoint {description}: {err}");
+                                // The journal is already durable; failure of
+                                // optional compaction does not undo that commit.
+                                tracing::warn!(
+                                    "failed to compact completed-tool history journal: {err}"
+                                );
                             }
                         }
                     }
-                    completed_sequence_tx.send_replace(completed);
+                    // Never cancel an active persistence future: it may own a
+                    // blocking writer. Release serialization only after it ends.
+                    drop(permit);
+                    if let Some(error) = failure {
+                        progress.failure = Some((completed, error));
+                    } else {
+                        progress.completed_sequence = completed;
+                        progress.failure = None;
+                    }
+                    progress_tx.send_replace(progress.clone());
+                    if worker_shutdown.is_cancelled() {
+                        return;
+                    }
                 }
             }
         });
         Self {
             state,
             wake_tx,
-            completed_sequence,
+            progress,
             mirror,
+            _worker: Arc::new(ToolHistoryPersistenceWorker {
+                shutdown,
+                _task: task,
+            }),
             #[cfg(test)]
             persisted_batch_count,
         }
@@ -268,40 +378,51 @@ impl ToolHistoryPersistenceQueue {
         self.writer().await.enqueue_mutation(mutation, description)
     }
 
-    pub(super) async fn drain(&self) {
-        let target_sequence = self.state.lock().await.next_sequence;
-        self.wait_for_sequence(target_sequence).await;
+    pub(super) fn check_failure(&self) -> Result<(), ToolHistoryPersistenceError> {
+        match &self.progress.borrow().failure {
+            Some((_, error)) => Err(error.clone()),
+            None if self.wake_tx.is_closed() => Err(ToolHistoryPersistenceError::WorkerClosed),
+            None => Ok(()),
+        }
     }
 
-    pub(super) async fn checkpoint(&self) {
-        let result = self.writer().await.enqueue_command(
+    pub(super) async fn drain(&self) -> Result<(), ToolHistoryPersistenceError> {
+        if self.wake_tx.is_closed() {
+            return Err(ToolHistoryPersistenceError::WorkerClosed);
+        }
+        let target_sequence = self.state.lock().await.next_sequence;
+        self.wait_for_sequence(target_sequence).await
+    }
+
+    pub(super) async fn checkpoint(&self) -> Result<(), ToolHistoryPersistenceError> {
+        let target_sequence = self.writer().await.enqueue_command(
             ToolHistoryPersistenceCommand::Checkpoint,
             "completed-tool history checkpoint",
-        );
-        let target_sequence = match result {
-            Ok(target_sequence) => target_sequence,
-            Err(err) => {
-                tracing::warn!(
-                    "completed-tool history checkpoint could not be enqueued; durability cannot be acknowledged: {err}"
-                );
-                return std::future::pending().await;
-            }
-        };
-        self.wait_for_sequence(target_sequence).await;
+        )?;
+        self.wait_for_sequence(target_sequence).await
     }
 
-    async fn wait_for_sequence(&self, target_sequence: u64) {
-        let mut completed_sequence = self.completed_sequence.clone();
+    async fn wait_for_sequence(
+        &self,
+        target_sequence: u64,
+    ) -> Result<(), ToolHistoryPersistenceError> {
+        let mut progress = self.progress.clone();
         loop {
-            if *completed_sequence.borrow_and_update() >= target_sequence {
-                return;
+            {
+                let current = progress.borrow_and_update();
+                if current.completed_sequence >= target_sequence {
+                    return Ok(());
+                }
+                if let Some((failed_sequence, error)) = &current.failure
+                    && *failed_sequence >= target_sequence
+                {
+                    return Err(error.clone());
+                }
             }
-            if completed_sequence.changed().await.is_err() {
-                tracing::warn!(
-                    "completed-tool history persistence queue ended during flush; durability cannot be acknowledged"
-                );
-                std::future::pending::<()>().await;
-            }
+            progress
+                .changed()
+                .await
+                .map_err(|_| ToolHistoryPersistenceError::WorkerClosed)?;
         }
     }
 
@@ -313,6 +434,11 @@ impl ToolHistoryPersistenceQueue {
     pub(super) fn persisted_batch_count(&self) -> u64 {
         self.persisted_batch_count
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(super) fn worker_handle_for_test(&self) -> tokio::task::AbortHandle {
+        self._worker._task.abort_handle()
     }
 
     #[cfg(test)]
@@ -328,7 +454,7 @@ pub(super) struct ToolHistoryPersistenceWriter<'a> {
     wake_tx: &'a mpsc::Sender<()>,
 }
 
-impl ToolHistoryPersistenceWriter<'_> {
+impl<'queue> ToolHistoryPersistenceWriter<'queue> {
     pub(super) fn enqueue_mutation(
         &mut self,
         mutation: crate::tool_history::ToolHistoryMutation,
@@ -339,6 +465,36 @@ impl ToolHistoryPersistenceWriter<'_> {
             description,
         )
         .map(|_| ())
+    }
+
+    pub(super) fn reserve_snapshot<'writer>(
+        &'writer mut self,
+        snapshot: crate::tool_history::ToolHistoryState,
+        rollout_barrier: Option<LiveThread>,
+    ) -> Result<ToolHistorySnapshotReservation<'writer, 'queue>, ToolHistoryPersistenceEnqueueError>
+    {
+        let prior_sequence = self.state.next_sequence;
+        let prior_pending_len = self.state.pending.len();
+        let sequence = match self.enqueue_command(
+            ToolHistoryPersistenceCommand::ReplaceSnapshot {
+                snapshot: Box::new(snapshot),
+                rollout_barrier,
+            },
+            "compacted completed-tool history checkpoint",
+        ) {
+            Ok(sequence) => sequence,
+            Err(error) => {
+                self.state.pending.truncate(prior_pending_len);
+                self.state.next_sequence = prior_sequence;
+                return Err(error);
+            }
+        };
+        Ok(ToolHistorySnapshotReservation {
+            writer: self,
+            prior_sequence,
+            sequence,
+            committed: false,
+        })
     }
 
     fn enqueue_command(
@@ -364,6 +520,34 @@ impl ToolHistoryPersistenceWriter<'_> {
             }
         }
         Ok(sequence)
+    }
+}
+
+/// A queued snapshot stays behind the exclusively held writer until its
+/// matching rollout/live-history commit succeeds. Failed or canceled preparation
+/// rolls it back before the worker can observe it.
+pub(super) struct ToolHistorySnapshotReservation<'writer, 'queue> {
+    writer: &'writer mut ToolHistoryPersistenceWriter<'queue>,
+    prior_sequence: u64,
+    sequence: u64,
+    committed: bool,
+}
+
+impl ToolHistorySnapshotReservation<'_, '_> {
+    pub(super) fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for ToolHistorySnapshotReservation<'_, '_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.writer
+                .state
+                .pending
+                .retain(|request| request.sequence != self.sequence);
+            self.writer.state.next_sequence = self.prior_sequence;
+        }
     }
 }
 
@@ -396,6 +580,10 @@ pub(crate) struct Session {
     /// Serializes rebuild/apply cycles for the running proxy; each cycle
     /// rebuilds from the current SessionState while holding this lock.
     pub(super) managed_network_proxy_refresh_lock: Semaphore,
+    #[cfg(test)]
+    pub(super) managed_network_proxy_start_gate: Semaphore,
+    #[cfg(test)]
+    pub(super) managed_network_proxy_start_entered: tokio::sync::Notify,
     /// The set of enabled features should be invariant for the lifetime of the
     /// session.
     pub(super) features: ManagedFeatures,
@@ -599,6 +787,17 @@ impl SessionConfiguration {
         }
     }
 
+    pub(crate) async fn apply_async(
+        &self,
+        updates: &SessionSettingsUpdate,
+    ) -> ConstraintResult<Self> {
+        let configuration = self.clone();
+        let updates = updates.clone();
+        tokio::task::spawn_blocking(move || configuration.apply(&updates))
+            .await
+            .expect("session settings projection worker panicked")
+    }
+
     pub(crate) fn apply(&self, updates: &SessionSettingsUpdate) -> ConstraintResult<Self> {
         let mut next_configuration = self.clone();
         let current_sandbox_policy = self.sandbox_policy();
@@ -689,10 +888,20 @@ impl SessionConfiguration {
                         None
                     }
                 });
+            let profile_workspace_roots =
+                updates.profile_workspace_roots.clone().unwrap_or_else(|| {
+                    if permission_profile == self.permission_profile()
+                        && active_permission_profile == self.active_permission_profile()
+                    {
+                        self.profile_workspace_roots().to_vec()
+                    } else {
+                        Vec::new()
+                    }
+                });
             next_configuration.set_permission_profile_projection(
                 permission_profile,
                 active_permission_profile,
-                updates.profile_workspace_roots.clone().unwrap_or_default(),
+                profile_workspace_roots,
                 Some(&current_file_system_sandbox_policy),
             )?;
             if let Some(active_permission_profile) = next_configuration.active_permission_profile()
@@ -1313,7 +1522,9 @@ impl Session {
             {
                 user_shell_override
             } else {
-                shell::default_user_shell()
+                tokio::task::spawn_blocking(shell::default_user_shell)
+                    .await
+                    .context("default shell discovery task failed")?
             };
             let shell_snapshot = if config.features.enabled(Feature::ShellSnapshot) {
                 ShellSnapshot::new(
@@ -1551,6 +1762,7 @@ impl Session {
                 // changing this to use Option or OnceCell, though the current
                 // setup is straightforward enough and performs well.
                 mcp_runtime,
+                mcp_shutdown_managers: std::sync::Mutex::new(Vec::new()),
                 planning_generation: std::sync::atomic::AtomicU64::new(0),
                 mcp_projection_lock: Semaphore::new(1),
                 mcp_startup_cancellation_token: Mutex::new(CancellationToken::new()),
@@ -1650,6 +1862,10 @@ impl Session {
                 tool_history_reconciliation_gate: Semaphore::new(/*permits*/ 1),
                 tool_history_persistence,
                 managed_network_proxy_refresh_lock: Semaphore::new(/*permits*/ 1),
+                #[cfg(test)]
+                managed_network_proxy_start_gate: Semaphore::new(/*permits*/ 1),
+                #[cfg(test)]
+                managed_network_proxy_start_entered: tokio::sync::Notify::new(),
                 features: config.features.clone(),
                 multi_agent_version,
                 pending_mcp_server_refresh_config: Mutex::new(None),
@@ -1799,7 +2015,7 @@ impl Session {
                     config.codex_home.as_path(),
                     tool_history_fork_source,
                 )
-                .await;
+                .await?;
             }
             {
                 let mut state = sess.state.lock().await;

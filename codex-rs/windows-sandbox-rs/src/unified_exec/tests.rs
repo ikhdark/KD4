@@ -42,7 +42,6 @@ use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
 static TEST_HOME_COUNTER: AtomicU64 = AtomicU64::new(0);
 static LEGACY_PROCESS_TEST_LOCK: Mutex<()> = Mutex::new(());
-const REQUIRE_PROCESS_TESTS_ENV: &str = "CODEX_REQUIRE_WINDOWS_SANDBOX_PROCESS_TESTS";
 
 fn legacy_process_test_guard() -> MutexGuard<'static, ()> {
     LEGACY_PROCESS_TEST_LOCK
@@ -50,22 +49,14 @@ fn legacy_process_test_guard() -> MutexGuard<'static, ()> {
         .expect("legacy Windows sandbox process test lock poisoned")
 }
 
-fn legacy_process_sandbox_available_or_asserts_fail_closed() -> bool {
-    let available = crate::legacy_restricted_token_enforces_delete_child();
-    if !available {
-        let err = crate::ensure_legacy_delete_child_safety(false)
-            .expect_err("unsupported kernels must fail closed");
-        assert_eq!(
-            err.to_string(),
-            crate::LEGACY_RESTRICTED_TOKEN_UNSAFE_DELETE_ERROR
-        );
-        assert!(
-            std::env::var_os(REQUIRE_PROCESS_TESTS_ENV).is_none(),
-            "Windows process verification was not run: required legacy sandbox prerequisite is \
-             unavailable because this kernel cannot enforce delete-child process containment"
-        );
-    }
-    available
+fn require_legacy_process_sandbox() {
+    crate::ensure_legacy_delete_child_safety(
+        crate::legacy_restricted_token_enforces_delete_child(),
+    )
+    .expect(
+        "Windows sandbox process test prerequisite unavailable: this kernel cannot enforce \
+         FILE_DELETE_CHILD containment; the requested native process behavior was not exercised",
+    );
 }
 
 fn current_thread_runtime() -> tokio::runtime::Runtime {
@@ -251,9 +242,7 @@ async fn collect_stdout_and_exit(
 
 #[test]
 fn legacy_non_tty_cmd_emits_output() {
-    if !legacy_process_sandbox_available_or_asserts_fail_closed() {
-        return;
-    }
+    require_legacy_process_sandbox();
     let _guard = legacy_process_test_guard();
     let runtime = current_thread_runtime();
     runtime.block_on(async move {
@@ -294,9 +283,7 @@ fn legacy_non_tty_cmd_emits_output() {
 
 #[test]
 fn legacy_non_tty_cmd_rejects_deny_read_overrides() {
-    if !legacy_process_sandbox_available_or_asserts_fail_closed() {
-        return;
-    }
+    require_legacy_process_sandbox();
     let _guard = legacy_process_test_guard();
     let runtime = current_thread_runtime();
     runtime.block_on(async move {
@@ -339,9 +326,7 @@ fn legacy_non_tty_cmd_rejects_deny_read_overrides() {
 #[test]
 fn legacy_non_tty_powershell_emits_output() {
     let pwsh = powershell_path();
-    if !legacy_process_sandbox_available_or_asserts_fail_closed() {
-        return;
-    }
+    require_legacy_process_sandbox();
     let _guard = legacy_process_test_guard();
     let runtime = current_thread_runtime();
     runtime.block_on(async move {
@@ -530,9 +515,7 @@ fn runner_resizer_sends_resize_frame() {
 #[test]
 fn legacy_capture_emits_output_and_preserves_descendant_after_normal_exit() {
     let pwsh = powershell_path();
-    if !legacy_process_sandbox_available_or_asserts_fail_closed() {
-        return;
-    }
+    require_legacy_process_sandbox();
     let _guard = legacy_process_test_guard();
     let test_root = TempDir::new_in(sandbox_cwd()).expect("create capture workspace");
     let cwd = test_root.path();
@@ -747,9 +730,7 @@ fn legacy_workspace_write_delete_is_limited_to_writable_roots() {
 #[test]
 fn legacy_capture_cancellation_terminates_descendants_without_timeout() {
     let pwsh = powershell_path();
-    if !legacy_process_sandbox_available_or_asserts_fail_closed() {
-        return;
-    }
+    require_legacy_process_sandbox();
     let _guard = legacy_process_test_guard();
     let test_root = TempDir::new_in(sandbox_cwd()).expect("create cancellation workspace");
     let cwd = test_root.path();
@@ -930,9 +911,7 @@ async fn assert_legacy_tty_descendant_lifecycle(
 #[test]
 fn legacy_tty_job_terminates_and_preserves_descendants() {
     let pwsh = powershell_path();
-    if !legacy_process_sandbox_available_or_asserts_fail_closed() {
-        return;
-    }
+    require_legacy_process_sandbox();
     let _guard = legacy_process_test_guard();
     current_thread_runtime().block_on(async move {
         assert_legacy_tty_descendant_lifecycle(&pwsh, LegacyTtyDescendantLifecycle::Terminate)
@@ -944,9 +923,7 @@ fn legacy_tty_job_terminates_and_preserves_descendants() {
 #[test]
 fn legacy_tty_powershell_emits_output_and_accepts_input() {
     let pwsh = powershell_path();
-    if !legacy_process_sandbox_available_or_asserts_fail_closed() {
-        return;
-    }
+    require_legacy_process_sandbox();
     let _guard = legacy_process_test_guard();
     let runtime = current_thread_runtime();
     runtime.block_on(async move {
@@ -1003,9 +980,7 @@ fn legacy_tty_powershell_emits_output_and_accepts_input() {
 #[test]
 #[ignore = "TODO: legacy ConPTY cmd.exe exits with STATUS_DLL_INIT_FAILED in CI"]
 fn legacy_tty_cmd_emits_output_and_accepts_input() {
-    if !legacy_process_sandbox_available_or_asserts_fail_closed() {
-        return;
-    }
+    require_legacy_process_sandbox();
     let _guard = legacy_process_test_guard();
     let runtime = current_thread_runtime();
     runtime.block_on(async move {
@@ -1059,9 +1034,7 @@ fn legacy_tty_cmd_emits_output_and_accepts_input() {
 #[test]
 #[ignore = "TODO: legacy ConPTY cmd.exe exits with STATUS_DLL_INIT_FAILED in CI"]
 fn legacy_tty_cmd_default_desktop_emits_output_and_accepts_input() {
-    if !legacy_process_sandbox_available_or_asserts_fail_closed() {
-        return;
-    }
+    require_legacy_process_sandbox();
     let _guard = legacy_process_test_guard();
     let runtime = current_thread_runtime();
     runtime.block_on(async move {
@@ -1114,4 +1087,111 @@ fn legacy_tty_cmd_default_desktop_emits_output_and_accepts_input() {
         assert!(stdout.contains("ready"), "stdout={stdout:?}");
         assert!(stdout.contains("second"), "stdout={stdout:?}");
     });
+}
+
+#[test]
+fn public_windows_backends_defer_native_preparation_without_launching_on_error()
+-> anyhow::Result<()> {
+    use codex_protocol::config_types::WindowsSandboxLevel;
+    use std::future::Future;
+    use std::task::Poll;
+    // Occupy the sole worker so the normal public launch must yield before any
+    // filesystem or native security preparation can execute.
+    for level in [
+        WindowsSandboxLevel::RestrictedToken,
+        WindowsSandboxLevel::Elevated,
+    ] {
+        let home = tempfile::tempdir()?;
+        let cwd = tempfile::tempdir()?;
+        let sandbox_path = home.path().join(".sandbox");
+        fs::write(&sandbox_path, b"existing file must survive")?;
+        let marker = cwd.path().join("must-not-launch");
+        let profile = PermissionProfile::read_only();
+        let roots = workspace_roots_for(cwd.path());
+        let command = vec![
+            "cmd.exe".to_string(),
+            "/c".to_string(),
+            "echo unexpected>must-not-launch".to_string(),
+        ];
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()?;
+        runtime.block_on(async {
+            let (release, occupied) = std::sync::mpsc::channel::<()>();
+            let (started_tx, started_rx) = oneshot::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                let _ = started_tx.send(());
+                let _ = occupied.recv();
+            });
+            started_rx.await?;
+            let mut spawn = Box::pin(super::spawn_windows_sandbox_session_for_level(
+                super::WindowsSandboxSessionRequest {
+                    permission_profile: &profile,
+                    workspace_roots: &roots,
+                    codex_home: home.path(),
+                    command,
+                    cwd: cwd.path(),
+                    env_map: HashMap::new(),
+                    windows_sandbox_level: level,
+                    proxy_enforced: false,
+                    proxy_settings_mode: crate::WindowsSandboxProxySettingsMode::Preserve,
+                    timeout_ms: None,
+                    read_roots_override: None,
+                    read_roots_include_platform_defaults: true,
+                    write_roots_override: None,
+                    deny_read_paths_override: &[],
+                    deny_write_paths_override: &[],
+                    tty: false,
+                    stdin_open: false,
+                    use_private_desktop: false,
+                },
+            ));
+            let first_poll = std::future::poll_fn(|cx| Poll::Ready(spawn.as_mut().poll(cx))).await;
+            assert!(
+                first_poll.is_pending(),
+                "{level:?} preparation ran on the executor"
+            );
+            tokio::task::yield_now().await;
+            assert_eq!(fs::read(&sandbox_path)?, b"existing file must survive");
+            assert!(!marker.exists());
+            // Drop also releases the worker during assertion unwinding.
+            drop(release);
+            blocker.await?;
+            let result = timeout(Duration::from_secs(15), spawn).await?;
+            let error = result
+                .err()
+                .expect("native preflight must reject the file used as sandbox directory");
+            if matches!(level, WindowsSandboxLevel::RestrictedToken)
+                && !crate::legacy_restricted_token_enforces_delete_child()
+            {
+                assert_eq!(
+                    error.to_string(),
+                    crate::LEGACY_RESTRICTED_TOKEN_UNSAFE_DELETE_ERROR
+                );
+            } else {
+                assert!(
+                    error
+                        .chain()
+                        .any(|cause| cause.downcast_ref::<std::io::Error>().is_some_and(
+                            |io| matches!(
+                                io.kind(),
+                                std::io::ErrorKind::AlreadyExists
+                                    | std::io::ErrorKind::NotADirectory
+                            )
+                        )),
+                    "{error:#}"
+                );
+            }
+            assert_eq!(fs::read(&sandbox_path)?, b"existing file must survive");
+            assert!(!marker.exists(), "failed setup must never admit a command");
+            assert_eq!(
+                fs::read_dir(home.path())?.count(),
+                1,
+                "no capability/log/setup files on failed preflight"
+            );
+            anyhow::Ok(())
+        })?;
+    }
+    Ok(())
 }

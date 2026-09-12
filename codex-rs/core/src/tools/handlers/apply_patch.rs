@@ -461,6 +461,7 @@ impl ApplyPatchHandler {
             call_id,
             tool_name,
             payload,
+            cancellation_token,
             ..
         } = invocation;
         let turn = Arc::clone(&step_context.turn);
@@ -548,15 +549,8 @@ impl ApplyPatchHandler {
                             apply.auto_approved,
                             turn_environment.environment_id.clone(),
                         );
-                        let event_ctx = ToolEventCtx::new(
-                            session.as_ref(),
-                            turn.as_ref(),
-                            &call_id,
-                            Some(&tracker),
-                        );
-                        emitter.begin(event_ctx).await;
-
                         let req = ApplyPatchRequest {
+                            cancellation_token,
                             turn_environment: turn_environment.clone(),
                             action: apply.action,
                             file_paths,
@@ -568,35 +562,14 @@ impl ApplyPatchHandler {
                                 .permissions_preapproved,
                         };
 
-                        let mut orchestrator = ToolOrchestrator::new();
-                        let mut runtime = ApplyPatchRuntime::new();
                         let tool_ctx = ToolCtx {
                             session: session.clone(),
                             turn: turn.clone(),
                             call_id: call_id.clone(),
                             tool_name: tool_name.clone(),
                         };
-                        let out = orchestrator
-                            .run(
-                                &mut runtime,
-                                &req,
-                                &tool_ctx,
-                                turn.as_ref(),
-                                turn.approval_policy.value(),
-                            )
-                            .await
-                            .map(|result| result.output);
-                        let (out, delta) = match out {
-                            Ok(output) => (Ok(output.exec_output), Some(output.delta)),
-                            Err(error) => (Err(error), Some(runtime.committed_delta().clone())),
-                        };
-                        let event_ctx = ToolEventCtx::new(
-                            session.as_ref(),
-                            turn.as_ref(),
-                            &call_id,
-                            Some(&tracker),
-                        );
-                        let content = emitter.finish(event_ctx, out, delta.as_ref()).await?;
+                        let content =
+                            run_owned_patch(req, tool_ctx, Some(tracker), emitter).await?;
                         Ok(boxed_tool_output(ApplyPatchToolOutput::from_text(content)))
                     }
                 }
@@ -622,6 +595,14 @@ impl ApplyPatchHandler {
 }
 
 impl CoreToolRuntime for ApplyPatchHandler {
+    fn waits_for_runtime_cancellation(&self) -> bool {
+        true
+    }
+
+    fn cancellation_requires_commit_barrier(&self) -> bool {
+        true
+    }
+
     fn tool_execution_timing(&self) -> ToolExecutionTiming {
         ToolExecutionTiming::NestedRuntime
     }
@@ -678,6 +659,127 @@ impl CoreToolRuntime for ApplyPatchHandler {
     }
 }
 
+// An admitted patch owns its filesystem operations, mutation evidence and diff
+// publication until they settle, even if the dispatch waiter is force-aborted.
+async fn run_owned_patch(
+    req: ApplyPatchRequest,
+    tool_ctx: ToolCtx,
+    tracker: Option<SharedTurnDiffTracker>,
+    emitter: ToolEmitter,
+) -> Result<String, FunctionCallError> {
+    let terminal_tasks = tool_ctx.session.terminal_tasks.clone();
+    let timing = crate::tools::tool_dispatch_trace::active_tool_dispatch_timing();
+    let operation = async move {
+        let started = std::time::Instant::now();
+        let event_ctx = ToolEventCtx::new(
+            tool_ctx.session.as_ref(),
+            tool_ctx.turn.as_ref(),
+            &tool_ctx.call_id,
+            tracker.as_ref(),
+        );
+        emitter.begin(event_ctx).await;
+        let mut orchestrator = ToolOrchestrator::new();
+        let mut runtime = ApplyPatchRuntime::new();
+        let mutation_in_progress = runtime.mutation_in_progress();
+        let out = {
+            let execution = orchestrator.run(
+                &mut runtime,
+                &req,
+                &tool_ctx,
+                tool_ctx.turn.as_ref(),
+                tool_ctx.turn.approval_policy.value(),
+            );
+            tokio::pin!(execution);
+            let cancelled = req.cancellation_token.cancelled();
+            tokio::pin!(cancelled);
+            // Approval/hooks/guardian waits remain cancellable. Once run() enters
+            // mutation evidence or filesystem work, drive it through finalization.
+            // Check again after polling: an attempt can finish and enter a retry
+            // approval in the same poll, which must not strand a cancelled task.
+            let mut cancellation_seen = false;
+            std::future::poll_fn(|cx| {
+                cancellation_seen = cancellation_seen
+                    || std::future::Future::poll(cancelled.as_mut(), cx).is_ready();
+                let cancelled = cancellation_seen;
+                if cancelled && !mutation_in_progress.load(std::sync::atomic::Ordering::Acquire) {
+                    return std::task::Poll::Ready(Err(
+                        crate::tools::sandboxing::ToolError::Denied(
+                            "apply_patch cancelled before mutation".to_string(),
+                        ),
+                    ));
+                }
+                let result = std::future::Future::poll(execution.as_mut(), cx);
+                if result.is_pending()
+                    && cancelled
+                    && !mutation_in_progress.load(std::sync::atomic::Ordering::Acquire)
+                {
+                    std::task::Poll::Ready(Err(crate::tools::sandboxing::ToolError::Denied(
+                        "apply_patch cancelled before mutation".to_string(),
+                    )))
+                } else {
+                    result
+                }
+            })
+            .await
+            .map(|result| result.output)
+        };
+        if req.cancellation_token.is_cancelled() {
+            runtime.finish_cancelled_mutation_evidence(&tool_ctx).await;
+        }
+        let (out, delta) = match out {
+            Ok(output) => (Ok(output.exec_output), Some(output.delta)),
+            Err(error)
+                if req.cancellation_token.is_cancelled()
+                    && (!runtime.committed_delta().is_empty()
+                        || !runtime.committed_delta().is_exact()) =>
+            {
+                // Declined means no mutation to the event consumer. A cancelled
+                // retry can follow real writes, so publish a failed output and
+                // retain the delta for invalidation and the visible turn diff.
+                let message = match error {
+                    crate::tools::sandboxing::ToolError::Denied(message)
+                    | crate::tools::sandboxing::ToolError::Rejected(message) => message,
+                    error => format!("apply_patch cancelled after mutation: {error:?}"),
+                };
+                let output = codex_protocol::exec_output::ExecToolCallOutput {
+                    exit_code: 1,
+                    stdout: codex_protocol::exec_output::StreamOutput::new(String::new()),
+                    stderr: codex_protocol::exec_output::StreamOutput::new(message.clone()),
+                    aggregated_output: codex_protocol::exec_output::StreamOutput::new(message),
+                    duration: started.elapsed(),
+                    timed_out: false,
+                };
+                (Ok(output), Some(runtime.committed_delta().clone()))
+            }
+            Err(error) => (Err(error), Some(runtime.committed_delta().clone())),
+        };
+        let event_ctx = ToolEventCtx::new(
+            tool_ctx.session.as_ref(),
+            tool_ctx.turn.as_ref(),
+            &tool_ctx.call_id,
+            tracker.as_ref(),
+        );
+        let result = emitter.finish(event_ctx, out, delta.as_ref()).await;
+        // Release the workspace gate after the committed delta reaches consumers.
+        drop(runtime);
+        result
+    };
+    terminal_tasks
+        .spawn(async move {
+            match timing {
+                Some(timing) => {
+                    crate::tools::tool_dispatch_trace::scope_tool_dispatch_timing(timing, operation)
+                        .await
+                }
+                None => operation.await,
+            }
+        })
+        .await
+        .map_err(|error| {
+            FunctionCallError::Fatal(format!("apply_patch completion task failed: {error}"))
+        })?
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn intercept_apply_patch(
     is_validation: bool,
@@ -690,6 +792,7 @@ pub(crate) async fn intercept_apply_patch(
     tracker: Option<&SharedTurnDiffTracker>,
     call_id: &str,
     tool_name: &str,
+    cancellation_token: tokio_util::sync::CancellationToken,
 ) -> Result<Option<FunctionToolOutput>, ApplyPatchInterceptionError> {
     if is_validation {
         return Ok(None);
@@ -744,15 +847,8 @@ pub(crate) async fn intercept_apply_patch(
                         apply.auto_approved,
                         turn_environment.environment_id.clone(),
                     );
-                    let event_ctx = ToolEventCtx::new(
-                        session.as_ref(),
-                        turn.as_ref(),
-                        call_id,
-                        tracker.as_ref().copied(),
-                    );
-                    emitter.begin(event_ctx).await;
-
                     let req = ApplyPatchRequest {
+                        cancellation_token,
                         turn_environment,
                         action: apply.action,
                         file_paths: approval_keys,
@@ -764,35 +860,13 @@ pub(crate) async fn intercept_apply_patch(
                             .permissions_preapproved,
                     };
 
-                    let mut orchestrator = ToolOrchestrator::new();
-                    let mut runtime = ApplyPatchRuntime::new();
                     let tool_ctx = ToolCtx {
                         session: session.clone(),
                         turn: turn.clone(),
                         call_id: call_id.to_string(),
                         tool_name: ToolName::plain(tool_name),
                     };
-                    let out = orchestrator
-                        .run(
-                            &mut runtime,
-                            &req,
-                            &tool_ctx,
-                            turn.as_ref(),
-                            turn.approval_policy.value(),
-                        )
-                        .await
-                        .map(|result| result.output);
-                    let (out, delta) = match out {
-                        Ok(output) => (Ok(output.exec_output), Some(output.delta)),
-                        Err(error) => (Err(error), Some(runtime.committed_delta().clone())),
-                    };
-                    let event_ctx = ToolEventCtx::new(
-                        session.as_ref(),
-                        turn.as_ref(),
-                        call_id,
-                        tracker.as_ref().copied(),
-                    );
-                    let content = emitter.finish(event_ctx, out, delta.as_ref()).await?;
+                    let content = run_owned_patch(req, tool_ctx, tracker.cloned(), emitter).await?;
                     Ok(Some(FunctionToolOutput::from_text(content, Some(true))))
                 }
             }

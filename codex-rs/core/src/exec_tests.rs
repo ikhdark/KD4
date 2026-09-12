@@ -21,6 +21,31 @@ use tokio::io::AsyncWriteExt;
 use tokio::io::ReadBuf;
 use tokio::time::timeout;
 
+#[test]
+fn expiration_timeout_milliseconds_preserve_duration_and_saturate_overflow() {
+    for (duration, expected_ms) in [
+        (Duration::ZERO, 0),
+        (Duration::from_millis(1234), 1234),
+        (Duration::from_millis(u64::MAX), u64::MAX),
+        (
+            Duration::from_millis(u64::MAX) + Duration::from_millis(1),
+            u64::MAX,
+        ),
+    ] {
+        let expiration = ExecExpiration::Timeout(duration);
+        assert_eq!(expiration.timeout_ms(), Some(expected_ms));
+        let expiration = expiration.with_cancellation(CancellationToken::new());
+        assert_eq!(expiration.timeout_ms(), Some(expected_ms));
+        let expiration = expiration.with_cancellation(CancellationToken::new());
+        assert_eq!(expiration.timeout_ms(), Some(expected_ms));
+    }
+
+    assert_eq!(
+        ExecExpiration::Cancellation(CancellationToken::new()).timeout_ms(),
+        None
+    );
+}
+
 struct ChunkedReader {
     chunks: VecDeque<Vec<u8>>,
 }
@@ -724,9 +749,15 @@ async fn windows_direct_exec_completes_for_trivial_command() -> Result<()> {
 
 #[tokio::test]
 async fn forced_direct_exec_termination_reaps_the_child() -> Result<()> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
+    };
+
     let cwd = codex_utils_absolute_path::AbsolutePathBuf::current_dir()?;
     let managed_root = ManagedRootProcess::reserve_with_reclaim().await?;
-    let mut child = spawn_child_async(SpawnChildRequest {
+    let child = spawn_child_async(SpawnChildRequest {
         program: PathBuf::from("powershell.exe"),
         args: vec![
             "-NoProfile".to_string(),
@@ -743,12 +774,16 @@ async fn forced_direct_exec_termination_reaps_the_child() -> Result<()> {
     })
     .await?;
     managed_root.attach_and_resume(child.id().expect("child process id"))?;
+    let raw = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, child.id().expect("child id")) };
+    assert!(!raw.is_null(), "observe child: {}", io::Error::last_os_error());
+    let observed = unsafe { OwnedHandle::from_raw_handle(raw) };
 
-    terminate_and_reap_child_process_tree(&mut child, &managed_root).await?;
+    terminate_and_reap_child_process_tree(child, managed_root).await?;
 
-    assert!(
-        child.try_wait()?.is_some(),
-        "terminated child was not reaped"
+    assert_eq!(
+        unsafe { WaitForSingleObject(observed.as_raw_handle(), 0) },
+        WAIT_OBJECT_0,
+        "owned termination must finish after actual child exit"
     );
     Ok(())
 }
@@ -1548,40 +1583,62 @@ fn process_exec_tool_call_uses_platform_sandbox_for_network_only_restrictions() 
     );
 }
 
-#[test]
-fn build_exec_request_preserves_windows_workspace_roots() -> Result<()> {
+#[tokio::test]
+async fn build_exec_request_preserves_windows_workspace_roots() -> Result<()> {
     let temp_dir = tempfile::TempDir::new()?;
     let cwd = temp_dir.path().abs();
     let codex_home = temp_dir.path().join("configured-home").abs();
     let additional_root = temp_dir.path().join("additional").abs();
     let workspace_roots = vec![cwd.clone(), additional_root];
 
-    let exec_request = build_exec_request(
-        ExecParams {
-            command: vec!["echo".to_string(), "ok".to_string()],
-            codex_home: codex_home.clone(),
-            cwd: cwd.clone(),
-            expiration: ExecExpiration::DefaultTimeout,
-            capture_policy: ExecCapturePolicy::ShellTool,
-            env: HashMap::new(),
-            network: None,
-            network_environment_id: None,
-            sandbox_permissions: SandboxPermissions::UseDefault,
-            windows_sandbox_level: WindowsSandboxLevel::Disabled,
-            windows_sandbox_private_desktop: false,
-            justification: None,
-            arg0: None,
-        },
+    let make_params = || ExecParams {
+        command: vec!["echo".to_string(), "ok".to_string()],
+        codex_home: codex_home.clone(),
+        cwd: cwd.clone(),
+        expiration: ExecExpiration::DefaultTimeout,
+        capture_policy: ExecCapturePolicy::ShellTool,
+        env: HashMap::new(),
+        network: None,
+        network_environment_id: None,
+        sandbox_permissions: SandboxPermissions::UseDefault,
+        windows_sandbox_level: WindowsSandboxLevel::Disabled,
+        windows_sandbox_private_desktop: false,
+        justification: None,
+        arg0: None,
+    };
+    let synchronous = build_exec_request(
+        make_params(),
         &PermissionProfile::Disabled,
         &cwd,
         workspace_roots.as_slice(),
     )?;
+    assert_eq!(synchronous.windows_sandbox_workspace_roots, workspace_roots);
+    assert_eq!(synchronous.codex_home, codex_home);
+    let exec_request = build_exec_request_async(
+        make_params(),
+        &PermissionProfile::Disabled,
+        &cwd,
+        workspace_roots.as_slice(),
+    )
+    .await?;
 
     assert_eq!(
         exec_request.windows_sandbox_workspace_roots,
         workspace_roots
     );
     assert_eq!(exec_request.codex_home, codex_home);
+    let mut invalid = make_params();
+    invalid.command.clear();
+    let error = build_exec_request_async(
+        invalid,
+        &PermissionProfile::Disabled,
+        &cwd,
+        workspace_roots.as_slice(),
+    )
+    .await
+    .err()
+    .expect("empty command must not produce an executable request");
+    assert!(matches!(error, CodexErr::Io(error) if error.kind() == io::ErrorKind::InvalidInput));
     Ok(())
 }
 
@@ -1599,11 +1656,18 @@ fn powershell_literal_path(path: &std::path::Path) -> String {
 
 #[tokio::test]
 async fn direct_exec_cancellation_terminates_windows_descendants() -> Result<()> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
+    };
+
     let temp_dir = tempfile::TempDir::new()?;
     let ready_marker = temp_dir.path().join("descendant.ready");
     let survival_marker = temp_dir.path().join("descendant.survived");
     let descendant_script = format!(
-        "Start-Sleep -Seconds 2; Set-Content -LiteralPath '{}' -Value survived",
+        "[System.IO.File]::WriteAllText('{}', [string]$PID); Start-Sleep -Seconds 2; Set-Content -LiteralPath '{}' -Value survived",
+        powershell_literal_path(&ready_marker),
         powershell_literal_path(&survival_marker)
     );
     let descendant_script = encode_powershell_script(&descendant_script);
@@ -1612,9 +1676,7 @@ async fn direct_exec_cancellation_terminates_windows_descendants() -> Result<()>
          $null = Start-Process -FilePath 'powershell.exe' \
              -ArgumentList @('-NoLogo','-NoProfile','-NonInteractive','-EncodedCommand','{descendant_script}') \
              -WindowStyle Hidden; \
-         Set-Content -LiteralPath '{}' -Value ready; \
-         Start-Sleep -Seconds 60",
-        powershell_literal_path(&ready_marker)
+         Start-Sleep -Seconds 60"
     );
     let command = vec![
         "powershell.exe".to_string(),
@@ -1630,12 +1692,27 @@ async fn direct_exec_cancellation_terminates_windows_descendants() -> Result<()>
     let ready_for_cancel = ready_marker.clone();
     let cancel_task = tokio::spawn(async move {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        while !ready_for_cancel.exists() && tokio::time::Instant::now() < deadline {
+        let descendant = loop {
+            let descendant = std::fs::read_to_string(&ready_for_cancel)
+                .ok()
+                .and_then(|text| text.parse::<u32>().ok())
+                .and_then(|pid| {
+                    let raw = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+                    (!raw.is_null()).then(|| unsafe { OwnedHandle::from_raw_handle(raw) })
+                });
+            if descendant.is_some() || tokio::time::Instant::now() >= deadline {
+                break descendant;
+            }
             tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+        if let Some(handle) = &descendant {
+            assert_eq!(
+                unsafe { WaitForSingleObject(handle.as_raw_handle(), 0) },
+                WAIT_TIMEOUT
+            );
         }
-        let ready = ready_for_cancel.exists();
         cancel_tx.cancel();
-        ready
+        descendant
     });
     let params = ExecParams {
         command,
@@ -1664,10 +1741,17 @@ async fn direct_exec_cancellation_terminates_windows_descendants() -> Result<()>
     )
     .await
     .expect("Windows direct exec cancellation should complete promptly")?;
-    assert!(
-        cancel_task.await.expect("join cancellation task"),
-        "descendant did not start before cancellation"
-    );
+    let descendant = cancel_task
+        .await
+        .expect("join cancellation task")
+        .expect("actual descendant must start before cancellation");
+    timeout(Duration::from_secs(5), async {
+        while unsafe { WaitForSingleObject(descendant.as_raw_handle(), 0) } != WAIT_OBJECT_0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("direct exec cancellation must confirm native descendant exit");
     assert!(!output.timed_out);
 
     tokio::time::sleep(Duration::from_secs(3)).await;

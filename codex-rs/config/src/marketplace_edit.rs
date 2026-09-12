@@ -235,6 +235,8 @@ mod tests {
         };
         record_user_marketplace(codex_home.path(), "debug", &update).unwrap();
 
+        let config_path = codex_home.path().join(CONFIG_TOML_FILE);
+        let before = fs::read(&config_path).expect("read initial config");
         let outcome = remove_user_marketplace_config(codex_home.path(), "Debug").unwrap();
 
         assert_eq!(
@@ -242,6 +244,10 @@ mod tests {
             RemoveMarketplaceConfigOutcome::NameCaseMismatch {
                 configured_name: "debug".to_string()
             }
+        );
+        assert_eq!(
+            fs::read(&config_path).expect("read preserved config"),
+            before
         );
     }
 

@@ -25,16 +25,6 @@ use crate::extension::MemoriesExtensionConfig;
 use crate::local::LocalMemoriesBackend;
 
 #[test]
-fn memory_tool_namespace_matches_responses_api_identifier() {
-    assert!(!crate::MEMORY_TOOLS_NAMESPACE.is_empty());
-    assert!(
-        crate::MEMORY_TOOLS_NAMESPACE
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
-    );
-}
-
-#[test]
 fn tools_are_not_contributed_without_thread_config() {
     let extension = MemoriesExtension::default();
 
@@ -121,22 +111,33 @@ fn install_registers_dedicated_tool_contributor() {
         codex_home: test_path_buf("/tmp/codex-home").abs(),
     });
 
-    let tool_names = registry
+    let tools = registry
         .tool_contributors()
         .iter()
         .flat_map(|contributor| contributor.tools(&ExtensionData::new("session"), &thread_store))
+        .collect::<Vec<_>>();
+    let tool_names = tools
+        .iter()
         .map(|tool| tool.tool_name())
         .collect::<Vec<_>>();
 
     assert_eq!(
         tool_names,
         vec![
-            memory_tool_name(crate::ADD_AD_HOC_NOTE_TOOL_NAME),
-            memory_tool_name(crate::LIST_TOOL_NAME),
-            memory_tool_name(crate::READ_TOOL_NAME),
-            memory_tool_name(crate::SEARCH_TOOL_NAME),
+            ToolName::namespaced("memories", "add_ad_hoc_note"),
+            ToolName::namespaced("memories", "list"),
+            ToolName::namespaced("memories", "read"),
+            ToolName::namespaced("memories", "search"),
         ]
     );
+    for (tool, expected_name) in tools
+        .iter()
+        .zip(["add_ad_hoc_note", "list", "read", "search"])
+    {
+        let spec = serde_json::to_value(tool.spec()).expect("serialize registered tool spec");
+        assert_eq!(spec.pointer("/name"), Some(&json!("memories")));
+        assert_eq!(spec.pointer("/tools/0/name"), Some(&json!(expected_name)));
+    }
 }
 
 #[test]

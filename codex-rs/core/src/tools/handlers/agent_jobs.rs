@@ -272,6 +272,7 @@ async fn run_agent_job_loop(
     job_id: String,
     options: JobRunnerOptions,
     cancellation_token: CancellationToken,
+    active_items: &mut HashMap<ThreadId, ActiveJobItem>,
 ) -> anyhow::Result<()> {
     let job = db
         .get_agent_job(job_id.as_str())
@@ -296,12 +297,11 @@ async fn run_agent_job_loop(
         }
     }));
     let runtime_timeout = job_runtime_timeout(&job);
-    let mut active_items: HashMap<ThreadId, ActiveJobItem> = HashMap::new();
     recover_running_items(
         session.clone(),
         db.clone(),
         job_id.as_str(),
-        &mut active_items,
+        active_items,
         runtime_timeout,
     )
     .await?;
@@ -458,7 +458,7 @@ async fn run_agent_job_loop(
             session.clone(),
             db.clone(),
             job_id.as_str(),
-            &mut active_items,
+            active_items,
             runtime_timeout,
         )
         .await?
@@ -466,7 +466,7 @@ async fn run_agent_job_loop(
             progressed = true;
         }
 
-        let finished = find_finished_threads(session.clone(), &mut active_items).await;
+        let finished = find_finished_threads(session.clone(), active_items).await;
         if finished.is_empty() {
             let progress = db.get_agent_job_progress(job_id.as_str()).await?;
             if progress.pending_items == 0 && progress.running_items == 0 && active_items.is_empty()
@@ -504,7 +504,7 @@ async fn run_agent_job_loop(
             session.clone(),
             db.clone(),
             job_id.as_str(),
-            &mut active_items,
+            active_items,
             "job cancelled before worker completion",
         )
         .await
@@ -634,21 +634,6 @@ async fn recover_running_items(
         )
         .await?;
     for item in running_items {
-        if is_item_stale(&item, runtime_timeout) {
-            let error_message = format!("worker exceeded max runtime of {runtime_timeout:?}");
-            db.mark_agent_job_item_failed(job_id, item.item_id.as_str(), error_message.as_str())
-                .await?;
-            if let Some(assigned_thread_id) = item.assigned_thread_id.as_ref()
-                && let Ok(thread_id) = ThreadId::from_string(assigned_thread_id.as_str())
-            {
-                let _ = session
-                    .services
-                    .agent_control
-                    .shutdown_live_agent(thread_id)
-                    .await;
-            }
-            continue;
-        }
         let Some(assigned_thread_id) = item.assigned_thread_id.clone() else {
             db.mark_agent_job_item_failed(
                 job_id,
@@ -671,7 +656,27 @@ async fn recover_running_items(
                 continue;
             }
         };
-        if is_final(&session.services.agent_control.get_status(thread_id).await) {
+        // Keep the job/thread association available to the caller's error cleanup.
+        active_items.insert(
+            thread_id,
+            ActiveJobItem {
+                item_id: item.item_id.clone(),
+                started_at: started_at_from_item(&item),
+                status_rx: session
+                    .services
+                    .agent_control
+                    .subscribe_status(thread_id)
+                    .await
+                    .ok(),
+            },
+        );
+        if is_item_stale(&item, runtime_timeout) {
+            shutdown_agent_job_worker(&session, thread_id).await?;
+            let error_message = format!("worker exceeded max runtime of {runtime_timeout:?}");
+            db.mark_agent_job_item_failed(job_id, item.item_id.as_str(), error_message.as_str())
+                .await?;
+            active_items.remove(&thread_id);
+        } else if is_final(&session.services.agent_control.get_status(thread_id).await) {
             finalize_finished_item(
                 session.clone(),
                 db.clone(),
@@ -680,23 +685,24 @@ async fn recover_running_items(
                 thread_id,
             )
             .await?;
-        } else {
-            active_items.insert(
-                thread_id,
-                ActiveJobItem {
-                    item_id: item.item_id.clone(),
-                    started_at: started_at_from_item(&item),
-                    status_rx: session
-                        .services
-                        .agent_control
-                        .subscribe_status(thread_id)
-                        .await
-                        .ok(),
-                },
-            );
+            active_items.remove(&thread_id);
         }
     }
     Ok(())
+}
+
+async fn shutdown_agent_job_worker(session: &Session, thread_id: ThreadId) -> anyhow::Result<()> {
+    match session
+        .services
+        .agent_control
+        .shutdown_live_agent(thread_id)
+        .await
+    {
+        Ok(_) | Err(CodexErr::ThreadNotFound(_)) => Ok(()),
+        Err(error) => Err(anyhow::anyhow!(
+            "worker {thread_id} cleanup failed: {error}"
+        )),
+    }
 }
 
 async fn terminate_agent_job_workers(
@@ -706,72 +712,61 @@ async fn terminate_agent_job_workers(
     active_items: &mut HashMap<ThreadId, ActiveJobItem>,
     reason: &str,
 ) -> anyhow::Result<()> {
-    let mut state_errors = Vec::new();
-    let mut item_ids = HashSet::new();
-    let mut thread_ids = HashSet::new();
-    for (thread_id, item) in std::mem::take(active_items) {
-        thread_ids.insert(thread_id);
-        item_ids.insert(item.item_id);
+    let mut errors = Vec::new();
+    let mut workers: HashMap<String, HashSet<ThreadId>> = HashMap::new();
+    for (thread_id, item) in active_items.iter() {
+        workers
+            .entry(item.item_id.clone())
+            .or_default()
+            .insert(*thread_id);
     }
-
     match db
-        .list_agent_job_items(
-            job_id,
-            Some(codex_state::AgentJobItemStatus::Running),
-            /*limit*/ None,
-        )
+        .list_agent_job_items(job_id, Some(codex_state::AgentJobItemStatus::Running), None)
         .await
     {
-        Ok(running_items) => {
-            for item in running_items {
-                let item_id = item.item_id;
+        Ok(items) => {
+            for item in items {
+                let thread_ids = workers.entry(item.item_id.clone()).or_default();
                 if let Some(assigned_thread_id) = item.assigned_thread_id {
-                    match ThreadId::from_string(assigned_thread_id.as_str()) {
+                    match ThreadId::from_string(&assigned_thread_id) {
                         Ok(thread_id) => {
                             thread_ids.insert(thread_id);
                         }
                         Err(error) => {
-                            tracing::warn!(
-                                job_id,
-                                item_id,
-                                assigned_thread_id,
-                                error = ?error,
-                                "failed to parse worker thread id while terminating agent job"
-                            );
+                            tracing::warn!(job_id, item_id = item.item_id, %assigned_thread_id, %error, "invalid worker thread id during job cleanup")
                         }
                     }
                 }
-                item_ids.insert(item_id);
             }
         }
-        Err(error) => state_errors.push(format!("failed to load running items: {error}")),
+        Err(error) => errors.push(format!("failed to load running items: {error}")),
     }
-
-    for item_id in item_ids {
-        if let Err(err) = db
-            .mark_agent_job_item_failed(job_id, item_id.as_str(), reason)
+    for (item_id, thread_ids) in workers {
+        let mut stopped = true;
+        for thread_id in &thread_ids {
+            if let Err(error) = shutdown_agent_job_worker(&session, *thread_id).await {
+                errors.push(error.to_string());
+                stopped = false;
+            }
+        }
+        if !stopped {
+            // AgentControl retains late-shutdown ownership. Preserve the job's binding
+            // and report incomplete cleanup instead of clearing a still-live worker.
+            continue;
+        }
+        if let Err(error) = db
+            .mark_agent_job_item_failed(job_id, &item_id, reason)
             .await
         {
-            state_errors.push(format!("failed to terminate item {item_id}: {err}"));
+            errors.push(format!("failed to terminate item {item_id}: {error}"));
+            continue;
+        }
+        for thread_id in thread_ids {
+            active_items.remove(&thread_id);
         }
     }
-
-    for thread_id in thread_ids {
-        if let Err(err) = session
-            .services
-            .agent_control
-            .shutdown_live_agent(thread_id)
-            .await
-        {
-            tracing::warn!(
-                %thread_id,
-                error = %err,
-                "failed to shut down worker for cancelled agent job"
-            );
-        }
-    }
-    if !state_errors.is_empty() {
-        return Err(anyhow::anyhow!(state_errors.join("; ")));
+    if !errors.is_empty() {
+        return Err(anyhow::anyhow!(errors.join("; ")));
     }
     Ok(())
 }
@@ -843,14 +838,10 @@ async fn reap_stale_active_items(
         return Ok(false);
     }
     for (thread_id, item_id) in stale {
+        shutdown_agent_job_worker(&session, thread_id).await?;
         let error_message = format!("worker exceeded max runtime of {runtime_timeout:?}");
         db.mark_agent_job_item_failed(job_id, item_id.as_str(), error_message.as_str())
             .await?;
-        let _ = session
-            .services
-            .agent_control
-            .shutdown_live_agent(thread_id)
-            .await;
         active_items.remove(&thread_id);
     }
     Ok(true)
@@ -863,6 +854,7 @@ async fn finalize_finished_item(
     item_id: &str,
     thread_id: ThreadId,
 ) -> anyhow::Result<()> {
+    shutdown_agent_job_worker(&session, thread_id).await?;
     let item = db
         .get_agent_job_item(job_id, item_id)
         .await?
@@ -882,11 +874,6 @@ async fn finalize_finished_item(
                 .await?;
         }
     }
-    let _ = session
-        .services
-        .agent_control
-        .shutdown_live_agent(thread_id)
-        .await;
     Ok(())
 }
 

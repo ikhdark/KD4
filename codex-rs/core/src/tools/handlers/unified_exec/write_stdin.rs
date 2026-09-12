@@ -96,7 +96,9 @@ impl WriteStdinHandler {
             .await;
         let wake_reason = match &response {
             Ok(response) if response.process_id.is_some() => ToolLifecycleWakeReason::Timeout,
-            Ok(_) => ToolLifecycleWakeReason::Completed,
+            Ok(_) | Err(crate::unified_exec::UnifiedExecError::ToolHistoryPersistence { .. }) => {
+                ToolLifecycleWakeReason::Completed
+            }
             Err(_) => ToolLifecycleWakeReason::Cancelled,
         };
         tool_dispatch_trace::record_timer_wait(ToolLifecycleTimerWait {
@@ -107,8 +109,28 @@ impl WriteStdinHandler {
             wake_reason,
             sequence: 0,
         });
-        let mut response = response.map_err(|err| {
-            FunctionCallError::RespondToModel(format!("write_stdin failed: {err}"))
+        if let Err(crate::unified_exec::UnifiedExecError::ToolHistoryPersistence {
+            event_call_id: Some(call_id),
+            ..
+        }) = &response
+            && !args.chars.is_empty()
+        {
+            session
+                .send_event(
+                    turn.as_ref(),
+                    EventMsg::TerminalInteraction(TerminalInteractionEvent {
+                        call_id: call_id.clone(),
+                        process_id: args.session_id.to_string(),
+                        stdin: args.chars.clone(),
+                    }),
+                )
+                .await;
+        }
+        let mut response = response.map_err(|err| match err {
+            crate::unified_exec::UnifiedExecError::ToolHistoryPersistence { message, .. } => {
+                FunctionCallError::Fatal(message)
+            }
+            err => FunctionCallError::RespondToModel(format!("write_stdin failed: {err}")),
         })?;
 
         if let Some(running) = session
@@ -158,18 +180,22 @@ impl WriteStdinHandler {
                 .await;
         }
 
-        Ok(boxed_tool_output(response))
+        Ok(boxed_tool_output(
+            response.with_prepared_reduction_notice().await,
+        ))
     }
 }
 
 fn owner_wait_yield_time_ms(chars: &str, requested_yield_time_ms: Option<u64>) -> u64 {
-    requested_yield_time_ms.unwrap_or_else(|| {
-        if chars.is_empty() {
-            DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS
-        } else {
-            super::default_write_stdin_yield_time_ms()
-        }
-    })
+    if chars.is_empty() {
+        // An empty poll is a wait for progress. A short requested yield must not
+        // repeatedly resume the model while the same silent process is running.
+        requested_yield_time_ms
+            .unwrap_or(DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS)
+            .max(DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS)
+    } else {
+        requested_yield_time_ms.unwrap_or_else(super::default_write_stdin_yield_time_ms)
+    }
 }
 
 impl CoreToolRuntime for WriteStdinHandler {
@@ -216,7 +242,9 @@ mod tests {
     #[test]
     fn empty_poll_uses_one_owner_wait_deadline() {
         assert_eq!(owner_wait_yield_time_ms("", None), 60_000);
-        assert_eq!(owner_wait_yield_time_ms("", Some(5_000)), 5_000);
+        assert_eq!(owner_wait_yield_time_ms("", Some(5_000)), 60_000);
+        assert_eq!(owner_wait_yield_time_ms("", Some(0)), 60_000);
+        assert_eq!(owner_wait_yield_time_ms("", Some(120_000)), 120_000);
         assert_eq!(owner_wait_yield_time_ms("input", None), 250);
         assert_eq!(owner_wait_yield_time_ms("input", Some(1_000)), 1_000);
     }

@@ -343,12 +343,16 @@ impl RpcClient {
         self.closed.load(Ordering::Acquire) || *self.disconnected_rx.borrow()
     }
 
-    pub(crate) async fn close_transport(&self) {
+    pub(crate) fn request_transport_close(&self) {
         self.closed.store(true, Ordering::Release);
         self.transport.terminate();
         for task in &self.transport_tasks {
             task.abort();
         }
+    }
+
+    pub(crate) async fn close_transport(&self) {
+        self.request_transport_close();
         let _ = self.transport.terminate_and_wait().await;
         drain_pending(&self.pending).await;
     }
@@ -423,7 +427,10 @@ impl RpcClient {
             Err(_) => match self.cleanup_call_slots.try_acquire() {
                 Ok(call_slot) => call_slot,
                 Err(_) => {
-                    self.close_transport().await;
+                    // Preserve the caller's cleanup deadline even when the child
+                    // supervisor is slow. Its retained owner finishes termination.
+                    self.request_transport_close();
+                    drain_pending(&self.pending).await;
                     return Err(RpcCallError::Closed);
                 }
             },
@@ -463,44 +470,46 @@ impl RpcClient {
                 return Err(RpcCallError::Json(err));
             }
         };
-        if self
-            .write_tx
-            .send(JSONRPCMessage::Request(JSONRPCRequest {
-                id: request_id.clone(),
-                method: method.to_string(),
-                params: Some(params),
-                trace: codex_otel::current_span_w3c_trace_context(),
-            }))
-            .await
-            .is_err()
-        {
-            self.pending.lock().await.remove(&request_id);
-            return Err(RpcCallError::Closed);
-        }
+        let exchange = async {
+            self.write_tx
+                .send(JSONRPCMessage::Request(JSONRPCRequest {
+                    id: request_id.clone(),
+                    method: method.to_string(),
+                    params: Some(params),
+                    trace: codex_otel::current_span_w3c_trace_context(),
+                }))
+                .await
+                .map_err(|_| RpcCallError::Closed)?;
 
-        // Do not race in-flight requests directly against the transport-close
-        // watch value. The connection reader receives JSON-RPC messages and
-        // the terminal disconnect event on one ordered queue, then drains any
-        // still-pending requests. Awaiting this receiver preserves that order:
-        // responses already read before EOF still win, and truly pending calls
-        // are failed once the reader observes the disconnect.
+            // Do not race in-flight requests directly against the transport-close
+            // watch value. The connection reader receives JSON-RPC messages and
+            // the terminal disconnect event on one ordered queue, then drains any
+            // still-pending requests. Awaiting this receiver preserves that order:
+            // responses already read before EOF still win, and truly pending calls
+            // are failed once the reader observes the disconnect.
+            response_rx.await.map_err(|_| RpcCallError::Closed)?
+        };
+
+        // Queue admission is part of the same deadline as response delivery.
+        // Otherwise a stalled transport can strand cleanup before its response
+        // timer even starts. Dropping a pending send also keeps an expired request
+        // from being queued later when the transport recovers.
         let response = match call_timeout {
-            RpcCallTimeout::None => response_rx.await,
-            RpcCallTimeout::After(call_timeout) => match timeout(call_timeout, response_rx).await {
+            RpcCallTimeout::None => exchange.await,
+            RpcCallTimeout::After(call_timeout) => match timeout(call_timeout, exchange).await {
                 Ok(response) => response,
-                Err(_) => {
-                    self.pending.lock().await.remove(&request_id);
-                    return Err(RpcCallError::TimedOut {
-                        method: method.to_string(),
-                        timeout: call_timeout,
-                    });
-                }
+                Err(_) => Err(RpcCallError::TimedOut {
+                    method: method.to_string(),
+                    timeout: call_timeout,
+                }),
             },
         };
-        let result: Result<Value, RpcCallError> = response.map_err(|_| RpcCallError::Closed)?;
-        let response = match result {
+        let response = match response {
             Ok(response) => response,
-            Err(error) => return Err(error),
+            Err(error) => {
+                self.pending.lock().await.remove(&request_id);
+                return Err(error);
+            }
         };
         serde_json::from_value(response).map_err(RpcCallError::Json)
     }
@@ -938,6 +947,86 @@ mod tests {
         if let Err(err) = server.await {
             panic!("server task failed: {err}");
         }
+    }
+
+    async fn assert_timeout_covers_stalled_outbound_queue(cleanup: bool) {
+        let (client_stdin, server_reader) = tokio::io::duplex(1);
+        let (mut server_writer, client_stdout) = tokio::io::duplex(4096);
+        let connection =
+            JsonRpcConnection::from_stdio(client_stdout, client_stdin, "stalled-rpc".to_string());
+        let (client, _events_rx) = RpcClient::new(connection);
+
+        // The first notification blocks the real stdio writer; the remaining
+        // notifications fill its bounded queue without a fabricated transport.
+        for _ in 0..=crate::connection::CHANNEL_CAPACITY {
+            client
+                .notify("blocker", &serde_json::json!({}))
+                .await
+                .expect("notification should enter the outbound queue");
+        }
+        let call_timeout = Duration::from_millis(10);
+        let params = serde_json::json!({});
+        let result = timeout(Duration::from_secs(1), async {
+            if cleanup {
+                client
+                    .call_for_cleanup::<_, serde_json::Value>("expired", &params, call_timeout)
+                    .await
+            } else {
+                client
+                    .call_with_timeout::<_, serde_json::Value>("expired", &params, call_timeout)
+                    .await
+            }
+        })
+        .await
+        .expect("the RPC deadline must include waiting for outbound queue capacity");
+        assert!(matches!(
+            result,
+            Err(RpcCallError::TimedOut { method, timeout })
+                if method == "expired" && timeout == call_timeout
+        ));
+        assert_eq!(client.pending_request_count().await, 0);
+
+        let server = tokio::spawn(async move {
+            let mut lines = BufReader::new(server_reader).lines();
+            for _ in 0..=crate::connection::CHANNEL_CAPACITY {
+                match read_jsonrpc_line(&mut lines).await {
+                    JSONRPCMessage::Notification(notification) => {
+                        assert_eq!(notification.method, "blocker");
+                    }
+                    message => panic!("expired request must not reach the server: {message:?}"),
+                }
+            }
+            let request = match read_jsonrpc_line(&mut lines).await {
+                JSONRPCMessage::Request(request) => request,
+                message => panic!("expected recovered request, got {message:?}"),
+            };
+            assert_eq!(request.method, "recovered");
+            write_jsonrpc_line(
+                &mut server_writer,
+                JSONRPCMessage::Response(JSONRPCResponse {
+                    id: request.id,
+                    result: serde_json::json!({ "cleaned": true }),
+                }),
+            )
+            .await;
+        });
+        let response = client
+            .call_for_cleanup::<_, serde_json::Value>("recovered", &params, Duration::from_secs(1))
+            .await
+            .expect("cleanup should recover after the stalled queue drains");
+        assert_eq!(response, serde_json::json!({ "cleaned": true }));
+        assert_eq!(client.pending_request_count().await, 0);
+        server.await.expect("server should complete");
+    }
+
+    #[tokio::test]
+    async fn rpc_client_timeout_covers_stalled_outbound_queue() {
+        assert_timeout_covers_stalled_outbound_queue(false).await;
+    }
+
+    #[tokio::test]
+    async fn rpc_client_cleanup_timeout_covers_stalled_outbound_queue() {
+        assert_timeout_covers_stalled_outbound_queue(true).await;
     }
 
     #[tokio::test]

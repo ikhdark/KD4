@@ -476,10 +476,12 @@ impl App {
                 )
                 .await
             {
-                self.sync_feature_state_from_effective_config(
+                if !self.sync_feature_state_from_effective_config(
                     &effective_config,
                     &feature_updates_to_apply,
-                );
+                ) {
+                    return;
+                }
                 self.sync_auto_review_runtime_state_from_effective_config(
                     &effective_config,
                     &feature_updates_to_apply,
@@ -761,10 +763,26 @@ impl App {
         &mut self,
         effective_config: &ConfigReadResponse,
         feature_updates: &[(Feature, bool)],
-    ) {
-        for (feature, _) in feature_updates {
-            let enabled = feature_enabled_from_effective_config(effective_config, *feature);
-            if let Err(err) = self.config.features.set_enabled(*feature, enabled) {
+    ) -> bool {
+        let feature_states = feature_updates
+            .iter()
+            .map(|(feature, _)| {
+                feature_enabled_from_effective_config(effective_config, *feature)
+                    .map(|enabled| (*feature, enabled))
+            })
+            .collect::<Result<Vec<_>, _>>();
+        let feature_states = match feature_states {
+            Ok(states) => states,
+            Err(error) => {
+                tracing::warn!(%error, "invalid effective feature state after an overridden write");
+                self.chat_widget.add_error_message(format!(
+                    "Failed to refresh overridden experimental features: {error}"
+                ));
+                return false;
+            }
+        };
+        for (feature, enabled) in feature_states {
+            if let Err(err) = self.config.features.set_enabled(feature, enabled) {
                 tracing::warn!(
                     error = %err,
                     feature = feature.key(),
@@ -772,7 +790,7 @@ impl App {
                 );
                 continue;
             }
-            self.chat_widget.set_feature_enabled(*feature, enabled);
+            self.chat_widget.set_feature_enabled(feature, enabled);
         }
 
         if feature_updates
@@ -781,7 +799,7 @@ impl App {
             && !self.config.features.enabled(Feature::GuardianApproval)
         {
             self.set_approvals_reviewer_in_app_and_widget(ApprovalsReviewer::User);
-            return;
+            return true;
         }
 
         if let Some(reviewer) = approvals_reviewer_from_effective_config(effective_config) {
@@ -805,6 +823,7 @@ impl App {
                 self.chat_widget.set_approval_policy(policy);
             }
         }
+        true
     }
 
     async fn sync_auto_review_runtime_state_from_effective_config(
@@ -962,16 +981,25 @@ fn overridden_write_message(write_response: &ConfigWriteResponse) -> &str {
 fn feature_enabled_from_effective_config(
     effective_config: &ConfigReadResponse,
     feature: Feature,
-) -> bool {
-    let root_features = effective_config
-        .config
-        .additional
-        .get("features")
-        .and_then(features_toml_from_json);
-    root_features
-        .as_ref()
-        .and_then(|features| features.entries().get(feature.key()).copied())
-        .unwrap_or_else(|| feature.default_enabled())
+) -> Result<bool, String> {
+    let Some(features) = effective_config.config.additional.get("features") else {
+        return Ok(feature.default_enabled());
+    };
+    let features = features
+        .as_object()
+        .ok_or_else(|| "effective config `features` must be an object".to_string())?;
+    let Some(value) = features.get(feature.key()) else {
+        return Ok(feature.default_enabled());
+    };
+    // Keep known structured-feature formats while ignoring unrelated future keys.
+    let selected = serde_json::Map::from_iter([(feature.key().to_string(), value.clone())]);
+    let features: FeaturesToml = serde_json::from_value(serde_json::Value::Object(selected))
+        .map_err(|error| format!("invalid effective feature `{}`: {error}", feature.key()))?;
+    Ok(features
+        .entries()
+        .get(feature.key())
+        .copied()
+        .unwrap_or_else(|| feature.default_enabled()))
 }
 
 fn approvals_reviewer_from_effective_config(
@@ -1001,10 +1029,6 @@ fn memories_from_effective_config(effective_config: &ConfigReadResponse) -> Opti
         .additional
         .get("memories")
         .and_then(|memories| serde_json::from_value(memories.clone()).ok())
-}
-
-fn features_toml_from_json(value: &serde_json::Value) -> Option<FeaturesToml> {
-    serde_json::from_value(value.clone()).ok()
 }
 
 fn windows_sandbox_mode_from_effective_config(

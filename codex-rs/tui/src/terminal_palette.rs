@@ -41,6 +41,10 @@ pub fn best_color_for_level(target: (u8, u8, u8), color_level: StdoutColorLevel)
 }
 
 fn effective_stdout_color_level() -> StdoutColorLevel {
+    #[cfg(test)]
+    if let Some((_, level)) = TEST_TERMINAL_COLORS.get() {
+        return level;
+    }
     stdout_color_level_for_terminal(
         stdout_color_level(),
         terminal_info().name,
@@ -94,6 +98,10 @@ pub struct DefaultColors {
 }
 
 pub fn default_colors() -> Option<DefaultColors> {
+    #[cfg(test)]
+    if let Some((colors, _)) = TEST_TERMINAL_COLORS.get() {
+        return Some(colors);
+    }
     imp::default_colors()
 }
 
@@ -109,6 +117,37 @@ pub(crate) fn set_default_colors_from_startup_probe(
     colors: Option<crate::terminal_probe::DefaultColors>,
 ) {
     imp::set_default_colors_from_startup_probe(colors);
+}
+
+// Replace only the external terminal probe in synchronous renderer tests. The
+// override is local to one test thread and is restored even if an assertion panics.
+#[cfg(test)]
+thread_local! {
+    static TEST_TERMINAL_COLORS: std::cell::Cell<Option<(DefaultColors, StdoutColorLevel)>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+#[cfg(test)]
+pub(crate) fn with_test_terminal_colors<T>(
+    background: (u8, u8, u8),
+    color_level: StdoutColorLevel,
+    render: impl FnOnce() -> T,
+) -> T {
+    struct Restore(Option<(DefaultColors, StdoutColorLevel)>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TEST_TERMINAL_COLORS.set(self.0);
+        }
+    }
+    let _restore = Restore(TEST_TERMINAL_COLORS.replace(Some((
+        DefaultColors {
+            fg: (255, 255, 255),
+            bg: background,
+        },
+        color_level,
+    ))));
+    render()
 }
 
 mod imp {

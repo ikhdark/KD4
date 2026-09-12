@@ -12,6 +12,7 @@ use codex_sandboxing::SandboxCommand;
 use codex_sandboxing::SandboxDirectSpawnTransformRequest;
 use codex_sandboxing::SandboxExecRequest;
 use codex_sandboxing::SandboxTransformRequest;
+use codex_sandboxing::SandboxType;
 use codex_sandboxing::SandboxablePreference;
 use codex_sandboxing::select_initial;
 use codex_sandboxing::transform_for_direct_spawn;
@@ -98,6 +99,11 @@ impl FileSystemSandboxRunner {
             sandbox_context.windows_sandbox_level,
             /*has_managed_network_requirements*/ false,
         );
+        if sandbox == SandboxType::None {
+            return Err(invalid_request(
+                "sandbox intent cannot be enforced on this executor".to_string(),
+            ));
+        }
         let command = SandboxCommand {
             program: helper.as_path().as_os_str().to_owned(),
             args: vec![CODEX_FS_HELPER_ARG1.to_string()],

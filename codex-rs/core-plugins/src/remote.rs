@@ -810,9 +810,10 @@ pub async fn fetch_remote_marketplaces(
                 let scope = RemotePluginScope::Global;
                 if let Some(codex_home) = global_catalog_cache_path
                     && let Some(directory_plugins) =
-                        catalog_cache::load_cached_global_directory_plugins(
+                        catalog_cache::load_cached_global_directory_plugins_async(
                             codex_home, config, auth,
                         )
+                        .await
                 {
                     let installed_plugins =
                         fetch_installed_plugins_for_scope_with_client(client, config, auth, scope)
@@ -850,8 +851,9 @@ pub async fn fetch_remote_marketplaces(
                         codex_home,
                         config,
                         auth,
-                        &directory_plugins,
-                    );
+                        directory_plugins,
+                    )
+                    .await;
                 }
             }
             RemoteMarketplaceSource::CreatedByMeRemote => {
@@ -964,7 +966,7 @@ pub async fn fetch_and_cache_global_remote_plugin_catalog(
         RemotePluginScope::Global,
     )
     .await?;
-    catalog_cache::write_cached_global_directory_plugins(codex_home, config, auth, &plugins);
+    catalog_cache::write_cached_global_directory_plugins(codex_home, config, auth, plugins).await;
     Ok(())
 }
 
@@ -1048,7 +1050,7 @@ fn recommended_plugins_mode(response: RecommendedPluginsResponse) -> Recommended
     }
 }
 
-pub fn has_cached_global_remote_plugin_catalog(
+pub async fn has_cached_global_remote_plugin_catalog(
     codex_home: &Path,
     config: &RemotePluginServiceConfig,
     auth: Option<&CodexAuth>,
@@ -1056,7 +1058,9 @@ pub fn has_cached_global_remote_plugin_catalog(
     let Ok(auth) = ensure_chatgpt_auth(auth) else {
         return false;
     };
-    catalog_cache::load_cached_global_directory_plugins(codex_home, config, auth).is_some()
+    catalog_cache::load_cached_global_directory_plugins_async(codex_home, config, auth)
+        .await
+        .is_some()
 }
 
 pub fn cached_global_remote_discoverable_plugins(
@@ -1877,6 +1881,7 @@ async fn fetch_directory_plugins_for_scope_with_optional_collection_with_client(
 ) -> Result<Vec<RemotePluginDirectoryItem>, RemotePluginCatalogError> {
     let mut plugins = Vec::new();
     let mut page_token = None;
+    let mut seen_page_tokens = HashSet::new();
     loop {
         let response = get_remote_plugin_list_page(
             client,
@@ -1891,6 +1896,11 @@ async fn fetch_directory_plugins_for_scope_with_optional_collection_with_client(
         let Some(next_page_token) = response.pagination.next_page_token else {
             break;
         };
+        if !seen_page_tokens.insert(next_page_token.clone()) {
+            return Err(RemotePluginCatalogError::UnexpectedResponse(
+                "remote plugin catalog returned a repeated pagination token".to_string(),
+            ));
+        }
         page_token = Some(next_page_token);
     }
     Ok(plugins)
@@ -1903,6 +1913,7 @@ async fn fetch_shared_workspace_plugins_with_client(
 ) -> Result<Vec<RemotePluginDirectoryItem>, RemotePluginCatalogError> {
     let mut plugins = Vec::new();
     let mut page_token = None;
+    let mut seen_page_tokens = HashSet::new();
     loop {
         let response =
             get_remote_shared_workspace_plugins_page(client, config, auth, page_token.as_deref())
@@ -1911,6 +1922,11 @@ async fn fetch_shared_workspace_plugins_with_client(
         let Some(next_page_token) = response.pagination.next_page_token else {
             break;
         };
+        if !seen_page_tokens.insert(next_page_token.clone()) {
+            return Err(RemotePluginCatalogError::UnexpectedResponse(
+                "remote plugin catalog returned a repeated pagination token".to_string(),
+            ));
+        }
         page_token = Some(next_page_token);
     }
     Ok(plugins)
@@ -1962,6 +1978,7 @@ async fn fetch_installed_plugins_for_scope_with_download_url_with_client(
 ) -> Result<Vec<RemotePluginInstalledItem>, RemotePluginCatalogError> {
     let mut plugins = Vec::new();
     let mut page_token = None;
+    let mut seen_page_tokens = HashSet::new();
     loop {
         let response = get_remote_plugin_installed_page(
             client,
@@ -1976,6 +1993,11 @@ async fn fetch_installed_plugins_for_scope_with_download_url_with_client(
         let Some(next_page_token) = response.pagination.next_page_token else {
             break;
         };
+        if !seen_page_tokens.insert(next_page_token.clone()) {
+            return Err(RemotePluginCatalogError::UnexpectedResponse(
+                "remote plugin catalog returned a repeated pagination token".to_string(),
+            ));
+        }
         page_token = Some(next_page_token);
     }
     Ok(plugins)
@@ -2049,7 +2071,14 @@ async fn fetch_plugin_detail(
     if include_download_urls {
         request = request.query(&[("includeDownloadUrls", true)]);
     }
-    send_and_decode(request, &url).await
+    let plugin: RemotePluginDirectoryItem = send_and_decode(request, &url).await?;
+    if plugin.id != plugin_id {
+        return Err(RemotePluginCatalogError::UnexpectedPluginId {
+            expected: plugin_id.to_string(),
+            actual: plugin.id,
+        });
+    }
+    Ok(plugin)
 }
 
 fn remote_plugin_skill_detail_url(

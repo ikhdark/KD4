@@ -119,6 +119,7 @@ impl UnifiedExecContext {
 
 #[derive(Debug)]
 pub(crate) struct ExecCommandRequest {
+    pub validation: Option<codex_protocol::validation::ValidationCommandContext>,
     pub command: Vec<String>,
     pub command_for_safety: Vec<String>,
     pub attempt_key: CommandAttemptKey,
@@ -151,10 +152,30 @@ pub(crate) struct ExecCommandRequest {
 #[derive(Clone, Default)]
 pub(crate) struct PendingSpawnRegistration {
     processes: Arc<StdMutex<Vec<Arc<UnifiedExecProcess>>>>,
+    termination_owner: Option<process::ProcessTerminationOwner>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static PENDING_SPAWN_RETIREMENT_OBSERVER: std::cell::RefCell<Option<(
+        oneshot::Sender<Vec<Weak<UnifiedExecProcess>>>,
+        oneshot::Sender<()>,
+        std::sync::mpsc::Receiver<()>,
+    )>> = const { std::cell::RefCell::new(None) };
 }
 
 impl PendingSpawnRegistration {
+    fn with_termination_owner(owner: process::ProcessTerminationOwner) -> Self {
+        Self {
+            processes: Arc::default(),
+            termination_owner: Some(owner),
+        }
+    }
+
     pub(crate) fn register(&self, process: Arc<UnifiedExecProcess>) {
+        if let Some(owner) = self.termination_owner.as_ref() {
+            process.set_termination_owner(owner.clone());
+        }
         self.processes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -168,11 +189,48 @@ impl PendingSpawnRegistration {
             .clone()
     }
 
-    pub(crate) fn clear(&self) {
-        self.processes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clear();
+    pub(crate) async fn clear(&self) {
+        let processes = {
+            let mut registered = self
+                .processes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::mem::take(&mut *registered)
+        };
+        if processes.is_empty() {
+            return;
+        }
+        #[cfg(test)]
+        let observer =
+            PENDING_SPAWN_RETIREMENT_OBSERVER.with(|observer| observer.borrow_mut().take());
+        #[cfg(test)]
+        let retired = observer.map(|(taken, retired, release)| {
+            let _ = taken.send(processes.iter().map(Arc::downgrade).collect());
+            (retired, release)
+        });
+        // The final process owner can run native/client destructors. Keep both
+        // those destructors and their nested locks off the asynchronous caller.
+        // The worker owns the vector even if the awaiting caller is cancelled.
+        if let Err(error) = tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            if let Some((_, release)) = retired.as_ref() {
+                release
+                    .recv_timeout(std::time::Duration::from_secs(20))
+                    .expect("test must release the actual retirement worker");
+            }
+            drop(processes);
+            #[cfg(test)]
+            if let Some((retired, _)) = retired {
+                let _ = retired.send(());
+            }
+        })
+        .await
+        {
+            // Registration is already committed or cleaned up. A retirement
+            // worker failure must not turn a published process into a failed
+            // startup result. The worker owns disposal of its captured values.
+            tracing::warn!(%error, "pending process retirement worker failed");
+        }
     }
 }
 
@@ -227,6 +285,7 @@ impl ProcessStore {
 
 pub(crate) struct UnifiedExecProcessManager {
     process_store: Arc<Mutex<ProcessStore>>,
+    pending_cleanup_owners: Arc<process_manager::PendingProcessCleanupOwners>,
     max_write_stdin_yield_time_ms: u64,
     executor_ready_environments: StdMutex<HashSet<String>>,
 }
@@ -245,6 +304,7 @@ impl UnifiedExecProcessManager {
     ) -> Self {
         Self {
             process_store: Arc::new(Mutex::new(ProcessStore::default())),
+            pending_cleanup_owners: Arc::new(StdMutex::new(Vec::new())),
             max_write_stdin_yield_time_ms: max_write_stdin_yield_time_ms
                 .max(MIN_EMPTY_YIELD_TIME_MS),
             executor_ready_environments: StdMutex::new(HashSet::new()),

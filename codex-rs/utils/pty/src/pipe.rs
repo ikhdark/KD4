@@ -95,8 +95,21 @@ impl ChildTerminator for PipeChildTerminator {
     }
 }
 
+#[cfg(all(test, windows))]
+thread_local! {
+    static TEST_DUPLICATE_PROCESS_HANDLE: std::cell::RefCell<Option<
+        Box<dyn FnOnce(RawHandle) -> io::Result<OwnedHandle>>
+    >> = std::cell::RefCell::new(None);
+}
+
 #[cfg(windows)]
 fn duplicate_process_handle(process: RawHandle) -> io::Result<OwnedHandle> {
+    #[cfg(test)]
+    if let Some(duplicate) =
+        TEST_DUPLICATE_PROCESS_HANDLE.with(|duplicate| duplicate.borrow_mut().take())
+    {
+        return duplicate(process);
+    }
     unsafe { BorrowedHandle::borrow_raw(process) }.try_clone_to_owned()
 }
 
@@ -195,10 +208,10 @@ async fn spawn_process_with_stdin_mode(
     #[cfg(windows)]
     command.creation_flags(WINDOWS_CREATE_SUSPENDED);
 
-    let managed = Arc::new(ManagedRootProcess::reserve_with_reclaim().await?);
+    let managed = ManagedRootProcess::reserve_with_reclaim().await?;
 
     #[cfg(windows)]
-    let mut child = {
+    let child = {
         // CreateProcessW can block inside the Windows loader. Keep that synchronous call off the
         // async runtime so timers and cancellation continue to make progress. kill_on_drop also
         // ensures that a child returned after this future times out is terminated when the
@@ -208,16 +221,24 @@ async fn spawn_process_with_stdin_mode(
             .await?
     };
     #[cfg(not(windows))]
-    let mut child = command.spawn()?;
+    let child = command.spawn()?;
 
+    finish_pipe_process_setup(child, managed).await
+}
+
+async fn finish_pipe_process_setup(
+    mut child: tokio::process::Child,
+    managed: ManagedRootProcess,
+) -> Result<SpawnedProcess> {
     #[cfg(windows)]
     let windows_terminator = {
         let pid = child
             .id()
             .ok_or_else(|| io::Error::other("missing child pid"))?;
         if let Err(error) = managed.attach_and_resume(pid) {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
+            if let Err(cleanup_error) = managed.cleanup_after_failed_attach(child).await {
+                log::warn!("failed to finish pipe attachment cleanup: {cleanup_error}");
+            }
             return Err(error.into());
         }
         let process_handle = child
@@ -226,10 +247,9 @@ async fn spawn_process_with_stdin_mode(
         let process = match duplicate_process_handle(process_handle) {
             Ok(process) => process,
             Err(err) => {
-                if managed.terminate().is_err() {
-                    let _ = child.start_kill();
+                if let Err(cleanup_error) = managed.cleanup_after_failed_attach(child).await {
+                    log::warn!("failed to finish pipe handle setup cleanup: {cleanup_error}");
                 }
-                let _ = child.wait().await;
                 return Err(err.into());
             }
         };
@@ -240,6 +260,7 @@ async fn spawn_process_with_stdin_mode(
         .id()
         .ok_or_else(|| io::Error::other("missing child pid"))?;
 
+    let managed = Arc::new(managed);
     let stdin = child.stdin.take();
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();

@@ -84,15 +84,17 @@ pub async fn start_streaming_sse_server(
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
 
     let task = tokio::spawn(async move {
+        let mut connections = tokio::task::JoinSet::new();
         loop {
             tokio::select! {
                 _ = &mut shutdown_rx => break,
+                Some(_) = connections.join_next(), if !connections.is_empty() => {},
                 accept_res = listener.accept() => {
                     let (mut stream, _) = accept_res.expect("accept streaming SSE connection");
                     let state = Arc::clone(&state);
                     let requests = Arc::clone(&requests_for_task);
                     let request_notify = Arc::clone(&request_notify_for_task);
-                    tokio::spawn(async move {
+                    connections.spawn(async move {
                         let (request, body_prefix) = read_http_request(&mut stream).await;
                         let Some((method, path)) = parse_request_line(&request) else {
                             let _ = write_http_response(&mut stream, /*status*/ 400, "bad request", "text/plain").await;
@@ -158,6 +160,7 @@ pub async fn start_streaming_sse_server(
                 }
             }
         }
+        connections.shutdown().await;
     });
 
     (
@@ -289,6 +292,45 @@ mod tests {
     use tokio::net::TcpStream;
     use tokio::time::Duration;
     use tokio::time::timeout;
+
+    #[tokio::test]
+    async fn shutdown_closes_a_connection_waiting_for_a_chunk_gate() {
+        let (gate, gate_receiver) = oneshot::channel();
+        let (server, _completed) = start_streaming_sse_server(vec![vec![StreamingSseChunk {
+            gate: Some(gate_receiver),
+            body: "data: held until gate opens\n\n".to_string(),
+        }]])
+        .await;
+        let address = server.uri().strip_prefix("http://").expect("HTTP URI");
+        let mut connection = TcpStream::connect(address).await.expect("connect");
+        connection
+            .write_all(
+                b"POST /v1/responses HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{}",
+            )
+            .await
+            .expect("send request");
+        let (headers, body) = timeout(Duration::from_secs(1), read_http_request(&mut connection))
+            .await
+            .expect("SSE response headers");
+        assert!(headers.starts_with("HTTP/1.1 200 OK"));
+        assert!(body.is_empty());
+
+        server.shutdown().await;
+
+        let mut remaining = Vec::new();
+        timeout(
+            Duration::from_secs(1),
+            connection.read_to_end(&mut remaining),
+        )
+        .await
+        .expect("shutdown must close the gate-blocked connection")
+        .expect("read EOF");
+        assert!(remaining.is_empty());
+        assert!(
+            gate.send(()).is_err(),
+            "shutdown must drop the chunk waiter"
+        );
+    }
 
     fn split_response(response: &str) -> (&str, &str) {
         response

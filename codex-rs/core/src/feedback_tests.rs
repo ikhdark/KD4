@@ -16,11 +16,30 @@ use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::util::SubscriberInitExt;
 
 #[test]
-fn feedback_tags_macro_compiles() {
+fn feedback_tags_macro_records_debug_values() {
     #[derive(Debug)]
     struct OnlyDebug;
 
+    let tags = Arc::new(Mutex::new(BTreeMap::new()));
+    let event_count = Arc::new(Mutex::new(0));
+    let _guard = tracing_subscriber::registry()
+        .with(TagCollectorLayer {
+            tags: tags.clone(),
+            event_count: event_count.clone(),
+        })
+        .set_default();
+
     feedback_tags!(model = "gpt-5.2", cached = true, debug_only = OnlyDebug);
+
+    assert_eq!(
+        *tags.lock().unwrap(),
+        BTreeMap::from([
+            ("cached".to_string(), "true".to_string()),
+            ("debug_only".to_string(), "OnlyDebug".to_string()),
+            ("model".to_string(), "\"gpt-5.2\"".to_string()),
+        ])
+    );
+    assert_eq!(*event_count.lock().unwrap(), 1);
 }
 
 #[derive(Default)]

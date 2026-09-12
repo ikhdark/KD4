@@ -44,6 +44,34 @@ pub(crate) fn load_cached_global_directory_plugins(
         codex_home,
         &RemotePluginCatalogCacheKey::global(config, auth),
     );
+    load_cached_global_directory_plugins_at_path(cache_path)
+}
+
+pub(crate) async fn load_cached_global_directory_plugins_async(
+    codex_home: &Path,
+    config: &RemotePluginServiceConfig,
+    auth: &CodexAuth,
+) -> Option<Vec<RemotePluginDirectoryItem>> {
+    let cache_path = cache_path(
+        codex_home,
+        &RemotePluginCatalogCacheKey::global(config, auth),
+    );
+    match tokio::task::spawn_blocking(move || {
+        load_cached_global_directory_plugins_at_path(cache_path)
+    })
+    .await
+    {
+        Ok(plugins) => plugins,
+        Err(err) => {
+            warn!("failed to join remote plugin catalog cache read task: {err}");
+            None
+        }
+    }
+}
+
+fn load_cached_global_directory_plugins_at_path(
+    cache_path: PathBuf,
+) -> Option<Vec<RemotePluginDirectoryItem>> {
     let bytes = match std::fs::read(&cache_path) {
         Ok(bytes) => bytes,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return None,
@@ -74,28 +102,34 @@ pub(crate) fn load_cached_global_directory_plugins(
     Some(cache.plugins)
 }
 
-pub(crate) fn write_cached_global_directory_plugins(
+pub(crate) async fn write_cached_global_directory_plugins(
     codex_home: &Path,
     config: &RemotePluginServiceConfig,
     auth: &CodexAuth,
-    plugins: &[RemotePluginDirectoryItem],
+    plugins: Vec<RemotePluginDirectoryItem>,
 ) {
     let cache_path = cache_path(
         codex_home,
         &RemotePluginCatalogCacheKey::global(config, auth),
     );
-    if let Some(parent) = cache_path.parent()
-        && std::fs::create_dir_all(parent).is_err()
+    if let Err(err) = tokio::task::spawn_blocking(move || {
+        if let Some(parent) = cache_path.parent()
+            && std::fs::create_dir_all(parent).is_err()
+        {
+            return;
+        }
+        let Ok(bytes) = serde_json::to_vec_pretty(&RemotePluginCatalogDiskCache {
+            schema_version: REMOTE_PLUGIN_CATALOG_DISK_CACHE_SCHEMA_VERSION,
+            plugins,
+        }) else {
+            return;
+        };
+        let _ = std::fs::write(cache_path, bytes);
+    })
+    .await
     {
-        return;
+        warn!("failed to join remote plugin catalog cache write task: {err}");
     }
-    let Ok(bytes) = serde_json::to_vec_pretty(&RemotePluginCatalogDiskCache {
-        schema_version: REMOTE_PLUGIN_CATALOG_DISK_CACHE_SCHEMA_VERSION,
-        plugins: plugins.to_vec(),
-    }) else {
-        return;
-    };
-    let _ = std::fs::write(cache_path, bytes);
 }
 
 fn cache_path(codex_home: &Path, cache_key: &RemotePluginCatalogCacheKey) -> PathBuf {

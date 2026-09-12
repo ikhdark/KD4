@@ -138,6 +138,14 @@ impl OutboundConnectionState {
     }
 }
 
+impl Drop for OutboundConnectionState {
+    fn drop(&mut self) {
+        // The router owns connection retirement even when its control receiver
+        // disappears before it can consume an explicit DisconnectAll event.
+        self.request_disconnect();
+    }
+}
+
 fn should_skip_notification_for_connection(
     connection_state: &OutboundConnectionState,
     message: &OutgoingMessage,

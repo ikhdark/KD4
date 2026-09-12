@@ -53,12 +53,95 @@ async fn test_shell_command_approval_triggers_elicitation() {
 
     // Apparently `#[tokio::test]` must return `()`, so we create a helper
     // function that returns `Result` so we can use `?` in favor of `unwrap`.
-    shell_command_approval_triggers_elicitation()
+    shell_command_approval_triggers_elicitation(true)
         .await
         .expect("shell command approval should trigger elicitation");
 }
 
-async fn shell_command_approval_triggers_elicitation() -> anyhow::Result<()> {
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shell_command_approval_client_error_denies_command_and_completes() -> anyhow::Result<()> {
+    skip_if_no_network!();
+    shell_command_approval_triggers_elicitation(false).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shell_command_approval_cancellation_completes_and_ignores_late_approval()
+-> anyhow::Result<()> {
+    skip_if_no_network!();
+    let workdir = TempDir::new()?;
+    let created_file = workdir.path().join("must_not_be_created.txt");
+    let command = vec![
+        "New-Item".to_string(),
+        "-ItemType".to_string(),
+        "File".to_string(),
+        "-Path".to_string(),
+        "must_not_be_created.txt".to_string(),
+        "-Force".to_string(),
+    ];
+    let McpHandle {
+        process: mut mcp_process,
+        server: _server,
+        dir: _dir,
+    } = create_mcp_process(vec![create_shell_command_sse_response(
+        command,
+        Some(workdir.path()),
+        Some(10_000),
+        "cancelled-call",
+    )?])
+    .await?;
+    let request_id = mcp_process
+        .send_codex_tool_call(CodexToolCallParam {
+            prompt: "Create the file".to_string(),
+            cwd: Some(workdir.path().to_string_lossy().into_owned()),
+            ..Default::default()
+        })
+        .await?;
+    let approval = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp_process.read_stream_until_request_message(),
+    )
+    .await??;
+    assert_eq!(approval.request.method, "elicitation/create");
+
+    mcp_process.cancel_tool_call(request_id).await?;
+    let response = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp_process.read_stream_until_response_message(RequestId::Number(request_id)),
+    )
+    .await??;
+    assert_eq!(response.result["isError"], json!(true));
+    assert_eq!(
+        response.result["content"],
+        json!([{ "type": "text", "text": "Turn aborted." }])
+    );
+    assert!(
+        !created_file.exists(),
+        "cancelled approval must not run the shell command"
+    );
+
+    mcp_process
+        .send_response(
+            approval.id,
+            serde_json::to_value(ExecApprovalResponse {
+                decision: ReviewDecision::Approved,
+            })?,
+        )
+        .await?;
+    let ping = mcp_process.send_ping_request().await?;
+    let response = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp_process.read_stream_until_response_message(RequestId::Number(ping)),
+    )
+    .await??;
+    assert_eq!(response.result, json!({}));
+    assert!(
+        !created_file.exists(),
+        "a late approval must not revive the cancelled command"
+    );
+    Ok(())
+}
+
+async fn shell_command_approval_triggers_elicitation(approve: bool) -> anyhow::Result<()> {
     // Use a simple, untrusted command that creates a file so we can
     // observe a side-effect.
     let workdir_for_shell_function_call = TempDir::new()?;
@@ -82,20 +165,27 @@ async fn shell_command_approval_triggers_elicitation() -> anyhow::Result<()> {
     let expected_shell_command =
         format_with_current_shell(&shlex::try_join(shell_command.iter().map(String::as_str))?);
 
+    let final_message = if approve {
+        "File created!"
+    } else {
+        "required tool `shell_command` blocked"
+    };
+    let mut responses = vec![create_shell_command_sse_response(
+        shell_command.clone(),
+        Some(workdir_for_shell_function_call.path()),
+        Some(timeout_ms),
+        "call1234",
+    )?];
+    if approve {
+        responses.push(create_final_assistant_message_sse_response(
+            "File created!",
+        )?);
+    }
     let McpHandle {
         process: mut mcp_process,
-        server: _server,
+        server,
         dir: _dir,
-    } = create_mcp_process(vec![
-        create_shell_command_sse_response(
-            shell_command.clone(),
-            Some(workdir_for_shell_function_call.path()),
-            Some(timeout_ms),
-            "call1234",
-        )?,
-        create_final_assistant_message_sse_response("File created!")?,
-    ])
-    .await?;
+    } = create_mcp_process(responses).await?;
 
     // Send a "codex" tool request, which should hit the responses endpoint.
     // In turn, it should reply with a tool call, which the MCP should forward
@@ -141,14 +231,23 @@ async fn shell_command_approval_triggers_elicitation() -> anyhow::Result<()> {
     );
 
     // Accept the `git init` request by responding to the elicitation.
-    mcp_process
-        .send_response(
-            elicitation_request_id,
-            serde_json::to_value(ExecApprovalResponse {
-                decision: ReviewDecision::Approved,
-            })?,
-        )
-        .await?;
+    if approve {
+        mcp_process
+            .send_response(
+                elicitation_request_id,
+                serde_json::to_value(ExecApprovalResponse {
+                    decision: ReviewDecision::Approved,
+                })?,
+            )
+            .await?;
+    } else {
+        mcp_process
+            .send_error(
+                elicitation_request_id,
+                rmcp::model::ErrorData::internal_error("approval UI unavailable", None),
+            )
+            .await?;
+    }
 
     // Verify task_complete notification arrives before the tool call completes.
     let _task_complete = timeout(
@@ -172,20 +271,31 @@ async fn shell_command_approval_triggers_elicitation() -> anyhow::Result<()> {
             result: json!({
                 "content": [
                     {
-                        "text": "File created!",
+                        "text": final_message,
                         "type": "text"
                     }
                 ],
                 "structuredContent": {
                     "threadId": params.thread_id,
-                    "content": "File created!"
+                    "content": final_message
                 }
             }),
         },
         codex_response
     );
 
-    assert!(created_file.is_file(), "created file should exist");
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(
+        requests.len(),
+        if approve { 2 } else { 1 },
+        "a denied required tool must terminate without another model request"
+    );
+
+    assert_eq!(
+        created_file.is_file(),
+        approve,
+        "a failed approval must not execute the command"
+    );
 
     Ok(())
 }

@@ -19,14 +19,92 @@ use std::fs;
 use tempfile::tempdir;
 
 #[tokio::test(flavor = "current_thread")]
-async fn confirmed_performance_config_metadata_probe_uses_blocking_pool() {
-    let async_thread = std::thread::current().id();
-
-    let blocking_thread = run_blocking_config_probe(|| std::thread::current().id())
-        .await
+async fn config_reload_retries_failed_mitm_build_without_committing_mtime() {
+    let home = tempdir().expect("create isolated Codex home");
+    let codex_home = AbsolutePathBuf::from_absolute_path(home.path()).unwrap();
+    let config_path = home.path().join(CONFIG_TOML_FILE);
+    let initial_config = r#"
+default_permissions = "reload"
+[permissions.reload.network]
+mode = "full"
+[permissions.reload.network.domains]
+"blocked.example.com" = "deny"
+"#;
+    fs::write(&config_path, initial_config).unwrap();
+    let initial_mtime = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+    fs::File::options()
+        .write(true)
+        .open(&config_path)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(initial_mtime))
         .unwrap();
+    let (initial_state, layer_mtimes) = build_config_state_with_mtimes(&codex_home).await.unwrap();
+    assert!(initial_state.mitm.is_none());
+    assert!(initial_state.deny_set.is_match("blocked.example.com"));
+    let reloader = MtimeConfigReloader::new(layer_mtimes, codex_home);
+    let entry: &dyn ConfigReloader = &reloader;
+    assert!(entry.maybe_reload().await.unwrap().is_none());
 
-    assert_ne!(blocking_thread, async_thread);
+    fs::write(&config_path, initial_config.replace("full", "limited")).unwrap();
+    let changed_mtime = initial_mtime + std::time::Duration::from_secs(10);
+    fs::File::options()
+        .write(true)
+        .open(&config_path)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(changed_mtime))
+        .unwrap();
+    let proxy_dir = home.path().join("proxy");
+    fs::write(&proxy_dir, "obstruct CA directory creation").unwrap();
+
+    let error = entry
+        .maybe_reload()
+        .await
+        .err()
+        .expect("MITM CA creation failure must reach the reloader caller");
+    let error = format!("{error:#}");
+    assert!(error.contains("failed to create"), "{error}");
+    assert!(error.contains("proxy"), "{error}");
+    assert_eq!(
+        reloader
+            .layer_mtimes
+            .read()
+            .await
+            .iter()
+            .find(|layer| layer.path.as_path() == config_path)
+            .unwrap()
+            .mtime,
+        Some(initial_mtime),
+        "a failed state build must not acknowledge the changed config"
+    );
+    assert_eq!(
+        fs::read_to_string(&proxy_dir).unwrap(),
+        "obstruct CA directory creation"
+    );
+
+    // Repair only CA storage: retry must notice the same uncommitted config mtime.
+    fs::remove_file(&proxy_dir).unwrap();
+    let repaired = entry
+        .maybe_reload()
+        .await
+        .unwrap()
+        .expect("unchanged config must retry after its failed MITM build");
+    assert_eq!(repaired.config.mode, NetworkMode::Limited);
+    assert!(repaired.mitm.is_some());
+    assert!(repaired.deny_set.is_match("blocked.example.com"));
+    assert!(!repaired.deny_set.is_match("other.example.com"));
+    let certificate = fs::read_dir(&proxy_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().is_some_and(|extension| extension == "pem"))
+        .expect("successful MITM initialization must persist its CA certificate");
+    let certificate = fs::read_to_string(certificate).unwrap();
+    assert!(certificate.starts_with("-----BEGIN CERTIFICATE-----"));
+    assert!(certificate.contains("-----END CERTIFICATE-----"));
+
+    assert!(
+        entry.maybe_reload().await.unwrap().is_none(),
+        "successful reload must commit the changed config mtime"
+    );
 }
 
 #[test]

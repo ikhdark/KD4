@@ -189,7 +189,8 @@ impl App {
                     self.chat_widget.thread_id(),
                     self.chat_widget.thread_name(),
                     self.chat_widget.rollout_path().as_deref(),
-                );
+                )
+                .await;
                 self.chat_widget
                     .add_plain_history_lines(vec!["/fork".magenta().into()]);
                 if let Some(thread_id) = self.chat_widget.thread_id() {
@@ -466,8 +467,15 @@ impl App {
                     .await?;
             }
             AppEvent::ApproveRecentAutoReviewDenial { thread_id, id } => {
-                self.chat_widget
-                    .approve_recent_auto_review_denial(thread_id, id);
+                if let Some(event) = self.chat_widget.recent_auto_review_denial(thread_id, &id) {
+                    let op = AppCommand::approve_guardian_denied_action(event);
+                    match self.submit_thread_op(app_server, thread_id, op).await {
+                        Ok(()) => self.chat_widget.complete_recent_auto_review_denial(&id),
+                        Err(err) => self.chat_widget.add_error_message(format!(
+                            "Failed to submit auto-review approval: {err:#}"
+                        )),
+                    }
+                }
             }
             AppEvent::SubmitThreadOp { thread_id, op } => {
                 self.submit_thread_op(app_server, thread_id, op).await?;
@@ -520,7 +528,7 @@ impl App {
                 self.open_url_in_browser(url);
             }
             AppEvent::OpenDesktopThread { thread_id } => {
-                self.open_desktop_thread(thread_id);
+                self.open_desktop_thread(thread_id).await;
             }
             AppEvent::PetSelected { pet_id } => {
                 self.handle_pet_selected(tui, pet_id);
@@ -1082,6 +1090,21 @@ impl App {
                     profile_selection,
                 );
             }
+            AppEvent::CheckWorldWritablePermissionMode {
+                preset,
+                label,
+                approvals_reviewer,
+                profile_selection,
+            } => {
+                self.chat_widget
+                    .apply_permission_mode_after_world_writable_scan(
+                        preset,
+                        label,
+                        approvals_reviewer,
+                        profile_selection,
+                    )
+                    .await;
+            }
             AppEvent::OpenWorldWritableWarningConfirmation {
                 preset,
                 profile_selection,
@@ -1390,7 +1413,7 @@ impl App {
                             let windows_sandbox_level =
                                 crate::windows_sandbox::level_from_config(&self.config);
                             if let Some((sample_paths, extra_count, failed_scan)) =
-                                self.chat_widget.world_writable_warning_details()
+                                self.chat_widget.world_writable_warning_details().await
                             {
                                 self.app_event_tx.send(AppEvent::CodexOp(
                                     AppCommand::override_turn_context(
@@ -1679,22 +1702,7 @@ impl App {
                         && permission_profile_is_managed_restricted
                         && !self.chat_widget.world_writable_warning_hidden();
                     if should_check {
-                        let cwd = self.config.cwd.clone();
-                        let workspace_roots = self.config.effective_workspace_roots();
-                        let env_map: std::collections::HashMap<String, String> =
-                            std::env::vars().collect();
-                        let tx = self.app_event_tx.clone();
-                        let logs_base_dir = self.config.codex_home.clone();
-                        let permission_profile =
-                            self.config.permissions.effective_permission_profile();
-                        Self::spawn_world_writable_scan(
-                            cwd,
-                            workspace_roots,
-                            env_map,
-                            logs_base_dir,
-                            permission_profile,
-                            tx,
-                        );
+                        self.spawn_world_writable_scan();
                     }
                 }
             }

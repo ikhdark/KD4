@@ -593,10 +593,17 @@ async fn skills_read_honors_response_budgets_without_rereading_cached_contents()
             .post_tool_use_response(&call_id, &payload)
             .ok_or("skills.read should expose structured output")?;
         assert!(serde_json::to_vec(&response)?.len() <= 360);
-        reconstructed.push_str(
-            response["contents"]
-                .as_str()
-                .ok_or("skills.read response should contain text")?,
+        let page = response["contents"]
+            .as_str()
+            .ok_or("skills.read response should contain text")?;
+        assert!(
+            !page.is_empty(),
+            "each page must advance through the resource"
+        );
+        reconstructed.push_str(page);
+        assert!(
+            contents.starts_with(&reconstructed),
+            "pages must preserve the resource prefix without repeating or adding bytes"
         );
         cursor = response["next_cursor"].as_str().map(str::to_owned);
         first_cursor.get_or_insert_with(|| cursor.clone());

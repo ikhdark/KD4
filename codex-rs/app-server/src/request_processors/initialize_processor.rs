@@ -186,10 +186,20 @@ impl InitializeRequestProcessor {
             .send_response(connection_request_id, response)
             .await;
 
-        if let Err(err) = crate::runtime_provenance::write_desktop_runtime_receipt(
-            self.config.codex_home.as_path(),
-            &name,
-        ) {
+        let receipt_codex_home = self.config.codex_home.clone();
+        // Hashing the running executable and atomically writing the receipt are
+        // blocking filesystem operations. Keep initialization ordered while
+        // leaving the async executor available for other connections.
+        let receipt_result = tokio::task::spawn_blocking(move || {
+            crate::runtime_provenance::write_desktop_runtime_receipt(
+                receipt_codex_home.as_path(),
+                &name,
+            )
+        })
+        .await
+        .map_err(std::io::Error::other)
+        .and_then(std::convert::identity);
+        if let Err(err) = receipt_result {
             tracing::warn!(
                 error = %err,
                 "failed to publish app-server runtime receipt after initialization"

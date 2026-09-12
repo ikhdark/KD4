@@ -233,14 +233,13 @@ impl NetworkProxyBuilder {
             socks_addr,
             socks_enabled: current_cfg.enable_socks5,
             socks5_udp_enabled: current_cfg.enable_socks5_udp,
-            runtime_settings: Arc::new(RwLock::new(NetworkProxyRuntimeSettings::from_config(
-                &current_cfg,
-                &codex_home,
-            )?)),
+            runtime_settings: Arc::new(RwLock::new(
+                NetworkProxyRuntimeSettings::from_config(&current_cfg, &codex_home).await?,
+            )),
             codex_home,
             reserved_listeners,
             policy_decider: self.policy_decider,
-            environment_proxies: Arc::new(Mutex::new(HashMap::new())),
+            environment_proxies: Arc::new(Mutex::new(Some(HashMap::new()))),
             execution_scope: None,
         })
     }
@@ -316,10 +315,19 @@ struct NetworkProxyRuntimeSettings {
 }
 
 impl NetworkProxyRuntimeSettings {
-    fn from_config(config: &config::NetworkProxyConfig, codex_home: &Path) -> Result<Self> {
+    async fn from_config(config: &config::NetworkProxyConfig, codex_home: &Path) -> Result<Self> {
         let mitm_ca_trust_bundle = if config.mitm {
             let env = crate::certs::ca_env_from_process();
-            Some(crate::certs::managed_ca_trust_bundle(codex_home, &env)?)
+            let codex_home = codex_home.to_path_buf();
+            // CA initialization locks artifacts and loads native roots and PEM files.
+            // Keep those operations off the async runtime, including config reloads.
+            Some(
+                tokio::task::spawn_blocking(move || {
+                    crate::certs::managed_ca_trust_bundle(&codex_home, &env)
+                })
+                .await
+                .context("managed MITM CA initialization task failed")??,
+            )
         } else {
             None
         };
@@ -376,7 +384,7 @@ pub struct NetworkProxy {
     runtime_settings: Arc<RwLock<NetworkProxyRuntimeSettings>>,
     reserved_listeners: Option<Arc<ReservedListeners>>,
     policy_decider: Option<Arc<dyn NetworkPolicyDecider>>,
-    environment_proxies: Arc<Mutex<HashMap<String, EnvironmentProxy>>>,
+    environment_proxies: Arc<Mutex<Option<HashMap<String, EnvironmentProxy>>>>,
     execution_scope: Option<Arc<ExecutionScope>>,
 }
 
@@ -736,6 +744,23 @@ impl NetworkProxy {
         Ok(self.prepare_for_addrs(env, addrs))
     }
 
+    /// Prepares the command environment without blocking an async executor on
+    /// cold listener reservation. Accepted work remains owned until cache publication
+    /// or rejection after shutdown, even if its caller is canceled.
+    pub async fn prepare_for_optional_environment_async(
+        &self,
+        env: HashMap<String, String>,
+        environment_id: Option<&str>,
+    ) -> Result<PreparedManagedNetwork> {
+        let proxy = self.clone();
+        let environment_id = environment_id.map(str::to_owned);
+        tokio::task::spawn_blocking(move || {
+            proxy.prepare_for_optional_environment(env, environment_id.as_deref())
+        })
+        .await
+        .context("network proxy preparation worker failed")?
+    }
+
     fn environment_proxy_addrs(&self, environment_id: &str) -> Result<EnvironmentProxyAddrs> {
         if let Some(execution_scope) = self.execution_scope.as_ref() {
             anyhow::ensure!(
@@ -745,12 +770,15 @@ impl NetworkProxy {
             );
         }
 
-        let mut proxies = self
-            .environment_proxies
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(proxy) = proxies.get(environment_id) {
-            return Ok(proxy.addrs);
+        {
+            let proxies = self
+                .environment_proxies
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let proxies = proxies.as_ref().context("network proxy has shut down")?;
+            if let Some(proxy) = proxies.get(environment_id) {
+                return Ok(proxy.addrs);
+            }
         }
 
         let runtime = tokio::runtime::Handle::try_current().with_context(|| {
@@ -775,6 +803,17 @@ impl NetworkProxy {
             socks_listener,
         } = listeners;
 
+        // Reserve outside the cache lock so shutdown never waits on socket creation.
+        // Recheck under the publication lock: shutdown or a competing preparation may
+        // have completed while these listeners were being reserved.
+        let mut proxies = self
+            .environment_proxies
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let proxies = proxies.as_mut().context("network proxy has shut down")?;
+        if let Some(proxy) = proxies.get(environment_id) {
+            return Ok(proxy.addrs);
+        }
         let environment_id = environment_id.to_string();
         let http_state = self.state.clone();
         let http_decider = self.policy_decider.clone();
@@ -845,7 +884,7 @@ impl NetworkProxy {
         );
 
         let settings =
-            NetworkProxyRuntimeSettings::from_config(&new_state.config, &self.codex_home)?;
+            NetworkProxyRuntimeSettings::from_config(&new_state.config, &self.codex_home).await?;
         self.state.replace_config_state(new_state).await?;
         let mut guard = self
             .runtime_settings
@@ -870,7 +909,7 @@ impl NetworkProxy {
         let current_cfg = self.state.current_cfg().await?;
         if !current_cfg.enabled {
             warn!("network.enabled is false; skipping proxy listeners");
-            return Ok(NetworkProxyHandle::noop());
+            return Ok(NetworkProxyHandle::noop(self.environment_proxies.clone()));
         }
 
         if !unix_socket_permissions_supported()
@@ -957,25 +996,25 @@ impl NetworkProxy {
 pub struct NetworkProxyHandle {
     http_task: Option<JoinHandle<Result<()>>>,
     socks_task: Option<JoinHandle<Result<()>>>,
-    environment_proxies: Arc<Mutex<HashMap<String, EnvironmentProxy>>>,
+    environment_proxies: Arc<Mutex<Option<HashMap<String, EnvironmentProxy>>>>,
     completed: bool,
 }
 
 impl NetworkProxyHandle {
-    fn noop() -> Self {
+    fn noop(environment_proxies: Arc<Mutex<Option<HashMap<String, EnvironmentProxy>>>>) -> Self {
         Self {
             http_task: Some(tokio::spawn(async { Ok(()) })),
             socks_task: None,
-            environment_proxies: Arc::new(Mutex::new(HashMap::new())),
-            completed: true,
+            environment_proxies,
+            completed: false,
         }
     }
 
     pub async fn wait(mut self) -> Result<()> {
-        let http_task = self.http_task.take().context("missing http proxy task")?;
-        let socks_task = self.socks_task.take();
+        // Retain ownership while awaiting so dropping this future still cancels listeners.
+        let http_task = self.http_task.as_mut().context("missing http proxy task")?;
         let http_result = http_task.await;
-        let socks_result = match socks_task {
+        let socks_result = match self.socks_task.as_mut() {
             Some(task) => Some(task.await),
             None => None,
         };
@@ -1007,19 +1046,33 @@ async fn abort_tasks(
     http_task: Option<JoinHandle<Result<()>>>,
     socks_task: Option<JoinHandle<Result<()>>>,
 ) {
+    // Request cancellation for every listener before the first suspension point.
+    for task in [&http_task, &socks_task].into_iter().flatten() {
+        task.abort();
+    }
     abort_task(http_task).await;
     abort_task(socks_task).await;
 }
 
 async fn abort_environment_proxies(
-    environment_proxies: Arc<Mutex<HashMap<String, EnvironmentProxy>>>,
+    environment_proxies: Arc<Mutex<Option<HashMap<String, EnvironmentProxy>>>>,
 ) {
     let proxies = {
         let mut guard = environment_proxies
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.drain().map(|(_, proxy)| proxy).collect::<Vec<_>>()
+        guard
+            .take()
+            .unwrap_or_default()
+            .into_values()
+            .collect::<Vec<_>>()
     };
+    for proxy in &proxies {
+        proxy.http_task.abort();
+        if let Some(task) = &proxy.socks_task {
+            task.abort();
+        }
+    }
     for proxy in proxies {
         abort_task(Some(proxy.http_task)).await;
         abort_task(proxy.socks_task).await;
@@ -1031,13 +1084,22 @@ impl Drop for NetworkProxyHandle {
         if self.completed {
             return;
         }
-        let http_task = self.http_task.take();
-        let socks_task = self.socks_task.take();
-        let environment_proxies = self.environment_proxies.clone();
-        tokio::spawn(async move {
-            abort_tasks(http_task, socks_task).await;
-            abort_environment_proxies(environment_proxies).await;
-        });
+        if let Some(task) = &self.http_task {
+            task.abort();
+        }
+        if let Some(task) = &self.socks_task {
+            task.abort();
+        }
+        let mut proxies = self
+            .environment_proxies
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for proxy in proxies.take().unwrap_or_default().into_values() {
+            proxy.http_task.abort();
+            if let Some(task) = proxy.socks_task {
+                task.abort();
+            }
+        }
     }
 }
 
@@ -1050,6 +1112,66 @@ mod tests {
     use std::net::IpAddr;
     use std::net::Ipv4Addr;
     use std::path::Path;
+
+    async fn running_proxy_with_environment() -> (NetworkProxyHandle, Vec<SocketAddr>) {
+        let state = Arc::new(network_proxy_state_for_policy(NetworkProxyConfig {
+            enabled: true,
+            ..NetworkProxyConfig::default()
+        }));
+        let proxy = NetworkProxy::builder().state(state).build().await.unwrap();
+        let handle = proxy.run().await.unwrap();
+        proxy
+            .prepare_for_optional_environment(HashMap::new(), Some("drop-test"))
+            .unwrap();
+        let environment = proxy.environment_proxy_addrs("drop-test").unwrap();
+        let addrs = vec![
+            proxy.http_addr(),
+            proxy.socks_addr,
+            environment.http_addr,
+            environment.socks_addr,
+        ];
+        for addr in &addrs {
+            tokio::net::TcpStream::connect(addr).await.unwrap();
+        }
+        (handle, addrs)
+    }
+
+    async fn assert_proxy_listeners_released(addrs: Vec<SocketAddr>) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            for addr in addrs {
+                loop {
+                    if StdTcpListener::bind(addr).is_ok() {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            }
+        })
+        .await
+        .expect("all main and environment listener ports must be released");
+    }
+
+    #[test]
+    fn dropping_proxy_handle_outside_runtime_releases_all_listeners() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (handle, addrs) = runtime.block_on(running_proxy_with_environment());
+        drop(handle);
+        runtime.block_on(assert_proxy_listeners_released(addrs));
+    }
+
+    #[tokio::test]
+    async fn cancelling_proxy_wait_releases_all_listeners() {
+        let (handle, addrs) = running_proxy_with_environment().await;
+        let wait = tokio::spawn(handle.wait());
+        tokio::task::yield_now().await;
+        assert!(!wait.is_finished());
+        wait.abort();
+        assert!(wait.await.unwrap_err().is_cancelled());
+        assert_proxy_listeners_released(addrs).await;
+    }
 
     #[tokio::test]
     async fn managed_proxy_builder_uses_loopback_ports() {
@@ -1219,30 +1341,23 @@ mod tests {
         );
     }
 
-    #[test]
-    fn reserve_windows_managed_listeners_falls_back_when_http_port_is_busy() {
+    #[tokio::test]
+    async fn reserve_windows_managed_listeners_falls_back_when_http_port_is_busy() {
         let occupied = StdTcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
         let busy_port = occupied.local_addr().unwrap().port();
 
-        let reserved = reserve_windows_managed_listeners(
-            SocketAddr::from(([127, 0, 0, 1], busy_port)),
-            SocketAddr::from(([127, 0, 0, 1], 48081)),
-            /*reserve_socks_listener*/ false,
-        )
-        .unwrap();
-
-        assert!(reserved.socks_listener.is_none());
+        let state = Arc::new(network_proxy_state_for_policy(NetworkProxyConfig {
+            proxy_url: format!("http://127.0.0.1:{busy_port}"),
+            enable_socks5: false,
+            ..NetworkProxyConfig::default()
+        }));
+        let proxy = NetworkProxy::builder().state(state).build().await.unwrap();
+        assert!(!proxy.socks_enabled);
+        assert!(proxy.http_addr().ip().is_loopback());
+        assert_ne!(proxy.http_addr().port(), busy_port);
         assert!(
-            reserved
-                .http_listener
-                .local_addr()
-                .unwrap()
-                .ip()
-                .is_loopback()
-        );
-        assert_ne!(
-            reserved.http_listener.local_addr().unwrap().port(),
-            busy_port
+            StdTcpListener::bind(proxy.http_addr()).is_err(),
+            "builder must reserve the replacement port"
         );
     }
 
@@ -1481,5 +1596,185 @@ mod tests {
         );
 
         assert_eq!(env.get(GIT_SSH_COMMAND_ENV_KEY), None);
+    }
+    #[test]
+    fn async_environment_preparation_preserves_progress_and_listener_ownership() -> Result<()> {
+        use std::future::Future;
+        use std::task::Poll;
+        use std::time::Duration;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()?;
+        runtime.block_on(async {
+            for cancel_waiter in [false, true] {
+                let state = Arc::new(network_proxy_state_for_policy(NetworkProxyConfig {
+                    enabled: true,
+                    proxy_url: "http://127.0.0.1:0".to_string(),
+                    socks_url: "socks5://127.0.0.1:0".to_string(),
+                    enable_socks5_udp: false,
+                    allow_local_binding: true,
+                    ..NetworkProxyConfig::default()
+                }));
+                let proxy = NetworkProxy::builder().state(state).build().await?;
+                let handle = proxy.run().await?;
+                let mut addrs = vec![proxy.http_addr(), proxy.socks_addr];
+                for addr in &addrs {
+                    tokio::time::timeout(Duration::from_secs(5), tokio::net::TcpStream::connect(addr)).await??;
+                }
+
+                let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+                let (release_tx, release_rx) = std::sync::mpsc::channel();
+                let blocker = tokio::task::spawn_blocking(move || {
+                    let _ = started_tx.send(());
+                    release_rx.recv_timeout(Duration::from_secs(5)).is_ok()
+                });
+                started_rx.await?;
+                let base_env = HashMap::from([("PRESERVED".to_string(), "caller value".to_string())]);
+                let mut preparation = Box::pin(proxy.prepare_for_optional_environment_async(
+                    base_env.clone(), Some("cold-command"),
+                ));
+                std::future::poll_fn(|cx| {
+                    assert!(preparation.as_mut().poll(cx).is_pending(),
+                        "cold preparation must queue blocking work instead of executing socket setup on the runtime thread");
+                    Poll::Ready(())
+                }).await;
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                assert!(!blocker.is_finished(), "runtime timer must progress while its sole blocking worker remains occupied");
+
+                let (prepared, canceled_addrs) = if cancel_waiter {
+                    drop(preparation);
+                    release_tx.send(())?;
+                    assert!(blocker.await?);
+                    // Observe completion without issuing a second preparation that
+                    // could create the missing entry and mask lost accepted work.
+                    let accepted_addrs = tokio::time::timeout(Duration::from_secs(5), async {
+                        loop {
+                            let addrs = proxy.environment_proxies.lock().unwrap()
+                                .as_ref().and_then(|proxies| proxies.get("cold-command"))
+                                .map(|entry| entry.addrs);
+                            if let Some(addrs) = addrs {
+                                break addrs;
+                            }
+                            tokio::task::yield_now().await;
+                        }
+                    }).await.expect("accepted preparation survives cancellation of its waiter");
+                    let prepared = proxy.prepare_for_optional_environment_async(
+                        base_env.clone(), Some("cold-command"),
+                    ).await?;
+                    (prepared, Some(accepted_addrs))
+                } else {
+                    release_tx.send(())?;
+                    assert!(blocker.await?);
+                    (tokio::time::timeout(Duration::from_secs(5), preparation).await??, None)
+                };
+                assert_eq!(prepared.env.get("PRESERVED"), base_env.get("PRESERVED"));
+                assert_eq!(prepared.env.get(PROXY_ACTIVE_ENV_KEY).map(String::as_str), Some("1"));
+                let http_addr = prepared.env["HTTP_PROXY"].strip_prefix("http://")
+                    .expect("HTTP proxy URL").parse::<SocketAddr>()?;
+                let socks_addr = prepared.env["ALL_PROXY"].strip_prefix("socks5h://")
+                    .expect("SOCKS proxy URL").parse::<SocketAddr>()?;
+                if let Some(canceled_addrs) = canceled_addrs {
+                    assert_eq!(http_addr, canceled_addrs.http_addr,
+                        "next command reuses HTTP listener created by the canceled caller's owned job");
+                    assert_eq!(socks_addr, canceled_addrs.socks_addr);
+                }
+                assert_ne!(http_addr, proxy.http_addr());
+                assert_ne!(socks_addr, proxy.socks_addr);
+                let mut expected_ports = vec![http_addr.port(), socks_addr.port()];
+                expected_ports.sort_unstable();
+                expected_ports.dedup();
+                assert_eq!(prepared.sandbox_context, ManagedNetworkSandboxContext {
+                    loopback_ports: expected_ports,
+                    allow_local_binding: true,
+                });
+                for addr in [http_addr, socks_addr] {
+                    assert!(addr.ip().is_loopback());
+                    tokio::time::timeout(Duration::from_secs(5), tokio::net::TcpStream::connect(addr)).await??;
+                    assert!(StdTcpListener::bind(addr).is_err(), "published listener must own its advertised port");
+                    addrs.push(addr);
+                }
+                drop(proxy);
+                handle.shutdown().await?;
+                assert_proxy_listeners_released(addrs).await;
+            }
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn shutdown_rejects_environment_preparation_queued_on_blocking_worker() -> Result<()> {
+        use std::future::Future;
+        use std::task::Poll;
+        use std::time::Duration;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()?;
+        runtime.block_on(async {
+            let state = Arc::new(network_proxy_state_for_policy(NetworkProxyConfig {
+                enabled: true,
+                proxy_url: "http://127.0.0.1:0".to_string(),
+                socks_url: "socks5://127.0.0.1:0".to_string(),
+                enable_socks5_udp: false,
+                ..NetworkProxyConfig::default()
+            }));
+            let proxy = NetworkProxy::builder().state(state).build().await?;
+            let handle = proxy.run().await?;
+            let addrs = vec![proxy.http_addr(), proxy.socks_addr];
+            for addr in &addrs {
+                tokio::time::timeout(Duration::from_secs(5), tokio::net::TcpStream::connect(addr))
+                    .await??;
+            }
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                let _ = started_tx.send(());
+                release_rx.recv_timeout(Duration::from_secs(5)).is_ok()
+            });
+            started_rx.await?;
+            let mut preparation = Box::pin(proxy.prepare_for_optional_environment_async(
+                HashMap::new(),
+                Some("must-not-start-after-shutdown"),
+            ));
+            std::future::poll_fn(|cx| {
+                assert!(preparation.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            tokio::time::timeout(Duration::from_secs(5), handle.shutdown()).await??;
+            // The accepted worker has not run yet; shutdown must close admission
+            // before draining listeners so delayed preparation cannot resurrect them.
+            release_tx.send(())?;
+            assert!(blocker.await?);
+            let result = tokio::time::timeout(Duration::from_secs(5), preparation).await?;
+            assert!(
+                result.is_err(),
+                "queued environment preparation must not publish live endpoints after shutdown"
+            );
+            assert!(
+                proxy
+                    .prepare_for_optional_environment_async(
+                        HashMap::new(),
+                        Some("retry-after-shutdown")
+                    )
+                    .await
+                    .is_err()
+            );
+            assert!(
+                proxy
+                    .prepare_for_optional_environment(
+                        HashMap::new(),
+                        Some("sync-retry-after-shutdown")
+                    )
+                    .is_err(),
+                "the preserved synchronous entry point must share the closed admission boundary"
+            );
+            drop(proxy);
+            assert_proxy_listeners_released(addrs).await;
+            Ok(())
+        })
     }
 }

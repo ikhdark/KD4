@@ -454,11 +454,16 @@ pub(crate) async fn backfill_sessions_with_lease(
                     if outcome.parse_errors > 0
                         && let Some(ref metric_client) = metric_client
                     {
-                        let _ = metric_client.counter(
-                            DB_ERROR_METRIC,
-                            outcome.parse_errors as i64,
-                            &[("stage", "backfill_sessions")],
-                        );
+                        let metric_client = metric_client.clone();
+                        let parse_errors = outcome.parse_errors as i64;
+                        let _ = tokio::task::spawn_blocking(move || {
+                            let _ = metric_client.counter(
+                                DB_ERROR_METRIC,
+                                parse_errors,
+                                &[("stage", "backfill_sessions")],
+                            );
+                        })
+                        .await;
                     }
                     let parent_thread_id = outcome.parent_thread_id;
                     let mut metadata = outcome.metadata;
@@ -562,27 +567,35 @@ pub(crate) async fn backfill_sessions_with_lease(
         "state db backfill scanned={}, upserted={}, failed={}",
         stats.scanned, stats.upserted, stats.failed
     );
-    if let Some(metric_client) = metric_client {
-        let _ = metric_client.counter(
-            DB_METRIC_BACKFILL,
-            stats.upserted as i64,
-            &[("status", "upserted")],
-        );
-        let _ = metric_client.counter(
-            DB_METRIC_BACKFILL,
-            stats.failed as i64,
-            &[("status", "failed")],
-        );
-    }
-    if let Some(timer) = timer.as_ref() {
-        let status = if stats.failed == 0 {
-            "success"
-        } else if stats.upserted == 0 {
-            "failed"
-        } else {
-            "partial_failure"
-        };
-        let _ = timer.record(&[("status", status)]);
+    if metric_client.is_some() || timer.is_some() {
+        // SDK instrument creation and measurement may take shared SDK locks or
+        // invoke configured tracing subscribers. Keep these synchronous operations
+        // off the executor that drives embedded archive/startup backfill.
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Some(metric_client) = metric_client {
+                let _ = metric_client.counter(
+                    DB_METRIC_BACKFILL,
+                    stats.upserted as i64,
+                    &[("status", "upserted")],
+                );
+                let _ = metric_client.counter(
+                    DB_METRIC_BACKFILL,
+                    stats.failed as i64,
+                    &[("status", "failed")],
+                );
+            }
+            if let Some(timer) = timer.as_ref() {
+                let status = if stats.failed == 0 {
+                    "success"
+                } else if stats.upserted == 0 {
+                    "failed"
+                } else {
+                    "partial_failure"
+                };
+                let _ = timer.record(&[("status", status)]);
+            }
+        })
+        .await;
     }
 }
 

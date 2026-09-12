@@ -231,10 +231,9 @@ async fn wait_for_python_repl_ready(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pty_python_repl_emits_output_and_exits() -> anyhow::Result<()> {
-    let Some(python) = find_python() else {
-        eprintln!("python not found; skipping pty_python_repl_emits_output_and_exits");
-        return Ok(());
-    };
+    let python = find_python().ok_or_else(|| {
+        anyhow::anyhow!("Python is required to verify real PTY input/output behavior")
+    })?;
 
     let ready_marker = "__codex_pty_ready__";
     let args = vec![
@@ -260,7 +259,7 @@ async fn pty_python_repl_emits_output_and_exits() -> anyhow::Result<()> {
     let mut output =
         wait_for_python_repl_ready(&mut output_rx, startup_timeout_ms, ready_marker).await?;
     writer
-        .send(format!("print('hello from pty'){newline}").into_bytes())
+        .send(format!("print(137 * 19){newline}").into_bytes())
         .await?;
     writer.send(format!("exit(){newline}").into_bytes()).await?;
 
@@ -270,7 +269,7 @@ async fn pty_python_repl_emits_output_and_exits() -> anyhow::Result<()> {
     let text = String::from_utf8_lossy(&output);
 
     assert!(
-        text.contains("hello from pty"),
+        text.contains("2603"),
         "expected python output in PTY: {text:?}"
     );
     assert_eq!(code, 0, "expected python to exit cleanly");

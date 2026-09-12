@@ -1,4 +1,6 @@
 approval_policy = "never"
+model_auto_compact_token_limit = 127000
+model_auto_compact_token_limit_scope = "total"
 
 sandbox_mode = "danger-full-access"
 allow_login_shell = false
@@ -10,7 +12,8 @@ max_depth = 1
 
 [features.multi_agent_v2]
 enabled = true
-max_concurrent_threads_per_session = 20
+max_concurrent_threads_per_session = 10
+
 
 [reasoning_phase_efforts]
 orient = "high"

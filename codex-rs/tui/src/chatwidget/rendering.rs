@@ -96,23 +96,37 @@ struct TranscriptAreaRenderable<'a> {
 impl Renderable for TranscriptAreaRenderable<'_> {
     fn render(&self, area: Rect, buf: &mut Buffer) {
         let area = self.child_area(area);
-        let lines = self.child.display_lines(area.width);
-        let paragraph = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
-        let y = if area.height == 0 {
-            0
-        } else {
-            let overflow = paragraph
-                .line_count(area.width)
-                .saturating_sub(usize::from(area.height));
-            u16::try_from(overflow).unwrap_or(u16::MAX)
-        };
         Clear.render(area, buf);
+        if area.is_empty() {
+            return;
+        }
+        let lines = self.child.display_lines(area.width);
+        // Drop complete logical lines before the visible suffix. Paragraph's scroll and row
+        // counters are u16, so scrolling through the entire history can overflow even though the
+        // terminal only needs a few rows. Count with Paragraph itself to preserve its wrapping.
+        let mut first_line = lines.len();
+        let mut suffix_rows = 0usize;
+        while first_line > 0 && suffix_rows < usize::from(area.height) {
+            first_line -= 1;
+            suffix_rows = suffix_rows.saturating_add(
+                Paragraph::new(lines[first_line].clone())
+                    .wrap(Wrap { trim: false })
+                    .line_count(area.width),
+            );
+        }
+        let lines: Vec<_> = lines.into_iter().skip(first_line).collect();
+        let paragraph = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
+        // A single logical line wrapping beyond u16::MAX still exceeds Paragraph's API; keep
+        // that case within its counters instead of overflowing the renderer.
+        let y = suffix_rows
+            .saturating_sub(usize::from(area.height))
+            .min(usize::from(u16::MAX.saturating_sub(area.height))) as u16;
         paragraph.scroll((y, 0)).render(area, buf);
     }
 
     fn desired_height(&self, width: u16) -> u16 {
         let child_width = width.saturating_sub(self.right).max(1);
-        HistoryCell::desired_height(self.child, child_width) + self.top
+        HistoryCell::desired_height(self.child, child_width).saturating_add(self.top)
     }
 }
 
@@ -145,5 +159,78 @@ impl Renderable for ChatWidget {
 
     fn cursor_style(&self, area: Rect) -> crossterm::cursor::SetCursorStyle {
         self.as_renderable().cursor_style(area)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::history_cell::HistoryRenderMode;
+    use crate::history_cell::PlainHistoryCell;
+    use ratatui::text::Span;
+
+    #[test]
+    fn transcript_height_saturates_and_preserves_visible_tail_and_reserved_area() {
+        for (line_count, child_height, composed_height) in [
+            (3_usize, 3_u16, 4_u16),
+            (65_535, u16::MAX, u16::MAX),
+            (65_536, u16::MAX, u16::MAX),
+            (65_537, u16::MAX, u16::MAX),
+            (131_075, u16::MAX, u16::MAX),
+        ] {
+            let mut lines = vec![Line::from("x"); line_count];
+            lines[line_count - 1] = Line::from("tail");
+            let child = PlainHistoryCell::new(lines);
+            for mode in [HistoryRenderMode::Rich, HistoryRenderMode::Raw] {
+                assert_eq!(child.desired_height_for_mode(4, mode), child_height);
+            }
+            let renderable = TranscriptAreaRenderable {
+                child: &child,
+                top: 1,
+                right: 2,
+            };
+            assert_eq!(renderable.desired_height(6), composed_height);
+            let mut buf = Buffer::empty(Rect::new(0, 0, 8, 4));
+            for y in 0..4 {
+                buf.set_string(0, y, "........", Style::default());
+            }
+            renderable.render(Rect::new(1, 1, 6, 2), &mut buf);
+            let rows: Vec<String> = (0..4)
+                .map(|y| (0..8).map(|x| buf[(x, y)].symbol()).collect())
+                .collect();
+            assert_eq!(rows, ["........", "........", ".tail...", "........"]);
+        }
+    }
+
+    #[test]
+    fn long_transcript_preserves_wrapped_styled_final_rows() {
+        let mut lines = vec![Line::from("x"); 65_537];
+        lines.push(Line::from(vec![
+            Span::styled("HEAD", Style::default().fg(Color::Red)),
+            Span::styled("LAST", Style::default().fg(Color::Green)),
+            Span::styled("TAIL", Style::default().fg(Color::Yellow)),
+        ]));
+        let child = PlainHistoryCell::new(lines);
+        let renderable = TranscriptAreaRenderable {
+            child: &child,
+            top: 1,
+            right: 2,
+        };
+        let mut buf = Buffer::empty(Rect::new(0, 0, 8, 5));
+        for y in 0..5 {
+            buf.set_string(0, y, "........", Style::default());
+        }
+        renderable.render(Rect::new(1, 1, 6, 3), &mut buf);
+        let rows: Vec<String> = (0..5)
+            .map(|y| (0..8).map(|x| buf[(x, y)].symbol()).collect())
+            .collect();
+        assert_eq!(
+            rows,
+            ["........", "........", ".LAST...", ".TAIL...", "........"]
+        );
+        for x in 1..5 {
+            assert_eq!(buf[(x, 2)].fg, Color::Green);
+            assert_eq!(buf[(x, 3)].fg, Color::Yellow);
+        }
     }
 }

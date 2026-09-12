@@ -231,8 +231,9 @@ pub fn intersect_uri_permission_profiles(
                 .iter()
                 .filter(|entry| uri_grant_is_within_request(&requested_file_system, entry, cwd))
             {
-                if !entries.contains(entry) {
-                    entries.push(entry.clone());
+                let entry = materialize_uri_cwd_dependent_entry(entry, cwd);
+                if !entries.contains(&entry) {
+                    entries.push(entry);
                 }
             }
             // Extra deny entries only narrow a grant, so preserving requested and
@@ -243,8 +244,9 @@ pub fn intersect_uri_permission_profiles(
                 .chain(granted_file_system.entries.iter())
                 .filter(|entry| entry.access == FileSystemAccessMode::Deny)
             {
-                if !entries.contains(entry) {
-                    entries.push(entry.clone());
+                let entry = materialize_uri_cwd_dependent_entry(entry, cwd);
+                if !entries.contains(&entry) {
+                    entries.push(entry);
                 }
             }
             FileSystemPermissions {
@@ -276,6 +278,25 @@ pub fn intersect_uri_permission_profiles(
         network,
         file_system,
     }
+}
+
+fn materialize_uri_cwd_dependent_entry(
+    entry: &FileSystemSandboxEntry<PathUri>,
+    cwd: &PathUri,
+) -> FileSystemSandboxEntry<PathUri> {
+    if matches!(
+        &entry.path,
+        FileSystemPath::Special {
+            value: FileSystemSpecialPath::ProjectRoots { .. }
+        }
+    ) && let Some(path) = resolve_uri_permission_path(&entry.path, cwd)
+    {
+        return FileSystemSandboxEntry {
+            path: FileSystemPath::Path { path },
+            access: entry.access,
+        };
+    }
+    entry.clone()
 }
 
 fn uri_grant_is_within_request(

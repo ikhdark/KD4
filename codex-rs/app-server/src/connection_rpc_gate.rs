@@ -74,37 +74,51 @@ impl ConnectionRpcGate {
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        let join_handle = {
-            let mut state = self
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if !state.accepting {
-                return Ok(false);
-            }
-
-            let task_id = state.next_task_id;
-            state.next_task_id = state.next_task_id.wrapping_add(1);
-            let registration = TaskRegistration {
-                state: Arc::downgrade(&self.state),
-                task_id,
-            };
-            let (start_tx, start_rx) = tokio::sync::oneshot::channel();
-            let join_handle = self.tasks.spawn(async move {
-                let _registration = registration;
-                if start_rx.await.is_ok() {
-                    future.await;
-                }
-            });
-            state
-                .abort_handles
-                .insert(task_id, join_handle.abort_handle());
-            let _ = start_tx.send(());
-            join_handle
+        let Some(join_handle) = self
+            .spawn_with_commit(|| Ok::<_, std::convert::Infallible>(future))
+            .unwrap_or_else(|never| match never {})
+        else {
+            return Ok(false);
         };
-
         join_handle.await?;
         Ok(true)
+    }
+
+    /// Commit ordered admission and transfer its completion to the connection
+    /// owner atomically with close. A closed gate never invokes the commit.
+    pub(crate) fn spawn_with_commit<F, E>(
+        &self,
+        commit: impl FnOnce() -> Result<F, E>,
+    ) -> Result<Option<tokio::task::JoinHandle<()>>, E>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !state.accepting {
+            return Ok(None);
+        }
+        let future = commit()?;
+        let task_id = state.next_task_id;
+        state.next_task_id = state.next_task_id.wrapping_add(1);
+        let registration = TaskRegistration {
+            state: Arc::downgrade(&self.state),
+            task_id,
+        };
+        let (start_tx, start_rx) = tokio::sync::oneshot::channel();
+        let join_handle = self.tasks.spawn(async move {
+            let _registration = registration;
+            if start_rx.await.is_ok() {
+                future.await;
+            }
+        });
+        state
+            .abort_handles
+            .insert(task_id, join_handle.abort_handle());
+        let _ = start_tx.send(());
+        Ok(Some(join_handle))
     }
 
     pub(crate) fn cancellation_token(&self) -> CancellationToken {
@@ -171,7 +185,7 @@ impl ConnectionRpcGate {
     }
 
     #[cfg(test)]
-    fn inflight_count(&self) -> usize {
+    pub(crate) fn inflight_count(&self) -> usize {
         self.tasks.len()
     }
 }

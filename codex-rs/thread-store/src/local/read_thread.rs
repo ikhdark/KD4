@@ -169,10 +169,12 @@ async fn resolve_requested_rollout_path(
             reason: "file does not exist".to_string(),
         });
     };
-    std::fs::canonicalize(path.as_path()).map_err(|err| ThreadStoreError::RolloutNotMaterialized {
-        path,
-        reason: err.to_string(),
-    })
+    tokio::fs::canonicalize(path.as_path())
+        .await
+        .map_err(|err| ThreadStoreError::RolloutNotMaterialized {
+            path,
+            reason: err.to_string(),
+        })
 }
 
 async fn attach_history_if_requested(
@@ -326,9 +328,7 @@ async fn stored_thread_from_session_meta(
 ) -> ThreadStoreResult<StoredThread> {
     let meta_line = read_required_session_meta_line(path.as_path()).await?;
     let archived = rollout_path_is_archived(store.config.codex_home.as_path(), path.as_path());
-    Ok(stored_thread_from_meta_line(
-        store, meta_line, path, archived,
-    ))
+    Ok(stored_thread_from_meta_line(store, meta_line, path, archived).await)
 }
 
 async fn read_required_session_meta_line(
@@ -341,14 +341,15 @@ async fn read_required_session_meta_line(
         })
 }
 
-fn stored_thread_from_meta_line(
+async fn stored_thread_from_meta_line(
     store: &LocalThreadStore,
     meta_line: SessionMetaLine,
     path: std::path::PathBuf,
     archived: bool,
 ) -> StoredThread {
     let created_at = parse_rfc3339_non_optional(&meta_line.meta.timestamp).unwrap_or_else(Utc::now);
-    let updated_at = std::fs::metadata(path.as_path())
+    let updated_at = tokio::fs::metadata(path.as_path())
+        .await
         .ok()
         .and_then(|meta| meta.modified().ok())
         .map(DateTime::<Utc>::from)
@@ -1119,6 +1120,12 @@ mod tests {
             },
         });
         writeln!(file, "{meta}").expect("write session meta");
+        let expected_updated_at = DateTime::parse_from_rfc3339("2025-02-04T15:16:17Z")
+            .expect("valid modified time")
+            .with_timezone(&Utc);
+        file.set_times(std::fs::FileTimes::new().set_modified(expected_updated_at.into()))
+            .expect("set modified time");
+        drop(file);
 
         let thread = store
             .read_thread(ReadThreadParams {
@@ -1138,7 +1145,8 @@ mod tests {
             thread.created_at,
             parse_rfc3339_non_optional("2025-01-03T12:00:00Z").unwrap()
         );
-        assert!(thread.updated_at >= thread.created_at);
+        assert_eq!(thread.updated_at, expected_updated_at);
+        assert_eq!(thread.recency_at, expected_updated_at);
         assert_eq!(thread.archived_at, None);
         assert_eq!(thread.cwd, home.path());
         assert_eq!(thread.cli_version, "test_version");

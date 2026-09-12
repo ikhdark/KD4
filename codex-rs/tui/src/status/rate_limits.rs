@@ -406,6 +406,7 @@ fn format_credit_balance(raw: &str) -> Option<String> {
     if let Ok(value) = trimmed.parse::<f64>()
         && value.is_finite()
         && value > 0.0
+        && value < i64::MAX as f64
     {
         let rounded = value.round() as i64;
         return Some(rounded.to_string());
@@ -416,7 +417,7 @@ fn format_credit_balance(raw: &str) -> Option<String> {
 
 fn format_credit_amount(raw: &str) -> Option<String> {
     let value = raw.trim().parse::<f64>().ok()?;
-    if !value.is_finite() || value < 0.0 {
+    if !value.is_finite() || value < 0.0 || value >= i64::MAX as f64 {
         return None;
     }
     Some(format_with_separators(value.round() as i64))
@@ -437,6 +438,57 @@ mod tests {
             used_percent,
             resets_at: Some("soon".to_string()),
             window_minutes: Some(300),
+        }
+    }
+
+    #[test]
+    fn credit_status_rejects_out_of_range_amounts_without_saturation() {
+        let now = Local::now();
+        for (balance, used, expected_credit, expected_spend) in [
+            ("1e20", "1e20", "Available", None),
+            ("12.6", "1250.4", "13 credits", Some("1,250")),
+        ] {
+            let snapshot = codex_app_server_protocol::RateLimitSnapshot {
+                limit_id: None,
+                limit_name: None,
+                primary: None,
+                secondary: None,
+                credits: Some(codex_app_server_protocol::CreditsSnapshot {
+                    has_credits: true,
+                    unlimited: false,
+                    balance: Some(balance.to_string()),
+                }),
+                individual_limit: Some(codex_app_server_protocol::SpendControlLimitSnapshot {
+                    limit: "5000".to_string(),
+                    used: used.to_string(),
+                    remaining_percent: 75,
+                    resets_at: 0,
+                }),
+                spend_control_reached: None,
+                plan_type: None,
+                rate_limit_reached_type: None,
+            };
+            let display =
+                super::rate_limit_snapshot_display_for_limit(&snapshot, "codex".to_string(), now);
+            assert_eq!(
+                display
+                    .individual_limit
+                    .as_ref()
+                    .map(|limit| limit.used.as_str()),
+                expected_spend
+            );
+            let rows = match compose_rate_limit_data_many(&[display], now) {
+                StatusRateLimitData::Available(rows) => rows,
+                other => panic!("unexpected status: {other:?}"),
+            };
+            let credits = rows
+                .iter()
+                .find(|row| row.label == "Credits")
+                .expect("credits row");
+            match &credits.value {
+                super::StatusRateLimitValue::Text(text) => assert_eq!(text, expected_credit),
+                other => panic!("unexpected credit display: {other:?}"),
+            }
         }
     }
 

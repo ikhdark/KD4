@@ -44,6 +44,7 @@ use crate::tools::tool_dispatch_trace::scope_tool_dispatch_timing;
 use crate::turn_timing::ToolCallTimingLineage;
 use crate::turn_timing::TurnTimingState;
 use codex_protocol::error::CodexErr;
+use codex_protocol::error::Result as CodexResult;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
@@ -280,12 +281,62 @@ struct WorkspaceEvidenceGenerationBatchState {
     call_ordinals: std::collections::HashMap<String, u64>,
     responses: Vec<PendingWorkspaceEvidenceResponse>,
     mutations: Vec<PendingWorkspaceMutation>,
+    owner: Option<WorkspaceEvidenceGenerationOwner>,
+}
+
+struct WorkspaceEvidenceGenerationOwner {
+    session: Arc<Session>,
+    turn: Arc<TurnContext>,
+    tracker: SharedTurnDiffTracker,
+    commit_guard: Option<crate::session::DurableHistoryCommitInFlight>,
+}
+
+impl WorkspaceEvidenceGenerationOwner {
+    fn retain_accepted_effect(&mut self) {
+        if self.commit_guard.is_none() {
+            self.commit_guard = Some(self.session.retain_tool_dispatch_commit());
+        }
+    }
 }
 
 /// Request-scoped workspace evidence collected until all accepted tool calls
 /// in one model sampling generation have settled.
 pub(crate) struct WorkspaceEvidenceGenerationBatch {
     state: Mutex<WorkspaceEvidenceGenerationBatchState>,
+}
+
+impl Drop for WorkspaceEvidenceGenerationBatch {
+    fn drop(&mut self) {
+        let state = self
+            .state
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.sealed {
+            return;
+        }
+        let Some(owner) = state.owner.take() else {
+            return;
+        };
+        if owner.commit_guard.is_none() {
+            return;
+        }
+        // The final shared batch reference retires only after direct and nested
+        // dispatch owners finish. Transfer the complete ordered state without
+        // sealing early or rejecting effects from a still-running nested call.
+        let batch = Arc::new(Self {
+            state: Mutex::new(std::mem::take(state)),
+        });
+        let terminal_tasks = owner.session.terminal_tasks.clone();
+        terminal_tasks.spawn(async move {
+            if let Err(error) = batch
+                .flush(&owner.session, &owner.turn, &owner.tracker)
+                .await
+            {
+                warn!(%error, "retiring workspace evidence generation failed");
+            }
+            drop(owner);
+        });
+    }
 }
 
 pub(crate) struct WorkspaceEvidenceGenerationFlush {
@@ -301,6 +352,26 @@ impl WorkspaceEvidenceGenerationBatch {
     pub(crate) fn new() -> Self {
         Self {
             state: Mutex::new(WorkspaceEvidenceGenerationBatchState::default()),
+        }
+    }
+
+    fn retain_generation_owner(
+        &self,
+        session: &Arc<Session>,
+        turn: &Arc<TurnContext>,
+        tracker: &SharedTurnDiffTracker,
+    ) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !state.sealed && state.owner.is_none() {
+            state.owner = Some(WorkspaceEvidenceGenerationOwner {
+                session: Arc::clone(session),
+                turn: Arc::clone(turn),
+                tracker: Arc::clone(tracker),
+                commit_guard: None,
+            });
         }
     }
 
@@ -343,6 +414,9 @@ impl WorkspaceEvidenceGenerationBatch {
         if state.sealed || !state.call_ordinals.contains_key(call_id) {
             return false;
         }
+        if let Some(owner) = state.owner.as_mut() {
+            owner.retain_accepted_effect();
+        }
         let ordinal = state.next_effect_ordinal;
         state.next_effect_ordinal = state.next_effect_ordinal.saturating_add(1);
         state.mutations.push(PendingWorkspaceMutation {
@@ -374,6 +448,9 @@ impl WorkspaceEvidenceGenerationBatch {
         };
         if state.sealed {
             return false;
+        }
+        if let Some(owner) = state.owner.as_mut() {
+            owner.retain_accepted_effect();
         }
         state.responses.push(PendingWorkspaceEvidenceResponse {
             ordinal,
@@ -407,8 +484,8 @@ impl WorkspaceEvidenceGenerationBatch {
         session: &Session,
         turn: &TurnContext,
         tracker: &SharedTurnDiffTracker,
-    ) -> WorkspaceEvidenceGenerationFlush {
-        let (responses, mutations) = {
+    ) -> CodexResult<WorkspaceEvidenceGenerationFlush> {
+        let (responses, mutations, _generation_owner) = {
             let mut state = self
                 .state
                 .lock()
@@ -417,6 +494,7 @@ impl WorkspaceEvidenceGenerationBatch {
             (
                 std::mem::take(&mut state.responses),
                 std::mem::take(&mut state.mutations),
+                state.owner.take(),
             )
         };
         tracker
@@ -486,6 +564,7 @@ impl WorkspaceEvidenceGenerationBatch {
             canonical_workspace_evidence_key_cached(turn.config.cwd.as_path(), &mut canonical_keys);
         let mut prefetched_workspace_identity = None;
         let mut finalized_responses = Vec::new();
+        let mut persistence_error = None;
         let git_workspace = Arc::clone(&session.services.git_workspace);
         let captured_groups =
             futures::future::join_all(groups.into_iter().map(|(key, mut group)| {
@@ -533,14 +612,17 @@ impl WorkspaceEvidenceGenerationBatch {
                         })
                         .collect::<std::collections::BTreeSet<_>>()
                 });
-                session
+                if let Err(error) = session
                     .invalidate_tool_history_source_dependencies_excluding_call_ids(
                         turn.config.codex_home.as_path(),
                         affected_paths.as_ref(),
                         capture.identity.as_ref(),
                         &current_generation_response_call_ids,
                     )
-                    .await;
+                    .await
+                {
+                    persistence_error.get_or_insert(error);
+                }
 
                 let (final_mutation_revision, observe_command_ledger) = {
                     let tracker = tracker.lock().await;
@@ -583,6 +665,13 @@ impl WorkspaceEvidenceGenerationBatch {
             }
         }
 
+        // Finish invalidating every mutated workspace and recording command
+        // revisions before returning an error. Failed durability must not publish
+        // these queued responses as fresh evidence for the next model request.
+        if let Some(error) = persistence_error {
+            return Err(error);
+        }
+
         finalized_responses.sort_by_key(|response| response.ordinal);
         #[cfg(test)]
         let registered_call_ids = finalized_responses
@@ -605,13 +694,13 @@ impl WorkspaceEvidenceGenerationBatch {
             .await;
         }
 
-        WorkspaceEvidenceGenerationFlush {
+        Ok(WorkspaceEvidenceGenerationFlush {
             prefetched_workspace_identity,
             #[cfg(test)]
             authoritative_capture_count,
             #[cfg(test)]
             registered_call_ids,
-        }
+        })
     }
 }
 
@@ -921,12 +1010,19 @@ async fn capture_workspace_evidence_baseline(
     // Register dependency watches before the authoritative snapshot. A change
     // that races the snapshot is then either reflected by the snapshot or
     // invalidates the path-scoped observation.
-    let repo_root = codex_git_utils::get_git_repo_root(cwd);
-    let source_path_observations = begin_source_path_observations(cache, cwd, &source_dependencies);
+    let owned_cwd = cwd.to_path_buf();
+    let repo_root =
+        tokio::task::spawn_blocking(move || codex_git_utils::get_git_repo_root(&owned_cwd))
+            .await
+            .ok()
+            .flatten();
+    let source_path_observations =
+        begin_source_path_observations(cache, repo_root.as_deref(), &source_dependencies).await;
     let cached_revision = if reuse_latest {
-        repo_root
-            .as_deref()
-            .and_then(|repo_root| cache.latest_workspace_evidence_identity(repo_root))
+        match repo_root.as_deref() {
+            Some(repo_root) => cache.latest_workspace_evidence_identity(repo_root).await,
+            None => None,
+        }
     } else {
         None
     };
@@ -948,26 +1044,28 @@ async fn capture_workspace_evidence_baseline(
     }
 }
 
-fn begin_source_path_observations(
+async fn begin_source_path_observations(
     cache: &crate::git_workspace::GitWorkspaceCache,
-    cwd: &std::path::Path,
+    repo_root: Option<&std::path::Path>,
     source_dependencies: &std::collections::BTreeSet<crate::tool_history::SourceDependencyV1>,
 ) -> Vec<crate::git_workspace::SourcePathChangeObservation> {
-    codex_git_utils::get_git_repo_root(cwd)
-        .as_ref()
-        .map(|repo_root| {
-            source_dependencies
-                .iter()
-                .filter_map(|dependency| {
-                    cache.begin_source_path_change_observation(
-                        repo_root,
-                        std::path::Path::new(&dependency.path),
-                        dependency.recursive,
-                    )
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+    let Some(repo_root) = repo_root else {
+        return Vec::new();
+    };
+    let mut observations = Vec::new();
+    for dependency in source_dependencies {
+        if let Some(observation) = cache
+            .begin_source_path_change_observation(
+                repo_root,
+                std::path::Path::new(&dependency.path),
+                dependency.recursive,
+            )
+            .await
+        {
+            observations.push(observation);
+        }
+    }
+    observations
 }
 
 fn finish_workspace_evidence_capture(
@@ -987,7 +1085,10 @@ fn finish_workspace_evidence_capture(
     // `None` is an authoritative identity for a non-Git workspace. The
     // mutation tracker, rather than the presence of a Git revision, determines
     // whether the pre-dispatch observation is still current.
-    let captured_current = !mutation_advanced;
+    let captured_current = !mutation_advanced
+        && revision
+            .as_ref()
+            .is_none_or(|identity| !identity.unavailable);
     (revision, captured_current)
 }
 
@@ -1036,6 +1137,7 @@ impl ToolCallRuntime {
         if !batch.register_call(call_id) {
             return;
         }
+        batch.retain_generation_owner(&self.session, &self.step_context.turn, &self.tracker);
         self.tracker
             .lock()
             .await
@@ -1044,12 +1146,11 @@ impl ToolCallRuntime {
 
     pub(crate) async fn flush_workspace_evidence_generation(
         &self,
-    ) -> WorkspaceEvidenceGenerationFlush {
-        self.step_context
-            .workspace_evidence_generation_batch
-            .flush(
-                self.session.as_ref(),
-                self.step_context.turn.as_ref(),
+    ) -> CodexResult<WorkspaceEvidenceGenerationFlush> {
+        self.session
+            .flush_workspace_evidence_generation(
+                &self.step_context.turn,
+                &self.step_context.workspace_evidence_generation_batch,
                 &self.tracker,
             )
             .await
@@ -1967,6 +2068,14 @@ impl ToolCallRuntime {
             payload: call.payload.clone(),
         };
 
+        // Dropping the response waiter must enter the same supervised cancellation
+        // path as explicit cancellation. A child token isolates it from sibling calls.
+        let cancellation_token = cancellation_token.child_token();
+        let caller_drop = cancellation_token.clone().drop_guard();
+        let mut commit_guard = (owns_unified_exec_processes || requires_commit_barrier)
+            .then(|| self.session.retain_tool_dispatch_commit());
+        let terminal_tasks = self.session.terminal_tasks.clone();
+
         let mut dispatch_handle: AbortOnDropHandle<Result<AnyToolResult, FunctionCallError>> =
             AbortOnDropHandle::new(tokio::spawn(async move {
                 let gate_guard = if workspace_admission.bypass_outer_gate {
@@ -2167,19 +2276,19 @@ impl ToolCallRuntime {
                 result
             }));
 
-        Either::Right(
+        let cancellation_owner = terminal_tasks.spawn(
             async move {
                 tokio::select! {
-                res = &mut dispatch_handle => res.map_err(Self::tool_task_join_error)?,
+                res = &mut dispatch_handle => Self::joined_tool_result(res, &dispatch_state).await,
                 _ = cancellation_token.cancelled() => {
                     if dispatch_state.is_terminal() || dispatch_handle.is_finished() {
-                        dispatch_handle.await.map_err(Self::tool_task_join_error)?
+                        Self::joined_tool_result(dispatch_handle.await, &dispatch_state).await
                     } else {
                         let cancelled_before_admission = match dispatch_state.try_abort() {
                             ToolDispatchAbort::BeforeAdmission => true,
                             ToolDispatchAbort::AfterAdmission => false,
                             ToolDispatchAbort::AlreadyTerminal => {
-                                return dispatch_handle.await.map_err(Self::tool_task_join_error)?;
+                                return Self::joined_tool_result(dispatch_handle.await, &dispatch_state).await;
                             }
                         };
                         let secs = started.elapsed().as_secs_f32().max(0.1);
@@ -2200,10 +2309,9 @@ impl ToolCallRuntime {
                                 dispatch_handle,
                                 wait_for_runtime_cancellation,
                                 owns_unified_exec_processes,
-                                Arc::clone(&abort_session),
-                                call.call_id.clone(),
-                                call.tool_name.clone(),
+                                abort_invocation.clone(),
                                 Arc::clone(&cancellation_timing),
+                                Arc::clone(&dispatch_state),
                             );
                             if owns_unified_exec_processes || requires_commit_barrier {
                                 // A retained exec process is part of the turn's terminal
@@ -2215,9 +2323,12 @@ impl ToolCallRuntime {
                                 // Other runtimes retain their owned dispatch future in a
                                 // supervised task so user-visible cancellation does not wait
                                 // for teardown beyond the terminal result they already own.
-                                tokio::spawn(cleanup);
+                                abort_session.terminal_tasks.spawn(cleanup);
                             }
                         }
+                        // Required state/process cleanup has joined. Lifecycle observers
+                        // do not extend the turn's durable-commit barrier.
+                        drop(commit_guard.take());
                         let mut response = Self::aborted_response(&call, secs);
                         scope_tool_dispatch_timing(
                             Arc::clone(&cancellation_timing),
@@ -2241,7 +2352,14 @@ impl ToolCallRuntime {
             }
         }
             .in_current_span(),
-        )
+        );
+        Either::Right(async move {
+            let result = cancellation_owner
+                .await
+                .map_err(Self::tool_task_join_error)?;
+            caller_drop.disarm();
+            result
+        })
     }
 }
 
@@ -2249,11 +2367,16 @@ async fn supervise_cancelled_dispatch_cleanup(
     mut dispatch_handle: AbortOnDropHandle<Result<AnyToolResult, FunctionCallError>>,
     wait_for_runtime_cancellation: bool,
     owns_unified_exec_processes: bool,
-    session: Arc<Session>,
-    call_id: String,
-    tool_name: codex_tools::ToolName,
+    invocation: ToolInvocation,
     timing: Arc<ToolDispatchTiming>,
+    dispatch_state: Arc<ToolDispatchState>,
 ) {
+    let ToolInvocation {
+        session,
+        call_id,
+        tool_name,
+        ..
+    } = invocation;
     if wait_for_runtime_cancellation {
         match tokio::time::timeout(TOOL_RUNTIME_CLEANUP_DEADLINE, &mut dispatch_handle).await {
             Ok(Ok(_)) => {}
@@ -2330,6 +2453,9 @@ async fn supervise_cancelled_dispatch_cleanup(
     // it only after the supervised process cleanup has reached a terminal
     // state so ProcessExit remains ordered before HandlerReturn.
     timing.mark_handler_exit_if_entered();
+    // The handler has joined and any required process cleanup has been awaited.
+    // An aborted future cannot execute the registry's ordinary trace terminal.
+    dispatch_state.record_cancelled_trace().await;
 }
 
 fn suppressed_function_response(call_id: &str, message: String) -> ResponseInputItem {
@@ -2342,6 +2468,21 @@ fn suppressed_function_response(call_id: &str, message: String) -> ResponseInput
 }
 
 impl ToolCallRuntime {
+    async fn joined_tool_result(
+        result: Result<Result<AnyToolResult, FunctionCallError>, JoinError>,
+        dispatch_state: &ToolDispatchState,
+    ) -> Result<AnyToolResult, FunctionCallError> {
+        match result {
+            Ok(result) => result,
+            Err(error) => {
+                let error = Self::tool_task_join_error(error);
+                // A joined panic cannot execute the registry's terminal branch.
+                dispatch_state.record_failed_trace(&error).await;
+                Err(error)
+            }
+        }
+    }
+
     fn tool_task_join_error(err: JoinError) -> FunctionCallError {
         FunctionCallError::Fatal(format!("tool task failed to receive: {err:?}"))
     }
@@ -3205,6 +3346,7 @@ mod tests {
     #[test]
     fn unchanged_workspace_command_keeps_its_result_fresh_for_model_delivery() {
         let identity = crate::git_workspace::WorkspaceEvidenceIdentity {
+            unavailable: false,
             repository_root: Some("repo".to_string()),
             head_identity: Some("head".to_string()),
             index_identity: Some("index".to_string()),
@@ -3225,8 +3367,22 @@ mod tests {
 
         let (mutated_revision, mutated_current) =
             finish_workspace_evidence_capture(&baseline, true);
-        assert_eq!(mutated_revision, Some(identity));
+        assert_eq!(mutated_revision, Some(identity.clone()));
         assert!(!mutated_current);
+
+        let unavailable_baseline = WorkspaceEvidenceBaseline {
+            revision: Some(crate::git_workspace::WorkspaceEvidenceIdentity {
+                unavailable: true,
+                ..identity
+            }),
+            ..baseline
+        };
+        let (_, unavailable_current) =
+            finish_workspace_evidence_capture(&unavailable_baseline, false);
+        assert!(
+            !unavailable_current,
+            "failed capture cannot certify an unchanged command"
+        );
 
         let non_git_baseline = WorkspaceEvidenceBaseline {
             revision: None,
@@ -4013,7 +4169,10 @@ mod tests {
         .expect("queued durability should start after nested relay returns");
 
         persistence_pause.release();
-        session.flush_tool_history_persistence().await;
+        session
+            .flush_tool_history_persistence()
+            .await
+            .expect("released persistence completes successfully");
     }
 
     struct BlockingHandler {
@@ -5221,21 +5380,560 @@ mod tests {
         Ok(())
     }
 
+    fn attach_dispatch_regression_trace(
+        session: &mut crate::session::session::Session,
+        turn: &crate::session::turn_context::TurnContext,
+        root: &std::path::Path,
+    ) -> anyhow::Result<std::path::PathBuf> {
+        let trace = codex_rollout_trace::ThreadTraceContext::start_root_in_root_for_test(
+            root,
+            codex_rollout_trace::ThreadStartedTraceMetadata {
+                thread_id: session.thread_id.to_string(),
+                agent_path: "/root".to_string(),
+                task_name: None,
+                nickname: None,
+                agent_role: None,
+                session_source: codex_protocol::protocol::SessionSource::Exec,
+                cwd: turn.config.cwd.to_path_buf(),
+                rollout_path: None,
+                model: "gpt-test".to_string(),
+                provider_name: "test-provider".to_string(),
+                approval_policy: "never".to_string(),
+                sandbox_policy: "danger-full-access".to_string(),
+            },
+        )?;
+        trace.record_codex_turn_started(turn.sub_id.as_str());
+        session.services.rollout_thread_trace = trace;
+        let mut bundles = std::fs::read_dir(root)?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(bundles.len(), 1);
+        Ok(bundles.remove(0))
+    }
+
+    fn dispatch_regression_events(
+        bundle: &std::path::Path,
+        call_id: &str,
+    ) -> anyhow::Result<(usize, Vec<codex_rollout_trace::ExecutionStatus>)> {
+        let text = std::fs::read_to_string(bundle.join("trace.jsonl"))?;
+        // A terminal writer may be appending. Only complete records are observable.
+        let complete = text.rfind('\n').map_or("", |end| &text[..=end]);
+        let mut starts = 0;
+        let mut endings = Vec::new();
+        for line in complete.lines() {
+            let event: codex_rollout_trace::RawTraceEvent = serde_json::from_str(line)?;
+            match event.payload {
+                codex_rollout_trace::RawTraceEventPayload::ToolCallStarted {
+                    tool_call_id, ..
+                } if tool_call_id == call_id => starts += 1,
+                codex_rollout_trace::RawTraceEventPayload::ToolCallEnded {
+                    tool_call_id,
+                    status,
+                    ..
+                } if tool_call_id == call_id => endings.push(status),
+                _ => {}
+            }
+        }
+        Ok((starts, endings))
+    }
+
+    fn assert_dispatch_regression_trace(
+        bundle: &std::path::Path,
+        call_id: &str,
+        expected: codex_rollout_trace::ExecutionStatus,
+        terminal: bool,
+    ) -> anyhow::Result<()> {
+        let (starts, endings) = dispatch_regression_events(bundle, call_id)?;
+        assert_eq!(starts, 1);
+        assert_eq!(endings.len(), usize::from(terminal));
+        if terminal {
+            assert_eq!(endings[0], expected);
+        }
+        let replay = codex_rollout_trace::replay_bundle(bundle)?;
+        let call = &replay.tool_calls[call_id];
+        assert_eq!(call.execution.status, expected);
+        assert_eq!(call.model_visible_call_id.as_deref(), Some(call_id));
+        if terminal {
+            assert!(call.raw_result_payload_id.is_some());
+        }
+        Ok(())
+    }
+
+    async fn wait_for_dispatch_regression_terminal(
+        bundle: &std::path::Path,
+        call_id: &str,
+    ) -> anyhow::Result<()> {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if !dispatch_regression_events(bundle, call_id)?.1.is_empty() {
+                    return Ok::<(), anyhow::Error>(());
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("dispatch {call_id} did not persist a terminal trace"))?
+    }
+
+    struct DispatchDropAcknowledgment(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for DispatchDropAcknowledgment {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    struct TracedCancellationCleanupHandler {
+        inner: CancellationCleanupHandler,
+        commit_barrier: bool,
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl ToolExecutor<ToolInvocation> for TracedCancellationCleanupHandler {
+        fn tool_name(&self) -> codex_tools::ToolName {
+            self.inner.tool_name()
+        }
+
+        fn spec(&self) -> codex_tools::ToolSpec {
+            self.inner.spec()
+        }
+
+        fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+            Box::pin(async move {
+                let _acknowledgment = DispatchDropAcknowledgment(Arc::clone(&self.dropped));
+                self.inner.handle_call(invocation).await
+            })
+        }
+    }
+
+    impl CoreToolRuntime for TracedCancellationCleanupHandler {
+        fn waits_for_runtime_cancellation(&self) -> bool {
+            true
+        }
+
+        fn cancellation_requires_commit_barrier(&self) -> bool {
+            self.commit_barrier
+        }
+    }
+
+    struct DispatchTraceOutcomeHandler {
+        outcome: &'static str,
+    }
+
+    impl ToolExecutor<ToolInvocation> for DispatchTraceOutcomeHandler {
+        fn tool_name(&self) -> codex_tools::ToolName {
+            codex_tools::ToolName::plain("trace_outcome_tool")
+        }
+
+        fn spec(&self) -> codex_tools::ToolSpec {
+            codex_tools::ToolSpec::Function(codex_tools::ResponsesApiTool {
+                name: self.tool_name().name,
+                description: "Trace outcome regression tool.".to_string(),
+                strict: false,
+                defer_loading: None,
+                parameters: codex_tools::JsonSchema::default(),
+                output_schema: None,
+            })
+        }
+
+        fn handle(&self, _invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+            Box::pin(async move {
+                match self.outcome {
+                    "panic" => panic!("dispatch-trace-panic-sentinel"),
+                    "error" => Err(FunctionCallError::RespondToModel("trace-error".to_string())),
+                    "success" => Ok(Box::new(FunctionToolOutput::from_text(
+                        "trace-success".to_string(),
+                        Some(true),
+                    ))
+                        as Box<dyn crate::tools::context::ToolOutput>),
+                    _ => unreachable!("known test outcome"),
+                }
+            })
+        }
+    }
+
+    impl CoreToolRuntime for DispatchTraceOutcomeHandler {}
+
+    struct LifecyclePanicProbe {
+        label: &'static str,
+        panic_at: Option<&'static str>,
+        records: Arc<std::sync::Mutex<Vec<(&'static str, &'static str, Option<ToolCallOutcome>)>>>,
+    }
+
+    impl codex_extension_api::ToolLifecycleContributor for LifecyclePanicProbe {
+        fn on_tool_start<'a>(
+            &'a self,
+            input: codex_extension_api::ToolStartInput<'a>,
+        ) -> codex_extension_api::ToolLifecycleFuture<'a> {
+            assert_eq!(input.call_id, "observer-panic-call");
+            if self.panic_at == Some("construct") {
+                panic!("start-construction-sentinel");
+            }
+            Box::pin(async move {
+                self.records
+                    .lock()
+                    .unwrap()
+                    .push((self.label, "start", None));
+                if self.panic_at == Some("poll") {
+                    panic!("start-poll-sentinel");
+                }
+            })
+        }
+
+        fn on_tool_finish<'a>(
+            &'a self,
+            input: codex_extension_api::ToolFinishInput<'a>,
+        ) -> codex_extension_api::ToolLifecycleFuture<'a> {
+            assert_eq!(input.call_id, "observer-panic-call");
+            Box::pin(async move {
+                if self.panic_at == Some("finish") {
+                    panic!("finish-poll-sentinel");
+                }
+                self.records
+                    .lock()
+                    .unwrap()
+                    .push((self.label, "finish", Some(input.outcome)));
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn registered_observer_panics_preserve_terminal_fanout_and_handler_outcome()
+    -> anyhow::Result<()> {
+        for panic_at in ["construct", "poll", "finish"] {
+            let temp = tempfile::TempDir::new()?;
+            let (mut session, turn) = crate::session::tests::make_session_and_context().await;
+            let bundle = attach_dispatch_regression_trace(&mut session, &turn, temp.path())?;
+            let records = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let mut builder =
+                codex_extension_api::ExtensionRegistryBuilder::<crate::config::Config>::new();
+            for label in ["before", "faulty", "after"] {
+                builder.tool_lifecycle_contributor(Arc::new(LifecyclePanicProbe {
+                    label,
+                    panic_at: (label == "faulty").then_some(panic_at),
+                    records: Arc::clone(&records),
+                }));
+            }
+            session.services.extensions = Arc::new(builder.build());
+            let session = Arc::new(session);
+            let turn = Arc::new(turn);
+            turn.turn_timing_state.mark_turn_started();
+            let router = Arc::new(ToolRouter::from_parts(
+                ToolRegistry::from_tools([Arc::new(DispatchTraceOutcomeHandler {
+                    outcome: "success",
+                }) as Arc<dyn CoreToolRuntime>]),
+                Vec::new(),
+            ));
+            let runtime = ToolCallRuntime::new(
+                Arc::clone(&session),
+                StepContext::for_test(Arc::clone(&turn)).with_tool_router_for_test(router),
+                Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+            );
+            let result = runtime
+                .handle_tool_call(
+                    ToolCall {
+                        tool_name: codex_tools::ToolName::plain("trace_outcome_tool"),
+                        call_id: "observer-panic-call".to_string(),
+                        payload: ToolPayload::Function {
+                            arguments: "{}".to_string(),
+                        },
+                    },
+                    CancellationToken::new(),
+                )
+                .await;
+            let handler_executed = panic_at == "finish";
+            let expected = if handler_executed {
+                let ResponseInputItem::FunctionCallOutput { output, .. } = result? else {
+                    anyhow::bail!("expected completed registered tool output");
+                };
+                assert_eq!(output.success, Some(true));
+                assert_eq!(output.body.to_text().as_deref(), Some("trace-success"));
+                ToolCallOutcome::Completed { success: true }
+            } else {
+                let error =
+                    result.expect_err("start observer panic must prevent handler execution");
+                assert!(
+                    matches!(error, CodexErr::Fatal(ref message) if message.contains(
+                        if panic_at == "construct" { "start-construction-sentinel" } else { "start-poll-sentinel" }
+                    ))
+                );
+                ToolCallOutcome::Failed {
+                    handler_executed: false,
+                }
+            };
+            for label in ["before", "after"] {
+                let observed = records
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|record| record.0 == label)
+                    .copied()
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    observed,
+                    vec![(label, "start", None), (label, "finish", Some(expected))]
+                );
+            }
+            let timing = turn.turn_timing_state.complete_snapshot().protocol_timing();
+            let call = timing
+                .tool_calls
+                .iter()
+                .find(|call| call.call_id == "observer-panic-call")
+                .expect("registered call timing");
+            assert_eq!(call.handler_entry_at_ms.is_some(), handler_executed);
+            assert_dispatch_regression_trace(
+                &bundle,
+                "observer-panic-call",
+                if handler_executed {
+                    codex_rollout_trace::ExecutionStatus::Completed
+                } else {
+                    codex_rollout_trace::ExecutionStatus::Failed
+                },
+                true,
+            )?;
+            session.terminal_tasks.close();
+            tokio::time::timeout(Duration::from_secs(5), session.terminal_tasks.wait()).await?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn registered_dispatch_trace_start_waits_off_thread_and_survives_cancellation()
+    -> anyhow::Result<()> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()?
+            .block_on(async {
+                for cancel in [false, true] {
+                    let temp = tempfile::TempDir::new()?;
+                    let (mut session, turn) =
+                        crate::session::tests::make_session_and_context().await;
+                    let bundle =
+                        attach_dispatch_regression_trace(&mut session, &turn, temp.path())?;
+                    let session = Arc::new(session);
+                    let turn = Arc::new(turn);
+                    let router = Arc::new(ToolRouter::from_parts(
+                        ToolRegistry::from_tools([Arc::new(DispatchTraceOutcomeHandler {
+                            outcome: "success",
+                        })
+                            as Arc<dyn CoreToolRuntime>]),
+                        Vec::new(),
+                    ));
+                    let step =
+                        StepContext::for_test(Arc::clone(&turn)).with_tool_router_for_test(router);
+                    let runtime = ToolCallRuntime::new(
+                        Arc::clone(&session),
+                        step,
+                        Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+                    );
+                    let (release, held) = std::sync::mpsc::channel();
+                    let (entered, occupied) = oneshot::channel();
+                    let blocker = tokio::task::spawn_blocking(move || {
+                        let _ = entered.send(());
+                        // Dropping the release sender also releases on assertion failure.
+                        let _ = held.recv();
+                    });
+                    occupied.await?;
+                    let baseline = session.terminal_tasks.len();
+                    assert_eq!(baseline, 0);
+                    let cancellation = CancellationToken::new();
+                    let call_id = if cancel {
+                        "queued-trace-cancelled"
+                    } else {
+                        "queued-trace-success"
+                    };
+                    let response = tokio::spawn(runtime.handle_tool_call(
+                        ToolCall {
+                            tool_name: codex_tools::ToolName::plain("trace_outcome_tool"),
+                            call_id: call_id.to_string(),
+                            payload: ToolPayload::Function {
+                                arguments: "{}".to_string(),
+                            },
+                        },
+                        cancellation.clone(),
+                    ));
+                    tokio::time::timeout(Duration::from_secs(5), async {
+                        // The normal cancellation owner is tracked separately;
+                        // wait for it and the queued trace initializer.
+                        while session.terminal_tasks.len() < baseline + 2 {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await?;
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    assert!(!response.is_finished());
+                    assert_eq!(dispatch_regression_events(&bundle, call_id)?, (0, vec![]));
+                    if cancel {
+                        cancellation.cancel();
+                        // Let the normal cancellation owner abort the registry waiter
+                        // while the trace initializer still cannot run.
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                        assert_eq!(dispatch_regression_events(&bundle, call_id)?, (0, vec![]));
+                    }
+                    release.send(())?;
+                    blocker.await?;
+                    let result = tokio::time::timeout(Duration::from_secs(5), response).await???;
+                    let ResponseInputItem::FunctionCallOutput { output, .. } = result else {
+                        anyhow::bail!("expected registered function output");
+                    };
+                    if cancel {
+                        // Cancellation has its existing neutral success field;
+                        // the explicit abort body and trace carry the outcome.
+                        assert_eq!(output.success, None);
+                        assert!(output.body.to_text().unwrap().contains("aborted by user"));
+                    } else {
+                        assert_eq!(output.success, Some(true));
+                        assert_eq!(output.body.to_text().as_deref(), Some("trace-success"));
+                    }
+                    // Ordinary cancellation returns before its existing cleanup
+                    // coroutine settles. Observe that owner's actual terminal,
+                    // not a transient gap between its tracked blocking writes.
+                    wait_for_dispatch_regression_terminal(&bundle, call_id).await?;
+                    session.terminal_tasks.close();
+                    tokio::time::timeout(Duration::from_secs(5), session.terminal_tasks.wait())
+                        .await?;
+                    assert_dispatch_regression_trace(
+                        &bundle,
+                        call_id,
+                        if cancel {
+                            codex_rollout_trace::ExecutionStatus::Cancelled
+                        } else {
+                            codex_rollout_trace::ExecutionStatus::Completed
+                        },
+                        true,
+                    )?;
+                    let timing = turn.turn_timing_state.complete_snapshot().protocol_timing();
+                    let call = timing
+                        .tool_calls
+                        .iter()
+                        .find(|call| call.call_id == call_id)
+                        .expect("registered call timing");
+                    assert_eq!(
+                        call.handler_entry_at_ms.is_some(),
+                        !cancel,
+                        "cancelled queued initialization must never enter the handler"
+                    );
+                }
+                Ok(())
+            })
+    }
+
+    #[tokio::test]
+    async fn registered_dispatch_trace_preserves_success_error_and_panic_terminals()
+    -> anyhow::Result<()> {
+        for outcome in ["success", "error", "panic"] {
+            let temp = tempfile::TempDir::new()?;
+            let (mut session, turn) = crate::session::tests::make_session_and_context().await;
+            let bundle = attach_dispatch_regression_trace(&mut session, &turn, temp.path())?;
+            let session = Arc::new(session);
+            let turn = Arc::new(turn);
+            let handler =
+                Arc::new(DispatchTraceOutcomeHandler { outcome }) as Arc<dyn CoreToolRuntime>;
+            let router = Arc::new(ToolRouter::from_parts(
+                ToolRegistry::from_tools([handler]),
+                Vec::new(),
+            ));
+            let step = StepContext::for_test(turn).with_tool_router_for_test(router);
+            let runtime = ToolCallRuntime::new(
+                Arc::clone(&session),
+                step,
+                Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+            );
+            let cancellation = CancellationToken::new();
+            let call_id = match outcome {
+                "success" => "trace-success-call",
+                "error" => "trace-error-call",
+                "panic" => "trace-panic-call",
+                _ => unreachable!("known test outcome"),
+            };
+            let response = runtime
+                .handle_tool_call(
+                    ToolCall {
+                        tool_name: codex_tools::ToolName::plain("trace_outcome_tool"),
+                        call_id: call_id.to_string(),
+                        payload: ToolPayload::Function {
+                            arguments: "{}".to_string(),
+                        },
+                    },
+                    cancellation.clone(),
+                )
+                .await;
+            let expected = if outcome == "panic" {
+                let error =
+                    response.expect_err("the actual dispatch panic must return a fatal join error");
+                assert!(
+                    matches!(error, CodexErr::Fatal(ref message) if message.contains("dispatch-trace-panic-sentinel"))
+                );
+                codex_rollout_trace::ExecutionStatus::Failed
+            } else {
+                let ResponseInputItem::FunctionCallOutput {
+                    call_id: response_id,
+                    output,
+                } = response?
+                else {
+                    anyhow::bail!("registered function must return function output");
+                };
+                assert_eq!(response_id, call_id);
+                assert_eq!(output.success, Some(outcome == "success"));
+                let FunctionCallOutputBody::Text(text) = output.body else {
+                    anyhow::bail!("registered function must return text");
+                };
+                assert_eq!(
+                    text,
+                    if outcome == "error" {
+                        "trace-error"
+                    } else {
+                        "trace-success"
+                    }
+                );
+                if outcome == "error" {
+                    codex_rollout_trace::ExecutionStatus::Failed
+                } else {
+                    codex_rollout_trace::ExecutionStatus::Completed
+                }
+            };
+            assert_dispatch_regression_trace(&bundle, call_id, expected.clone(), true)?;
+            cancellation.cancel();
+            session.terminal_tasks.close();
+            tokio::time::timeout(Duration::from_secs(5), session.terminal_tasks.wait()).await?;
+            assert_dispatch_regression_trace(&bundle, call_id, expected, true)?;
+        }
+        Ok(())
+    }
+
     #[tokio::test(start_paused = true)]
     async fn cancellation_returns_before_supervised_runtime_cleanup_deadline() -> anyhow::Result<()>
     {
-        let (session, turn_context) = crate::session::tests::make_session_and_context().await;
+        check_dispatch_cancellation_trace(true).await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cooperative_cleanup_preserves_one_registry_terminal_trace() -> anyhow::Result<()> {
+        check_dispatch_cancellation_trace(false).await
+    }
+
+    async fn check_dispatch_cancellation_trace(force_cleanup: bool) -> anyhow::Result<()> {
+        let (mut session, turn_context) = crate::session::tests::make_session_and_context().await;
+        let temp = tempfile::TempDir::new()?;
+        let bundle = attach_dispatch_regression_trace(&mut session, &turn_context, temp.path())?;
         let session = Arc::new(session);
         let turn_context = Arc::new(turn_context);
         let tool_name = codex_tools::ToolName::plain("non_cooperative_cleanup_tool");
         let (started_tx, started_rx) = oneshot::channel();
         let (cleanup_started_tx, cleanup_started_rx) = oneshot::channel();
-        let handler = Arc::new(CancellationCleanupHandler {
-            tool_name: tool_name.clone(),
-            started: std::sync::Mutex::new(Some(started_tx)),
-            invocation_token: std::sync::Mutex::new(None),
-            cleanup_started: std::sync::Mutex::new(Some(cleanup_started_tx)),
-            allow_cleanup: Arc::new(Notify::new()),
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let allow_cleanup = Arc::new(Notify::new());
+        let handler = Arc::new(TracedCancellationCleanupHandler {
+            commit_barrier: !force_cleanup,
+            dropped: Arc::clone(&dropped),
+            inner: CancellationCleanupHandler {
+                tool_name: tool_name.clone(),
+                started: std::sync::Mutex::new(Some(started_tx)),
+                invocation_token: std::sync::Mutex::new(None),
+                cleanup_started: std::sync::Mutex::new(Some(cleanup_started_tx)),
+                allow_cleanup: Arc::clone(&allow_cleanup),
+            },
         }) as Arc<dyn CoreToolRuntime>;
         let step_context = StepContext::for_test(Arc::clone(&turn_context));
         let router = Arc::new(ToolRouter::from_parts(
@@ -5244,11 +5942,16 @@ mod tests {
         ));
         let step_context = step_context.with_tool_router_for_test(router);
         let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
-        let runtime = ToolCallRuntime::new(session, step_context, tracker);
+        let runtime = ToolCallRuntime::new(Arc::clone(&session), step_context, tracker);
         let cancellation_token = CancellationToken::new();
+        let call_id = if force_cleanup {
+            "non-cooperative-call"
+        } else {
+            "cooperative-call"
+        };
         let call = ToolCall {
             tool_name,
-            call_id: "non-cooperative-call".to_string(),
+            call_id: call_id.to_string(),
             payload: ToolPayload::Function {
                 arguments: "{}".to_string(),
             },
@@ -5257,25 +5960,90 @@ mod tests {
         let response_task =
             tokio::spawn(runtime.handle_tool_call(call, cancellation_token.clone()));
         started_rx.await.expect("handler should start");
+        assert_dispatch_regression_trace(
+            &bundle,
+            call_id,
+            codex_rollout_trace::ExecutionStatus::Running,
+            false,
+        )?;
         cancellation_token.cancel();
         cleanup_started_rx
             .await
             .expect("handler should enter non-cooperative cleanup");
 
-        let response = tokio::time::timeout(Duration::from_secs(1), response_task)
-            .await
-            .expect("cancelled response must not wait for supervised runtime cleanup")
-            .expect("tool response task should join")?;
+        let mut response_task = Some(response_task);
+        let response = if force_cleanup {
+            Some(
+                tokio::time::timeout(
+                    Duration::from_secs(1),
+                    response_task.take().expect("response task"),
+                )
+                .await
+                .expect("cancelled response must not wait for supervised runtime cleanup")
+                .expect("tool response task should join")?,
+            )
+        } else {
+            // This runtime advertises the existing commit-barrier capability, so
+            // response completion must join the supervisor and its competing writer.
+            assert!(!response_task.as_ref().expect("response task").is_finished());
+            None
+        };
+        assert!(!dropped.load(std::sync::atomic::Ordering::Acquire));
+        assert_dispatch_regression_trace(
+            &bundle,
+            call_id,
+            codex_rollout_trace::ExecutionStatus::Running,
+            false,
+        )?;
+        if force_cleanup {
+            tokio::time::advance(TOOL_RUNTIME_CLEANUP_DEADLINE).await;
+        }
+        // Only OS-backed writer observation uses real time. The forced-cleanup
+        // deadline above was advanced deterministically; cooperative release is now.
+        tokio::time::resume();
+        let response = match response {
+            Some(response) => response,
+            None => {
+                allow_cleanup.notify_one();
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    response_task.take().expect("response task"),
+                )
+                .await
+                .expect("cooperative cleanup and supervisor must finish before deadline")
+                .expect("tool response task should join")?
+            }
+        };
         let ResponseInputItem::FunctionCallOutput { output, .. } = response else {
             anyhow::bail!("cancelled tool should return function output");
         };
+        // AbortedToolOutput uses the protocol text constructor; cancellation is
+        // carried by its diagnostic body rather than the optional success field.
+        assert_eq!(output.success, None);
         let FunctionCallOutputBody::Text(text) = output.body else {
             anyhow::bail!("cancelled tool output should be text");
         };
         assert!(text.contains("aborted by user"));
-
-        tokio::time::advance(TOOL_RUNTIME_CLEANUP_DEADLINE).await;
-        tokio::task::yield_now().await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !dropped.load(std::sync::atomic::Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the actual admitted handler future must finish or be aborted");
+        wait_for_dispatch_regression_terminal(&bundle, call_id).await?;
+        session.terminal_tasks.close();
+        tokio::time::timeout(Duration::from_secs(5), session.terminal_tasks.wait()).await?;
+        assert_dispatch_regression_trace(
+            &bundle,
+            call_id,
+            if force_cleanup {
+                codex_rollout_trace::ExecutionStatus::Cancelled
+            } else {
+                codex_rollout_trace::ExecutionStatus::Failed
+            },
+            true,
+        )?;
 
         Ok(())
     }
@@ -5299,5 +6067,440 @@ mod tests {
             panic!("suppression receipt must be textual");
         };
         assert!(text.contains("\"disposition\":\"suppressed\""));
+    }
+    #[tokio::test]
+    async fn registered_dispatch_caller_abort_retires_handler_gate_and_trace() -> anyhow::Result<()>
+    {
+        let temp = tempfile::TempDir::new()?;
+        let (mut session, turn) = crate::session::tests::make_session_and_context().await;
+        let bundle = attach_dispatch_regression_trace(&mut session, &turn, temp.path())?;
+        let session = Arc::new(session);
+        let turn = Arc::new(turn);
+        let (started_tx, started_rx) = oneshot::channel();
+        let (cleanup_tx, cleanup_rx) = oneshot::channel();
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let tool_name = codex_tools::ToolName::plain("caller_abort_tool");
+        let allow_cleanup = Arc::new(Notify::new());
+        let handler = Arc::new(TracedCancellationCleanupHandler {
+            commit_barrier: true,
+            dropped: Arc::clone(&dropped),
+            inner: CancellationCleanupHandler {
+                tool_name: tool_name.clone(),
+                started: std::sync::Mutex::new(Some(started_tx)),
+                invocation_token: std::sync::Mutex::new(None),
+                cleanup_started: std::sync::Mutex::new(Some(cleanup_tx)),
+                allow_cleanup: Arc::clone(&allow_cleanup),
+            },
+        }) as Arc<dyn CoreToolRuntime>;
+        let router = Arc::new(ToolRouter::from_parts(
+            ToolRegistry::from_tools([handler]),
+            Vec::new(),
+        ));
+        let step = StepContext::for_test(Arc::clone(&turn)).with_tool_router_for_test(router);
+        let runtime = ToolCallRuntime::new(
+            Arc::clone(&session),
+            step,
+            Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+        );
+        let gate = Arc::clone(&runtime.parallel_execution);
+        let cancellation = CancellationToken::new();
+        let call_id = "dropped-dispatch-caller";
+        let caller = tokio::spawn(runtime.handle_tool_call(
+            ToolCall {
+                tool_name,
+                call_id: call_id.to_string(),
+                payload: ToolPayload::Function {
+                    arguments: "{}".to_string(),
+                },
+            },
+            cancellation.clone(),
+        ));
+        tokio::time::timeout(Duration::from_secs(5), started_rx).await??;
+        assert!(!dropped.load(std::sync::atomic::Ordering::Acquire));
+        caller.abort();
+        let Err(join_error) = caller.await else {
+            panic!("outer caller must stop");
+        };
+        assert!(join_error.is_cancelled());
+        tokio::time::timeout(Duration::from_secs(5), cleanup_rx).await??;
+        assert!(
+            !dropped.load(std::sync::atomic::Ordering::Acquire),
+            "caller Drop must preserve the admitted handler until its cleanup finishes"
+        );
+        let terminal = session.flush_rollout_after_ordered_commits(&turn);
+        tokio::pin!(terminal);
+        assert!(
+            matches!(futures::poll!(&mut terminal), std::task::Poll::Pending),
+            "turn terminalization must wait for the accepted tool commit"
+        );
+        assert_dispatch_regression_trace(
+            &bundle,
+            call_id,
+            codex_rollout_trace::ExecutionStatus::Running,
+            false,
+        )?;
+        allow_cleanup.notify_one();
+        assert!(
+            !cancellation.is_cancelled(),
+            "caller Drop must not cancel its parent's token"
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !dropped.load(std::sync::atomic::Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("owned cleanup must retire the actual registered handler");
+        drop(
+            tokio::time::timeout(Duration::from_secs(1), gate.write_owned())
+                .await
+                .expect("workspace gate must be released after dispatch retires"),
+        );
+        tokio::time::timeout(Duration::from_secs(5), terminal).await??;
+        wait_for_dispatch_regression_terminal(&bundle, call_id).await?;
+        // Cooperative cleanup returns the handler's failure, so retain the same
+        // registry terminal as explicit cancellation rather than overwrite it.
+        assert_dispatch_regression_trace(
+            &bundle,
+            call_id,
+            codex_rollout_trace::ExecutionStatus::Failed,
+            true,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn generation_flush_survives_caller_abort_and_blocks_terminal_until_invalidation() {
+        check_generation_flush_survives_caller_abort(false).await;
+    }
+
+    #[tokio::test]
+    async fn generation_drop_retains_late_nested_effects_before_terminal_invalidation() {
+        check_generation_flush_survives_caller_abort(true).await;
+    }
+
+    async fn check_generation_flush_survives_caller_abort(drop_before_flush: bool) {
+        let (session, turn) = crate::session::tests::make_session_and_context().await;
+        let session = Arc::new(session);
+        let turn = Arc::new(turn);
+        let workspace = tempfile::tempdir().expect("workspace");
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "--quiet"])
+                .current_dir(workspace.path())
+                .status()
+                .expect("git init")
+                .success()
+        );
+        let source = workspace.path().join("source.txt");
+        tokio::fs::write(&source, "before")
+            .await
+            .expect("initial source");
+        let dependency = crate::tool_history::SourceDependencyV1::new(&source, false);
+        let observation = crate::tool_history::WorkspaceEvidenceObservation::from_response_item(
+            None,
+            &ResponseItem::FunctionCallOutput {
+                id: None,
+                call_id: "prior-read".to_string(),
+                output: FunctionCallOutputPayload::from_text("before".to_string()),
+                internal_chat_message_metadata_passthrough: None,
+            },
+            std::collections::BTreeSet::from([dependency]),
+        )
+        .expect("prior workspace observation");
+        session
+            .register_workspace_evidence(&turn.config.codex_home, observation, ())
+            .await;
+        session
+            .flush_tool_history_persistence()
+            .await
+            .expect("prior evidence durable");
+        let step = StepContext::for_test(Arc::clone(&turn));
+        let batch = Arc::clone(&step.workspace_evidence_generation_batch);
+        let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
+        let runtime = ToolCallRuntime::new(Arc::clone(&session), step, Arc::clone(&tracker));
+        runtime
+            .activate_workspace_evidence_generation("actual-mutation")
+            .await;
+        tokio::fs::write(&source, "after")
+            .await
+            .expect("actual mutation");
+        tracker.lock().await.record_unknown_mutation();
+        assert!(batch.record_mutation(
+            "actual-mutation",
+            workspace.path().to_path_buf(),
+            Some(std::collections::BTreeSet::from([source.clone()])),
+            false
+        ));
+        assert!(batch.queue_response(
+            &ResponseInputItem::FunctionCallOutput {
+                call_id: "actual-mutation".to_string(),
+                output: FunctionCallOutputPayload::from_text("after".to_string()),
+            },
+            &crate::tool_history::WorkspaceCallClassification {
+                observes_workspace: true,
+                workspace_cwd: workspace.path().to_path_buf(),
+                source_dependencies: Default::default(),
+            },
+            Default::default(),
+            Vec::new(),
+            None,
+        ));
+        let pause = session
+            .services
+            .git_workspace
+            .pause_next_workspace_evidence_capture();
+        if drop_before_flush {
+            // Nested code mode constructs its own runtime and gate while sharing
+            // this StepContext batch. Its late effect must survive outer Drop.
+            let nested = ToolCallRuntime::new(
+                Arc::clone(&session),
+                Arc::clone(&runtime.step_context),
+                Arc::clone(&tracker),
+            );
+            assert!(!Arc::ptr_eq(
+                &runtime.parallel_execution,
+                &nested.parallel_execution
+            ));
+            let (entered_tx, entered_rx) = oneshot::channel();
+            let caller = tokio::spawn(async move {
+                let _runtime = runtime;
+                entered_tx.send(()).expect("caller entered");
+                std::future::pending::<()>().await;
+            });
+            entered_rx.await.expect("sampling caller started");
+            caller.abort();
+            assert!(caller.await.err().expect("caller aborted").is_cancelled());
+            assert!(
+                batch.accepts_call("actual-mutation"),
+                "outer runtime Drop must not seal a shared nested generation"
+            );
+            nested
+                .activate_workspace_evidence_generation("late-nested-mutation")
+                .await;
+            tokio::fs::write(&source, "late nested mutation")
+                .await
+                .expect("late actual mutation");
+            tracker.lock().await.record_unknown_mutation();
+            assert!(batch.record_mutation(
+                "late-nested-mutation",
+                workspace.path().to_path_buf(),
+                Some(std::collections::BTreeSet::from([source.clone()])),
+                false
+            ));
+            assert!(batch.queue_response(
+                &ResponseInputItem::FunctionCallOutput {
+                    call_id: "late-nested-mutation".to_string(),
+                    output: FunctionCallOutputPayload::from_text(
+                        "late nested mutation".to_string()
+                    ),
+                },
+                &crate::tool_history::WorkspaceCallClassification {
+                    observes_workspace: true,
+                    workspace_cwd: workspace.path().to_path_buf(),
+                    source_dependencies: Default::default(),
+                },
+                Default::default(),
+                Vec::new(),
+                None
+            ));
+            let before_retirement = session.flush_rollout_after_ordered_commits(&turn);
+            tokio::pin!(before_retirement);
+            assert!(
+                futures::poll!(before_retirement.as_mut()).is_pending(),
+                "accepted generation effects must already retain the terminal barrier"
+            );
+            drop(batch);
+            drop(nested);
+            tokio::time::timeout(Duration::from_secs(10), pause.wait_until_started())
+                .await
+                .expect("final shared batch Drop must start owned capture");
+        } else {
+            let caller =
+                tokio::spawn(async move { runtime.flush_workspace_evidence_generation().await });
+            tokio::time::timeout(Duration::from_secs(10), pause.wait_until_started())
+                .await
+                .expect("generation capture must start after draining the batch");
+            assert!(!batch.accepts_call("actual-mutation"));
+            caller.abort();
+            assert!(caller.await.err().expect("caller aborted").is_cancelled());
+        }
+        let barrier = session.flush_rollout_after_ordered_commits(&turn);
+        tokio::pin!(barrier);
+        assert!(
+            futures::poll!(barrier.as_mut()).is_pending(),
+            "terminal barrier must retain the generation owner after caller abort"
+        );
+        pause.release();
+        tokio::time::timeout(Duration::from_secs(10), barrier)
+            .await
+            .expect("generation owner must finish")
+            .expect("terminal barrier");
+        let history = session.clone_history().await;
+        let live = serde_json::to_value(history.tool_history_state()).expect("live evidence");
+        assert_eq!(
+            live["workspace_evidence"]["prior-read"]["source_dependencies_current"],
+            false
+        );
+        assert!(
+            live["workspace_evidence"].get("actual-mutation").is_some(),
+            "accepted response must be registered after authoritative capture"
+        );
+        session
+            .flush_tool_history_persistence()
+            .await
+            .expect("evidence durable");
+        let (saved, warning) = crate::tool_history::load_tool_history_state(
+            &turn.config.codex_home,
+            &session.thread_id.to_string(),
+        )
+        .await
+        .into_state_and_warning();
+        assert_eq!(warning, None);
+        let saved = serde_json::to_value(saved).expect("saved evidence");
+        assert_eq!(
+            saved["workspace_evidence"]["prior-read"]["source_dependencies_current"],
+            false
+        );
+        assert!(saved["workspace_evidence"].get("actual-mutation").is_some());
+        if drop_before_flush {
+            assert!(
+                live["workspace_evidence"]
+                    .get("late-nested-mutation")
+                    .is_some(),
+                "late nested response must reach the live evidence consumer"
+            );
+            assert!(
+                saved["workspace_evidence"]
+                    .get("late-nested-mutation")
+                    .is_some(),
+                "late nested response must remain durable after terminalization"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn workspace_evidence_flush_failure_invalidates_all_groups_without_publishing_fresh_results()
+     {
+        let (session, turn) = crate::session::tests::make_session_and_context().await;
+        let first = tempfile::tempdir().expect("first workspace");
+        let second = tempfile::tempdir().expect("second workspace");
+        let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
+        let batch = Arc::new(WorkspaceEvidenceGenerationBatch::new());
+        let codex_home = &turn.config.codex_home;
+        for (index, workspace) in [first.path(), second.path()].into_iter().enumerate() {
+            let dependency =
+                crate::tool_history::SourceDependencyV1::new(&workspace.join("source.txt"), false);
+            let observation =
+                crate::tool_history::WorkspaceEvidenceObservation::from_response_item(
+                    None,
+                    &ResponseItem::FunctionCallOutput {
+                        id: None,
+                        call_id: format!("earlier-{index}"),
+                        output: FunctionCallOutputPayload::from_text("before mutation".to_string()),
+                        internal_chat_message_metadata_passthrough: None,
+                    },
+                    std::collections::BTreeSet::from([dependency]),
+                )
+                .expect("workspace observation");
+            session
+                .register_workspace_evidence(codex_home, observation, ())
+                .await;
+            let call_id = format!("mutation-{index}");
+            assert!(batch.register_call(&call_id));
+            tracker
+                .lock()
+                .await
+                .activate_workspace_evidence_generation_batch(&batch);
+            tracker.lock().await.record_unknown_mutation();
+            assert!(batch.record_mutation(
+                &call_id,
+                workspace.to_path_buf(),
+                Some(std::collections::BTreeSet::from([
+                    workspace.join("source.txt")
+                ])),
+                true,
+            ));
+            let classification = crate::tool_history::WorkspaceCallClassification {
+                observes_workspace: true,
+                workspace_cwd: workspace.to_path_buf(),
+                source_dependencies: Default::default(),
+            };
+            assert!(batch.queue_mutating_response_for_test(
+                &ResponseInputItem::FunctionCallOutput {
+                    call_id,
+                    output: FunctionCallOutputPayload::from_text("mutation completed".to_string()),
+                },
+                &classification,
+                Vec::new(),
+            ));
+        }
+        session
+            .flush_tool_history_persistence()
+            .await
+            .expect("initial evidence is durable");
+        let directory = codex_home.join("tool-history");
+        let saved = codex_home.join("saved-tool-history");
+        tokio::fs::rename(&directory, &saved)
+            .await
+            .expect("save baseline");
+        tokio::fs::write(&directory, "blocks journal and snapshot")
+            .await
+            .expect("failure fixture");
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            batch.flush(&session, &turn, &tracker),
+        )
+        .await
+        .expect("failure must not leave the generation hanging");
+        assert!(matches!(result, Err(CodexErr::Fatal(_))));
+        let history = session.clone_history().await;
+        let live = serde_json::to_value(history.tool_history_state()).unwrap();
+        for index in 0..2 {
+            assert_eq!(
+                live["workspace_evidence"][format!("earlier-{index}")]["source_dependencies_current"],
+                false
+            );
+            assert!(
+                live["workspace_evidence"]
+                    .get(format!("mutation-{index}"))
+                    .is_none(),
+                "failed invalidation must not publish queued responses as fresh"
+            );
+        }
+        assert_eq!(tracker.lock().await.current_mutation_revision(), 2);
+        assert!(
+            tracker
+                .lock()
+                .await
+                .workspace_evidence_generation_batch_for_call("mutation-0")
+                .is_none()
+        );
+
+        tokio::fs::remove_file(&directory)
+            .await
+            .expect("remove failure fixture");
+        tokio::fs::rename(&saved, &directory)
+            .await
+            .expect("restore baseline");
+        session
+            .flush_tool_history_persistence()
+            .await
+            .expect("explicit recovery checkpoint");
+        let (reloaded, warning) = crate::tool_history::load_tool_history_state(
+            codex_home,
+            &session.thread_id.to_string(),
+        )
+        .await
+        .into_state_and_warning();
+        assert_eq!(warning, None);
+        let reloaded = serde_json::to_value(reloaded).unwrap();
+        for index in 0..2 {
+            assert_eq!(
+                reloaded["workspace_evidence"][format!("earlier-{index}")]["source_dependencies_current"],
+                false
+            );
+        }
     }
 }

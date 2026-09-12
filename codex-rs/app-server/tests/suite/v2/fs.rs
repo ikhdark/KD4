@@ -18,7 +18,9 @@ use codex_exec_server::CODEX_EXEC_SERVER_URL_ENV_VAR;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use pretty_assertions::assert_eq;
 use serde_json::json;
+use std::io::Write;
 use std::path::PathBuf;
+use tempfile::NamedTempFile;
 use tempfile::TempDir;
 use tokio::time::Duration;
 use tokio::time::timeout;
@@ -28,7 +30,6 @@ use tokio::time::timeout;
 
 const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(60);
 
-const OPTIONAL_FS_CHANGE_TIMEOUT: Duration = Duration::from_secs(2);
 const READ_FILE_LIMIT_BYTES: usize = 10 * 1024 * 1024;
 
 async fn initialized_mcp(codex_home: &TempDir) -> Result<TestAppServer> {
@@ -611,23 +612,25 @@ async fn fs_watch_directory_reports_changed_child_paths_and_unwatch_stops_notifi
 
     std::fs::write(&fetch_head, "updated\n")?;
 
-    // Kernel file watching is not reliable in every sandboxed test environment.
-    // Keep validating notification shape when the backend does emit, but do not
-    // fail the whole suite if no OS event arrives.
-    if let Some(changed) = maybe_fs_changed_notification(&mut mcp).await? {
-        assert_eq!(changed.watch_id, watch_id.clone());
-        assert_eq!(
-            changed.changed_paths,
-            vec![absolute_path(fetch_head.clone())]
-        );
-    }
-    while timeout(
-        Duration::from_millis(200),
-        mcp.read_stream_until_notification_message("fs/changed"),
-    )
+    let changed = read_fs_changed_notification(&mut mcp).await?;
+    assert_eq!(changed.watch_id, watch_id.clone());
+    assert_eq!(
+        changed.changed_paths,
+        vec![absolute_path(fetch_head.clone())]
+    );
+    timeout(DEFAULT_READ_TIMEOUT, async {
+        while let Ok(notification) = timeout(
+            Duration::from_millis(200),
+            mcp.read_stream_until_notification_message("fs/changed"),
+        )
+        .await
+        {
+            notification?;
+        }
+        Ok::<(), anyhow::Error>(())
+    })
     .await
-    .is_ok()
-    {}
+    .context("filesystem change notifications did not become idle")??;
 
     let unwatch_request_id = mcp
         .send_fs_unwatch_request(FsUnwatchParams { watch_id })
@@ -679,15 +682,14 @@ async fn fs_watch_file_reports_atomic_replace_events() -> Result<()> {
 
     replace_file_atomically(&head_path, "ref: refs/heads/feature\n")?;
 
-    if let Some(changed) = maybe_fs_changed_notification(&mut mcp).await? {
-        assert_eq!(
-            changed,
-            FsChangedNotification {
-                watch_id,
-                changed_paths: vec![absolute_path(head_path.clone())],
-            }
-        );
-    }
+    let changed = read_fs_changed_notification(&mut mcp).await?;
+    assert_eq!(
+        changed,
+        FsChangedNotification {
+            watch_id,
+            changed_paths: vec![absolute_path(head_path.clone())],
+        }
+    );
 
     Ok(())
 }
@@ -718,15 +720,14 @@ async fn fs_watch_allows_missing_file_targets() -> Result<()> {
 
     replace_file_atomically(&fetch_head, "origin/main\n")?;
 
-    if let Some(changed) = maybe_fs_changed_notification(&mut mcp).await? {
-        assert_eq!(
-            changed,
-            FsChangedNotification {
-                watch_id,
-                changed_paths: vec![absolute_path(fetch_head.clone())],
-            }
-        );
-    }
+    let changed = read_fs_changed_notification(&mut mcp).await?;
+    assert_eq!(
+        changed,
+        FsChangedNotification {
+            watch_id,
+            changed_paths: vec![absolute_path(fetch_head.clone())],
+        }
+    );
 
     Ok(())
 }
@@ -759,30 +760,49 @@ fn fs_changed_notification(notification: JSONRPCNotification) -> Result<FsChange
     Ok(serde_json::from_value::<FsChangedNotification>(params)?)
 }
 
-async fn maybe_fs_changed_notification(
-    mcp: &mut TestAppServer,
-) -> Result<Option<FsChangedNotification>> {
-    match timeout(
-        OPTIONAL_FS_CHANGE_TIMEOUT,
+async fn read_fs_changed_notification(mcp: &mut TestAppServer) -> Result<FsChangedNotification> {
+    let notification = timeout(
+        DEFAULT_READ_TIMEOUT,
         mcp.read_stream_until_notification_message("fs/changed"),
     )
     .await
-    {
-        Ok(notification) => Ok(Some(fs_changed_notification(notification?)?)),
-        Err(_) => Ok(None),
-    }
+    .context("expected fs/changed notification after filesystem mutation")??;
+    fs_changed_notification(notification)
 }
 
 fn replace_file_atomically(path: &PathBuf, contents: &str) -> Result<()> {
-    let temp_path = path.with_extension("lock");
-    std::fs::write(&temp_path, contents)?;
+    let parent = path
+        .parent()
+        .context("replacement path must have a parent")?;
+    let mut staged = NamedTempFile::new_in(parent)?;
+    staged.write_all(contents.as_bytes())?;
+    staged.persist(path)?;
+    Ok(())
+}
 
-    match std::fs::remove_file(path) {
-        Ok(()) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => return Err(err.into()),
-    }
+#[test]
+fn atomic_file_replacement_overwrites_existing_contents_and_cleans_staging() -> Result<()> {
+    let directory = TempDir::new()?;
+    let path = directory.path().join("HEAD");
+    std::fs::write(&path, "ref: refs/heads/main\n")?;
 
-    std::fs::rename(temp_path, path)?;
+    replace_file_atomically(&path, "ref: refs/heads/feature\n")?;
+
+    assert_eq!(std::fs::read_to_string(&path)?, "ref: refs/heads/feature\n");
+    assert_eq!(std::fs::read_dir(directory.path())?.count(), 1);
+    Ok(())
+}
+
+#[test]
+fn atomic_file_replacement_failure_preserves_destination_and_cleans_staging() -> Result<()> {
+    let directory = TempDir::new()?;
+    let path = directory.path().join("HEAD");
+    std::fs::create_dir(&path)?;
+    std::fs::write(path.join("original"), "preserved")?;
+
+    assert!(replace_file_atomically(&path, "replacement").is_err());
+
+    assert_eq!(std::fs::read_to_string(path.join("original"))?, "preserved");
+    assert_eq!(std::fs::read_dir(directory.path())?.count(), 1);
     Ok(())
 }

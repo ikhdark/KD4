@@ -235,6 +235,7 @@ pub async fn run_windows_sandbox_setup(request: WindowsSandboxSetupRequest) -> a
                 originator_tag.as_str(),
                 start.elapsed(),
                 &err,
+                codex_otel::global().as_ref(),
             );
             Err(err)
         }
@@ -252,7 +253,7 @@ async fn run_windows_sandbox_setup_and_persist(
     let codex_home = request.codex_home;
     let setup_codex_home = codex_home.clone();
 
-    let setup_result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+    let setup_native = move || -> anyhow::Result<()> {
         match mode {
             WindowsSandboxSetupMode::Elevated => {
                 if !sandbox_setup_is_complete(setup_codex_home.as_path()) {
@@ -276,18 +277,30 @@ async fn run_windows_sandbox_setup_and_persist(
             }
         }
         Ok(())
+    };
+    #[cfg(test)]
+    let setup_native = SETUP_NATIVE_OVERRIDE
+        .with(|override_fn| override_fn.borrow_mut().take())
+        .unwrap_or_else(|| Box::new(setup_native));
+
+    // Native setup and its persisted mode are one owned blocking operation.
+    // Dropping the awaiting RPC must not leave a successful setup unrecorded.
+    tokio::task::spawn_blocking(move || {
+        setup_native()?;
+        ConfigEditsBuilder::new(codex_home.as_path())
+            .set_windows_sandbox_mode(windows_sandbox_setup_mode_tag(mode))
+            .clear_legacy_windows_sandbox_keys()
+            .apply_blocking()
+            .map_err(|err| anyhow::anyhow!("failed to persist windows sandbox mode: {err}"))
     })
     .await
-    .map_err(|join_err| anyhow::anyhow!("windows sandbox setup task failed: {join_err}"))?;
+    .map_err(|join_err| anyhow::anyhow!("windows sandbox setup task failed: {join_err}"))?
+}
 
-    setup_result?;
-
-    ConfigEditsBuilder::new(codex_home.as_path())
-        .set_windows_sandbox_mode(windows_sandbox_setup_mode_tag(mode))
-        .clear_legacy_windows_sandbox_keys()
-        .apply()
-        .await
-        .map_err(|err| anyhow::anyhow!("failed to persist windows sandbox mode: {err}"))
+#[cfg(test)]
+thread_local! {
+    static SETUP_NATIVE_OVERRIDE: std::cell::RefCell<Option<Box<dyn FnOnce() -> anyhow::Result<()> + Send>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 fn emit_windows_sandbox_setup_success_metrics(
@@ -319,11 +332,18 @@ fn emit_windows_sandbox_setup_failure_metrics(
     mode: WindowsSandboxSetupMode,
     originator_tag: &str,
     duration: std::time::Duration,
-    _err: &anyhow::Error,
+    err: &anyhow::Error,
+    metrics: Option<&codex_otel::MetricsClient>,
 ) {
-    let Some(metrics) = codex_otel::global() else {
+    tracing::warn!(
+        error = %err,
+        mode = windows_sandbox_setup_mode_tag(mode),
+        "Windows sandbox setup failed"
+    );
+    let Some(metrics) = metrics else {
         return;
     };
+    let originator_tag = codex_otel::bounded_originator_tag_value(originator_tag);
     let mode_tag = windows_sandbox_setup_mode_tag(mode);
     let _ = metrics.record_duration(
         "codex.windows_sandbox.setup_duration_ms",
@@ -343,20 +363,12 @@ fn emit_windows_sandbox_setup_failure_metrics(
     if matches!(mode, WindowsSandboxSetupMode::Elevated) {
         {
             let mut failure_tags: Vec<(&str, &str)> = vec![("originator", originator_tag)];
-            let mut code_tag: Option<String> = None;
-            let mut message_tag: Option<String> = None;
-            if let Some((code, message)) = elevated_setup_failure_details(_err) {
-                code_tag = Some(code);
-                message_tag = Some(message);
-            }
-            if let Some(code) = code_tag.as_deref() {
-                failure_tags.push(("code", code));
-            }
-            if let Some(message) = message_tag.as_deref() {
-                failure_tags.push(("message", message));
+            if let Some(failure) = codex_windows_sandbox::extract_setup_failure(err) {
+                // Error messages contain workspace paths and belong in diagnostics, not labels.
+                failure_tags.push(("code", failure.code.as_str()));
             }
             let _ = metrics.counter(
-                elevated_setup_failure_metric_name(_err),
+                elevated_setup_failure_metric_name(err),
                 /*inc*/ 1,
                 &failure_tags,
             );
@@ -374,6 +386,83 @@ fn windows_sandbox_setup_mode_tag(mode: WindowsSandboxSetupMode) -> &'static str
     match mode {
         WindowsSandboxSetupMode::Elevated => "elevated",
         WindowsSandboxSetupMode::Unelevated => "unelevated",
+    }
+}
+
+#[cfg(test)]
+mod setup_ownership_tests {
+    use super::*;
+
+    fn request(home: &std::path::Path) -> WindowsSandboxSetupRequest {
+        WindowsSandboxSetupRequest {
+            mode: WindowsSandboxSetupMode::Unelevated,
+            permission_profile: PermissionProfile::read_only(),
+            workspace_roots: Vec::new(),
+            command_cwd: home.to_path_buf(),
+            env_map: HashMap::new(),
+            codex_home: home.to_path_buf(),
+        }
+    }
+
+    #[test]
+    fn setup_persists_native_success_after_caller_and_runtime_are_dropped() {
+        let home = tempfile::tempdir().unwrap();
+        let marker = home.path().join("native-setup-completed");
+        let native_marker = marker.clone();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        SETUP_NATIVE_OVERRIDE.with(|override_fn| {
+            *override_fn.borrow_mut() = Some(Box::new(move || {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                std::fs::write(native_marker, "native setup succeeded")?;
+                Ok(())
+            }));
+        });
+        runtime.block_on(async {
+            let mut setup = Box::pin(run_windows_sandbox_setup(request(home.path())));
+            assert!(futures::poll!(&mut setup).is_pending());
+            started_rx.await.unwrap();
+            assert!(!home.path().join("config.toml").exists());
+            drop(setup);
+        });
+        runtime.shutdown_background();
+        release_tx.send(()).unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let config = loop {
+            if let Ok(config) = std::fs::read_to_string(home.path().join("config.toml")) {
+                break config;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "successful native setup must persist its mode after cancellation"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        let config: toml::Value = toml::from_str(&config).unwrap();
+        assert_eq!(config["windows"]["sandbox"].as_str(), Some("unelevated"));
+        assert_eq!(
+            std::fs::read_to_string(marker).unwrap(),
+            "native setup succeeded"
+        );
+    }
+
+    #[tokio::test]
+    async fn setup_native_failure_does_not_persist_a_successful_mode() {
+        let home = tempfile::tempdir().unwrap();
+        SETUP_NATIVE_OVERRIDE.with(|override_fn| {
+            *override_fn.borrow_mut() = Some(Box::new(|| anyhow::bail!("native setup refused")));
+        });
+        let error = run_windows_sandbox_setup(request(home.path()))
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "native setup refused");
+        assert!(!home.path().join("config.toml").exists());
     }
 }
 

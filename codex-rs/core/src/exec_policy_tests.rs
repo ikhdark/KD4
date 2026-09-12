@@ -2056,12 +2056,14 @@ fn vec_str(items: &[&str]) -> Vec<String> {
 }
 
 /// Exercises the Windows-specific unmatched-command rendering path.
+#[cfg(windows)]
 #[tokio::test]
 async fn verify_approval_requirement_for_unsafe_powershell_command() {
-    // `pwsh` is required to parse a PowerShell command to see if it is safe.
-    if which::which("pwsh").is_err() {
-        return;
-    }
+    // A missing parser prerequisite must not turn this behavior scenario into a pass.
+    assert!(
+        which::which("pwsh").is_ok(),
+        "this Windows behavior test requires pwsh"
+    );
 
     let policy = ExecPolicyManager::new(Arc::new(Policy::empty()));
     let permissions = SandboxPermissions::UseDefault;

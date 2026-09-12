@@ -164,6 +164,17 @@ use crate::event_processor::EventProcessor;
 const DEFAULT_ANALYTICS_ENABLED: bool = true;
 const EXEC_DEFAULT_LOG_FILTER: &str = "error,opentelemetry_sdk=off,opentelemetry_otlp=off";
 
+fn build_exec_otel_provider(
+    config: &Config,
+) -> Result<Option<codex_otel::OtelProvider>, Box<dyn std::error::Error>> {
+    codex_core::otel_init::build_provider(
+        config,
+        env!("CARGO_PKG_VERSION"),
+        /*service_name_override*/ None,
+        DEFAULT_ANALYTICS_ENABLED,
+    )
+}
+
 enum InitialOperation {
     UserTurn {
         items: Vec<UserInput>,
@@ -491,12 +502,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
     }
 
     let otel = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        codex_core::otel_init::build_provider(
-            &config,
-            env!("CARGO_PKG_VERSION"),
-            /*service_name_override*/ None,
-            DEFAULT_ANALYTICS_ENABLED,
-        )
+        build_exec_otel_provider(&config)
     })) {
         Ok(Ok(otel)) => otel,
         Ok(Err(e)) => {

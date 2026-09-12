@@ -1158,7 +1158,18 @@ impl AgentControl {
         state
             .notify_thread_created(new_thread.thread_id, &new_thread.thread)
             .await;
-        pending_cleanup.disarm();
+        #[cfg(test)]
+        {
+            let barrier = self
+                .test_hooks
+                .after_thread_created
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if let Some(barrier) = barrier {
+                barrier.pause().await;
+            }
+        }
 
         if let Some(SessionSource::SubAgent(
             subagent_source @ SubAgentSource::ThreadSpawn {
@@ -1217,10 +1228,14 @@ impl AgentControl {
             );
         }
 
+        let status = self.get_status(new_thread.thread_id).await;
+        // Metadata and status collection can still suspend after publication.
+        // Retain rollback ownership until the completed result is handed back.
+        pending_cleanup.disarm();
         Ok(LiveAgent {
             thread_id: new_thread.thread_id,
             metadata: agent_metadata,
-            status: self.get_status(new_thread.thread_id).await,
+            status,
         })
     }
 
@@ -1230,6 +1245,18 @@ impl AgentControl {
         child_thread_id: ThreadId,
         submission_error: CodexErr,
     ) -> CodexErr {
+        #[cfg(test)]
+        {
+            let barrier = self
+                .test_hooks
+                .before_spawn_rollback
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if let Some(barrier) = barrier {
+                barrier.pause().await;
+            }
+        }
         let mut cleanup_failures = Vec::new();
         match self.upgrade() {
             Ok(state) => {

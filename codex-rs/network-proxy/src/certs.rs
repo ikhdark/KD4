@@ -27,8 +27,10 @@ use std::collections::HashSet;
 use std::fs;
 use std::fs::File;
 use std::fs::OpenOptions;
+use std::io::Read as _;
 use std::io::Write;
 use std::net::IpAddr;
+use std::os::windows::fs::OpenOptionsExt as _;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -518,22 +520,20 @@ fn managed_ca_certificate_lock_path(certificate_path: &Path) -> Option<PathBuf> 
 }
 
 fn open_managed_ca_lock(path: &Path) -> Result<File> {
-    if fs::symlink_metadata(path)
-        .ok()
-        .is_some_and(|metadata| metadata.file_type().is_symlink())
-    {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    // Inspect the opened reparse point rather than checking a path and reopening it.
+    options.custom_flags(0x00200000); // FILE_FLAG_OPEN_REPARSE_POINT
+    let file = options
+        .open(path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    if !file.metadata()?.is_file() {
         return Err(anyhow!(
-            "refusing to use symlink lock file {}",
+            "refusing to use non-regular lock file {}",
             path.display()
         ));
     }
-
-    let mut options = OpenOptions::new();
-    options.read(true).write(true).create(true).truncate(false);
-
-    options
-        .open(path)
-        .with_context(|| format!("failed to open {}", path.display()))
+    Ok(file)
 }
 
 fn prune_managed_ca_artifacts(proxy_dir: &Path) {
@@ -665,50 +665,22 @@ fn write_atomic_create_new(path: &Path, contents: &[u8], mode: u32) -> Result<()
     let tmp_path = parent.join(format!(".{file_name}.tmp.{pid}.{nanos}"));
 
     let mut file = open_create_new_with_mode(&tmp_path, mode)?;
-    file.write_all(contents)
-        .with_context(|| format!("failed to write {}", tmp_path.display()))?;
-    file.sync_all()
-        .with_context(|| format!("failed to fsync {}", tmp_path.display()))?;
-    drop(file);
-
-    // Create the final file using "create-new" semantics (no overwrite). Prefer a hard link so
-    // publishing fails if the destination already exists.
-    match fs::hard_link(&tmp_path, path) {
-        Ok(()) => {
-            fs::remove_file(&tmp_path)
-                .with_context(|| format!("failed to remove {}", tmp_path.display()))?;
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-            let _ = fs::remove_file(&tmp_path);
-            return Err(anyhow!(
-                "refusing to overwrite existing file {}",
-                path.display()
-            ));
-        }
-        Err(_) => {
-            // Best-effort fallback for environments where hard links are not supported.
-            // This is still subject to a TOCTOU race, but the typical case is a private per-user
-            // config directory, where other users cannot create files anyway.
-            if path.exists() {
-                let _ = fs::remove_file(&tmp_path);
-                return Err(anyhow!(
-                    "refusing to overwrite existing file {}",
-                    path.display()
-                ));
-            }
-            fs::rename(&tmp_path, path).with_context(|| {
-                format!(
-                    "failed to rename {} -> {}",
-                    tmp_path.display(),
-                    path.display()
-                )
-            })?;
-        }
+    let result = (|| {
+        file.write_all(contents)
+            .with_context(|| format!("failed to write {}", tmp_path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("failed to fsync {}", tmp_path.display()))?;
+        drop(file);
+        // Hard-link publication is create-new. A check-then-rename fallback could overwrite a
+        // concurrently published artifact on filesystems without hard-link support.
+        fs::hard_link(&tmp_path, path)
+            .with_context(|| format!("failed to publish {} without overwriting", path.display()))?;
+        sync_parent_dir(parent)
+    })();
+    if let Err(err) = fs::remove_file(&tmp_path) {
+        warn!(path = %tmp_path.display(), "failed to remove temporary CA artifact: {err}");
     }
-
-    sync_parent_dir(parent)?;
-
-    Ok(())
+    result
 }
 
 fn sync_parent_dir(_parent: &Path) -> Result<()> {
@@ -716,26 +688,42 @@ fn sync_parent_dir(_parent: &Path) -> Result<()> {
 }
 
 fn write_atomic_create_new_or_reuse(path: &Path, contents: &[u8], mode: u32) -> Result<()> {
-    if fs::symlink_metadata(path)
-        .ok()
-        .is_some_and(|metadata| metadata.file_type().is_symlink())
-    {
-        return Err(anyhow!("refusing to reuse symlink {}", path.display()));
-    }
-    if fs::read(path).ok().as_deref() == Some(contents) {
+    if managed_ca_file_matches(path, contents)? {
         return Ok(());
     }
-    if path.exists() {
+    match write_atomic_create_new(path, contents, mode) {
+        Ok(()) => Ok(()),
+        Err(_err) if managed_ca_file_matches(path, contents)? => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+fn managed_ca_file_matches(path: &Path, contents: &[u8]) -> Result<bool> {
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(0x00200000) // FILE_FLAG_OPEN_REPARSE_POINT
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err).with_context(|| format!("failed to open {}", path.display())),
+    };
+    if !file.metadata()?.is_file() {
+        return Err(anyhow!(
+            "refusing to reuse non-regular file {}",
+            path.display()
+        ));
+    }
+    let mut existing = Vec::new();
+    file.take(contents.len() as u64 + 1)
+        .read_to_end(&mut existing)?;
+    if existing != contents {
         return Err(anyhow!(
             "refusing to reuse existing mismatched file {}",
             path.display()
         ));
     }
-    match write_atomic_create_new(path, contents, mode) {
-        Ok(()) => Ok(()),
-        Err(_err) if fs::read(path).ok().as_deref() == Some(contents) => Ok(()),
-        Err(err) => Err(err),
-    }
+    Ok(true)
 }
 
 fn open_create_new_with_mode(path: &Path, _mode: u32) -> Result<File> {
@@ -753,6 +741,298 @@ mod tests {
     use codex_utils_rustls_provider::ensure_rustls_crypto_provider;
     use pretty_assertions::assert_eq;
     use tempfile::tempdir;
+
+    struct StaticCaConfigReloader(crate::ConfigState);
+
+    #[test]
+    fn ca_publication_preserves_existing_file_and_removes_temporary_artifact() {
+        let home = tempdir().unwrap();
+        let path = home.path().join("certificate.pem");
+        fs::write(&path, "existing certificate").unwrap();
+        let error = write_atomic_create_new(&path, b"replacement certificate", 0o644).unwrap_err();
+        assert!(format!("{error:#}").contains("without overwriting"));
+        assert_eq!(fs::read(&path).unwrap(), b"existing certificate");
+        assert_eq!(fs::read_dir(home.path()).unwrap().count(), 1);
+    }
+
+    impl crate::ConfigReloader for StaticCaConfigReloader {
+        fn source_label(&self) -> String {
+            "managed CA regression config".to_string()
+        }
+
+        fn maybe_reload(&self) -> crate::ConfigReloaderFuture<'_, Option<crate::ConfigState>> {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn reload_now(&self) -> crate::ConfigReloaderFuture<'_, crate::ConfigState> {
+            Box::pin(async { Ok(self.0.clone()) })
+        }
+    }
+
+    fn managed_ca_proxy_builder(home: &Path, mitm: bool) -> crate::NetworkProxyBuilder {
+        let config = crate::NetworkProxyConfig {
+            mitm,
+            ..Default::default()
+        };
+        let state = crate::build_config_state_with_codex_home(
+            config,
+            crate::NetworkProxyConstraints::default(),
+            home,
+        )
+        .unwrap();
+        let reloader = Arc::new(StaticCaConfigReloader(state.clone()));
+        crate::NetworkProxy::builder()
+            .state(Arc::new(crate::NetworkProxyState::with_reloader(
+                state, reloader,
+            )))
+            .codex_home(codex_utils_absolute_path::AbsolutePathBuf::try_from(home).unwrap())
+            .managed_by_codex(false)
+    }
+
+    async fn with_contended_ca_cache<T>(operation: impl std::future::Future<Output = T>) -> T {
+        with_contended_ca_cache_and_progress(operation, async {}).await
+    }
+
+    async fn with_contended_ca_cache_and_progress<T>(
+        operation: impl std::future::Future<Output = T>,
+        progress: impl std::future::Future<Output = ()>,
+    ) -> T {
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _cache = MANAGED_MITM_CAS.lock().unwrap();
+            ready_tx.send(()).unwrap();
+            // A watchdog makes a regression fail instead of deadlocking the test runtime.
+            release_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .is_ok()
+        });
+        ready_rx.recv().unwrap();
+        let (result, ()) = tokio::join!(operation, async {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            progress.await;
+            let _ = release_tx.send(());
+        });
+        assert!(
+            holder.join().unwrap(),
+            "CA initialization blocked the async runtime timer"
+        );
+        result
+    }
+
+    fn assert_managed_ca_child_environment(proxy: &crate::NetworkProxy, home: &Path) {
+        let bundle = proxy.managed_mitm_ca_trust_bundle_path().unwrap();
+        assert!(bundle.as_path().starts_with(home.join(MANAGED_MITM_CA_DIR)));
+        let pem = fs::read(bundle.as_path()).unwrap();
+        let certificates = CertificateDer::pem_slice_iter(&pem)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        let ca = ManagedMitmCa::load_or_create(home).unwrap();
+        let ca_pem = fs::read(ca.certificate_path()).unwrap();
+        let expected_ca = CertificateDer::from_pem_slice(&ca_pem).unwrap();
+        assert!(certificates.contains(&expected_ca));
+        assert!(!String::from_utf8(pem).unwrap().contains("PRIVATE KEY"));
+        let mut env = HashMap::new();
+        proxy.apply_to_env(&mut env);
+        for key in CUSTOM_CA_ENV_KEYS {
+            assert_eq!(env.get(key), Some(&bundle.as_path().display().to_string()));
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn managed_ca_async_builder_preserves_runtime_progress_and_child_bundle() {
+        let home = tempdir().unwrap();
+        let builder = managed_ca_proxy_builder(home.path(), true);
+        let proxy = with_contended_ca_cache(builder.build()).await.unwrap();
+        assert!(proxy.current_cfg().await.unwrap().mitm);
+        assert_managed_ca_child_environment(&proxy, home.path());
+    }
+
+    #[tokio::test]
+    async fn managed_ca_builder_reuses_regular_bundle_and_rejects_symlink_bundle() {
+        let home = tempdir().unwrap();
+        let proxy = managed_ca_proxy_builder(home.path(), true)
+            .build()
+            .await
+            .unwrap();
+        let bundle = proxy
+            .managed_mitm_ca_trust_bundle_path()
+            .unwrap()
+            .as_path()
+            .to_path_buf();
+        let expected = fs::read(&bundle).unwrap();
+        let reused = managed_ca_proxy_builder(home.path(), true)
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(
+            reused
+                .managed_mitm_ca_trust_bundle_path()
+                .unwrap()
+                .as_path(),
+            bundle
+        );
+        let external = home.path().join("external-ca.pem");
+        fs::write(&external, &expected).unwrap();
+        fs::remove_file(&bundle).unwrap();
+        std::os::windows::fs::symlink_file(&external, &bundle).unwrap();
+
+        let error = managed_ca_proxy_builder(home.path(), true)
+            .build()
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("refusing to reuse non-regular file"));
+        assert_eq!(fs::read(&external).unwrap(), expected);
+        assert!(
+            fs::symlink_metadata(&bundle)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn managed_ca_async_reload_preserves_runtime_progress_and_child_bundle() {
+        let home = tempdir().unwrap();
+        let proxy = managed_ca_proxy_builder(home.path(), false)
+            .build()
+            .await
+            .unwrap();
+        assert!(proxy.managed_mitm_ca_trust_bundle_path().is_none());
+        let config = crate::NetworkProxyConfig {
+            mitm: true,
+            allow_local_binding: true,
+            ..proxy.current_cfg().await.unwrap()
+        };
+        let state = crate::build_config_state_with_codex_home(
+            config.clone(),
+            crate::NetworkProxyConstraints::default(),
+            home.path(),
+        )
+        .unwrap();
+        with_contended_ca_cache(proxy.replace_config_state(state))
+            .await
+            .unwrap();
+        assert_eq!(proxy.current_cfg().await.unwrap(), config);
+        assert!(proxy.allow_local_binding());
+        assert_managed_ca_child_environment(&proxy, home.path());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn managed_ca_async_domain_updates_preserve_progress_and_policy_decisions() {
+        const CHILD_ENV: &str = "CODEX_TEST_MANAGED_CA_DOMAIN_UPDATES";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            // Domain updates resolve CODEX_HOME from the process environment. Keep the
+            // real constructor and its artifacts isolated from the developer's home.
+            let home = tempdir().unwrap();
+            let output = tokio::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("certs::tests::managed_ca_async_domain_updates_preserve_progress_and_policy_decisions")
+                .arg("--nocapture")
+                .env(CHILD_ENV, "1")
+                .env("CODEX_HOME", home.path())
+                .output()
+                .await
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated domain update failed: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            return;
+        }
+        let home = codex_utils_home_dir::find_codex_home().unwrap();
+        let config = crate::NetworkProxyConfig {
+            enabled: true,
+            mitm: true,
+            allow_local_binding: true,
+            ..Default::default()
+        };
+        let initial = crate::build_config_state_with_codex_home(
+            config,
+            crate::NetworkProxyConstraints::default(),
+            &home,
+        )
+        .unwrap();
+        let reloader = Arc::new(StaticCaConfigReloader(initial.clone()));
+        let state = crate::NetworkProxyState::with_reloader(initial, reloader);
+        assert!(matches!(
+            state.host_blocked("8.8.8.8", 443).await.unwrap(),
+            crate::runtime::HostBlockDecision::Blocked(crate::runtime::HostBlockReason::NotAllowed)
+        ));
+        with_contended_ca_cache_and_progress(state.add_allowed_domain("8.8.8.8"), async {
+            state
+                .record_blocked(crate::BlockedRequest::new(crate::BlockedRequestArgs {
+                    host: "8.8.8.8".to_string(),
+                    reason: "not_allowed".to_string(),
+                    client: None,
+                    method: Some("CONNECT".to_string()),
+                    mode: None,
+                    protocol: "https".to_string(),
+                    decision: Some("deny".to_string()),
+                    source: Some("policy".to_string()),
+                    port: Some(443),
+                }))
+                .await
+                .unwrap();
+        })
+        .await
+        .unwrap();
+        let blocked = state.blocked_snapshot().await.unwrap();
+        assert_eq!(blocked.len(), 1);
+        assert_eq!(blocked[0].host, "8.8.8.8");
+        assert_eq!(blocked[0].reason, "not_allowed");
+        assert!(matches!(
+            state.host_blocked("8.8.8.8", 443).await.unwrap(),
+            crate::runtime::HostBlockDecision::Allowed
+        ));
+        with_contended_ca_cache(state.add_denied_domain("8.8.8.8"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            state.host_blocked("8.8.8.8", 443).await.unwrap(),
+            crate::runtime::HostBlockDecision::Blocked(crate::runtime::HostBlockReason::Denied)
+        ));
+        assert_eq!(
+            state.current_cfg().await.unwrap().denied_domains(),
+            Some(vec!["8.8.8.8".to_string()])
+        );
+        assert_eq!(state.blocked_snapshot().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn managed_ca_async_reload_failure_preserves_config_and_environment() {
+        let home = tempdir().unwrap();
+        let proxy = managed_ca_proxy_builder(home.path(), false)
+            .build()
+            .await
+            .unwrap();
+        let before = proxy.current_cfg().await.unwrap();
+        let mut before_env = HashMap::new();
+        proxy.apply_to_env(&mut before_env);
+        let config = crate::NetworkProxyConfig {
+            mitm: true,
+            allow_local_binding: true,
+            ..before.clone()
+        };
+        let state = crate::build_config_state_with_codex_home(
+            config,
+            crate::NetworkProxyConstraints::default(),
+            home.path(),
+        )
+        .unwrap();
+        let ca = ManagedMitmCa::load_or_create(home.path()).unwrap();
+        fs::remove_file(ca.certificate_path()).unwrap();
+        let error = proxy.replace_config_state(state).await.unwrap_err();
+        assert!(format!("{error:#}").contains("failed to read managed MITM CA certificate"));
+        assert_eq!(proxy.current_cfg().await.unwrap(), before);
+        assert!(!proxy.allow_local_binding());
+        assert!(proxy.managed_mitm_ca_trust_bundle_path().is_none());
+        let mut after_env = HashMap::new();
+        proxy.apply_to_env(&mut after_env);
+        assert_eq!(after_env, before_env);
+    }
 
     #[test]
     fn managed_ca_uses_explicit_codex_home() {

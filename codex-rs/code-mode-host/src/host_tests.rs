@@ -211,6 +211,169 @@ async fn incompatible_or_invalid_handshake_is_rejected() {
 }
 
 #[tokio::test]
+async fn cancelled_queued_execute_never_starts_and_host_shuts_down() {
+    use codex_code_mode_protocol::host::WireRuntimeResponse;
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let (host_stream, client_stream) = tokio::io::duplex(4096);
+        let (host_reader, host_writer) = tokio::io::split(host_stream);
+        let (client_reader, client_writer) = tokio::io::split(client_stream);
+        let host = tokio::spawn(run(host_reader, host_writer));
+        let mut reader = FramedReader::new(client_reader);
+        let mut writer = FramedWriter::new(client_writer);
+        writer
+            .write(&client_hello([ProtocolVersion::V1], CapabilitySet::empty()))
+            .await
+            .expect("write hello");
+        assert_eq!(
+            reader.read::<HostToClient>().await.expect("read hello"),
+            Some(HostToClient::HostHello(HostHello::new(
+                ProtocolVersion::V1,
+                CapabilitySet::empty(),
+            )))
+        );
+        let session = session_id("saturated-session");
+        writer
+            .write(&ClientToHost::Request {
+                id: request_id(1),
+                request: HostRequest::OpenSession {
+                    session_id: session.clone(),
+                },
+            })
+            .await
+            .expect("open session");
+        assert_eq!(
+            reader.read::<HostToClient>().await.expect("session ready"),
+            Some(HostToClient::Response {
+                id: request_id(1),
+                result: WireResult::Ok {
+                    value: HostResponse::SessionReady {
+                        session_id: session.clone(),
+                    },
+                },
+            })
+        );
+
+        let mut cells = Vec::new();
+        for value in 2..10 {
+            let mut request = execute_request("await new Promise(() => {});");
+            request.yield_time_ms = Some(1);
+            writer
+                .write(&ClientToHost::Request {
+                    id: request_id(value),
+                    request: HostRequest::Execute {
+                        session_id: session.clone(),
+                        request,
+                    },
+                })
+                .await
+                .expect("start occupying cell");
+            let Some(HostToClient::Response {
+                id,
+                result:
+                    WireResult::Ok {
+                        value: HostResponse::ExecutionStarted { cell_id },
+                    },
+            }) = reader.read().await.expect("execution started")
+            else {
+                panic!("expected occupying cell to start");
+            };
+            assert_eq!(id, request_id(value));
+            assert_eq!(
+                reader.read::<HostToClient>().await.expect("initial yield"),
+                Some(HostToClient::InitialResponse {
+                    id,
+                    result: WireResult::Ok {
+                        value: WireRuntimeResponse::Yielded {
+                            cell_id: cell_id.clone(),
+                            content_items: Vec::new(),
+                        },
+                    },
+                })
+            );
+            cells.push(cell_id);
+        }
+        writer
+            .write(&ClientToHost::Request {
+                id: request_id(10),
+                request: HostRequest::Execute {
+                    session_id: session.clone(),
+                    request: execute_request("notify('cancelled execution must never run');"),
+                },
+            })
+            .await
+            .expect("queue ninth execution");
+        // Give admission a chance to run and prove the full session keeps the
+        // ninth request queued before cancelling it.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), reader.read::<HostToClient>())
+                .await
+                .is_err()
+        );
+        writer
+            .write(&ClientToHost::CancelRequest { id: request_id(10) })
+            .await
+            .expect("cancel queued execution");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), reader.read::<HostToClient>())
+                .await
+                .expect("queued cancellation must respond without a free cell")
+                .expect("cancellation response"),
+            Some(HostToClient::Response {
+                id: request_id(10),
+                result: WireResult::Err {
+                    message: "code-mode request cancelled".to_string(),
+                },
+            })
+        );
+        writer
+            .write(&ClientToHost::Request {
+                id: request_id(11),
+                request: HostRequest::ShutdownSession {
+                    session_id: session.clone(),
+                },
+            })
+            .await
+            .expect("shutdown saturated session");
+        loop {
+            match reader.read::<HostToClient>().await.expect("shutdown frame") {
+                Some(HostToClient::CellClosed {
+                    session_id,
+                    cell_id,
+                }) => {
+                    assert_eq!(session_id, session);
+                    let index = cells
+                        .iter()
+                        .position(|id| id == &cell_id)
+                        .expect("only the eight admitted cells may close");
+                    cells.remove(index);
+                }
+                message => {
+                    assert_eq!(
+                        message,
+                        Some(HostToClient::Response {
+                            id: request_id(11),
+                            result: WireResult::Ok {
+                                value: HostResponse::SessionClosed {
+                                    session_id: session.clone(),
+                                },
+                            },
+                        })
+                    );
+                    assert!(cells.is_empty());
+                    break;
+                }
+            }
+        }
+        drop(writer);
+        drop(reader);
+        host.await.expect("host task").expect("clean EOF shutdown");
+    })
+    .await
+    .expect("queued cancellation and shutdown must finish");
+}
+
+#[tokio::test]
 async fn unsupported_required_capability_is_rejected() {
     let (host_stream, client_stream) = tokio::io::duplex(/*max_buf_size*/ 1024);
     let (host_reader, host_writer) = tokio::io::split(host_stream);

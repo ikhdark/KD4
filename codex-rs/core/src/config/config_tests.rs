@@ -115,6 +115,120 @@ fn stdio_mcp(command: &str) -> McpServerConfig {
     stdio_mcp_with_args(command, &[])
 }
 
+#[test]
+fn discovered_codex_home_is_used_by_normal_config_entrypoints() {
+    const CHILD_CASE: &str = "CODEX_TEST_DISCOVERED_HOME_CASE";
+    if let Ok(case) = std::env::var(CHILD_CASE) {
+        let home = PathBuf::from(std::env::var_os("CODEX_HOME").expect("child home"));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let loaded = ConfigBuilder::without_managed_config_for_tests()
+                .harness_overrides(ConfigOverrides {
+                    cwd: Some(std::env::current_dir().expect("child cwd")),
+                    ..Default::default()
+                })
+                .build()
+                .await;
+            let fallback = Config::load_default_with_cli_overrides(vec![(
+                "model".to_string(),
+                toml::Value::String("fallback-home-model".to_string()),
+            )])
+            .await;
+            if case == "directory" {
+                let expected_home = AbsolutePathBuf::from_absolute_path(
+                    home.canonicalize().expect("existing home"),
+                )
+                .expect("absolute home");
+                let loaded = loaded.expect("load discovered home");
+                assert_eq!(loaded.codex_home.as_path(), expected_home.as_path());
+                assert_eq!(loaded.model.as_deref(), Some("discovered-home-model"));
+                let fallback = fallback.expect("fallback in discovered home");
+                assert_eq!(fallback.codex_home.as_path(), expected_home.as_path());
+                assert_eq!(fallback.model.as_deref(), Some("fallback-home-model"));
+                std::fs::write(
+                    home.join(CONFIG_TOML_FILE),
+                    r#"
+default_permissions = "network-home"
+[permissions.network-home.network]
+mode = "full"
+[permissions.network-home.network.domains]
+"home.example.com" = "deny"
+"allowed.example.com" = "allow"
+"#,
+                )
+                .expect("network home config");
+                let (network, reloader) =
+                    crate::network_proxy_loader::build_network_proxy_state_and_reloader()
+                        .await
+                        .expect("network config in discovered home");
+                assert!(network.deny_set.is_match("home.example.com"));
+                assert!(!network.deny_set.is_match("allowed.example.com"));
+                assert!(
+                    codex_network_proxy::ConfigReloader::maybe_reload(&reloader)
+                        .await
+                        .expect("unchanged discovered network config")
+                        .is_none()
+                );
+            } else {
+                for result in [loaded, fallback] {
+                    let err = result.expect_err("invalid home must fail");
+                    assert!(err.to_string().contains("CODEX_HOME"));
+                    assert!(err.to_string().contains(if case == "missing" {
+                        "does not exist"
+                    } else {
+                        "not a directory"
+                    }));
+                }
+                if case == "missing" {
+                    assert!(!home.exists(), "failed discovery must not create the home");
+                }
+                let network =
+                    crate::network_proxy_loader::build_network_proxy_state_and_reloader().await;
+                let error = network.err().expect("network startup rejects invalid home");
+                assert!(format!("{error:#}").contains("CODEX_HOME"));
+            }
+        });
+        return;
+    }
+
+    let fixture = tempdir().expect("fixture");
+    let directory = fixture.path().join("home");
+    std::fs::create_dir(&directory).expect("home directory");
+    std::fs::write(
+        directory.join(CONFIG_TOML_FILE),
+        "model = 'discovered-home-model'\n",
+    )
+    .expect("home config");
+    let file = fixture.path().join("file");
+    std::fs::write(&file, "not a directory").expect("home file");
+    for (case, home) in [
+        ("directory", directory),
+        ("missing", fixture.path().join("missing")),
+        ("file", file),
+    ] {
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "config::tests::discovered_codex_home_is_used_by_normal_config_entrypoints",
+                "--nocapture",
+            ])
+            .env(CHILD_CASE, case)
+            .env("CODEX_HOME", home)
+            .current_dir(fixture.path())
+            .output()
+            .expect("isolated config test");
+        assert!(
+            output.status.success(),
+            "{case} failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
 fn stdio_mcp_with_args(command: &str, args: &[&str]) -> McpServerConfig {
     McpServerConfig {
         auth: Default::default(),
@@ -9655,6 +9769,70 @@ auto_review = false
         .await?;
 
     assert!(!config.features.enabled(Feature::GuardianApproval));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn feature_requirements_conflicting_guardian_aliases_reject_config() -> std::io::Result<()> {
+    for guardian_enabled in [false, true] {
+        let codex_home = TempDir::new()?;
+        let auto_review_enabled = !guardian_enabled;
+        let requirements = format!(
+            "[features]\nauto_review = {auto_review_enabled}\nguardian_approval = {guardian_enabled}\n"
+        );
+
+        let err = ConfigBuilder::without_managed_config_for_tests()
+            .codex_home(codex_home.path().to_path_buf())
+            .cloud_config_bundle(
+                CloudConfigBundleFixture::loader_with_enterprise_requirement(&requirements),
+            )
+            .build()
+            .await
+            .expect_err("contradictory aliases must not produce a usable config");
+
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+        let message = err.to_string();
+        assert!(
+            message.contains("Conflicting `features` requirements"),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!("auto_review={auto_review_enabled}")),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!("guardian_approval={guardian_enabled}")),
+            "{message}"
+        );
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn feature_requirements_matching_guardian_aliases_pin_effective_feature()
+-> std::io::Result<()> {
+    for required in [false, true] {
+        let codex_home = TempDir::new()?;
+        let requirements = format!(
+            "[features]\nauto_review = {required}\nguardian_approval = {required}\n"
+        );
+
+        let mut config = ConfigBuilder::without_managed_config_for_tests()
+            .codex_home(codex_home.path().to_path_buf())
+            .cloud_config_bundle(
+                CloudConfigBundleFixture::loader_with_enterprise_requirement(&requirements),
+            )
+            .build()
+            .await?;
+
+        assert_eq!(config.features.enabled(Feature::GuardianApproval), required);
+        config
+            .features
+            .set_enabled(Feature::GuardianApproval, !required)?;
+        assert_eq!(config.features.enabled(Feature::GuardianApproval), required);
+    }
 
     Ok(())
 }

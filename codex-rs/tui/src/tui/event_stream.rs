@@ -78,6 +78,11 @@ impl<S: EventSource + Default> EventBrokerState<S> {
 }
 
 impl<S: EventSource + Default> EventBroker<S> {
+    #[cfg(test)]
+    pub(super) fn lock_state_for_test(&self) -> impl Drop + '_ {
+        self.state.lock().expect("test broker state")
+    }
+
     pub fn new() -> Self {
         let (resume_events_tx, _resume_events_rx) = watch::channel(());
         Self {

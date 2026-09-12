@@ -1275,11 +1275,54 @@ async fn kd4_latency_continuation_prefetch_preserves_workspace_evidence_read() {
 
 #[tokio::test]
 async fn workspace_evidence_coalesces_mutating_calls_at_generation_boundary() {
-    let (session, turn_context) = crate::session::tests::make_session_and_context().await;
+    let codex_home = tempfile::tempdir().expect("create isolated session home");
+    let workspace = tempfile::tempdir().expect("create isolated generation workspace");
+    let git_init = tokio::process::Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(workspace.path())
+        .status()
+        .await
+        .expect("run git init for generation workspace");
+    assert!(git_init.success(), "initialize generation Git workspace");
+    let repo_root = dunce::canonicalize(workspace.path()).expect("canonical generation workspace");
+    tokio::fs::create_dir(repo_root.join("workspace-evidence-test"))
+        .await
+        .expect("create source fixture directory");
+    for name in [
+        "dependency-a.rs",
+        "dependency-b.rs",
+        "mutation-b.rs",
+        "later-disjoint.rs",
+    ] {
+        tokio::fs::write(
+            repo_root.join("workspace-evidence-test").join(name),
+            format!("original {name}\n"),
+        )
+        .await
+        .expect("write actual initial workspace files");
+    }
+    let (mut session, turn_context, _rx_event) =
+        crate::session::tests::make_session_and_context_with_auth_config_home_and_rx(
+            CodexAuth::from_api_key("Test API Key"),
+            Vec::new(),
+            codex_home.path(),
+            |config| {
+                config.cwd = codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(
+                    repo_root.clone(),
+                )
+                .expect("the fixture cwd must be absolute");
+            },
+        )
+        .await;
+    // This scenario reports every real mutation through the host path boundary.
+    // Retain its normal watcher epoch and journal without also receiving delayed
+    // native directory/rescan events during the authoritative Git subprocesses.
+    Arc::get_mut(&mut session)
+        .expect("unique generation fixture session")
+        .services
+        .git_workspace = crate::git_workspace::GitWorkspaceCache::with_noop_watcher_for_tests();
     let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
     let batch = Arc::new(crate::tools::parallel::WorkspaceEvidenceGenerationBatch::new());
-    let repo_root = codex_git_utils::get_git_repo_root(turn_context.config.cwd.as_path())
-        .expect("turn workspace should belong to a Git repository");
     let dependency_paths = [
         repo_root.join("workspace-evidence-test/dependency-a.rs"),
         repo_root.join("workspace-evidence-test/dependency-b.rs"),
@@ -1330,20 +1373,21 @@ async fn workspace_evidence_coalesces_mutating_calls_at_generation_boundary() {
             .lock()
             .await
             .activate_workspace_evidence_generation_batch(&batch);
-        let source_path_observations = classification
-            .source_dependencies
-            .iter()
-            .filter_map(|dependency| {
-                session
-                    .services
-                    .git_workspace
-                    .begin_source_path_change_observation(
-                        &repo_root,
-                        Path::new(&dependency.path),
-                        dependency.recursive,
-                    )
-            })
-            .collect::<Vec<_>>();
+        let mut source_path_observations = Vec::new();
+        for dependency in &classification.source_dependencies {
+            if let Some(observation) = session
+                .services
+                .git_workspace
+                .begin_source_path_change_observation(
+                    &repo_root,
+                    Path::new(&dependency.path),
+                    dependency.recursive,
+                )
+                .await
+            {
+                source_path_observations.push(observation);
+            }
+        }
         assert_eq!(source_path_observations.len(), 1);
         assert!(
             session
@@ -1351,13 +1395,17 @@ async fn workspace_evidence_coalesces_mutating_calls_at_generation_boundary() {
                 .git_workspace
                 .source_path_change_observation_is_current(&source_path_observations[0])
         );
+        tokio::fs::write(&mutation_paths[index], format!("mutated by {call_id}\n"))
+            .await
+            .expect("perform the workspace mutation represented by this call");
         session
             .services
             .git_workspace
             .note_host_workspace_mutation_paths(
                 &repo_root,
                 &[mutation_paths[index].to_string_lossy().into_owned()],
-            );
+            )
+            .await;
         assert_eq!(
             session
                 .services
@@ -1386,11 +1434,22 @@ async fn workspace_evidence_coalesces_mutating_calls_at_generation_boundary() {
         .services
         .git_workspace
         .workspace_evidence_capture_count();
-    let flush = batch.flush(&session, &turn_context, &tracker).await;
+    let flush = batch
+        .flush(&session, &turn_context, &tracker)
+        .await
+        .expect("generation evidence must be durable");
     let final_identity = flush
         .prefetched_workspace_identity
         .expect("the generation flush should capture the primary workspace")
         .expect("the primary workspace should have a Git identity");
+    assert!(
+        !final_identity.unavailable,
+        "the isolated fixture must provide a successful authoritative Git capture",
+    );
+    assert_eq!(
+        final_identity.repository_root.as_deref(),
+        Some(repo_root.to_string_lossy().as_ref()),
+    );
 
     assert_eq!(flush.authoritative_capture_count, 1);
     assert_eq!(
@@ -1448,24 +1507,32 @@ async fn workspace_evidence_coalesces_mutating_calls_at_generation_boundary() {
         assert_eq!(output, format!("completed {call_id}"));
     }
 
+    let later_path = repo_root.join("workspace-evidence-test/later-disjoint.rs");
+    tokio::fs::write(&later_path, b"later disjoint mutation\n")
+        .await
+        .expect("perform a later mutation outside both source dependencies");
     session
         .services
         .git_workspace
         .note_host_workspace_mutation_paths(
             &repo_root,
-            &[repo_root
-                .join("workspace-evidence-test/later-disjoint.rs")
-                .to_string_lossy()
-                .into_owned()],
-        );
-    let mut later_identity = final_identity.clone();
-    later_identity.worktree_identity = Some(format!(
-        "{}:later-disjoint",
-        final_identity
-            .worktree_identity
-            .as_deref()
-            .unwrap_or("none")
-    ));
+            &[later_path.to_string_lossy().into_owned()],
+        )
+        .await;
+    let later_identity = session
+        .services
+        .git_workspace
+        .workspace_evidence_identity(&repo_root)
+        .await
+        .expect("the later workspace must still have a Git identity");
+    assert!(
+        !later_identity.unavailable,
+        "the later capture must succeed"
+    );
+    assert_ne!(
+        later_identity, final_identity,
+        "the real later mutation must change the workspace identity"
+    );
     let later_prepared = prepare_sampling_prompt_with_workspace_identity(
         session.clone_history().await,
         &turn_context,
@@ -1554,7 +1621,7 @@ async fn workspace_evidence_flushes_distinct_repositories_concurrently() {
         "a paused repository capture must not prevent another repository capture from starting",
     );
     pause.release();
-    let completed = flush.await;
+    let completed = flush.await.expect("generation evidence must be durable");
     assert_eq!(completed.authoritative_capture_count, 2);
 }
 
@@ -1598,7 +1665,10 @@ async fn workspace_evidence_flush_preserves_authoritative_non_git_identity() {
     ));
     assert!(batch.queue_mutating_response_for_test(&response, &classification, Vec::new(),));
 
-    let flush = batch.flush(&session, &turn_context, &tracker).await;
+    let flush = batch
+        .flush(&session, &turn_context, &tracker)
+        .await
+        .expect("generation evidence must be durable");
 
     assert_eq!(
         flush.prefetched_workspace_identity,
@@ -2941,6 +3011,643 @@ else:
     Ok(())
 }
 
+#[test]
+fn registered_turn_stop_panic_publishes_one_failed_terminal() -> Result<()> {
+    run_turn_multi_thread_test_with_stack(
+        "registered_turn_stop_panic_publishes_one_failed_terminal",
+        || terminal_publication_survives_registered_contributor_panic(false),
+    )
+}
+
+#[test]
+fn registered_thread_idle_panic_preserves_one_successful_terminal() -> Result<()> {
+    run_turn_multi_thread_test_with_stack(
+        "registered_thread_idle_panic_preserves_one_successful_terminal",
+        || terminal_publication_survives_registered_contributor_panic(true),
+    )
+}
+
+async fn terminal_publication_survives_registered_contributor_panic(
+    panic_after_publication: bool,
+) -> Result<()> {
+    use codex_app_server_protocol::ThreadHistoryBuilder;
+    use codex_app_server_protocol::TurnStatus;
+    use codex_protocol::protocol::CodexErrorInfo;
+    use codex_protocol::protocol::RolloutItem;
+
+    struct HealthyTurnObserver {
+        starts: Arc<std::sync::atomic::AtomicUsize>,
+        stops: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl codex_extension_api::TurnLifecycleContributor for HealthyTurnObserver {
+        fn on_turn_start<'a>(
+            &'a self,
+            _input: codex_extension_api::TurnStartInput<'a>,
+        ) -> codex_extension_api::ExtensionFuture<'a, ()> {
+            Box::pin(async move {
+                self.starts.fetch_add(1, Ordering::SeqCst);
+            })
+        }
+        fn on_turn_stop<'a>(
+            &'a self,
+            _input: codex_extension_api::TurnStopInput<'a>,
+        ) -> codex_extension_api::ExtensionFuture<'a, ()> {
+            Box::pin(async move {
+                self.stops.fetch_add(1, Ordering::SeqCst);
+            })
+        }
+    }
+
+    struct StopPanic {
+        reached: async_channel::Sender<()>,
+    }
+    impl codex_extension_api::TurnLifecycleContributor for StopPanic {
+        fn on_turn_stop<'a>(
+            &'a self,
+            _input: codex_extension_api::TurnStopInput<'a>,
+        ) -> codex_extension_api::ExtensionFuture<'a, ()> {
+            Box::pin(async move {
+                self.reached.send(()).await.expect("panic observer open");
+                panic!("installed turn-stop contributor failed before terminal publication");
+            })
+        }
+    }
+
+    struct IdlePanic {
+        reached: async_channel::Sender<()>,
+        fired: std::sync::atomic::AtomicBool,
+    }
+    impl<C: Sync> codex_extension_api::ThreadLifecycleContributor<C> for IdlePanic {
+        fn on_thread_idle<'a>(
+            &'a self,
+            _input: codex_extension_api::ThreadIdleInput<'a>,
+        ) -> codex_extension_api::ExtensionFuture<'a, ()> {
+            Box::pin(async move {
+                if !self.fired.swap(true, Ordering::SeqCst) {
+                    self.reached.send(()).await.expect("panic observer open");
+                    panic!("installed thread-idle contributor failed after terminal publication");
+                }
+            })
+        }
+    }
+
+    let server = responses::start_mock_server().await;
+    let request_log = responses::mount_sse_sequence(
+        &server,
+        vec![responses::sse(vec![
+            responses::ev_response_created("terminal-publication-response"),
+            responses::ev_assistant_message(
+                "terminal-publication-message",
+                "The completed answer is 42.",
+            ),
+            responses::ev_completed("terminal-publication-response"),
+        ])],
+    )
+    .await;
+    let (reached_tx, reached_rx) = async_channel::bounded(1);
+    let mut extensions = codex_extension_api::ExtensionRegistryBuilder::new();
+    if panic_after_publication {
+        extensions.thread_lifecycle_contributor(Arc::new(IdlePanic {
+            reached: reached_tx,
+            fired: std::sync::atomic::AtomicBool::new(false),
+        }));
+    } else {
+        extensions.turn_lifecycle_contributor(Arc::new(StopPanic {
+            reached: reached_tx,
+        }));
+    }
+    let healthy_starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let healthy_stops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    // Register after the panicking stop contributor to prove later observers still run.
+    extensions.turn_lifecycle_contributor(Arc::new(HealthyTurnObserver {
+        starts: Arc::clone(&healthy_starts),
+        stops: Arc::clone(&healthy_stops),
+    }));
+    let provider = non_openai_model_provider(&server);
+    let mut builder = test_codex()
+        .with_extensions(Arc::new(extensions.build()))
+        .with_config(move |config| {
+            config.model_provider = provider;
+            config.model_provider.request_max_retries = Some(0);
+            config.model_provider.stream_max_retries = Some(0);
+        });
+    let test = builder.build(&server).await?;
+    let rollout_path = test.codex.rollout_path().expect("physical rollout enabled");
+    let turn_id = test
+        .codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "Return the completed answer.".to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await?;
+    let mut live_events = Vec::new();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let event = test.codex.next_event().await.expect("normal turn event");
+            let terminal = matches!(&event.msg,
+                EventMsg::TurnComplete(event) if event.turn_id == turn_id)
+                || matches!(&event.msg,
+                    EventMsg::TurnAborted(event) if event.turn_id.as_deref() == Some(turn_id.as_str()));
+            live_events.push(event.msg);
+            if terminal {
+                break;
+            }
+        }
+        // This observes the installed callback, not a production completion flag.
+        reached_rx.recv().await.expect("installed panic callback ran");
+    })
+    .await
+    .expect("normal turn must reach the installed panic and a terminal event");
+
+    // Shutdown waits for the real terminal task owner and flushes physical history.
+    // Continue consuming through its acknowledgment so a second terminal cannot hide
+    // after the first event or behind a short quiet-period timeout.
+    test.codex.submit(Op::Shutdown).await?;
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let event = test.codex.next_event().await.expect("shutdown event");
+            let shutdown = matches!(event.msg, EventMsg::ShutdownComplete);
+            live_events.push(event.msg);
+            if shutdown {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("terminal finalizer and physical history must finish before shutdown");
+    assert_eq!(request_log.requests().len(), 1, "one real model turn");
+    assert_eq!(
+        healthy_starts.load(Ordering::SeqCst),
+        1,
+        "normal registered start callback"
+    );
+    assert_eq!(
+        healthy_stops.load(Ordering::SeqCst),
+        1,
+        "a healthy later stop observer runs exactly once despite another observer panic"
+    );
+
+    let initial =
+        crate::rollout::recorder::RolloutRecorder::get_rollout_history(&rollout_path).await?;
+    let rollout = initial.get_rollout_items();
+    let persisted_events = rollout
+        .iter()
+        .filter_map(|item| match item {
+            RolloutItem::EventMsg(event) => Some(event.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let expected_error = "The turn finalizer failed before ordinary terminal cleanup completed.";
+    let expected_status = if panic_after_publication {
+        TurnStatus::Completed
+    } else {
+        TurnStatus::Failed
+    };
+    let mut terminal_payloads = Vec::new();
+    for (boundary, events) in [
+        ("live event stream", live_events.as_slice()),
+        ("physical rollout", persisted_events.as_slice()),
+    ] {
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event,
+                EventMsg::TurnStarted(event) if event.turn_id == turn_id))
+                .count(),
+            1,
+            "{boundary}: normal RegularTask starts exactly once"
+        );
+        let terminals = events
+            .iter()
+            .filter(|event| matches!(event, EventMsg::TurnComplete(_) | EventMsg::TurnAborted(_)))
+            .collect::<Vec<_>>();
+        assert_eq!(terminals.len(), 1, "{boundary}: one terminal per real turn");
+        let EventMsg::TurnComplete(completion) = terminals[0] else {
+            panic!("{boundary}: contributor panic must not turn completed work into interruption");
+        };
+        assert_eq!(completion.turn_id, turn_id);
+        assert!(completion.surfaced_result.is_none());
+        if panic_after_publication {
+            assert_eq!(
+                completion.last_agent_message.as_deref(),
+                Some("The completed answer is 42.")
+            );
+            assert!(
+                completion.error.is_none(),
+                "{boundary}: published success must survive idle panic"
+            );
+        } else {
+            let error = completion
+                .error
+                .as_ref()
+                .expect("pre-publication panic needs a failure");
+            assert_eq!(error.message, expected_error);
+            assert_eq!(
+                error.codex_error_info,
+                Some(CodexErrorInfo::InternalServerError)
+            );
+            assert_eq!(
+                completion.last_agent_message.as_deref(),
+                Some(expected_error)
+            );
+        }
+        terminal_payloads.push(serde_json::to_value(completion)?);
+        let mut consumer = ThreadHistoryBuilder::new();
+        for event in events {
+            consumer.handle_event(event);
+        }
+        assert!(
+            consumer.in_progress_turn_snapshot().is_none(),
+            "{boundary}: consumer must be terminal"
+        );
+        let turns = consumer.finish();
+        assert_eq!(
+            turns.len(),
+            1,
+            "{boundary}: consumer must not fabricate a second turn"
+        );
+        assert_eq!(turns[0].id, turn_id);
+        assert_eq!(turns[0].status, expected_status);
+        assert_eq!(
+            turns[0].error.as_ref().map(|error| error.message.as_str()),
+            (!panic_after_publication).then_some(expected_error)
+        );
+    }
+    assert_eq!(
+        terminal_payloads[0], terminal_payloads[1],
+        "physical history preserves the delivered terminal outcome"
+    );
+    let mut replay = ThreadHistoryBuilder::new();
+    for item in rollout {
+        replay.handle_rollout_item(item);
+    }
+    let turns = replay.finish();
+    assert_eq!(turns.len(), 1, "normal physical replay contains one turn");
+    assert_eq!(turns[0].id, turn_id);
+    assert_eq!(turns[0].status, expected_status);
+    assert_eq!(
+        turns[0].error.as_ref().map(|error| error.message.as_str()),
+        (!panic_after_publication).then_some(expected_error)
+    );
+    Ok(())
+}
+
+#[test]
+fn registered_tool_completion_survives_worker_abort_before_history_commit() -> Result<()> {
+    run_turn_multi_thread_test_with_stack(
+        "registered_tool_completion_survives_worker_abort_before_history_commit",
+        registered_tool_completion_survives_worker_abort_before_history_commit_impl,
+    )
+}
+
+async fn registered_tool_completion_survives_worker_abort_before_history_commit_impl() -> Result<()>
+{
+    use codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem;
+    use codex_protocol::dynamic_tools::DynamicToolFunctionSpec;
+    use codex_protocol::dynamic_tools::DynamicToolResponse;
+    use codex_protocol::dynamic_tools::DynamicToolSpec;
+    use codex_protocol::protocol::RolloutItem;
+    use codex_utils_absolute_path::AbsolutePathBuf;
+
+    let server = responses::start_mock_server().await;
+    let requests = responses::mount_sse_sequence(
+        &server,
+        vec![
+            responses::sse(vec![
+                responses::ev_response_created("completed-tool-before-abort"),
+                responses::ev_function_call("owned-result", "completion_probe", "{}"),
+                responses::ev_completed("completed-tool-before-abort"),
+            ]),
+            responses::sse(vec![
+                responses::ev_response_created("after-worker-abort"),
+                responses::ev_assistant_message(
+                    "after-worker-abort-message",
+                    "retained result received",
+                ),
+                responses::ev_completed("after-worker-abort"),
+            ]),
+        ],
+    )
+    .await;
+    let home = tempfile::tempdir()?;
+    let mut config = crate::config::test_config().await;
+    config.codex_home = AbsolutePathBuf::from_absolute_path(home.path())?;
+    config.cwd = config.codex_home.clone();
+    config.model_provider = non_openai_model_provider(&server);
+    config.model_provider.request_max_retries = Some(0);
+    config.model_provider.stream_max_retries = Some(0);
+    let manager = crate::ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        home.path().to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+    );
+    let mut options = manager.start_thread_options(config);
+    options.dynamic_tools = vec![DynamicToolSpec::Function(DynamicToolFunctionSpec {
+        name: "completion_probe".to_string(),
+        description: "Return the externally supplied result".to_string(),
+        input_schema: serde_json::json!({"type": "object", "properties": {}, "additionalProperties": false}),
+        defer_loading: false,
+    })];
+    let started = manager.start_thread_with_options(options).await?;
+    let thread = started.thread;
+    let session = Arc::clone(&thread.codex.session);
+    let first_turn_id = thread
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "Run the completion probe".to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await?;
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            match thread.next_event().await.expect("tool-start event").msg {
+                EventMsg::ItemStarted(event) if matches!(&event.item,
+                    TurnItem::DynamicToolCall(item) if item.id == "owned-result" && item.tool == "completion_probe") => break,
+                EventMsg::Error(error) => panic!("registered tool failed before response: {}", error.message),
+                _ => {}
+            }
+        }
+    }).await.expect("normal registered dynamic tool must start");
+    let (turn, worker_abort, worker_done) = {
+        let active = session.active_turn.lock().await;
+        let task = active
+            .as_ref()
+            .and_then(|active| active.task.as_ref())
+            .expect("actual running turn task");
+        (
+            Arc::clone(&task.turn_context),
+            task.worker_abort_handle.clone(),
+            Arc::clone(&task.worker_done),
+        )
+    };
+    assert_eq!(turn.sub_id, first_turn_id);
+    let post_context = "post-tool evidence belongs after the completed result";
+    turn.queue_post_tool_contexts(
+        "owned-result",
+        vec![ResponseItem::Message {
+            id: None,
+            role: "developer".to_string(),
+            content: vec![ContentItem::InputText {
+                text: post_context.to_string(),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        }],
+    )
+    .await;
+    // Hold the real extraction mutex, rather than replacing the drain or its result.
+    // A developer context also selects the real blocking identity-preparation path.
+    let contexts = Arc::clone(&turn.pending_post_tool_contexts);
+    let contexts_guard = contexts.lock().await;
+    assert_eq!(
+        session
+            .durable_history_commits_in_flight
+            .load(Ordering::Acquire),
+        0,
+        "prior history commits must finish before the external tool response",
+    );
+    let exact_output = "completed external result: 7 * 6 = 42";
+    thread
+        .submit(Op::DynamicToolResponse {
+            id: "owned-result".to_string(),
+            response: DynamicToolResponse {
+                content_items: vec![DynamicToolCallOutputContentItem::InputText {
+                    text: exact_output.to_string(),
+                }],
+                success: true,
+            },
+        })
+        .await?;
+    let completed_item = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if let EventMsg::ItemCompleted(event) = thread
+                .next_event()
+                .await
+                .expect("tool completion event")
+                .msg
+                && let TurnItem::DynamicToolCall(item) = event.item
+                && item.id == "owned-result"
+            {
+                break item;
+            }
+        }
+    })
+    .await
+    .expect("normal registered tool must publish its actual completed result");
+    assert_eq!(completed_item.tool, "completion_probe");
+    assert_eq!(
+        completed_item.status,
+        codex_protocol::items::DynamicToolCallStatus::Completed
+    );
+    assert_eq!(completed_item.success, Some(true));
+    assert_eq!(
+        completed_item.content_items,
+        Some(vec![DynamicToolCallOutputContentItem::InputText {
+            text: exact_output.to_string(),
+        }])
+    );
+    // Synchronize with the real commit owner without finalizing timing state.
+    // The context mutex remains held, so this owner cannot commit until released.
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while session
+            .durable_history_commits_in_flight
+            .load(Ordering::Acquire)
+            == 0
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("real completed result must reach its owner before context extraction");
+    assert_eq!(
+        requests.requests().len(),
+        1,
+        "blocked commit must not permit another sample"
+    );
+    assert!(!session.clone_history().await.raw_items().iter().any(|item|
+        matches!(item, ResponseItem::FunctionCallOutput { call_id, .. } if call_id == "owned-result")),
+        "the paused window is before this tool output enters live history");
+
+    // Exercise the exact abort primitive used when terminal cleanup exceeds its grace.
+    worker_abort.abort();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !worker_done.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the original sampling worker must actually be dropped");
+    drop(contexts_guard);
+    tokio::time::timeout(
+        Duration::from_secs(15),
+        session.flush_rollout_after_ordered_commits(&turn),
+    )
+    .await
+    .expect("accepted completion owner must finish after caller cancellation")?;
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            match thread
+                .next_event()
+                .await
+                .expect("aborted-turn terminal event")
+                .msg
+            {
+                EventMsg::TurnAborted(event)
+                    if event.turn_id.as_deref() == Some(first_turn_id.as_str()) =>
+                {
+                    break;
+                }
+                EventMsg::TurnComplete(event) if event.turn_id == first_turn_id => {
+                    panic!("aborted worker must not publish ordinary success: {event:?}")
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("aborted worker must terminalize");
+    let rollout_path = thread.rollout_path().expect("real rollout path");
+    let initial =
+        crate::rollout::recorder::RolloutRecorder::get_rollout_history(&rollout_path).await?;
+    let persisted = initial
+        .get_rollout_items()
+        .iter()
+        .filter_map(|item| match item {
+            RolloutItem::ResponseItem(item) => Some(item.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let live = session.clone_history().await;
+    for (boundary, items) in [
+        ("live history", live.raw_items()),
+        ("physical rollout", persisted.as_slice()),
+    ] {
+        let observed = items
+            .iter()
+            .filter_map(|item| match item {
+                ResponseItem::FunctionCallOutput {
+                    call_id, output, ..
+                } if call_id == "owned-result" => {
+                    if boundary == "live history" {
+                        assert_eq!(output.success, Some(true), "preserve actual tool success");
+                    }
+                    Some((
+                        "output",
+                        output.body.to_text().expect("actual tool result text"),
+                    ))
+                }
+                ResponseItem::Message { role, content, .. } if role == "developer" => {
+                    content.iter().find_map(|item| match item {
+                        ContentItem::InputText { text } if text == post_context => {
+                            Some(("context", text.clone()))
+                        }
+                        _ => None,
+                    })
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            observed,
+            vec![
+                ("output", exact_output.to_string()),
+                ("context", post_context.to_string())
+            ],
+            "{boundary}: one accepted result followed by its context must survive worker Drop"
+        );
+    }
+    assert!(
+        turn.pending_post_tool_contexts
+            .lock()
+            .await
+            .get("owned-result")
+            .is_none(),
+        "the committed post-tool context must be consumed exactly once"
+    );
+
+    let next_turn = thread
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "Use the completed probe result".to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await?;
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if let EventMsg::TurnComplete(event) =
+                thread.next_event().await.expect("continuation event").msg
+                && event.turn_id == next_turn
+            {
+                assert!(event.error.is_none(), "{event:?}");
+                break;
+            }
+        }
+    })
+    .await
+    .expect("next normal turn consumes retained result");
+    let captured = requests.requests();
+    assert_eq!(captured.len(), 2);
+    assert_eq!(
+        captured[1]
+            .function_call_output_content_and_success("owned-result")
+            .expect("next request contains the function output")
+            .0
+            .as_deref(),
+        Some(exact_output)
+    );
+    let input = captured[1].input();
+    let output_indices = input
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| {
+            (item["type"] == "function_call_output" && item["call_id"] == "owned-result")
+                .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    let context_indices = input
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| {
+            (item["role"] == "developer"
+                && item["content"]
+                    .as_array()
+                    .is_some_and(|content| content.iter().any(|item| item["text"] == post_context)))
+            .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        output_indices.len(),
+        1,
+        "next model request contains result exactly once"
+    );
+    assert_eq!(
+        context_indices.len(),
+        1,
+        "next model request contains post-tool context exactly once"
+    );
+    assert!(output_indices[0] < context_indices[0]);
+    thread.shutdown_and_wait().await?;
+    manager.remove_thread(&started.thread_id).await;
+    Ok(())
+}
+
 #[tokio::test]
 async fn drain_in_flight_returns_first_error_after_draining_remaining_futures() {
     let (session, turn_context) = crate::session::tests::make_session_and_context().await;
@@ -3219,8 +3926,92 @@ async fn drain_in_flight_returns_earliest_required_terminal_after_persisting_all
 }
 
 #[tokio::test]
+async fn drain_in_flight_attributes_duplicate_call_visibility_to_delivered_execution() {
+    use crate::tools::tool_dispatch_trace::ToolDispatchTiming;
+    use crate::turn_timing::ToolCallTimingLineage;
+    use codex_protocol::protocol::TurnTimingToolCallSource;
+
+    let (session, turn_context) = crate::session::tests::make_session_and_context().await;
+    let session = Arc::new(session);
+    let turn_context = Arc::new(turn_context);
+    turn_context.turn_timing_state.mark_turn_started();
+    let mut calls = Vec::new();
+    for _ in 0..2 {
+        let mut call = InFlightToolCall::from_test_future(
+            "duplicate-relay",
+            Box::pin(async { Ok(synthetic_tool_result("duplicate-relay")) }),
+        );
+        call.timing = Arc::new(ToolDispatchTiming::new_with_turn_clock(
+            Arc::clone(&turn_context.turn_timing_state),
+            tokio::time::Instant::now(),
+            false,
+        ));
+        call.execution_id = call.timing.execution_id().clone();
+        calls.push(call.into_future().await);
+    }
+    let first = calls.remove(0);
+    let later = calls.remove(0);
+    let first_execution = first.execution_id.clone();
+    let later_execution = later.execution_id.clone();
+    // The later request completed first, but the relay must publish the earlier
+    // request first. Keep the later completion queued outside this drain.
+    for call in [&later, &first] {
+        turn_context.turn_timing_state.record_tool_dispatch_timing(
+            "duplicate-relay",
+            "test_tool",
+            TurnTimingToolCallSource::Direct,
+            ToolCallTimingLineage::default(),
+            call.timing.snapshot(tokio::time::Instant::now()),
+        );
+    }
+    let mut in_flight: FuturesOrdered<BoxFuture<'static, InFlightToolResult>> =
+        FuturesOrdered::new();
+    in_flight.push_back(Box::pin(async move { first }));
+    drain_in_flight(
+        &mut in_flight,
+        Arc::clone(&session),
+        Arc::clone(&turn_context),
+    )
+    .await
+    .expect("the first relay output should commit");
+
+    let history = session.clone_history().await;
+    assert_eq!(
+        history
+            .raw_items()
+            .iter()
+            .filter(|item| matches!(
+                item,
+                ResponseItem::ToolSearchOutput { call_id, .. }
+                    if call_id.as_deref() == Some("duplicate-relay")
+            ))
+            .count(),
+        1,
+    );
+    let timing = turn_context
+        .turn_timing_state
+        .complete_snapshot()
+        .protocol_timing();
+    let delivered = timing
+        .tool_calls
+        .iter()
+        .find(|call| call.execution_id == first_execution)
+        .expect("first execution timing");
+    let pending = timing
+        .tool_calls
+        .iter()
+        .find(|call| call.execution_id == later_execution)
+        .expect("later execution timing");
+    assert!(delivered.delivered_at_ms.is_some());
+    assert!(delivered.output_model_visible_at_ms.is_some());
+    assert_eq!(pending.delivered_at_ms, None);
+    assert_eq!(pending.output_model_visible_at_ms, None);
+}
+
+#[tokio::test]
 async fn drain_in_flight_keeps_successful_delivery_independent_of_telemetry_state() {
     let (session, turn_context) = crate::session::tests::make_session_and_context().await;
+    let session = Arc::new(session);
     let mut in_flight: FuturesOrdered<BoxFuture<'static, InFlightToolResult>> =
         FuturesOrdered::new();
     in_flight.push_back(Box::pin(
@@ -3231,9 +4022,36 @@ async fn drain_in_flight_keeps_successful_delivery_independent_of_telemetry_stat
         .into_future(),
     ));
 
-    drain_in_flight(&mut in_flight, Arc::new(session), Arc::new(turn_context))
+    drain_in_flight(&mut in_flight, Arc::clone(&session), Arc::new(turn_context))
         .await
         .expect("successful tool delivery must not depend on telemetry-only state");
+    let history = session.clone_history().await;
+    let actual = history
+        .raw_items()
+        .iter()
+        .find(|item| {
+            matches!(
+                item,
+                ResponseItem::ToolSearchOutput { call_id, .. }
+                    if call_id.as_deref() == Some("successful")
+            )
+        })
+        .expect("successful output must reach model-visible history");
+    if let ResponseItem::ToolSearchOutput {
+        status,
+        execution,
+        tools,
+        omitted_result_count,
+        ..
+    } = actual
+    {
+        assert_eq!(status, "completed");
+        assert_eq!(execution, "client");
+        assert!(tools.is_empty());
+        assert_eq!(*omitted_result_count, None);
+    } else {
+        panic!("expected tool search output");
+    }
 }
 
 #[tokio::test]
@@ -5308,4 +6126,315 @@ async fn projected_prompt_state_reads_start_concurrently() {
     .expect("independent prompt-pressure state reads should overlap");
 
     assert_eq!(values, ("active", "history", "compact"));
+}
+
+#[test]
+fn planned_plugin_mention_emits_persisted_identity_and_turn_metadata() -> Result<()> {
+    run_turn_multi_thread_test_with_stack(
+        "planned_plugin_mention_emits_persisted_identity_and_turn_metadata",
+        planned_plugin_mention_emits_persisted_identity_and_turn_metadata_impl,
+    )
+}
+
+async fn planned_plugin_mention_emits_persisted_identity_and_turn_metadata_impl() -> Result<()> {
+    use codex_config::ConfigLayerEntry;
+    use codex_config::ConfigLayerSource;
+    use codex_config::ConfigLayerStack;
+    use codex_config::ConfigRequirements;
+    use codex_config::ConfigRequirementsToml;
+    use codex_core_plugins::PluginsManager;
+    use codex_core_plugins::store::PluginStore;
+    use codex_plugin::PluginId;
+    use codex_utils_absolute_path::AbsolutePathBuf;
+
+    let home = tempfile::tempdir()?;
+    let source = home.path().join("source");
+    fs::create_dir_all(source.join(".codex-plugin"))?;
+    fs::write(
+        source.join(".codex-plugin/plugin.json"),
+        r#"{"name":"sample","version":"1.0.0","description":"Mentioned plugin"}"#,
+    )?;
+    fs::create_dir_all(source.join("skills/sample"))?;
+    fs::write(
+        source.join("skills/sample/SKILL.md"),
+        "---\nname: sample\ndescription: A real plugin capability for mention discovery.\n---\nUse the sample capability.\n",
+    )?;
+    let plugin_id = PluginId::parse("sample@test")?;
+    let store = PluginStore::new(home.path().to_path_buf());
+    store.install(AbsolutePathBuf::try_from(source)?, plugin_id.clone())?;
+    store.write_remote_plugin_id(&plugin_id, "plugins~persisted-sample")?;
+
+    let server = wiremock::MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/codex/analytics-events/events"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    let (mut session, mut turn_context, _events) =
+        crate::session::tests::make_session_and_context_with_rx().await;
+    let auth =
+        AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
+    let session_mut = Arc::get_mut(&mut session).expect("unique session");
+    session_mut.services.plugins_manager = Arc::new(PluginsManager::new(home.path().to_path_buf()));
+    session_mut.services.auth_manager = Arc::clone(&auth);
+    session_mut.services.analytics_events_client = codex_analytics::AnalyticsEventsClient::new(
+        Arc::clone(&auth),
+        server.uri(),
+        Some(true),
+        codex_http_client::HttpClientFactory::new(
+            codex_http_client::OutboundProxyPolicy::ReqwestDefault,
+        ),
+    );
+    let turn = Arc::get_mut(&mut turn_context).expect("unique turn");
+    turn.auth_manager = Some(auth);
+    let config = Arc::make_mut(&mut turn.config);
+    config.codex_home = AbsolutePathBuf::try_from(home.path())?;
+    config.features.enable(Feature::Plugins)?;
+    config.features.disable(Feature::RemotePlugin)?;
+    config.features.disable(Feature::ToolSuggest)?;
+    config.config_layer_stack = ConfigLayerStack::new(
+        vec![ConfigLayerEntry::new(
+            ConfigLayerSource::User {
+                file: AbsolutePathBuf::try_from(home.path().join("config.toml"))?,
+                profile: None,
+            },
+            toml::from_str(
+                r#"[plugins."sample@test"]
+enabled = true
+"#,
+            )?,
+        )],
+        ConfigRequirements::default(),
+        ConfigRequirementsToml::default(),
+    )?
+    .into();
+    let input = vec![TurnInput::UserInput {
+        content: vec![UserInput::Mention {
+            name: "sample".to_string(),
+            path: "plugin://sample@test".to_string(),
+        }],
+        client_id: None,
+    }];
+    let step_context = session
+        .capture_step_context(Arc::clone(&turn_context))
+        .await;
+    let PendingTurnPlanBuild::Ready(plan) = build_pure_pending_turn_plan(
+        &session,
+        step_context,
+        &input,
+        session.services.planning_generation(),
+        &CancellationToken::new(),
+    )
+    .await?
+    else {
+        panic!("installed plugin mention must produce a ready plan");
+    };
+    assert_eq!(plan.mentioned_plugins.len(), 1);
+    assert_eq!(plan.mentioned_plugins[0].config_name, "sample@test");
+    commit_pending_turn_plan_effects(&session, &turn_context, &plan).await;
+
+    let event = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            for request in server.received_requests().await.unwrap_or_default() {
+                let payload: serde_json::Value = serde_json::from_slice(&request.body)?;
+                if let Some(event) = payload["events"].as_array().and_then(|events| {
+                    events
+                        .iter()
+                        .find(|event| event["event_type"] == "codex_plugin_used")
+                }) {
+                    return Ok::<_, anyhow::Error>(event.clone());
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await??;
+    let metadata = &event["event_params"];
+    assert_eq!(metadata["plugin_id"], "sample@test");
+    assert_eq!(metadata["remote_plugin_id"], "plugins~persisted-sample");
+    assert_eq!(metadata["plugin_name"], "sample");
+    assert_eq!(metadata["marketplace_name"], "test");
+    assert_eq!(metadata["has_skills"], true);
+    assert_eq!(metadata["mcp_server_names"], serde_json::json!([]));
+    assert_eq!(metadata["thread_id"], session.thread_id.to_string());
+    assert_eq!(metadata["turn_id"], turn_context.sub_id);
+    assert_eq!(metadata["model_slug"], turn_context.model_info.slug);
+    Ok(())
+}
+
+#[test]
+fn plan_prose_prefix_survives_worker_abort_during_item_start() -> Result<()> {
+    run_turn_multi_thread_test_with_stack(
+        "plan_prose_prefix_survives_worker_abort_during_item_start",
+        plan_prose_prefix_survives_worker_abort_during_item_start_impl,
+    )
+}
+
+async fn plan_prose_prefix_survives_worker_abort_during_item_start_impl() -> Result<()> {
+    use codex_protocol::config_types::CollaborationMode;
+    use codex_protocol::config_types::Settings;
+    use codex_protocol::protocol::RolloutItem;
+    use codex_utils_absolute_path::AbsolutePathBuf;
+    let server = responses::start_mock_server().await;
+    let requests = responses::mount_sse_sequence(
+        &server,
+        vec![responses::sse(vec![
+            responses::ev_response_created("plan-prefix-abort"),
+            responses::ev_message_item_added("plan-prefix-message", ""),
+            responses::ev_output_text_delta("  \n"),
+            responses::ev_output_text_delta("Accepted prose prefix.\n"),
+            responses::ev_completed("plan-prefix-abort"),
+        ])],
+    )
+    .await;
+    let home = tempfile::tempdir()?;
+    let mut config = crate::config::test_config().await;
+    config.codex_home = AbsolutePathBuf::from_absolute_path(home.path())?;
+    config.cwd = config.codex_home.clone();
+    config.model_provider = non_openai_model_provider(&server);
+    config.model_provider.request_max_retries = Some(0);
+    config.model_provider.stream_max_retries = Some(0);
+    let model = config.model.clone().expect("fixture model");
+    let manager = crate::ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        home.path().to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+    );
+    // The local store supports Legacy history; compare its persisted AgentMessage
+    // conversion with the live ItemCompleted payload below.
+    let started = manager.start_thread_with_options(manager.start_thread_options(config)).await?;
+    let thread = started.thread;
+    let session = Arc::clone(&thread.codex.session);
+    let (reached, reached_rx) = async_channel::bounded(1);
+    let (release, release_rx) = tokio::sync::oneshot::channel();
+    PLAN_START_PUBLICATION_GATES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .insert(session.thread_id, (reached, release_rx));
+    let turn_id = thread
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "Draft a plan.".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: ThreadSettingsOverrides {
+                collaboration_mode: Some(CollaborationMode {
+                    mode: ModeKind::Plan,
+                    settings: Settings {
+                        model,
+                        reasoning_effort: None,
+                        developer_instructions: None,
+                    },
+                }),
+                ..Default::default()
+            },
+        })
+        .await?;
+    tokio::time::timeout(Duration::from_secs(15), reached_rx.recv()).await??;
+    let (turn, worker_abort, worker_done) = {
+        let active = session.active_turn.lock().await;
+        let task = active
+            .as_ref()
+            .and_then(|active| active.task.as_ref())
+            .expect("actual sampling worker");
+        (
+            Arc::clone(&task.turn_context),
+            task.worker_abort_handle.clone(),
+            Arc::clone(&task.worker_done),
+        )
+    };
+    assert_eq!(turn.sub_id, turn_id);
+    worker_abort.abort();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !worker_done.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("original sampling worker actually dropped");
+    // Interrupt uses the normal terminal owner; its ordered barrier must wait for the accepted prefix.
+    thread.submit(Op::Interrupt).await?;
+    release
+        .send(())
+        .expect("accepted publication remains owned after caller abort");
+    tokio::time::timeout(
+        Duration::from_secs(15),
+        session.flush_rollout_after_ordered_commits(&turn),
+    )
+    .await??;
+    thread.submit(Op::Shutdown).await?;
+    let mut live = Vec::new();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let event = thread.next_event().await.expect("normal event stream").msg;
+            let done = matches!(event, EventMsg::ShutdownComplete);
+            live.push(event);
+            if done {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("normal shutdown flushes partial publication");
+    let history = crate::rollout::recorder::RolloutRecorder::get_rollout_history(
+        &thread.rollout_path().expect("physical rollout"),
+    )
+    .await?;
+    let physical = history
+        .get_rollout_items()
+        .iter()
+        .filter_map(|item| match item {
+            RolloutItem::EventMsg(event) => Some(event.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let expected = "  \nAccepted prose prefix.\n";
+    for (name, events) in [("live", &live), ("physical", &physical)] {
+        let completed = events
+            .iter()
+            .filter_map(|event| match event {
+                EventMsg::ItemCompleted(event) if name == "live" => match &event.item {
+                    TurnItem::AgentMessage(item) if item.id == "plan-prefix-message" => {
+                        Some(agent_message_text(item))
+                    }
+                    _ => None,
+                },
+                EventMsg::AgentMessage(event) if name == "physical" => Some(event.message.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            completed,
+            vec![expected],
+            "{name}: accepted prefix is completed exactly once"
+        );
+        let starts = events.iter().filter(|event| matches!(event,
+            EventMsg::ItemStarted(event) if matches!(&event.item, TurnItem::AgentMessage(item) if item.id == "plan-prefix-message"))).count();
+        assert_eq!(starts, if name == "live" { 1 } else { 0 },
+            "deferred start is delivered once and remains transient in physical history");
+    }
+    let deltas = live
+        .iter()
+        .filter_map(|event| match event {
+            EventMsg::AgentMessageContentDelta(event) if event.item_id == "plan-prefix-message" => {
+                Some(event.delta.as_str())
+            }
+            _ => None,
+        })
+        .collect::<String>();
+    assert_eq!(
+        deltas, expected,
+        "live prefix includes the buffered leading whitespace exactly once"
+    );
+    assert_eq!(
+        requests.requests().len(),
+        1,
+        "the real plan stream was not retried"
+    );
+    Ok(())
 }

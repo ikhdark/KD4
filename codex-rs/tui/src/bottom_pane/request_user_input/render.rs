@@ -102,7 +102,7 @@ impl Renderable for RequestUserInputOverlay {
             .saturating_add(footer_height)
             .saturating_add(PROGRESS_ROW_HEIGHT); // progress
         height = height.saturating_add(menu_surface_padding_height() as usize);
-        height.max(MIN_OVERLAY_HEIGHT) as u16
+        u16::try_from(height.max(MIN_OVERLAY_HEIGHT)).unwrap_or(u16::MAX)
     }
 
     fn render(&self, area: Rect, buf: &mut Buffer) {

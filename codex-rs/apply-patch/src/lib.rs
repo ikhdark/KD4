@@ -329,6 +329,20 @@ pub async fn apply_patch(
     fs: &dyn ExecutorFileSystem,
     sandbox: Option<&FileSystemSandboxContext>,
 ) -> Result<AppliedPatchDelta, ApplyPatchFailure> {
+    apply_patch_with_cancellation(patch, cwd, stdout, stderr, fs, sandbox, &|| false).await
+}
+
+/// Applies a patch, finishing each started hunk before observing cancellation.
+/// A cancellation failure includes the complete delta of all committed hunks.
+pub async fn apply_patch_with_cancellation(
+    patch: &str,
+    cwd: &PathUri,
+    stdout: &mut impl std::io::Write,
+    stderr: &mut impl std::io::Write,
+    fs: &dyn ExecutorFileSystem,
+    sandbox: Option<&FileSystemSandboxContext>,
+    is_cancelled: &(dyn Fn() -> bool + Sync),
+) -> Result<AppliedPatchDelta, ApplyPatchFailure> {
     let hunks = match parse_patch(patch) {
         Ok(source) => source.hunks,
         Err(e) => {
@@ -356,7 +370,7 @@ pub async fn apply_patch(
         }
     };
 
-    apply_hunks(&hunks, cwd, stdout, stderr, fs, sandbox).await
+    apply_hunks_with_cancellation(&hunks, cwd, stdout, stderr, fs, sandbox, is_cancelled).await
 }
 
 /// Applies hunks and continues to update stdout/stderr
@@ -368,8 +382,20 @@ pub async fn apply_hunks(
     fs: &dyn ExecutorFileSystem,
     sandbox: Option<&FileSystemSandboxContext>,
 ) -> Result<AppliedPatchDelta, ApplyPatchFailure> {
+    apply_hunks_with_cancellation(hunks, cwd, stdout, stderr, fs, sandbox, &|| false).await
+}
+
+async fn apply_hunks_with_cancellation(
+    hunks: &[Hunk],
+    cwd: &PathUri,
+    stdout: &mut impl std::io::Write,
+    stderr: &mut impl std::io::Write,
+    fs: &dyn ExecutorFileSystem,
+    sandbox: Option<&FileSystemSandboxContext>,
+    is_cancelled: &(dyn Fn() -> bool + Sync),
+) -> Result<AppliedPatchDelta, ApplyPatchFailure> {
     let mut delta = AppliedPatchDelta::empty();
-    match apply_hunks_to_files(hunks, cwd, fs, sandbox, &mut delta).await {
+    match apply_hunks_to_files(hunks, cwd, fs, sandbox, &mut delta, is_cancelled).await {
         Ok(affected_paths) => {
             print_summary(&affected_paths, stdout).map_err(|error| {
                 ApplyPatchFailure::new(ApplyPatchError::from(error), delta.clone())
@@ -414,6 +440,7 @@ async fn apply_hunks_to_files(
     fs: &dyn ExecutorFileSystem,
     sandbox: Option<&FileSystemSandboxContext>,
     delta: &mut AppliedPatchDelta,
+    is_cancelled: &(dyn Fn() -> bool + Sync),
 ) -> anyhow::Result<AffectedPaths> {
     if hunks.is_empty() {
         anyhow::bail!("No files were modified.");
@@ -439,6 +466,13 @@ async fn apply_hunks_to_files(
 
     // TODO(anp): Carry PathUri through committed patch deltas and the turn diff tracker.
     for (hunk_index, hunk) in hunks.iter().enumerate() {
+        if is_cancelled() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "Patch application cancelled before the next hunk",
+            )
+            .into());
+        }
         let affected_path = hunk.path().to_path_buf();
         let path_uri = hunk.resolve_path(cwd)?;
         match hunk {

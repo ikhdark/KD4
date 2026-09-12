@@ -2108,10 +2108,21 @@ async fn oauth_discovery_request_count(server: &MockServer) -> usize {
     server
         .received_requests()
         .await
-        .unwrap_or_default()
+        .expect("OAuth request assertions require wiremock request recording")
         .iter()
         .filter(|request| request.url.path().contains("oauth-authorization-server"))
         .count()
+}
+
+#[tokio::test]
+#[should_panic(expected = "OAuth request assertions require wiremock request recording")]
+async fn oauth_discovery_request_count_rejects_disabled_recording() {
+    let server = MockServer::builder()
+        .disable_request_recording()
+        .start()
+        .await;
+
+    oauth_discovery_request_count(&server).await;
 }
 
 fn write_remote_plugin_catalog_config(

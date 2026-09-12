@@ -522,6 +522,64 @@ async fn update_remote_plugin_share_targets_updates_targets() {
 }
 
 #[tokio::test]
+async fn list_remote_plugin_shares_rejects_pagination_token_cycles() {
+    for tokens in [
+        &["opaque A", "opaque A"][..],
+        &["opaque A", "opaque B", "opaque A"][..],
+    ] {
+        let codex_home = TempDir::new().unwrap();
+        let server = MockServer::start().await;
+        let config = test_config(&server);
+        let auth = test_auth();
+        for (index, token) in tokens.iter().enumerate() {
+            let request =
+                Mock::given(method("GET")).and(path("/backend-api/ps/plugins/workspace/created"));
+            let request = if index == 0 {
+                request.and(query_param_is_missing("pageToken"))
+            } else {
+                request.and(query_param("pageToken", tokens[index - 1]))
+            };
+            request
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "plugins": [],
+                    "pagination": {"next_page_token": token},
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            list_remote_plugin_shares(&config, Some(&auth), codex_home.path()),
+        )
+        .await
+        .expect("a repeated cursor must terminate the share listing");
+        let error = result.expect_err("partial shares must not be returned as complete");
+        assert_eq!(
+            error.error_data(),
+            PluginRemoteErrorData {
+                reason: PluginRemoteErrorReason::InvalidResponse,
+                retryable: false,
+            }
+        );
+        assert!(
+            matches!(error, RemotePluginCatalogError::UnexpectedResponse(message)
+            if message == "remote plugin catalog returned a repeated pagination token")
+        );
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests.len(),
+            tokens.len(),
+            "no repeated fetch or downstream installed request"
+        );
+        assert!(
+            fs::read_dir(codex_home.path()).unwrap().next().is_none(),
+            "failed share listing must not persist local paths"
+        );
+    }
+}
+
+#[tokio::test]
 async fn list_remote_plugin_shares_fetches_created_workspace_plugins() {
     let codex_home = TempDir::new().unwrap();
     let local_plugin_path =

@@ -459,6 +459,20 @@ mod api {
                 }
             };
 
+            let cwd = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
+            // The worker owns the request and Git's temporary files until the
+            // entire application finishes, even if the awaiting caller leaves.
+            tokio::task::spawn_blocking(move || Self::apply_diff(id, diff, preflight, cwd))
+                .await
+                .map_err(|e| CloudTaskError::Io(format!("git apply worker failed: {e}")))?
+        }
+
+        fn apply_diff(
+            id: String,
+            diff: String,
+            preflight: bool,
+            cwd: std::path::PathBuf,
+        ) -> Result<ApplyOutcome> {
             if !is_unified_diff(&diff) {
                 let summary = summarize_patch_for_logging(&diff);
                 let mode = if preflight { "preflight" } else { "apply" };
@@ -476,7 +490,7 @@ mod api {
             }
 
             let req = ApplyGitRequest {
-                cwd: std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir()),
+                cwd,
                 diff: diff.clone(),
                 revert: false,
                 preflight,
@@ -714,17 +728,22 @@ mod api {
             "completed" => AttemptStatus::Completed,
             "in_progress" => AttemptStatus::InProgress,
             "pending" => AttemptStatus::Pending,
-            _ => AttemptStatus::Pending,
+            "cancelled" => AttemptStatus::Cancelled,
+            _ => AttemptStatus::Unknown,
         }
     }
 
     fn parse_timestamp_value(v: Option<&Value>) -> Option<DateTime<Utc>> {
-        let ts = v?.as_f64()?;
-        let secs = ts as i64;
-        let nanos = ((ts - secs as f64) * 1_000_000_000.0) as u32;
-        Some(DateTime::<Utc>::from(
-            std::time::UNIX_EPOCH + std::time::Duration::new(secs.max(0) as u64, nanos),
-        ))
+        timestamp_from_seconds(v?.as_f64()?)
+    }
+
+    fn timestamp_from_seconds(ts: f64) -> Option<DateTime<Utc>> {
+        if !ts.is_finite() {
+            return None;
+        }
+        let seconds = ts.floor();
+        let nanos = (((ts - seconds) * 1_000_000_000.0) as u32).min(999_999_999);
+        DateTime::from_timestamp(seconds as i64, nanos)
     }
 
     fn map_task_list_item_to_summary(src: backend::TaskListItem) -> TaskSummary {
@@ -775,14 +794,8 @@ mod api {
     }
 
     fn parse_updated_at(ts: Option<&f64>) -> DateTime<Utc> {
-        if let Some(v) = ts {
-            let secs = *v as i64;
-            let nanos = ((*v - secs as f64) * 1_000_000_000.0) as u32;
-            return DateTime::<Utc>::from(
-                std::time::UNIX_EPOCH + std::time::Duration::new(secs.max(0) as u64, nanos),
-            );
-        }
-        Utc::now()
+        ts.and_then(|ts| timestamp_from_seconds(*ts))
+            .unwrap_or_else(Utc::now)
     }
 
     fn env_label_from_status_display(v: Option<&HashMap<String, Value>>) -> Option<String> {
@@ -875,7 +888,7 @@ mod api {
         if s.len() <= max {
             s.to_string()
         } else {
-            s[s.len() - max..].to_string()
+            s[s.ceil_char_boundary(s.len() - max)..].to_string()
         }
     }
 
@@ -898,12 +911,367 @@ mod api {
             .unwrap_or_else(|| "<unknown>".to_string());
         let head: String = patch.lines().take(20).collect::<Vec<&str>>().join("\n");
         let head_trunc = if head.len() > 800 {
-            format!("{}…", &head[..800])
+            format!("{}…", &head[..head.floor_char_boundary(800)])
         } else {
             head
         };
         format!(
             "patch_summary: kind={kind} lines={lines} chars={chars} cwd={cwd} ; head=\n{head_trunc}"
         )
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        async fn client_with_json_responses(
+            responses: Vec<(&'static str, Value)>,
+        ) -> (HttpClient, tokio::task::JoinHandle<()>) {
+            use tokio::io::AsyncReadExt;
+            use tokio::io::AsyncWriteExt;
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("HTTP listener");
+            let base_url = format!("http://{}", listener.local_addr().expect("server address"));
+            let server = tokio::spawn(async move {
+                for (expected_path, response) in responses {
+                    let (mut stream, _) = listener.accept().await.expect("HTTP request");
+                    let mut request = Vec::new();
+                    while !request.ends_with(b"\r\n\r\n") {
+                        let byte = stream.read_u8().await.expect("HTTP request header");
+                        request.push(byte);
+                        assert!(request.len() < 16_384, "bounded request header");
+                    }
+                    assert!(
+                        String::from_utf8(request)
+                            .expect("HTTP header")
+                            .starts_with(&format!("GET {expected_path} HTTP/1.1\r\n"))
+                    );
+                    let body = response.to_string();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    stream
+                        .write_all(response.as_bytes())
+                        .await
+                        .expect("HTTP response");
+                }
+            });
+            let client = HttpClient::new(
+                base_url,
+                codex_http_client::HttpClientFactory::new(
+                    codex_http_client::OutboundProxyPolicy::ReqwestDefault,
+                ),
+            );
+            (client, server)
+        }
+
+        #[tokio::test]
+        async fn cloud_backend_decodes_cancelled_and_unknown_attempt_statuses() {
+            let turns = [
+                ("failed", AttemptStatus::Failed),
+                ("completed", AttemptStatus::Completed),
+                ("in_progress", AttemptStatus::InProgress),
+                ("pending", AttemptStatus::Pending),
+                ("cancelled", AttemptStatus::Cancelled),
+                ("future_status", AttemptStatus::Unknown),
+            ];
+            let body = serde_json::json!({
+                "sibling_turns": turns.iter().enumerate().map(|(index, (status, _))| {
+                    serde_json::json!({"id": status, "attempt_placement": index, "turn_status": status})
+                }).collect::<Vec<_>>()
+            });
+            let (client, server) = client_with_json_responses(vec![(
+                "/api/codex/tasks/task/turns/turn/sibling_turns",
+                body,
+            )])
+            .await;
+            let attempts = client
+                .list_sibling_attempts(TaskId("task".to_string()), "turn".to_string())
+                .await
+                .expect("public sibling-turn response");
+            server.await.expect("HTTP server");
+            assert_eq!(attempts.len(), turns.len());
+            for (attempt, (id, status)) in attempts.iter().zip(turns) {
+                assert_eq!(attempt.turn_id, id);
+                assert_eq!(attempt.status, status);
+            }
+        }
+
+        #[tokio::test]
+        async fn cloud_backend_decodes_timestamps_without_panicking_or_losing_pre_epoch_time() {
+            let (client, server) = client_with_json_responses(vec![
+                (
+                    "/api/codex/tasks/task/turns/turn/sibling_turns",
+                    serde_json::json!({
+                        "sibling_turns": [
+                            {"id": "negative", "attempt_placement": 0, "created_at": -1.25},
+                            {"id": "positive", "attempt_placement": 1, "created_at": 1.25},
+                            {"id": "system_overflow", "attempt_placement": 2, "created_at": 1e300},
+                            {"id": "chrono_overflow", "attempt_placement": 3, "created_at": 1e13},
+                            {"id": "missing", "attempt_placement": 4}
+                        ]
+                    }),
+                ),
+                (
+                    "/api/codex/tasks/task",
+                    serde_json::json!({
+                        "task": {"id": "task", "title": "Invalid timestamp", "archived": false,
+                            "external_pull_requests": [], "created_at": 1e300}
+                    }),
+                ),
+            ])
+            .await;
+            let attempts = client
+                .list_sibling_attempts(TaskId("task".to_string()), "turn".to_string())
+                .await
+                .expect("public sibling-turn response");
+            assert_eq!(attempts.len(), 5);
+            assert_eq!(
+                attempts[0].created_at,
+                DateTime::from_timestamp(-2, 750_000_000)
+            );
+            assert_eq!(
+                attempts[1].created_at,
+                DateTime::from_timestamp(1, 250_000_000)
+            );
+            for attempt in &attempts[2..] {
+                assert_eq!(
+                    attempt.created_at, None,
+                    "{} has no usable timestamp",
+                    attempt.turn_id
+                );
+            }
+            let before = Utc::now();
+            let summary = client
+                .get_task_summary(TaskId("task".to_string()))
+                .await
+                .expect("public task summary");
+            let after = Utc::now();
+            server.await.expect("HTTP server");
+            assert_eq!(summary.id, TaskId("task".to_string()));
+            assert_eq!(summary.title, "Invalid timestamp");
+            assert!(before <= summary.updated_at && summary.updated_at <= after);
+        }
+
+        #[test]
+        fn tail_respects_byte_budget_without_splitting_unicode() {
+            for (input, budget, expected) in [
+                ("abc", 2, "bc"),
+                ("a雪b", 3, "b"),
+                ("a雪b", 4, "雪b"),
+                ("a雪b", 5, "a雪b"),
+                ("雪", 2, ""),
+                ("雪", 0, ""),
+                ("", 2, ""),
+            ] {
+                assert_eq!(tail(input, budget), expected);
+            }
+        }
+
+        #[test]
+        fn patch_summary_truncates_at_a_unicode_boundary() {
+            let patch = format!("{}雪suffix", "a".repeat(799));
+            let summary = summarize_patch_for_logging(&patch);
+            assert_eq!(
+                summary.split_once(" ; head=\n").unwrap().1,
+                format!("{}…", "a".repeat(799))
+            );
+            let short_patch = "雪\nunchanged";
+            assert_eq!(
+                summarize_patch_for_logging(short_patch)
+                    .split_once(" ; head=\n")
+                    .unwrap()
+                    .1,
+                short_patch
+            );
+        }
+
+        #[tokio::test]
+        async fn apply_task_rejects_long_unicode_non_unified_diff() {
+            let client = HttpClient::new(
+                "http://127.0.0.1:1",
+                codex_http_client::HttpClientFactory::new(
+                    codex_http_client::OutboundProxyPolicy::ReqwestDefault,
+                ),
+            );
+            let patch = "雪".repeat(300);
+            for preflight in [false, true] {
+                let task = TaskId("unicode-invalid-diff".to_string());
+                let outcome = if preflight {
+                    client.apply_task_preflight(task, Some(patch.clone())).await
+                } else {
+                    client.apply_task(task, Some(patch.clone())).await
+                }
+                .expect("invalid diffs return an application outcome");
+                assert_eq!(
+                    outcome,
+                    ApplyOutcome {
+                        applied: false,
+                        status: ApplyStatus::Error,
+                        message:
+                            "Expected unified git diff; backend returned an incompatible format."
+                                .to_string(),
+                        skipped_paths: Vec::new(),
+                        conflict_paths: Vec::new(),
+                    }
+                );
+            }
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn apply_task_and_preflight_keep_executor_responsive_and_preserve_index() {
+            use std::path::Path;
+            use std::process::Command;
+            use std::sync::atomic::AtomicBool;
+            use std::sync::atomic::Ordering;
+            use std::time::Duration;
+
+            struct RestoreDirectory(std::path::PathBuf);
+            impl Drop for RestoreDirectory {
+                fn drop(&mut self) {
+                    std::env::set_current_dir(&self.0).expect("restore current directory");
+                }
+            }
+
+            fn git(cwd: &Path, args: &[&str]) -> String {
+                let output = Command::new("git")
+                    .args(args)
+                    .current_dir(cwd)
+                    .output()
+                    .expect("run git");
+                assert!(
+                    output.status.success(),
+                    "git {args:?}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                String::from_utf8(output.stdout).expect("Git output is UTF-8")
+            }
+
+            let directory = tempfile::tempdir().expect("temporary repository");
+            let cwd = directory.path();
+            git(cwd, &["init", "--quiet"]);
+            git(cwd, &["config", "user.email", "test@example.com"]);
+            git(cwd, &["config", "user.name", "Cloud task test"]);
+            git(cwd, &["config", "core.autocrlf", "false"]);
+            std::fs::write(cwd.join("file.txt"), "before\n").expect("original file");
+            git(cwd, &["add", "file.txt"]);
+            git(cwd, &["commit", "--quiet", "-m", "initial"]);
+            std::fs::write(cwd.join("file.txt"), "after\n").expect("changed file");
+            let patch = git(cwd, &["diff", "--binary"]);
+            std::fs::write(cwd.join("file.txt"), "before\n").expect("restore file");
+            // Git's normal clean-filter path supplies a real slow subprocess on
+            // both Windows (Git's sh) and Unix, without replacing patch logic.
+            std::fs::write(cwd.join(".gitattributes"), "file.txt filter=slow\n")
+                .expect("filter attributes");
+            git(cwd, &["config", "filter.slow.clean", "sleep 0.5; cat"]);
+            git(cwd, &["config", "filter.slow.smudge", "cat"]);
+            git(cwd, &["config", "filter.slow.required", "true"]);
+            let original_index = std::fs::read(cwd.join(".git/index")).expect("original index");
+            let _restore = RestoreDirectory(std::env::current_dir().expect("current directory"));
+            std::env::set_current_dir(cwd).expect("enter test repository");
+            let client = HttpClient::new(
+                "http://127.0.0.1:1",
+                codex_http_client::HttpClientFactory::new(
+                    codex_http_client::OutboundProxyPolicy::ReqwestDefault,
+                ),
+            );
+
+            for preflight in [true, false] {
+                let completed = AtomicBool::new(false);
+                let apply = async {
+                    let task = TaskId("responsive-apply".to_string());
+                    let result = if preflight {
+                        client.apply_task_preflight(task, Some(patch.clone())).await
+                    } else {
+                        client.apply_task(task, Some(patch.clone())).await
+                    };
+                    completed.store(true, Ordering::SeqCst);
+                    result
+                };
+                let observe_executor = async {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    !completed.load(Ordering::SeqCst)
+                };
+                let (result, progressed_while_git_running) =
+                    tokio::join!(biased; apply, observe_executor);
+                let outcome = result.expect("apply outcome");
+                assert!(
+                    progressed_while_git_running,
+                    "Git blocked the async executor"
+                );
+                assert_eq!(
+                    outcome.status,
+                    ApplyStatus::Success,
+                    "preflight={preflight}, outcome={outcome:?}, log={:?}",
+                    std::fs::read_to_string(cwd.join("error.log"))
+                );
+                assert_eq!(outcome.applied, !preflight);
+                assert!(outcome.skipped_paths.is_empty());
+                assert!(outcome.conflict_paths.is_empty());
+                assert_eq!(
+                    std::fs::read_to_string(cwd.join("file.txt")).expect("resulting file"),
+                    if preflight { "before\n" } else { "after\n" }
+                );
+                assert_eq!(
+                    std::fs::read(cwd.join(".git/index")).expect("resulting index"),
+                    original_index
+                );
+            }
+
+            std::fs::write(cwd.join("file.txt"), "before\n").expect("reset for cancellation");
+            git(
+                cwd,
+                &[
+                    "config",
+                    "filter.slow.clean",
+                    "printf '%s' \"$GIT_INDEX_FILE\" > .git/clean-index-path; sleep 0.5; cat",
+                ],
+            );
+            let mut cancelled_apply =
+                client.apply_task(TaskId("cancelled-apply".to_string()), Some(patch));
+            let private_index = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    tokio::select! {
+                        result = &mut cancelled_apply => {
+                            panic!("apply completed before filter signalled: {result:?}");
+                        }
+                        _ = tokio::time::sleep(Duration::from_millis(10)) => {
+                            if let Ok(path) = std::fs::read_to_string(cwd.join(".git/clean-index-path"))
+                                && !path.is_empty()
+                            {
+                                break std::path::PathBuf::from(path);
+                            }
+                        }
+                    }
+                }
+            })
+            .await
+            .expect("real Git filter must start");
+            assert_ne!(private_index, cwd.join(".git/index"));
+            assert!(private_index.is_file());
+            drop(cancelled_apply);
+
+            let private_index_directory = private_index.parent().expect("private index directory");
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while private_index_directory.exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect(
+                "worker must finish and remove its private Git index after caller cancellation",
+            );
+            assert_eq!(
+                std::fs::read_to_string(cwd.join("file.txt")).expect("completed cancelled apply"),
+                "after\n"
+            );
+            assert_eq!(
+                std::fs::read(cwd.join(".git/index")).expect("real index after cancellation"),
+                original_index
+            );
+        }
     }
 }

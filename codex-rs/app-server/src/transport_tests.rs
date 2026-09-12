@@ -835,7 +835,7 @@ async fn to_connection_stdio_waits_instead_of_disconnecting_when_writer_queue_is
         ),
     );
 
-    let route_task = tokio::spawn(async move {
+    let route_task = async {
         route_outgoing_envelope(
             &mut connections,
             OutgoingEnvelope::ToConnection {
@@ -852,16 +852,20 @@ async fn to_connection_stdio_waits_instead_of_disconnecting_when_writer_queue_is
             },
         )
         .await
-    });
+    };
+    tokio::pin!(route_task);
+    assert!(
+        futures::poll!(&mut route_task).is_pending(),
+        "full stdio queue must retain the second message until capacity is available"
+    );
 
     let first = timeout(Duration::from_millis(100), writer_rx.recv())
         .await
         .expect("first queued message should be readable")
         .expect("first queued message should exist");
-    timeout(Duration::from_millis(100), route_task)
+    timeout(Duration::from_millis(100), &mut route_task)
         .await
-        .expect("routing should finish after the first queued message is drained")
-        .expect("routing task should succeed");
+        .expect("routing should finish after the first queued message is drained");
 
     assert!(matches!(
         first.message,
@@ -878,4 +882,116 @@ async fn to_connection_stdio_waits_instead_of_disconnecting_when_writer_queue_is
             ConfigWarningNotification { summary, .. }
         )) if summary == "second"
     ));
+}
+
+#[tokio::test]
+async fn dropping_router_state_closes_registered_websocket_connection() {
+    use futures::StreamExt;
+    use tokio_tungstenite::tungstenite::Message;
+
+    // Reserve an OS-assigned local address; the production acceptor owns binding.
+    let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = reservation.local_addr().unwrap();
+    drop(reservation);
+    let (transport_tx, mut transport_rx) = mpsc::channel(8);
+    let shutdown = CancellationToken::new();
+    let acceptor = start_websocket_acceptor(
+        address,
+        transport_tx,
+        shutdown.clone(),
+        auth::WebsocketAuthPolicy::default(),
+    )
+    .await
+    .unwrap();
+    let (mut client, _) = tokio_tungstenite::connect_async(format!("ws://{address}"))
+        .await
+        .unwrap();
+    let (connection_id, writer, disconnect_sender) =
+        match timeout(Duration::from_secs(2), transport_rx.recv())
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            TransportEvent::ConnectionOpened {
+                connection_id,
+                writer,
+                disconnect_sender,
+                ..
+            } => (connection_id, writer, disconnect_sender),
+            event => panic!("unexpected connection event: {event:?}"),
+        };
+    let mut connections = HashMap::from([(
+        connection_id,
+        OutboundConnectionState::new(
+            writer,
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(OutboundNotificationOptOuts::new(HashSet::new())),
+            disconnect_sender,
+        ),
+    )]);
+    route_outgoing_envelope(
+        &mut connections,
+        OutgoingEnvelope::ToConnection {
+            connection_id,
+            message: OutgoingMessage::Response(OutgoingResponse {
+                id: RequestId::Integer(91),
+                result: json!({"registered": true}),
+            }),
+            write_complete_tx: None,
+        },
+    )
+    .await;
+    let response = timeout(Duration::from_secs(2), client.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let Message::Text(response) = response else {
+        panic!("expected routed JSON response")
+    };
+    let response: serde_json::Value = serde_json::from_str(response.as_ref()).unwrap();
+    assert_eq!(response["id"], 91);
+    assert_eq!(response["result"], json!({"registered": true}));
+
+    // Exercise the actual owner disappearance path without a DisconnectAll send.
+    drop(connections);
+    match timeout(Duration::from_secs(2), client.next())
+        .await
+        .expect("router retirement must close its registered socket")
+    {
+        None | Some(Ok(Message::Close(_))) => {}
+        Some(Err(tokio_tungstenite::tungstenite::Error::Protocol(
+            tokio_tungstenite::tungstenite::error::ProtocolError::ResetWithoutClosingHandshake,
+        ))) => {}
+        Some(Err(tokio_tungstenite::tungstenite::Error::Io(error)))
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::UnexpectedEof
+            ) => {}
+        other => panic!("expected actual socket closure, got {other:?}"),
+    }
+    match timeout(Duration::from_secs(2), transport_rx.recv())
+        .await
+        .unwrap()
+        .unwrap()
+    {
+        TransportEvent::ConnectionClosed {
+            connection_id: closed,
+        } => assert_eq!(closed, connection_id),
+        event => panic!("unexpected retirement event: {event:?}"),
+    }
+    shutdown.cancel();
+    timeout(Duration::from_secs(2), acceptor)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        timeout(Duration::from_secs(2), transport_rx.recv())
+            .await
+            .unwrap()
+            .is_none()
+    );
 }

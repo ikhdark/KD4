@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
@@ -23,15 +24,39 @@ use tokio::sync::Mutex;
 #[derive(Clone)]
 pub(crate) struct SearchRequestProcessor {
     outgoing: Arc<OutgoingMessageSender>,
-    pending_fuzzy_searches: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
+    pending_fuzzy_searches: Arc<StdMutex<HashMap<String, Arc<AtomicBool>>>>,
     fuzzy_search_sessions: Arc<Mutex<HashMap<String, FuzzyFileSearchSession>>>,
+}
+
+struct PendingFuzzySearch {
+    searches: Arc<StdMutex<HashMap<String, Arc<AtomicBool>>>>,
+    token: Option<String>,
+    flag: Arc<AtomicBool>,
+}
+
+impl Drop for PendingFuzzySearch {
+    fn drop(&mut self) {
+        self.flag.store(true, Ordering::Relaxed);
+        if let Some(token) = &self.token {
+            let mut searches = self
+                .searches
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if searches
+                .get(token)
+                .is_some_and(|flag| Arc::ptr_eq(flag, &self.flag))
+            {
+                searches.remove(token);
+            }
+        }
+    }
 }
 
 impl SearchRequestProcessor {
     pub(crate) fn new(outgoing: Arc<OutgoingMessageSender>) -> Self {
         Self {
             outgoing,
-            pending_fuzzy_searches: Arc::new(Mutex::new(HashMap::new())),
+            pending_fuzzy_searches: Arc::new(StdMutex::new(HashMap::new())),
             fuzzy_search_sessions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -48,7 +73,10 @@ impl SearchRequestProcessor {
 
         let cancel_flag = match cancellation_token.clone() {
             Some(token) => {
-                let mut pending_fuzzy_searches = self.pending_fuzzy_searches.lock().await;
+                let mut pending_fuzzy_searches = self
+                    .pending_fuzzy_searches
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 // if a cancellation_token is provided and a pending_request exists for
                 // that token, cancel it
                 if let Some(existing) = pending_fuzzy_searches.get(&token) {
@@ -60,20 +88,18 @@ impl SearchRequestProcessor {
             }
             None => Arc::new(AtomicBool::new(false)),
         };
+        // The registry only needs synchronous map access. Keeping its cleanup
+        // synchronous also cancels requests dropped outside a running executor.
+        let _pending_search = PendingFuzzySearch {
+            searches: Arc::clone(&self.pending_fuzzy_searches),
+            token: cancellation_token,
+            flag: Arc::clone(&cancel_flag),
+        };
 
         let results = match query.as_str() {
             "" => vec![],
             _ => run_fuzzy_file_search(query, roots, cancel_flag.clone()).await,
         };
-
-        if let Some(token) = cancellation_token {
-            let mut pending_fuzzy_searches = self.pending_fuzzy_searches.lock().await;
-            if let Some(current_flag) = pending_fuzzy_searches.get(&token)
-                && Arc::ptr_eq(current_flag, &cancel_flag)
-            {
-                pending_fuzzy_searches.remove(&token);
-            }
-        }
 
         Ok(FuzzyFileSearchResponse { files: results })
     }
@@ -130,5 +156,73 @@ impl SearchRequestProcessor {
         self.fuzzy_search_sessions.lock().await.remove(&session_id);
 
         Ok(FuzzyFileSearchSessionStopResponse {})
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::future::Future;
+    use std::task::Poll;
+
+    #[test]
+    fn canceled_fuzzy_search_removes_only_its_own_registration() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .expect("runtime");
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocker = runtime.spawn_blocking(move || {
+            let _ = release_rx.recv();
+        });
+        let (outgoing_tx, _outgoing_rx) = tokio::sync::mpsc::channel(1);
+        let processor = SearchRequestProcessor::new(Arc::new(OutgoingMessageSender::new(
+            outgoing_tx,
+            codex_analytics::AnalyticsEventsClient::disabled(),
+        )));
+        let directory = tempfile::TempDir::new().expect("search directory");
+        let params = || FuzzyFileSearchParams {
+            query: "needle".to_string(),
+            roots: vec![directory.path().to_string_lossy().into_owned()],
+            cancellation_token: Some("same-search".to_string()),
+        };
+        let mut first = Box::pin(processor.fuzzy_file_search(params()));
+        runtime.block_on(std::future::poll_fn(|cx| {
+            assert!(first.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        }));
+        let first_flag =
+            processor.pending_fuzzy_searches.lock().expect("registry")["same-search"].clone();
+        assert!(!first_flag.load(Ordering::Relaxed));
+
+        let mut replacement = Box::pin(processor.fuzzy_file_search(params()));
+        runtime.block_on(std::future::poll_fn(|cx| {
+            assert!(replacement.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        }));
+        let replacement_flag =
+            processor.pending_fuzzy_searches.lock().expect("registry")["same-search"].clone();
+        assert!(first_flag.load(Ordering::Relaxed));
+        assert!(!replacement_flag.load(Ordering::Relaxed));
+
+        // Drop both normal request futures outside a runtime context. The old
+        // request must not erase the replacement's cancellation registration.
+        drop(first);
+        assert!(Arc::ptr_eq(
+            &processor.pending_fuzzy_searches.lock().expect("registry")["same-search"],
+            &replacement_flag,
+        ));
+        drop(replacement);
+        assert!(replacement_flag.load(Ordering::Relaxed));
+        assert!(
+            processor
+                .pending_fuzzy_searches
+                .lock()
+                .expect("registry")
+                .is_empty()
+        );
+        release_tx.send(()).expect("release blocking pool");
+        runtime.block_on(blocker).expect("blocking pool released");
     }
 }

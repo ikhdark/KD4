@@ -121,9 +121,14 @@ fn ensure_denybin_with_home(
     for tool in tools {
         for ext in [".bat", ".cmd"] {
             let path = base.join(format!("{tool}{ext}"));
-            if !path.exists() {
+            let needs_refresh = match fs::read(&path) {
+                Ok(contents) => contents == b"@echo off\\r\\nexit /b 1\\r\\n",
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
+                Err(err) => return Err(err.into()),
+            };
+            if needs_refresh {
                 let mut f = File::create(&path)?;
-                f.write_all(b"@echo off\\r\\nexit /b 1\\r\\n")?;
+                f.write_all(b"@echo off\r\nexit /b 1\r\n")?;
             }
         }
     }
@@ -196,12 +201,29 @@ mod tests {
         assert_eq!(base, home.path().join(".sbx-denybin"));
         for tool in ["ssh", "scp"] {
             for extension in ["bat", "cmd"] {
-                assert_eq!(
-                    std::fs::read(base.join(format!("{tool}.{extension}")))?,
-                    b"@echo off\\r\\nexit /b 1\\r\\n"
-                );
+                let output = std::process::Command::new("cmd.exe")
+                    .args(["/d", "/c"])
+                    .arg(base.join(format!("{tool}.{extension}")))
+                    .output()?;
+                assert_eq!(output.status.code(), Some(1));
+                assert!(output.stdout.is_empty());
+                assert!(output.stderr.is_empty());
             }
         }
+        // Repair only the known malformed generated file from earlier versions.
+        let legacy = base.join("ssh.cmd");
+        std::fs::write(&legacy, b"@echo off\\r\\nexit /b 1\\r\\n")?;
+        let custom = base.join("scp.cmd");
+        std::fs::write(&custom, b"@exit /b 7\r\n")?;
+        ensure_denybin_with_home(&["ssh", "scp"], Some(&base), || None)?;
+        let output = std::process::Command::new("cmd.exe")
+            .args(["/d", "/c"])
+            .arg(&legacy)
+            .output()?;
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stdout.is_empty());
+        assert!(output.stderr.is_empty());
+        assert_eq!(std::fs::read(custom)?, b"@exit /b 7\r\n");
         Ok(())
     }
 }

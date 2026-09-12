@@ -320,15 +320,26 @@ mod agent {
         // Approval policy
         agent_config.permissions.approval_policy = Constrained::allow_only(AskForApproval::Never);
         // Consolidation runs as an internal worker and must not recursively delegate.
-        let _ = agent_config.features.disable(Feature::SpawnCsv);
-        let _ = agent_config.features.disable(Feature::Collab);
-        let _ = agent_config.features.disable(Feature::MemoryTool);
-        let _ = agent_config.features.disable(Feature::Apps);
-        let _ = agent_config.features.disable(Feature::Plugins);
-        let _ = agent_config.features.disable(Feature::Personality);
-        let _ = agent_config
-            .features
-            .disable(Feature::SkillMcpDependencyInstall);
+        for feature in [
+            Feature::SpawnCsv,
+            Feature::Collab,
+            Feature::MemoryTool,
+            Feature::Apps,
+            Feature::Plugins,
+            Feature::Personality,
+            Feature::SkillMcpDependencyInstall,
+        ] {
+            agent_config.features.disable(feature).ok()?;
+            // Managed requirements can normalize a disabled feature back on while
+            // accepting the update. Do not start a worker with those capabilities.
+            if agent_config.features.enabled(feature) {
+                warn!(
+                    feature = feature.key(),
+                    "cannot disable feature for memory consolidation"
+                );
+                return None;
+            }
+        }
 
         // Sandbox policy
         let writable_roots = vec![root];

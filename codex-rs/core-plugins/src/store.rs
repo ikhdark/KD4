@@ -268,26 +268,14 @@ impl PluginStore {
     }
 
     pub fn active_plugin_version(&self, plugin_id: &PluginId) -> Option<String> {
-        let mut discovered_versions = fs::read_dir(self.plugin_base_root(plugin_id).as_path())
-            .ok()?
-            .filter_map(Result::ok)
-            .filter_map(|entry| {
-                entry.file_type().ok().filter(std::fs::FileType::is_dir)?;
-                entry.file_name().into_string().ok()
-            })
-            .filter(|version| validate_plugin_version_segment(version).is_ok())
-            .collect::<Vec<_>>();
-        discovered_versions.sort_unstable_by(|left, right| compare_plugin_versions(left, right));
-        if discovered_versions.is_empty() {
-            None
-        } else if discovered_versions
-            .iter()
-            .any(|version| version == DEFAULT_PLUGIN_VERSION)
-        {
-            Some(DEFAULT_PLUGIN_VERSION.to_string())
-        } else {
-            discovered_versions.pop()
-        }
+        let entries = fs::read_dir(self.plugin_base_root(plugin_id).as_path()).ok()?;
+        select_active_plugin_version(entries.map(|entry| {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                return Ok(None);
+            }
+            Ok(entry.file_name().into_string().ok())
+        }))
     }
 
     pub fn active_plugin_root(&self, plugin_id: &PluginId) -> Option<AbsolutePathBuf> {
@@ -806,6 +794,29 @@ fn stage_plugin_uninstall(path: &Path) -> Result<PendingPluginUninstall, PluginS
         transaction_dir: Some(transaction_dir),
         committed: false,
     })
+}
+
+// Choose an active version only after successfully inspecting every directory entry.
+fn select_active_plugin_version(
+    entries: impl IntoIterator<Item = io::Result<Option<String>>>,
+) -> Option<String> {
+    let mut discovered_versions = Vec::new();
+    for entry in entries {
+        if let Some(version) = entry.ok()?
+            && validate_plugin_version_segment(&version).is_ok()
+        {
+            discovered_versions.push(version);
+        }
+    }
+    discovered_versions.sort_unstable_by(|left, right| compare_plugin_versions(left, right));
+    if discovered_versions
+        .iter()
+        .any(|version| version == DEFAULT_PLUGIN_VERSION)
+    {
+        Some(DEFAULT_PLUGIN_VERSION.to_string())
+    } else {
+        discovered_versions.pop()
+    }
 }
 
 fn compare_plugin_versions(left: &str, right: &str) -> Ordering {

@@ -496,6 +496,182 @@ mod tests {
             .expect("second processor should join");
     }
 
+    #[test]
+    fn transport_disconnect_cleans_pending_start_before_process_id_reuse() {
+        struct ReleaseWorker(Option<std::sync::mpsc::Sender<()>>);
+        impl Drop for ReleaseWorker {
+            fn drop(&mut self) {
+                if let Some(release) = self.0.take() {
+                    let _ = release.send(());
+                }
+            }
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let registry = SessionRegistry::new(crate::ExecServerTelemetry::default());
+            let (mut first_writer, mut first_lines, first_task) =
+                spawn_test_connection(Arc::clone(&registry), "cancelled-start");
+            send_request(
+                &mut first_writer,
+                1,
+                INITIALIZE_METHOD,
+                &InitializeParams {
+                    client_name: "exec-server-test".to_string(),
+                    resume_session_id: None,
+                },
+            )
+            .await;
+            let initialized: InitializeResponse = read_response(&mut first_lines, 1).await;
+            send_notification(&mut first_writer, INITIALIZED_METHOD, &()).await;
+            let process = registry.process_for_test(&initialized.session_id).await;
+
+            // Occupy the actual Windows process-spawn worker, not a fake spawn.
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let release_worker = ReleaseWorker(Some(release_tx));
+            let worker = tokio::task::spawn_blocking(move || {
+                let _ = entered_tx.send(());
+                release_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("worker released");
+            });
+            entered_rx.await.expect("blocking worker entered");
+            let process_id = ProcessId::from("cancelled-process-start");
+            let temp = tempfile::TempDir::new().expect("temp directory");
+            let forbidden = temp.path().join("cancelled-child-ran.txt");
+            let mut first_params = exec_params(process_id.clone());
+            first_params.argv = vec![
+                std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string()),
+                "/C".to_string(),
+                format!("echo forbidden>\"{}\"", forbidden.display()),
+            ];
+            send_request(&mut first_writer, 2, EXEC_METHOD, &first_params).await;
+            timeout(Duration::from_secs(2), async {
+                loop {
+                    let result = process
+                        .exec_read(ReadParams {
+                            process_id: process_id.clone(),
+                            after_seq: None,
+                            max_bytes: None,
+                            wait_ms: Some(0),
+                        })
+                        .await;
+                    if result.is_err_and(|error| {
+                        error.message == format!("process id {process_id} is starting")
+                    }) {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("registered exec inserted its provisional entry");
+            assert!(!forbidden.exists());
+
+            drop(first_writer);
+            drop(first_lines);
+            timeout(Duration::from_secs(2), first_task)
+                .await
+                .expect("disconnect must cancel in-flight exec without the worker")
+                .expect("first connection joined");
+            let (mut writer, mut lines, task) =
+                spawn_test_connection(Arc::clone(&registry), "resumed-after-cancelled-start");
+            send_request(
+                &mut writer,
+                1,
+                INITIALIZE_METHOD,
+                &InitializeParams {
+                    client_name: "exec-server-test".to_string(),
+                    resume_session_id: Some(initialized.session_id.clone()),
+                },
+            )
+            .await;
+            let resumed: InitializeResponse = read_response(&mut lines, 1).await;
+            assert_eq!(resumed.session_id, initialized.session_id);
+            send_notification(&mut writer, INITIALIZED_METHOD, &()).await;
+
+            // Observe cleanup through the registered RPC, before permitting spawn.
+            timeout(Duration::from_secs(2), async {
+                for request_id in 2.. {
+                    send_request(
+                        &mut writer,
+                        request_id,
+                        EXEC_READ_METHOD,
+                        &ReadParams {
+                            process_id: process_id.clone(),
+                            after_seq: None,
+                            max_bytes: None,
+                            wait_ms: Some(0),
+                        },
+                    )
+                    .await;
+                    let line = lines
+                        .next_line()
+                        .await
+                        .expect("read error")
+                        .expect("error line");
+                    let JSONRPCMessage::Error(error) =
+                        serde_json::from_str(&line).expect("JSON-RPC error")
+                    else {
+                        panic!("cancelled start must not publish a process");
+                    };
+                    assert_eq!(error.id, RequestId::Integer(request_id));
+                    if error.error.message == format!("unknown process id {process_id}") {
+                        break;
+                    }
+                    assert_eq!(
+                        error.error.message,
+                        format!("process id {process_id} is starting")
+                    );
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("cancelled reservation removed without TTL expiry");
+            drop(release_worker);
+            worker.await.expect("blocking gate joined");
+            // FIFO on the sole blocking worker also waits for any queued spawn
+            // result to be discarded; it must never resume the cancelled child.
+            tokio::task::spawn_blocking(|| ())
+                .await
+                .expect("spawn work drained");
+            assert!(!forbidden.exists());
+
+            send_request(
+                &mut writer,
+                10_000,
+                EXEC_METHOD,
+                &exec_params(process_id.clone()),
+            )
+            .await;
+            let accepted: ExecResponse =
+                timeout(Duration::from_secs(3), read_response(&mut lines, 10_000))
+                    .await
+                    .expect("same process ID is reusable");
+            assert_eq!(accepted.process_id, process_id);
+            send_request(
+                &mut writer,
+                10_001,
+                EXEC_TERMINATE_METHOD,
+                &TerminateParams { process_id },
+            )
+            .await;
+            let terminated: TerminateResponse = read_response(&mut lines, 10_001).await;
+            assert!(terminated.running);
+            drop(writer);
+            drop(lines);
+            timeout(Duration::from_secs(2), task)
+                .await
+                .expect("second connection ended")
+                .expect("second joined");
+            registry.shutdown().await;
+        });
+    }
+
     fn spawn_test_connection(
         registry: Arc<SessionRegistry>,
         label: &str,

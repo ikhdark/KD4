@@ -67,6 +67,35 @@ impl JobObject {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) fn restrict_to_query_access_for_test(&mut self) -> io::Result<()> {
+        use winapi::um::handleapi::DuplicateHandle;
+        use winapi::um::processthreadsapi::GetCurrentProcess;
+        use winapi::um::winnt::JOB_OBJECT_QUERY;
+
+        let mut duplicate = std::ptr::null_mut();
+        // SAFETY: the source job and current-process pseudo handles are live;
+        // DuplicateHandle writes one owned handle on success. The duplicate
+        // keeps the job alive while the original handle is replaced below.
+        let duplicated = unsafe {
+            DuplicateHandle(
+                GetCurrentProcess(),
+                self.handle.as_raw_handle().cast(),
+                GetCurrentProcess(),
+                &mut duplicate,
+                JOB_OBJECT_QUERY,
+                0,
+                0,
+            )
+        };
+        if duplicated == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: successful DuplicateHandle transferred this valid handle.
+        self.handle = unsafe { OwnedHandle::from_raw_handle(duplicate.cast()) };
+        Ok(())
+    }
+
     /// Assigns a running process to this job.
     ///
     /// Assignment is not retroactive: descendants created before this call

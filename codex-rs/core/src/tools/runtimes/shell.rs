@@ -294,7 +294,7 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
                 call_id: ctx.call_id.clone(),
                 tool_name: flat_tool_name(&ctx.tool_name).into_owned(),
                 command: req.command.clone(),
-                cwd: req.cwd.clone(),
+                cwd: codex_utils_path_uri::PathUri::from_abs_path(&req.cwd),
                 sandbox_permissions: req.sandbox_permissions,
                 additional_permissions: req.additional_permissions.clone(),
                 justification: req.justification.clone(),
@@ -336,10 +336,12 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
             }
             None => None,
         };
-        let mutation = crate::turn_diff_tracker::command_mutation(
+        let mutation = crate::tools::events::command_mutation_for_exec(
             &req.command_for_approval,
             Some(req.cwd.as_path()),
-        );
+        )
+        .await
+        .map_err(ToolError::Codex)?;
         crate::tools::events::begin_exec_mutation_evidence(
             crate::tools::events::ToolEventCtx::new(
                 ctx.session.as_ref(),
@@ -412,6 +414,7 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
                 managed_network,
                 Some(&req.turn_environment.environment_id),
             )
+            .await
             .map_err(ToolError::Codex)?;
         env.windows_sandbox_additional_read_roots = additional_read_roots;
         let authorization_guard = if let Some(launch) = req.validation_launch.as_ref() {

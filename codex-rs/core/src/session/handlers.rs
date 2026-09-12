@@ -649,7 +649,7 @@ pub async fn set_thread_memory_mode(sess: &Arc<Session>, sub_id: String, mode: T
 
 pub(super) const TOOL_HISTORY_SHUTDOWN_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
 
-async fn shutdown_session_runtime(sess: &Arc<Session>) {
+async fn shutdown_session_runtime(sess: &Arc<Session>) -> Option<CodexErr> {
     sess.begin_shutdown().await;
     if let Some(startup_prewarm) = sess.take_session_startup_prewarm().await {
         startup_prewarm.abort().await;
@@ -673,23 +673,22 @@ async fn shutdown_session_runtime(sess: &Arc<Session>) {
     if let Err(err) = sess.services.code_mode_service.shutdown().await {
         warn!("failed to shutdown code mode session: {err}");
     }
-    if tokio::time::timeout(
+    let persistence_error = match tokio::time::timeout(
         TOOL_HISTORY_SHUTDOWN_FLUSH_TIMEOUT,
         sess.flush_tool_history_persistence(),
     )
     .await
-    .is_err()
     {
-        warn!(
-            "timed out flushing completed-tool history during session shutdown; continuing cleanup with persistence still pending"
-        );
-    }
-    sess.services
-        .latest_mcp_runtime()
-        .manager_arc()
-        .shutdown()
-        .await;
+        Ok(Ok(())) => None,
+        Ok(Err(error)) => Some(error),
+        Err(_) => Some(CodexErr::Fatal(
+            "timed out flushing completed-tool history during shutdown; durability remains pending"
+                .to_string(),
+        )),
+    };
+    sess.services.shutdown_mcp_managers().await;
     sess.guardian_review_session.shutdown().await;
+    persistence_error
 }
 
 async fn emit_thread_stop_lifecycle(sess: &Session) {
@@ -704,7 +703,13 @@ async fn emit_thread_stop_lifecycle(sess: &Session) {
 }
 
 pub async fn shutdown(sess: &Arc<Session>, sub_id: String) -> bool {
-    shutdown_session_runtime(sess).await;
+    if let Some(error) = shutdown_session_runtime(sess).await {
+        sess.send_event_raw(Event {
+            id: sub_id.clone(),
+            msg: EventMsg::Error(error.to_error_event(/*message_prefix*/ None)),
+        })
+        .await;
+    }
     info!("Shutting down Codex instance");
     let history = sess.clone_history().await;
     let turn_count = history
@@ -740,13 +745,20 @@ pub async fn shutdown(sess: &Arc<Session>, sub_id: String) -> bool {
         id: sub_id,
         msg: EventMsg::ShutdownComplete,
     };
-    sess.services
-        .rollout_thread_trace
-        .record_protocol_event(&event.msg);
+    if sess.services.rollout_thread_trace.is_enabled() {
+        let trace = sess.services.rollout_thread_trace.clone();
+        let trace_msg = event.msg.clone();
+        // Complete the diagnostic bundle before acknowledging shutdown to consumers.
+        let _ = crate::tools::tool_dispatch_trace::run_trace_recording(
+            &sess.terminal_tasks,
+            move || {
+                trace.record_protocol_event(&trace_msg);
+                trace.record_ended(codex_rollout_trace::RolloutStatus::Completed);
+            },
+        )
+        .await;
+    }
     sess.deliver_event_raw(event).await;
-    sess.services
-        .rollout_thread_trace
-        .record_ended(codex_rollout_trace::RolloutStatus::Completed);
     true
 }
 
@@ -761,7 +773,15 @@ pub async fn review(
         .await;
     sess.refresh_mcp_servers_if_requested(&turn_context, Some(sess.mcp_elicitation_reviewer()))
         .await;
-    match resolve_review_request(review_request, turn_context.cwd()) {
+    let cwd = turn_context.cwd().clone();
+    // Base-branch resolution runs Git and reads repository metadata. The worker owns
+    // only its inputs, so dropping this handler cannot start a review after cancellation.
+    let resolved =
+        tokio::task::spawn_blocking(move || resolve_review_request(review_request, &cwd))
+            .await
+            .map_err(|error| anyhow::anyhow!("review request resolution task failed: {error}"))
+            .and_then(|result| result);
+    match resolved {
         Ok(resolved) => {
             spawn_review_thread(
                 Arc::clone(sess),
@@ -907,7 +927,11 @@ pub(super) async fn submission_loop(
     // If the submission loop exits because the channel closed without an
     // explicit shutdown op, still run session teardown.
     if !shutdown_received {
-        shutdown_session_runtime(&sess).await;
+        if let Some(error) = shutdown_session_runtime(&sess).await {
+            warn!(
+                "completed-tool history was not durable when the submission channel closed: {error}"
+            );
+        }
         emit_thread_stop_lifecycle(sess.as_ref()).await;
         if let Some(live_thread) = sess.live_thread()
             && let Err(err) = live_thread.shutdown().await

@@ -293,12 +293,13 @@ fn retained_process_exec_args(program: &std::path::Path, yield_time_ms: u64) -> 
     })
 }
 
+#[cfg_attr(
+    target_arch = "aarch64",
+    ignore = "retained-process PTY behavior requires verification on a native aarch64 runner"
+)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn exec_command_retained_session_lifecycle_completes_without_stale_processes() -> Result<()> {
     skip_if_no_network!(Ok(()));
-    if cfg!(target_arch = "aarch64") {
-        return Ok(());
-    }
     let server = start_mock_server().await;
     let mut builder = test_codex()
         .with_raw_response_items()
@@ -774,13 +775,14 @@ async fn exec_command_fast_success_and_failure_lifecycles_finish_inline() -> Res
     Ok(())
 }
 
+#[cfg_attr(
+    target_arch = "aarch64",
+    ignore = "retained-process PTY behavior requires verification on a native aarch64 runner"
+)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn exec_command_interrupt_closes_unpublished_retained_process_before_turn_aborted()
 -> Result<()> {
     skip_if_no_network!(Ok(()));
-    if cfg!(target_arch = "aarch64") {
-        return Ok(());
-    }
 
     const CALL_ID: &str = "retained-interrupt-exec";
     const READY_MARKER: &str = "__KD4_RETAINED_READY__";
@@ -1149,7 +1151,9 @@ async fn unified_exec_owner_wait_delivers_terminal_output_before_model_resumes()
     let poll_args = json!({
         "chars": "",
         "session_id": 1000,
-        "yield_time_ms": 3_000,
+        // Even a model-requested short poll must wait for real output instead of
+        // burning another generation on the still-running, silent process.
+        "yield_time_ms": 250,
     });
     let responses = mount_sse_sequence(
         &server,

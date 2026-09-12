@@ -75,3 +75,41 @@ impl ContextualUserFragment for AvailableSkillsInstructions {
         render_available_skills_body(&self.skill_root_lines, &self.skill_lines)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codex_protocol::models::ContentItem;
+    use codex_protocol::models::ResponseItem;
+
+    #[test]
+    fn skills_usage_fragment_renders_complete_instructions_for_developer_context() {
+        // Session developer-section assembly consumes this normal render boundary.
+        let rendered = SkillsUsageInstructions.render();
+        let body = rendered
+            .strip_prefix("<skills_usage_instructions>\n## How to use skills\n")
+            .and_then(|text| text.strip_suffix("\n</skills_usage_instructions>"))
+            .expect("complete skills-usage markers and heading");
+        assert!(body.contains("read each selected `SKILL.md` completely"));
+        assert!(body.contains("Do not delegate that reading or interpretation"));
+        assert!(body.contains("Read task-required linked instructions"));
+        assert!(body.contains("dedicated read-only route"));
+        assert!(body.contains("orchestrator"));
+        assert!(body.contains("state ordering when needed"));
+        assert!(body.contains("named skill or required read is unavailable"));
+        assert!(body.contains("relevant variants"));
+        assert!(body.len() <= 1_000);
+
+        // The shared fragment conversion must retain that content and its developer role.
+        assert_eq!(
+            ContextualUserFragment::into(SkillsUsageInstructions),
+            ResponseItem::Message {
+                id: None,
+                role: "developer".to_string(),
+                content: vec![ContentItem::InputText { text: rendered }],
+                phase: None,
+                internal_chat_message_metadata_passthrough: None,
+            }
+        );
+    }
+}

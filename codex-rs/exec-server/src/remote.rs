@@ -124,10 +124,7 @@ impl EnvironmentRegistryClient {
     ) -> Result<EnvironmentRegistryRegistrationResponse, ExecServerError> {
         let response = self
             .http
-            .post(endpoint_url(
-                &self.base_url,
-                &format!("/cloud/environment/{environment_id}/register"),
-            ))
+            .post(endpoint_url(&self.base_url, environment_id, "register")?)
             .headers(self.auth_provider.to_auth_headers())
             .headers(current_trace_context_headers())
             .json(&EnvironmentRegistryRegistrationRequest {
@@ -171,10 +168,7 @@ impl EnvironmentRegistryClient {
     ) -> Result<NoiseRendezvousConnectBundle, ExecServerError> {
         let response = self
             .http
-            .post(endpoint_url(
-                &self.base_url,
-                &format!("/cloud/environment/{environment_id}/connect"),
-            ))
+            .post(endpoint_url(&self.base_url, environment_id, "connect")?)
             .headers(self.auth_provider.to_auth_headers())
             .json(&EnvironmentRegistryConnectRequest { harness_public_key })
             .timeout(self.connect_timeout)
@@ -250,8 +244,9 @@ impl HarnessKeyValidator for RegistryHarnessKeyValidator {
             .http
             .post(endpoint_url(
                 &self.client.base_url,
-                &format!("/cloud/environment/{environment_id}/validate"),
-            ))
+                environment_id,
+                "validate",
+            )?)
             .headers(self.client.auth_provider.to_auth_headers())
             .json(&EnvironmentRegistryHarnessKeyValidationRequest {
                 executor_registration_id: self.executor_registration_id.clone(),
@@ -619,8 +614,28 @@ fn normalize_base_url(base_url: String) -> Result<String, ExecServerError> {
     Ok(trimmed)
 }
 
-fn endpoint_url(base_url: &str, path: &str) -> String {
-    format!("{base_url}/{}", path.trim_start_matches('/'))
+fn endpoint_url(
+    base_url: &str,
+    environment_id: &str,
+    operation: &str,
+) -> Result<String, ExecServerError> {
+    // URL path builders normalize dot segments; they cannot identify an environment.
+    if matches!(environment_id, "." | "..") {
+        return Err(ExecServerError::EnvironmentRegistryConfig(
+            "environment id must not be a URL dot segment".to_string(),
+        ));
+    }
+    let mut url = url::Url::parse(base_url)
+        .map_err(|error| ExecServerError::EnvironmentRegistryConfig(error.to_string()))?;
+    url.path_segments_mut()
+        .map_err(|()| {
+            ExecServerError::EnvironmentRegistryConfig(
+                "environment registry URL must support path segments".to_string(),
+            )
+        })?
+        .pop_if_empty()
+        .extend(["cloud", "environment", environment_id, operation]);
+    Ok(url.into())
 }
 
 fn environment_registry_auth_error(status: StatusCode, body: &str) -> ExecServerError {
@@ -713,6 +728,122 @@ mod tests {
 
     fn static_registry_auth_provider() -> SharedAuthProvider {
         Arc::new(StaticRegistryAuthProvider)
+    }
+
+    #[tokio::test]
+    async fn registry_operations_encode_environment_id_segments() {
+        for (environment_id, encoded_id) in [
+            ("env-name_1.~", "env-name_1.~"),
+            ("team/name?# %", "team%2Fname%3F%23%20%25"),
+        ] {
+            let server = MockServer::start().await;
+            let public_key = NoiseChannelIdentity::generate()
+                .expect("identity")
+                .public_key();
+            for operation in ["register", "connect", "validate"] {
+                Mock::given(method("POST"))
+                    .and(path(format!(
+                        "/registry/cloud/environment/{encoded_id}/{operation}"
+                    )))
+                    .and(header("authorization", "Bearer registry-token"))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "environment_id": environment_id,
+                        "url": "wss://rendezvous.test/connection",
+                        "security_profile": "noise_hybrid_ik_v1",
+                        "executor_registration_id": "registration-1",
+                        "executor_public_key": public_key.clone(),
+                        "harness_key_authorization": "authorization-1",
+                        "valid": true,
+                    })))
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+            }
+            let base_url = format!("{}/registry/", server.uri());
+            let client =
+                EnvironmentRegistryClient::new(base_url.clone(), static_registry_auth_provider())
+                    .expect("client");
+            let registration = client
+                .register_environment(environment_id, &public_key)
+                .await
+                .expect("register encoded environment");
+            assert_eq!(registration.environment_id, environment_id);
+
+            let config = NoiseRendezvousEnvironmentConfig::new(
+                base_url,
+                environment_id.to_string(),
+                "registry-token".to_string(),
+                None,
+            )
+            .expect("noise configuration");
+            let bundle = config
+                .connect_provider()
+                .connect_bundle(public_key.clone())
+                .await
+                .expect("connect encoded environment");
+            assert_eq!(bundle.environment_id, environment_id);
+            assert_eq!(bundle.harness_key_authorization, "authorization-1");
+
+            RegistryHarnessKeyValidator {
+                client,
+                environment_id: environment_id.to_string(),
+                executor_registration_id: "registration-1".to_string(),
+            }
+            .validate_harness_key(&public_key, "authorization-1")
+            .await
+            .expect("validate encoded environment");
+            let requests = server.received_requests().await.expect("recorded requests");
+            assert_eq!(requests.len(), 3);
+            for request in requests {
+                assert_eq!(request.url.query(), None);
+                assert_eq!(request.url.fragment(), None);
+            }
+            server.verify().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn registry_operations_reject_dot_segment_environment_ids_without_requests() {
+        let server = MockServer::start().await;
+        let client = EnvironmentRegistryClient::new(server.uri(), static_registry_auth_provider())
+            .expect("client");
+        let public_key = NoiseChannelIdentity::generate()
+            .expect("identity")
+            .public_key();
+        for environment_id in [".", ".."] {
+            let registration = client
+                .register_environment(environment_id, &public_key)
+                .await;
+            assert!(matches!(
+                registration,
+                Err(ExecServerError::EnvironmentRegistryConfig(_))
+            ));
+            let connection = client
+                .connect_environment(environment_id, public_key.clone())
+                .await;
+            assert!(matches!(
+                connection,
+                Err(ExecServerError::EnvironmentRegistryConfig(_))
+            ));
+            let validation = RegistryHarnessKeyValidator {
+                client: client.clone(),
+                environment_id: environment_id.to_string(),
+                executor_registration_id: "registration-1".to_string(),
+            }
+            .validate_harness_key(&public_key, "authorization-1")
+            .await;
+            assert!(matches!(
+                validation,
+                Err(ExecServerError::EnvironmentRegistryConfig(_))
+            ));
+        }
+        assert!(
+            server
+                .received_requests()
+                .await
+                .expect("recorded requests")
+                .is_empty()
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

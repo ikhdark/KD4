@@ -301,14 +301,12 @@ impl PreparedCodexOneShot {
 
         // Bridge events so we can observe completion and shut down automatically.
         let (tx_bridge, rx_bridge) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
-        let ops_tx = self.io.tx_sub.clone();
         let agent_status = self.io.agent_status.clone();
         let session = Arc::clone(&self.io.session);
         let session_loop_termination = self.io.session_loop_termination.clone();
         tokio::spawn(bridge_one_shot_events(
             self.io,
             tx_bridge,
-            ops_tx,
             self.child_cancel,
         ));
 
@@ -331,28 +329,26 @@ impl PreparedCodexOneShot {
 async fn bridge_one_shot_events(
     io: Codex,
     tx_bridge: Sender<Event>,
-    ops_tx: Sender<Submission>,
     child_cancel: CancellationToken,
 ) {
-    while let Ok(event) = io.next_event().await {
+    while let Ok(Ok(event)) = io.next_event().or_cancel(&child_cancel).await {
         let should_shutdown = matches!(
             event.msg,
             EventMsg::TurnComplete(_) | EventMsg::TurnAborted(_)
         );
-        let _ = tx_bridge.send(event).await;
-        if should_shutdown {
-            let _ = ops_tx
-                .send(Submission {
-                    id: "shutdown".to_string(),
-                    op: Op::Shutdown {},
-                    client_user_message_id: None,
-                    trace: None,
-                })
-                .await;
-            child_cancel.cancel();
+        if !matches!(
+            tx_bridge.send(event).or_cancel(&child_cancel).await,
+            Ok(Ok(()))
+        ) || should_shutdown
+        {
             break;
         }
     }
+    // The interactive event forwarder owns child shutdown. Signal it even if
+    // the consumer closes or stops draining the one-shot output; queuing another
+    // proxy operation first could itself block teardown. A healthy receiver has
+    // already received the terminal event before this cancellation is signaled.
+    child_cancel.cancel();
 }
 
 async fn forward_events(

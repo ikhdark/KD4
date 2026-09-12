@@ -157,6 +157,8 @@ impl AgentControlTestBarrier {
 #[derive(Default)]
 struct AgentControlTestHooks {
     before_initial_submission: std::sync::Mutex<Option<Arc<AgentControlTestBarrier>>>,
+    after_thread_created: std::sync::Mutex<Option<Arc<AgentControlTestBarrier>>>,
+    before_spawn_rollback: std::sync::Mutex<Option<Arc<AgentControlTestBarrier>>>,
     before_v2_cold_load: std::sync::Mutex<Option<Arc<AgentControlTestBarrier>>>,
     after_execution_reservation: std::sync::Mutex<Option<Arc<AgentControlTestBarrier>>>,
 }
@@ -324,6 +326,17 @@ impl AgentControl {
             .before_initial_submission
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = barrier;
+    }
+
+    /// Wait for the actual child loop before retiring its accounting identity.
+    pub(crate) async fn wait_for_agent_termination(&self, agent_id: ThreadId) -> CodexResult<()> {
+        let state = self.upgrade()?;
+        match state.get_thread(agent_id).await {
+            Ok(thread) => thread.wait_until_terminated().await,
+            Err(CodexErr::ThreadNotFound(_)) => {}
+            Err(error) => return Err(error),
+        }
+        Ok(())
     }
 
     /// Send rich user input items to an existing agent thread.

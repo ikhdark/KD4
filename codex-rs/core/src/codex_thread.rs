@@ -255,6 +255,10 @@ impl CodexThread {
         self.codex.session.ensure_rollout_materialized().await;
     }
 
+    pub(crate) async fn try_ensure_rollout_materialized(&self) -> std::io::Result<()> {
+        self.codex.session.try_ensure_rollout_materialized().await
+    }
+
     #[doc(hidden)]
     pub async fn flush_rollout(&self) -> std::io::Result<()> {
         self.codex.session.flush_rollout().await
@@ -511,6 +515,17 @@ impl CodexThread {
     pub async fn submit_with_id(&self, sub: Submission) -> CodexResult<()> {
         let execution_guard = self.reserve_execution_guard(&sub.op).await?;
         self.submit_submission_with_execution_guard(sub, execution_guard)
+            .await
+    }
+
+    /// Interrupt only the identified turn, leaving any newer turn untouched.
+    pub async fn interrupt_turn_if_active(&self, turn_id: &str) -> bool {
+        self.codex
+            .session
+            .abort_turn_if_active(
+                turn_id,
+                codex_protocol::protocol::TurnAbortReason::Interrupted,
+            )
             .await
     }
 

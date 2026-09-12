@@ -1271,10 +1271,12 @@ impl RemoteControlWebsocket {
             {
                 return Ok(());
             }
-            state
-                .lock()
-                .await
-                .record_client_message_delivery(&delivered_client_envelope, client_message_key);
+            state.lock().await.record_client_message_delivery(
+                &delivered_client_envelope,
+                client_message_key.filter(|((client_id, stream_id), _)| {
+                    client_tracker.contains_client_stream(client_id, stream_id.as_ref())
+                }),
+            );
             if let Some((client_id, stream_id)) = closed_client {
                 let mut websocket_state = state.lock().await;
                 if let Some(stream_id) = stream_id {
@@ -2968,6 +2970,148 @@ mod tests {
 
         assert_eq!(err.kind(), ErrorKind::TimedOut);
         assert_eq!(err.to_string(), "remote control websocket pong timeout");
+    }
+
+    #[tokio::test]
+    async fn websocket_reader_retains_chunk_cursors_only_for_live_clients() {
+        let (client_stream, mut peer) = connected_websocket_pair().await;
+        let (_writer, reader) = client_stream.split();
+        let (outbound_buffer, _used_rx) = BoundedOutboundBuffer::new();
+        let state = Arc::new(Mutex::new(WebsocketState {
+            outbound_buffer,
+            subscribe_cursor: None,
+            next_seq_id_by_stream: HashMap::new(),
+            last_completed_client_chunk_seq_id_by_stream: HashMap::new(),
+            client_segment_reassembler: ClientSegmentReassembler::default(),
+        }));
+        let (server_event_tx, _server_event_rx) = mpsc::channel(8);
+        let (transport_event_tx, mut transport_event_rx) = mpsc::channel(8);
+        let shutdown = CancellationToken::new();
+        let tracker = Arc::new(Mutex::new(ClientTracker::new(
+            server_event_tx,
+            transport_event_tx,
+            &shutdown,
+        )));
+        let reader_task = tokio::spawn(RemoteControlWebsocket::run_websocket_reader_inner(
+            tracker.clone(),
+            state.clone(),
+            reader,
+            Duration::from_secs(10),
+            shutdown.clone(),
+        ));
+        let message = br#"{"jsonrpc":"2.0","method":"initialized"}"#;
+        let mut unknown =
+            client_chunk_envelope("unknown", "stream", 7, 0, 1, message.len(), message);
+        unknown.cursor = Some("unknown-delivered".to_string());
+        peer.send(tungstenite::Message::Text(
+            serde_json::to_string(&unknown)
+                .expect("serialize chunk")
+                .into(),
+        ))
+        .await
+        .expect("send unknown chunk");
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if state.lock().await.subscribe_cursor.as_deref() == Some("unknown-delivered") {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("unknown chunk should be consumed");
+        assert!(
+            state
+                .lock()
+                .await
+                .last_completed_client_chunk_seq_id_by_stream
+                .is_empty()
+        );
+        assert!(matches!(
+            transport_event_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+
+        peer.send(tungstenite::Message::Text(
+            serde_json::json!({"type":"client_message","client_id":"known","stream_id":"stream",
+                "message":{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}})
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send initialize");
+        let (connection_id, _connection_writer) =
+            match timeout(Duration::from_secs(1), transport_event_rx.recv())
+                .await
+                .expect("open delivered")
+                .expect("open event")
+            {
+                TransportEvent::ConnectionOpened {
+                    connection_id,
+                    writer,
+                    ..
+                } => (connection_id, writer),
+                other => panic!("expected open, got {other:?}"),
+            };
+        assert!(matches!(
+            transport_event_rx.recv().await,
+            Some(TransportEvent::IncomingMessage { .. })
+        ));
+        let mut known = client_chunk_envelope("known", "stream", 8, 0, 1, message.len(), message);
+        known.cursor = Some("known-delivered".to_string());
+        peer.send(tungstenite::Message::Text(
+            serde_json::to_string(&known)
+                .expect("serialize chunk")
+                .into(),
+        ))
+        .await
+        .expect("send known chunk");
+        match timeout(Duration::from_secs(1), transport_event_rx.recv())
+            .await
+            .expect("chunk forwarded")
+            .expect("incoming event")
+        {
+            TransportEvent::IncomingMessage {
+                connection_id: actual,
+                message,
+            } => {
+                assert_eq!(actual, connection_id);
+                assert_eq!(
+                    serde_json::to_value(message).expect("serialize message"),
+                    serde_json::json!({"method":"initialized"})
+                );
+            }
+            other => panic!("expected incoming message, got {other:?}"),
+        }
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if state.lock().await.subscribe_cursor.as_deref() == Some("known-delivered") {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("known delivery recorded");
+        assert_eq!(
+            state
+                .lock()
+                .await
+                .last_completed_client_chunk_seq_id_by_stream,
+            HashMap::from([(
+                (
+                    ClientId("known".to_string()),
+                    Some(StreamId("stream".to_string()))
+                ),
+                8
+            )])
+        );
+        shutdown.cancel();
+        reader_task
+            .await
+            .expect("reader task joins")
+            .expect("reader shutdown succeeds");
+        tracker.lock().await.shutdown().await;
     }
 
     #[test]

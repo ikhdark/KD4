@@ -78,6 +78,11 @@ impl SleepInhibitor {
         }
     }
 
+    #[cfg(all(test, windows))]
+    pub(super) fn request_handle_for_test(&self) -> Option<windows_sys::Win32::Foundation::HANDLE> {
+        self.request.as_ref().map(|request| request.handle)
+    }
+
     #[cfg(test)]
     pub(super) fn is_turn_running(&self) -> bool {
         self.turn_running

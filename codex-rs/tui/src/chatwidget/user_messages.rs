@@ -114,24 +114,6 @@ pub(crate) struct ThreadInputState {
     pub(super) agent_turn_running: bool,
 }
 
-#[cfg(test)]
-mod duplicate_representation_tests {
-    use super::*;
-
-    #[test]
-    fn thread_input_state_uses_composer_draft_snapshot() {
-        fn composer(
-            state: &ThreadInputState,
-        ) -> &Option<crate::bottom_pane::ComposerDraftSnapshot> {
-            &state.composer
-        }
-
-        let draft = ComposerDraftSnapshot::default();
-        assert!(!draft.has_content());
-        let _ = composer;
-    }
-}
-
 impl From<String> for UserMessage {
     fn from(text: String) -> Self {
         Self {

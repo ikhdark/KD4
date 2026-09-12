@@ -25,14 +25,8 @@ fn resume_parses_prompt_after_global_flags() {
     let Some(Command::Resume(args)) = cli.command else {
         panic!("expected resume command");
     };
-    let effective_prompt = args.prompt.clone().or_else(|| {
-        if args.last {
-            args.session_id.clone()
-        } else {
-            None
-        }
-    });
-    assert_eq!(effective_prompt.as_deref(), Some(PROMPT));
+    assert_eq!(args.session_id, None);
+    assert_eq!(args.prompt.as_deref(), Some(PROMPT));
 }
 
 #[test]

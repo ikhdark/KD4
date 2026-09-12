@@ -391,6 +391,10 @@ fn custom_event_sink_survives_registry_build() {
     registry
         .event_sink()
         .emit(warning_event("registry", "after"));
+    registry.event_sink().emit_for_thread(
+        codex_protocol::ThreadId::new(),
+        warning_event("turn-correlation", "scoped"),
+    );
 
     assert_eq!(
         sink.events
@@ -400,6 +404,7 @@ fn custom_event_sink_survives_registry_build() {
         [
             ("builder".to_string(), "before".to_string()),
             ("registry".to_string(), "after".to_string()),
+            ("turn-correlation".to_string(), "scoped".to_string()),
         ]
     );
 }

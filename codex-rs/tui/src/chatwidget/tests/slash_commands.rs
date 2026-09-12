@@ -993,6 +993,16 @@ async fn restored_queued_goal_slash_command_emits_set_goal_event() {
     let command = "/goal improve benchmark coverage";
 
     submit_composer_text(&mut chat, command);
+    let remote_url = "https://example.com/restored-draft.png".to_string();
+    let local_image = PathBuf::from("restored-local.png");
+    let first_paste = "x".repeat(1100);
+    let second_paste = "y".repeat(1100);
+    chat.bottom_pane
+        .set_composer_text("draft ".to_string(), Vec::new(), Vec::new());
+    chat.set_remote_image_urls(vec![remote_url.clone()]);
+    chat.bottom_pane.attach_image(local_image.clone());
+    chat.handle_paste(first_paste.clone());
+    chat.handle_paste(second_paste.clone());
     let input_state = chat
         .capture_thread_input_state()
         .expect("expected queued input state");
@@ -1007,6 +1017,35 @@ async fn restored_queued_goal_slash_command_emits_set_goal_event() {
 
     let _ = next_goal_draft(&mut restored_rx, thread_id);
     assert_no_submit_op(&mut restored_op_rx);
+    assert_eq!(
+        restored_chat.bottom_pane.composer_text(),
+        "draft [Image #2][Pasted Content 1100 chars][Pasted Content 1100 chars] #2"
+    );
+    assert_eq!(restored_chat.remote_image_urls(), vec![remote_url]);
+    assert_eq!(
+        restored_chat.bottom_pane.composer_local_image_paths(),
+        vec![local_image]
+    );
+    assert_eq!(
+        restored_chat.bottom_pane.composer_pending_pastes(),
+        vec![
+            ("[Pasted Content 1100 chars]".to_string(), first_paste),
+            ("[Pasted Content 1100 chars] #2".to_string(), second_paste),
+        ]
+    );
+    let text = restored_chat.bottom_pane.composer_text();
+    let elements = restored_chat.bottom_pane.composer_text_elements();
+    assert_eq!(
+        elements
+            .iter()
+            .map(|element| element.placeholder(&text))
+            .collect::<Vec<_>>(),
+        vec![
+            Some("[Image #2]"),
+            Some("[Pasted Content 1100 chars]"),
+            Some("[Pasted Content 1100 chars] #2")
+        ]
+    );
 }
 
 #[test]

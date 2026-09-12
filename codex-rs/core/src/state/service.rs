@@ -57,6 +57,8 @@ use tokio_util::sync::CancellationToken;
 pub(crate) struct SessionServices {
     /// The sole atomically published MCP runtime generation.
     pub(crate) mcp_runtime: Arc<ArcSwapOption<McpRuntimeSnapshot>>,
+    /// Retains unfinished manager cleanup across retired snapshot generations.
+    pub(crate) mcp_shutdown_managers: std::sync::Mutex<Vec<Arc<McpConnectionManager>>>,
     /// Aggregate generation for model-visible planning state. Every invalidating
     /// publication must advance this value before a pending turn may replan.
     pub(crate) planning_generation: AtomicU64,
@@ -228,6 +230,14 @@ impl SessionServices {
         available_environment_ids: Vec<String>,
         manager: Arc<McpConnectionManager>,
     ) -> Arc<McpRuntimeSnapshot> {
+        {
+            let mut managers = self
+                .mcp_shutdown_managers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            managers.retain(|manager| !manager.shutdown_finished());
+            managers.push(Arc::clone(&manager));
+        }
         let runtime = Arc::new(McpRuntimeSnapshot::new(
             generation,
             config,
@@ -287,5 +297,32 @@ impl SessionServices {
             unreachable!("MCP runtime must be installed before handling requests");
         };
         runtime
+    }
+
+    pub(crate) async fn shutdown_mcp_managers(&self) {
+        // Refresh checks this token under the same publication semaphore before
+        // installing its manager. No new generation can escape the shutdown drain.
+        let _projection = self
+            .mcp_projection_lock
+            .acquire()
+            .await
+            .expect("MCP projection semaphore is never closed");
+        self.mcp_startup_cancellation_token.lock().await.cancel();
+        let mut managers = {
+            let managers = self
+                .mcp_shutdown_managers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            managers.clone()
+        };
+        let latest = self.latest_mcp_runtime().manager_arc();
+        if !managers.iter().any(|manager| Arc::ptr_eq(manager, &latest)) {
+            managers.push(latest);
+        }
+        futures::future::join_all(managers.iter().map(|manager| manager.shutdown())).await;
+        self.mcp_shutdown_managers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|manager| !manager.shutdown_finished());
     }
 }

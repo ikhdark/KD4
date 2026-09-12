@@ -77,9 +77,14 @@ impl App {
             .add_info_message(format!("Opened {url} in your browser."), /*hint*/ None);
     }
 
-    pub(super) fn open_desktop_thread(&mut self, thread_id: ThreadId) {
+    pub(super) async fn open_desktop_thread(&mut self, thread_id: ThreadId) {
         let url = format!("codex://threads/{thread_id}");
-        if let Err(err) = open_desktop_thread_url(&url) {
+        let mut command = desktop_thread_open_command(&url);
+        #[cfg(test)]
+        if let Some(make_command) = self.desktop_thread_open_command_for_test.take() {
+            command = make_command(&url);
+        }
+        if let Err(err) = open_desktop_thread_url(&mut command).await {
             self.chat_widget
                 .add_error_message(desktop_thread_open_error_message(&err));
             return;
@@ -183,13 +188,17 @@ fn desktop_thread_open_error_message(err: &str) -> String {
     )
 }
 
-fn open_desktop_thread_url(url: &str) -> Result<(), String> {
+fn desktop_thread_open_command(url: &str) -> tokio::process::Command {
     let script = windows_desktop_app_launch_script(url);
-    let output = std::process::Command::new("powershell.exe")
-        .arg("-NoProfile")
-        .arg("-Command")
-        .arg(&script)
+    let mut command = tokio::process::Command::new("powershell.exe");
+    command.arg("-NoProfile").arg("-Command").arg(script);
+    command
+}
+
+async fn open_desktop_thread_url(command: &mut tokio::process::Command) -> Result<(), String> {
+    let output = command
         .output()
+        .await
         .map_err(|err| format!("failed to launch Codex Desktop through PowerShell: {err}"))?;
 
     if output.status.success() {
