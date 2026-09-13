@@ -35,18 +35,6 @@ struct RemotePluginCatalogDiskCache {
     plugins: Vec<RemotePluginDirectoryItem>,
 }
 
-pub(crate) fn load_cached_global_directory_plugins(
-    codex_home: &Path,
-    config: &RemotePluginServiceConfig,
-    auth: &CodexAuth,
-) -> Option<Vec<RemotePluginDirectoryItem>> {
-    let cache_path = cache_path(
-        codex_home,
-        &RemotePluginCatalogCacheKey::global(config, auth),
-    );
-    load_cached_global_directory_plugins_at_path(cache_path)
-}
-
 pub(crate) async fn load_cached_global_directory_plugins_async(
     codex_home: &Path,
     config: &RemotePluginServiceConfig,

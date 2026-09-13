@@ -1304,6 +1304,50 @@ async fn refresh_available_models_keeps_merging_for_api_auth() {
 }
 
 #[tokio::test]
+async fn refresh_available_models_replaces_obsolete_cache_before_decoding_models() {
+    for old_version in [None, Some("0.1.0")] {
+        let remote_models = vec![remote_model("current", "Current", /*priority*/ 5)];
+        let codex_home = tempdir().expect("temp dir");
+        let endpoint = TestModelsEndpoint::new(vec![remote_models.clone()]);
+        let manager = openai_manager_for_tests(codex_home.path().to_path_buf(), endpoint.clone());
+        // This model shape predates base_instructions and the required capability fields.
+        let mut cache = json!({
+            "fetched_at": Utc::now(),
+            "etag": "old-etag",
+            "models": [{
+                "slug": "legacy",
+                "display_name": "Legacy",
+                "default_reasoning_level": "medium",
+                "supported_reasoning_levels": [],
+                "shell_type": "shell_command",
+                "minimal_client_version": [0, 1, 0],
+            }],
+        });
+        if let Some(version) = old_version {
+            cache["client_version"] = json!(version);
+        }
+        let cache_path = codex_home.path().join(MODEL_CACHE_FILE);
+        std::fs::write(&cache_path, cache.to_string()).expect("write legacy cache");
+
+        manager
+            .refresh_available_models(
+                RefreshStrategy::OnlineIfUncached,
+                &DEFAULT_HTTP_CLIENT_FACTORY,
+            )
+            .await
+            .expect("obsolete cache should allow an online refresh");
+
+        assert_eq!(endpoint.fetch_count(), 1);
+        assert_eq!(manager.get_remote_models().await, remote_models);
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(cache_path).expect("read refreshed cache"))
+                .expect("valid refreshed cache");
+        assert_eq!(saved["models"][0]["slug"], "current");
+        assert_eq!(saved["client_version"], crate::client_version_to_whole());
+    }
+}
+
+#[tokio::test]
 async fn refresh_available_models_uses_cache_when_fresh() {
     let remote_models = vec![remote_model("cached", "Cached", /*priority*/ 5)];
     let codex_home = tempdir().expect("temp dir");

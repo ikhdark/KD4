@@ -202,6 +202,7 @@ impl HeadTailBuffer {
     }
 
     /// Drain retained chunks with an optional marker at the head/tail seam.
+    #[cfg(test)]
     pub(crate) fn drain_chunks_with_omission_marker(
         &mut self,
         omission_marker: Option<Vec<u8>>,

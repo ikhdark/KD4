@@ -236,6 +236,7 @@ impl AgentControl {
         let control = self.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(TYPED_ACTOR_HEARTBEAT_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 interval.tick().await;
                 if !matches!(

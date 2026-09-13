@@ -566,6 +566,20 @@ async fn exec_resume_includes_output_schema_in_request() -> anyhow::Result<()> {
     let test = test_codex_exec();
     let server = MockServer::start().await;
     let response_mock = mount_exec_responses(&server, /*count*/ 2).await;
+    // Both CLI invocations use this HTTP Responses/SSE fixture.
+    std::fs::write(
+        test.home_path().join("config.toml"),
+        format!(
+            "model_provider = \"schema_fixture\"\n\
+             [model_providers.schema_fixture]\n\
+             name = \"Schema HTTP fixture\"\n\
+             base_url = {}\n\
+             wire_api = \"responses\"\n\
+             requires_openai_auth = true\n\
+             supports_websockets = false\n",
+            serde_json::to_string(&format!("{}/v1", server.uri()))?,
+        ),
+    )?;
 
     let schema_contents = serde_json::json!({
         "type": "object",

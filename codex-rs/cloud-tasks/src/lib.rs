@@ -2189,7 +2189,7 @@ fn pretty_lines_from_error(raw: &str) -> Vec<String> {
     if lines.len() == 1 {
         // Parsing yielded nothing; include a trimmed, short raw message tail for context.
         let tail = if raw.len() > 320 {
-            format!("{}…", &raw[..320])
+            format!("{}…", &raw[..raw.floor_char_boundary(320)])
         } else {
             raw.to_string()
         };
@@ -2222,6 +2222,20 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ratatui::buffer::Buffer;
     use ratatui::layout::Rect;
+
+    #[test]
+    fn pretty_lines_from_error_truncates_at_utf8_boundary() {
+        let prefix = "x".repeat(319);
+        let raw = format!("{prefix}é backend failure");
+
+        assert_eq!(
+            pretty_lines_from_error(&raw),
+            vec![
+                "Failed to load task details.".to_string(),
+                format!("{prefix}…"),
+            ]
+        );
+    }
 
     #[tokio::test]
     async fn dismissed_apply_operations_release_the_gate_when_their_completion_arrives() {

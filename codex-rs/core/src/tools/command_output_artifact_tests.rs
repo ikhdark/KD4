@@ -1793,6 +1793,19 @@ async fn streaming_chunks_update_bytes_but_count_as_one_logical_mutation() {
     );
     assert_eq!(after.logical_mutations - before.logical_mutations, 1);
     assert_eq!(after.scans, before.scans);
+
+    let artifact = state.lock().await;
+    let RawOutputArtifact::Stored { path, bytes, .. } = &*artifact else {
+        panic!("expected stored streaming artifact");
+    };
+    assert_eq!(*bytes, 200);
+    assert_eq!(
+        tokio::fs::read(path).await.expect("retained output"),
+        vec![b'x'; 200]
+    );
+    let usage = retention_usage_locked_blocking(path.parent().expect("artifact directory"));
+    assert_eq!(usage.thread_bytes, 200);
+    assert_eq!(usage.global_bytes, 200);
 }
 
 #[tokio::test]

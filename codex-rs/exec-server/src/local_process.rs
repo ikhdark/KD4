@@ -265,10 +265,6 @@ impl LocalProcess {
         params: ExecParams,
     ) -> Result<(ExecResponse, watch::Sender<u64>, ExecProcessEventLog), JSONRPCErrorError> {
         let process_id = params.process_id.clone();
-        let prepared =
-            prepare_exec_request(&params, child_env(&params), self.runtime_paths.as_ref())?;
-        let sandbox = prepared.sandbox;
-
         let start = Arc::new(ProcessStart);
         let mut reservation = ProcessStartReservation {
             inner: Arc::clone(&self.inner),
@@ -291,7 +287,44 @@ impl LocalProcess {
             reservation.active = true;
         }
 
-        let spawned_result = prepared.spawn(params.tty, params.pipe_stdin).await;
+        // Sandbox preparation can walk filesystem trees to resolve deny globs.
+        // Reserve the process ID first so termination can cancel queued preparation.
+        let runtime_paths = self.runtime_paths.clone();
+        let preparation = tokio::task::spawn_blocking(move || {
+            prepare_exec_request(&params, child_env(&params), runtime_paths.as_ref())
+                .map(|prepared| (prepared, params.tty, params.pipe_stdin))
+        })
+        .await
+        .map_err(|err| internal_error(format!("process preparation task failed: {err}")))
+        .and_then(std::convert::identity);
+        let (prepared, tty, pipe_stdin) = match preparation {
+            Ok(prepared) => prepared,
+            Err(err) => {
+                let mut process_map = self.inner.processes.lock().await;
+                if matches!(
+                    process_map.get(&process_id),
+                    Some(ProcessEntry::Starting(current)) if Arc::ptr_eq(current, &start)
+                ) {
+                    process_map.remove(&process_id);
+                }
+                reservation.active = false;
+                return Err(err);
+            }
+        };
+        let sandbox = prepared.sandbox;
+        {
+            let process_map = self.inner.processes.lock().await;
+            if !matches!(
+                process_map.get(&process_id),
+                Some(ProcessEntry::Starting(current)) if Arc::ptr_eq(current, &start)
+            ) {
+                return Err(invalid_request(format!(
+                    "process {process_id} start was cancelled"
+                )));
+            }
+        }
+
+        let spawned_result = prepared.spawn(tty, pipe_stdin).await;
         let spawned = match spawned_result {
             Ok(spawned) => spawned,
             Err(err) => {
@@ -330,8 +363,8 @@ impl LocalProcess {
                 process_id.clone(),
                 ProcessEntry::Running(Box::new(RunningProcess {
                     session: spawned.session,
-                    tty: params.tty,
-                    pipe_stdin: params.pipe_stdin,
+                    tty,
+                    pipe_stdin,
                     accepted_stdin_write_ids: Arc::new(
                         Mutex::new(AcceptedStdinWriteIds::default()),
                     ),
@@ -354,7 +387,7 @@ impl LocalProcess {
         }
         tokio::spawn(stream_output(
             process_id.clone(),
-            if params.tty {
+            if tty {
                 ExecOutputStream::Pty
             } else {
                 ExecOutputStream::Stdout
@@ -365,7 +398,7 @@ impl LocalProcess {
         ));
         tokio::spawn(stream_output(
             process_id.clone(),
-            if params.tty {
+            if tty {
                 ExecOutputStream::Pty
             } else {
                 ExecOutputStream::Stderr
@@ -1168,6 +1201,115 @@ mod tests {
         };
 
         assert_eq!(error, expected);
+    }
+
+    #[test]
+    fn failed_preparation_releases_process_id_before_retry() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let backend = LocalProcess::default();
+            let cwd = PathUri::parse("file:///usr/local/checkout").expect("foreign cwd");
+            let source = cwd.to_abs_path().expect_err("non-native cwd");
+            let expected = invalid_params(format!(
+                "cwd URI `{cwd}` is not valid on this exec-server host: {source}"
+            ));
+            for _ in 0..2 {
+                let mut params = test_exec_params(HashMap::new());
+                params.cwd = cwd.clone();
+                let process_id = params.process_id.clone();
+                assert_eq!(backend.exec(params).await, Err(expected.clone()));
+                assert!(
+                    !backend
+                        .inner
+                        .processes
+                        .lock()
+                        .await
+                        .contains_key(&process_id)
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn preparation_yields_and_allows_termination_before_launch() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let (occupied_tx, occupied_rx) = oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                occupied_tx.send(()).expect("blocking pool occupied");
+                match release_rx.recv_timeout(Duration::from_secs(5)) {
+                    Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {}
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        panic!("blocking pool was not released");
+                    }
+                }
+            });
+            occupied_rx.await.expect("blocking worker started");
+            let backend = LocalProcess::default();
+            let mut params = test_exec_params(HashMap::new());
+            params.cwd = PathUri::parse("file:///usr/local/checkout").expect("foreign cwd");
+            let source = params.cwd.to_abs_path().expect_err("non-native cwd");
+            let expected = invalid_params(format!(
+                "cwd URI `{}` is not valid on this exec-server host: {source}",
+                params.cwd
+            ));
+            let process_id = params.process_id.clone();
+            let mut start = Box::pin(backend.exec(params));
+
+            // Invalid cwd validation used to run synchronously in this poll.
+            // With the blocking pool occupied, preparation must yield instead.
+            assert!(futures::poll!(start.as_mut()).is_pending());
+            assert!(matches!(
+                backend.inner.processes.lock().await.get(&process_id),
+                Some(ProcessEntry::Starting(_))
+            ));
+            let terminated = backend
+                .terminate_process(TerminateParams {
+                    process_id: process_id.clone(),
+                })
+                .await
+                .expect("terminate queued preparation");
+            release_tx.send(()).expect("release preparation");
+            assert!(terminated.running);
+            assert!(
+                !backend
+                    .inner
+                    .processes
+                    .lock()
+                    .await
+                    .contains_key(&process_id)
+            );
+            assert!(
+                !backend
+                    .terminate_process(TerminateParams {
+                        process_id: process_id.clone(),
+                    })
+                    .await
+                    .expect("queued preparation is already removed")
+                    .running
+            );
+            let result = timeout(Duration::from_secs(2), start)
+                .await
+                .expect("preparation finishes");
+            assert_eq!(result, Err(expected));
+            assert!(
+                !backend
+                    .inner
+                    .processes
+                    .lock()
+                    .await
+                    .contains_key(&process_id)
+            );
+            blocker.await.expect("blocking pool released");
+        });
     }
 
     #[test]

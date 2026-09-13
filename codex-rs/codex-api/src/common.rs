@@ -263,7 +263,7 @@ impl From<&ResponsesApiRequest> for ResponseCreateWsRequest {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 pub struct ResponseCreateWsRequest {
     pub model: String,
     #[serde(skip_serializing_if = "String::is_empty")]
@@ -315,7 +315,7 @@ pub fn response_create_client_metadata(
     (!client_metadata.is_empty()).then_some(client_metadata)
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(tag = "type")]
 #[allow(clippy::large_enum_variant)]
 pub enum ResponsesWsRequest {

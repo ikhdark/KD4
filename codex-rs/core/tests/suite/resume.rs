@@ -36,26 +36,28 @@ async fn resume_until_initial_messages(
     let poll_interval = Duration::from_millis(10);
     let mut last_initial_messages = "<missing initial messages>".to_string();
 
-    loop {
-        let resumed = builder
-            .resume(server, Arc::clone(&home), rollout_path.clone())
-            .await?;
-        if let Some(initial_messages) = resumed.session_configured.initial_messages.as_ref() {
-            if predicate(initial_messages) {
-                return Ok(resumed);
+    tokio::time::timeout_at(deadline, async {
+        loop {
+            let resumed = builder
+                .resume(server, Arc::clone(&home), rollout_path.clone())
+                .await?;
+            if let Some(initial_messages) = resumed.session_configured.initial_messages.as_ref() {
+                if predicate(initial_messages) {
+                    return Ok(resumed);
+                }
+                last_initial_messages = format!("{initial_messages:#?}");
             }
-            last_initial_messages = format!("{initial_messages:#?}");
-        }
 
-        if tokio::time::Instant::now() >= deadline {
-            panic!(
-                "timed out waiting for rollout resume messages to stabilize: {last_initial_messages}"
-            );
+            drop(resumed);
+            tokio::time::sleep(poll_interval).await;
         }
-
-        drop(resumed);
-        tokio::time::sleep(poll_interval).await;
-    }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "timed out waiting for rollout resume messages to stabilize: {last_initial_messages}"
+        )
+    })
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

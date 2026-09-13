@@ -683,7 +683,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                 // CLI input doesn't track UI element ranges, so none are available here.
                 text_elements: Vec::new(),
             });
-            let output_schema = load_output_schema(output_schema_path.clone());
+            let output_schema = load_output_schema(output_schema_path.clone()).await;
             (
                 InitialOperation::UserTurn {
                     items,
@@ -703,7 +703,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                 // CLI input doesn't track UI element ranges, so none are available here.
                 text_elements: Vec::new(),
             });
-            let output_schema = load_output_schema(output_schema_path);
+            let output_schema = load_output_schema(output_schema_path).await;
             (
                 InitialOperation::UserTurn {
                     items,
@@ -821,14 +821,17 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
     info!("Codex initialized with event: {session_configured:?}");
 
     let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel::<()>();
-    tokio::spawn(async move {
-        while tokio::signal::ctrl_c().await.is_ok() {
-            tracing::debug!("Keyboard interrupt");
-            if interrupt_tx.send(()).is_err() {
-                break;
+    tokio::spawn(
+        async move {
+            while tokio::signal::ctrl_c().await.is_ok() {
+                tracing::debug!("Keyboard interrupt");
+                if interrupt_tx.send(()).is_err() {
+                    break;
+                }
             }
         }
-    });
+        .in_current_span(),
+    );
 
     let task_id = match initial_operation {
         InitialOperation::UserTurn {
@@ -1739,10 +1742,10 @@ async fn handle_server_request(
     }
 }
 
-fn load_output_schema(path: Option<PathBuf>) -> Option<Value> {
+async fn load_output_schema(path: Option<PathBuf>) -> Option<Value> {
     let path = path?;
 
-    let schema_str = match std::fs::read_to_string(&path) {
+    let schema_str = match tokio::fs::read_to_string(&path).await {
         Ok(contents) => contents,
         Err(err) => {
             eprintln!(

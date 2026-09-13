@@ -403,26 +403,28 @@ fn is_generated_trust_bundle_path(path: &Path, proxy_dir: &Path) -> bool {
 }
 
 fn is_generated_managed_ca_artifact_path(path: &Path, proxy_dir: &Path, prefix: &str) -> bool {
-    let Some(file_name) = path.file_name().and_then(|file_name| file_name.to_str()) else {
+    let Some(expected_hash) = managed_ca_artifact_hash(path, proxy_dir, prefix) else {
         return false;
     };
-    let Some(expected_hash) = file_name
-        .strip_prefix(prefix)
-        .and_then(|suffix| suffix.strip_prefix('-'))
-        .and_then(|suffix| suffix.strip_suffix(".pem"))
-    else {
-        return false;
-    };
-    if path.parent() != Some(proxy_dir)
-        || expected_hash.len() != 64
-        || !expected_hash.bytes().all(|byte| byte.is_ascii_hexdigit())
-    {
-        return false;
-    }
     let Ok(trust_bundle) = fs::read(path) else {
         return false;
     };
     format!("{:x}", Sha256::digest(trust_bundle)) == expected_hash
+}
+
+fn managed_ca_artifact_hash<'a>(path: &'a Path, proxy_dir: &Path, prefix: &str) -> Option<&'a str> {
+    let file_name = path.file_name()?.to_str()?;
+    let expected_hash = file_name
+        .strip_prefix(prefix)
+        .and_then(|suffix| suffix.strip_prefix('-'))
+        .and_then(|suffix| suffix.strip_suffix(".pem"))?;
+    if path.parent() != Some(proxy_dir)
+        || expected_hash.len() != 64
+        || !expected_hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    Some(expected_hash)
 }
 
 /// Returns whether `path` points at a current Codex-generated MITM CA bundle.
@@ -543,12 +545,27 @@ fn prune_managed_ca_artifacts(proxy_dir: &Path) {
         remove_inactive_managed_ca_certificate(&certificate_path);
     }
 
-    let remaining_certificates =
-        generated_managed_ca_artifact_paths(proxy_dir, MANAGED_MITM_CA_CERT_PREFIX)
-            .into_iter()
-            .filter_map(|path| fs::read(path).ok())
-            .filter(|certificate| !certificate.is_empty())
-            .collect::<Vec<_>>();
+    let Ok(entries) = fs::read_dir(proxy_dir) else {
+        return;
+    };
+    let mut remaining_certificates = Vec::new();
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return;
+        };
+        let path = entry.path();
+        if managed_ca_artifact_hash(&path, proxy_dir, MANAGED_MITM_CA_CERT_PREFIX).is_none() {
+            continue;
+        }
+        // An unreadable certificate can still have an active lease. Without its
+        // contents we cannot establish that any associated bundle is stale.
+        let Ok(certificate) = fs::read(path) else {
+            return;
+        };
+        if !certificate.is_empty() {
+            remaining_certificates.push(certificate);
+        }
+    }
     let bundle_paths =
         generated_managed_ca_artifact_paths(proxy_dir, MANAGED_MITM_CA_TRUST_BUNDLE_PREFIX);
     for bundle_path in bundle_paths {
@@ -1117,6 +1134,38 @@ mod tests {
         assert!(remaining_certificates.is_empty());
         assert!(!artifacts[0].0.exists());
         assert!(!artifacts[0].1.exists());
+    }
+
+    #[test]
+    fn managed_ca_creation_preserves_bundles_for_unreadable_active_certificates() {
+        ensure_rustls_crypto_provider();
+        let dir = tempdir().unwrap();
+        let active_ca = ManagedMitmCa::create(dir.path()).unwrap();
+        let certificate = fs::read_to_string(active_ca.certificate_path()).unwrap();
+        let bundle = persist_managed_ca_trust_bundle(
+            active_ca.certificate_path(),
+            &format!("roots\n{certificate}"),
+        )
+        .unwrap();
+        let unreadable_certificate = OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(active_ca.certificate_path())
+            .unwrap();
+        assert!(fs::read(active_ca.certificate_path()).is_err());
+
+        let next_ca = ManagedMitmCa::create(dir.path()).unwrap();
+
+        assert!(next_ca.certificate_path().exists());
+        assert_eq!(
+            fs::read_to_string(&bundle).unwrap(),
+            format!("roots\n{certificate}")
+        );
+        drop(unreadable_certificate);
+        assert_eq!(
+            fs::read_to_string(active_ca.certificate_path()).unwrap(),
+            certificate
+        );
     }
 
     #[test]

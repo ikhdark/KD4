@@ -755,6 +755,18 @@ async fn chatgpt_auth_registers_agent_identity_when_enabled() -> anyhow::Result<
         result = &mut registration => panic!("registration finished before storage was released: {result:?}"),
         () = tokio::time::sleep(std::time::Duration::from_millis(20)) => {},
     }
+    let cached_auth = auth.clone();
+    let cached_before_save = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        tokio::task::spawn_blocking(move || cached_auth.get_current_auth_json()),
+    )
+    .await??
+    .expect("cached auth must remain readable while persistence is blocked");
+    assert_eq!(
+        cached_before_save.tokens.as_ref().unwrap().access_token,
+        "test-access-token"
+    );
+    assert!(cached_before_save.agent_identity.is_none());
     assert!(
         FileAuthStorage::new(codex_home.path().to_path_buf())
             .load()?

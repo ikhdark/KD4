@@ -183,6 +183,67 @@ async fn handle_mcp_inventory_result_respects_origin_thread() {
     assert_eq!(app.transcript_cells.len(), 1);
 }
 
+#[tokio::test]
+async fn handle_mcp_inventory_result_renders_tools_by_server() {
+    let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+    let statuses = [("search", "find"), ("docs", "list")]
+        .into_iter()
+        .map(|(server_name, tool_name)| McpServerStatus {
+            name: server_name.to_string(),
+            server_info: None,
+            tools: HashMap::from([(
+                tool_name.to_string(),
+                codex_protocol::mcp::Tool {
+                    description: None,
+                    name: tool_name.to_string(),
+                    title: None,
+                    input_schema: serde_json::json!({"type": "object"}),
+                    output_schema: None,
+                    annotations: None,
+                    icons: None,
+                    meta: None,
+                },
+            )]),
+            resources: Vec::new(),
+            resource_templates: Vec::new(),
+            auth_status: codex_app_server_protocol::McpAuthStatus::Unsupported,
+        })
+        .collect();
+
+    app.handle_mcp_inventory_result(
+        Ok(statuses),
+        McpServerStatusDetail::ToolsAndAuthOnly,
+        /*thread_id*/ None,
+    );
+
+    let cell = match app_event_rx.try_recv() {
+        Ok(AppEvent::InsertHistoryCell(cell)) => cell,
+        other => panic!("expected MCP inventory history, got {other:?}"),
+    };
+    let rendered = cell
+        .display_lines(/*width*/ 120)
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rendered,
+        vec![
+            "/mcp",
+            "",
+            "🔌  MCP Tools",
+            "",
+            "  • docs",
+            "    • Auth: Unsupported",
+            "    • Tools: list",
+            "",
+            "  • search",
+            "    • Auth: Unsupported",
+            "    • Tools: find",
+            "",
+        ]
+    );
+}
+
 #[test]
 fn bypass_hook_trust_startup_warning_snapshot() {
     let rendered = lines_to_single_string(
@@ -8097,7 +8158,10 @@ async fn commit_animation_events_stop_on_restart_and_app_drop() -> Result<()> {
     while events.try_recv().is_ok() {}
     tokio::time::pause();
 
-    for event in [AppEvent::StartCommitAnimation, AppEvent::StartCommitAnimation] {
+    for event in [
+        AppEvent::StartCommitAnimation,
+        AppEvent::StartCommitAnimation,
+    ] {
         app.handle_event(&mut tui, &mut app_server, event).await?;
     }
     // Receive through the channel so the producer and Tokio's rounded timer
@@ -8107,29 +8171,39 @@ async fn commit_animation_events_stop_on_restart_and_app_drop() -> Result<()> {
         Some(AppEvent::CommitTick)
     ));
     assert!(
-        tokio::time::timeout(COMMIT_ANIMATION_TICK / 2, events.recv()).await.is_err(),
+        tokio::time::timeout(COMMIT_ANIMATION_TICK / 2, events.recv())
+            .await
+            .is_err(),
         "duplicate start must not add a worker"
     );
 
     // Restart without yielding: the old sleeping worker must not be revived.
-    app.handle_event(&mut tui, &mut app_server, AppEvent::StopCommitAnimation).await?;
-    app.handle_event(&mut tui, &mut app_server, AppEvent::StartCommitAnimation).await?;
+    app.handle_event(&mut tui, &mut app_server, AppEvent::StopCommitAnimation)
+        .await?;
+    app.handle_event(&mut tui, &mut app_server, AppEvent::StartCommitAnimation)
+        .await?;
     assert!(matches!(
         tokio::time::timeout(COMMIT_ANIMATION_TICK * 2, events.recv()).await?,
         Some(AppEvent::CommitTick)
     ));
     assert!(
-        tokio::time::timeout(COMMIT_ANIMATION_TICK * 3 / 4, events.recv()).await.is_err(),
+        tokio::time::timeout(COMMIT_ANIMATION_TICK * 3 / 4, events.recv())
+            .await
+            .is_err(),
         "restart must retain exactly one worker"
     );
 
-    app.handle_event(&mut tui, &mut app_server, AppEvent::StopCommitAnimation).await?;
+    app.handle_event(&mut tui, &mut app_server, AppEvent::StopCommitAnimation)
+        .await?;
     assert!(
-        tokio::time::timeout(COMMIT_ANIMATION_TICK * 3, events.recv()).await.is_err(),
+        tokio::time::timeout(COMMIT_ANIMATION_TICK * 3, events.recv())
+            .await
+            .is_err(),
         "stop must prevent later ticks"
     );
 
-    app.handle_event(&mut tui, &mut app_server, AppEvent::StartCommitAnimation).await?;
+    app.handle_event(&mut tui, &mut app_server, AppEvent::StartCommitAnimation)
+        .await?;
     assert!(matches!(
         tokio::time::timeout(COMMIT_ANIMATION_TICK * 2, events.recv()).await?,
         Some(AppEvent::CommitTick)

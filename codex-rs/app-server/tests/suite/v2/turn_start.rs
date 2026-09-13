@@ -86,7 +86,9 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::path::Path;
 use tempfile::TempDir;
+use tokio::time::Instant;
 use tokio::time::timeout;
+use tokio::time::timeout_at;
 use wiremock::ResponseTemplate;
 
 use super::analytics::mount_analytics_capture;
@@ -2684,12 +2686,14 @@ async fn turn_start_file_change_approval_v2() -> Result<()> {
         create_final_assistant_message_sse_response("patch applied")?,
     ];
     let server = create_mock_responses_server_sequence(responses).await;
-    create_config_toml(
+    create_config_toml_with_sandbox(
         &codex_home,
         &server.uri(),
         "untrusted",
         &BTreeMap::default(),
+        "danger-full-access",
     )?;
+    let model_slug = write_apply_patch_models_cache(&codex_home)?;
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(&codex_home)
@@ -2699,7 +2703,7 @@ async fn turn_start_file_change_approval_v2() -> Result<()> {
 
     let start_req = mcp
         .send_thread_start_request_with_auto_env(ThreadStartParams {
-            model: Some("mock-model".to_string()),
+            model: Some(model_slug),
             cwd: Some(workspace.to_string_lossy().into_owned()),
             ..Default::default()
         })
@@ -2787,8 +2791,9 @@ async fn turn_start_file_change_approval_v2() -> Result<()> {
     .await?;
     let mut saw_resolved = false;
     let mut completed_file_change: Option<ThreadItem> = None;
+    let completion_deadline = Instant::now() + DEFAULT_READ_TIMEOUT;
     while completed_file_change.is_none() {
-        let message = timeout(DEFAULT_READ_TIMEOUT, mcp.read_next_message()).await??;
+        let message = timeout_at(completion_deadline, mcp.read_next_message()).await??;
         let JSONRPCMessage::Notification(notification) = message else {
             continue;
         };
@@ -2883,7 +2888,14 @@ async fn turn_start_does_not_stream_apply_patch_change_updates_without_feature_v
         create_final_assistant_message_sse_response("patch applied")?,
     ];
     let server = create_mock_responses_server_sequence(responses).await;
-    create_config_toml(&codex_home, &server.uri(), "never", &BTreeMap::default())?;
+    create_config_toml_with_sandbox(
+        &codex_home,
+        &server.uri(),
+        "never",
+        &BTreeMap::from([(Feature::ApplyPatchStreamingEvents, false)]),
+        "danger-full-access",
+    )?;
+    let model_slug = write_apply_patch_models_cache(&codex_home)?;
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(&codex_home)
@@ -2893,7 +2905,7 @@ async fn turn_start_does_not_stream_apply_patch_change_updates_without_feature_v
 
     let start_req = mcp
         .send_thread_start_request_with_auto_env(ThreadStartParams {
-            model: Some("mock-model".to_string()),
+            model: Some(model_slug),
             cwd: Some(workspace.to_string_lossy().into_owned()),
             ..Default::default()
         })
@@ -2913,7 +2925,7 @@ async fn turn_start_does_not_stream_apply_patch_change_updates_without_feature_v
                 text: "apply patch".into(),
                 text_elements: Vec::new(),
             }],
-            cwd: Some(workspace),
+            cwd: Some(workspace.clone()),
             ..Default::default()
         })
         .await?;
@@ -2932,6 +2944,10 @@ async fn turn_start_does_not_stream_apply_patch_change_updates_without_feature_v
         !mcp.pending_notification_methods()
             .iter()
             .any(|method| method == "item/fileChange/patchUpdated")
+    );
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("live.txt"))?,
+        "live line\n"
     );
 
     Ok(())
@@ -3010,22 +3026,7 @@ async fn turn_start_streams_apply_patch_change_updates_v2() -> Result<()> {
             (Feature::ShellSnapshot, false),
         ]),
     )?;
-    write_models_cache(&codex_home)?;
-    let cache_path = codex_home.join(TEST_MODEL_CATALOG_FILENAME);
-    let mut cache: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&cache_path)?)?;
-    let models = cache["models"]
-        .as_array_mut()
-        .expect("test model catalog models should be an array");
-    let model = models
-        .first_mut()
-        .expect("test model catalog should contain at least one model");
-    model["apply_patch_tool_type"] = serde_json::Value::from("freeform");
-    let model_slug = model["slug"]
-        .as_str()
-        .expect("models cache entry should have a slug")
-        .to_string();
-    std::fs::write(&cache_path, serde_json::to_string_pretty(&cache)?)?;
+    let model_slug = write_apply_patch_models_cache(&codex_home)?;
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(&codex_home)
@@ -3067,9 +3068,10 @@ async fn turn_start_streams_apply_patch_change_updates_v2() -> Result<()> {
     let TurnStartResponse { turn } = to_response::<TurnStartResponse>(turn_resp)?;
 
     let mut streamed_content = String::new();
+    let patch_deadline = Instant::now() + DEFAULT_READ_TIMEOUT;
     while streamed_content != "live line\n" {
-        let delta_notif = timeout(
-            DEFAULT_READ_TIMEOUT,
+        let delta_notif = timeout_at(
+            patch_deadline,
             mcp.read_stream_until_notification_message("item/fileChange/patchUpdated"),
         )
         .await??;
@@ -4220,6 +4222,26 @@ async fn turn_start_with_elevated_override_does_not_persist_project_trust() -> R
     assert!(!config_toml.contains(&workspace.path().display().to_string()));
 
     Ok(())
+}
+
+fn write_apply_patch_models_cache(codex_home: &Path) -> Result<String> {
+    write_models_cache(codex_home)?;
+    let cache_path = codex_home.join(TEST_MODEL_CATALOG_FILENAME);
+    let mut cache: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&cache_path)?)?;
+    let models = cache["models"]
+        .as_array_mut()
+        .expect("test model catalog models should be an array");
+    let model = models
+        .first_mut()
+        .expect("test model catalog should contain at least one model");
+    model["apply_patch_tool_type"] = serde_json::Value::from("freeform");
+    let model_slug = model["slug"]
+        .as_str()
+        .expect("models cache entry should have a slug")
+        .to_string();
+    std::fs::write(&cache_path, serde_json::to_string_pretty(&cache)?)?;
+    Ok(model_slug)
 }
 
 // Helper to create a config.toml pointing at the mock model server.

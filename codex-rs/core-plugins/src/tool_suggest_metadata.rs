@@ -200,11 +200,16 @@ async fn load_plugin_metadata(
             skill_inventory: None,
         }));
     };
-    if !plugin_root.as_path().is_dir() {
-        return Err("path does not exist or is not a directory".to_string());
-    }
-    let manifest = load_plugin_manifest(plugin_root.as_path())
-        .ok_or_else(|| "missing or invalid plugin.json".to_string())?;
+    let root_for_manifest = plugin_root.clone();
+    let manifest = tokio::task::spawn_blocking(move || {
+        if !root_for_manifest.as_path().is_dir() {
+            return Err("path does not exist or is not a directory".to_string());
+        }
+        load_plugin_manifest(root_for_manifest.as_path())
+            .ok_or_else(|| "missing or invalid plugin.json".to_string())
+    })
+    .await
+    .map_err(|err| format!("failed to read plugin manifest: {err}"))??;
     let skill_inventory = load_plugin_skill_inventory(
         plugin_root,
         &plugin_id,

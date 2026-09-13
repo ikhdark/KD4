@@ -298,6 +298,8 @@ struct RetentionIndex {
 }
 
 impl RetentionIndex {
+    // Callers normalize keys before taking the registry mutex. Index operations
+    // must not resolve filesystem paths while that shared mutex is held.
     fn insert(&mut self, record: ArtifactRetentionRecord) -> bool {
         self.remove(&record.path);
         let Some(thread_bytes) = self
@@ -330,8 +332,7 @@ impl RetentionIndex {
     }
 
     fn remove(&mut self, path: &Path) -> Option<ArtifactRetentionRecord> {
-        let path = normalized_retention_path(path);
-        let record = self.records.remove(&path)?;
+        let record = self.records.remove(path)?;
         self.global_order
             .remove(&(record.modified, record.path.clone()));
         self.total_bytes = self.total_bytes.saturating_sub(record.bytes);
@@ -339,7 +340,7 @@ impl RetentionIndex {
             self.unprotected = self.unprotected.saturating_sub(1);
         }
         let remove_thread = if let Some(thread) = self.threads.get_mut(&record.thread_directory) {
-            thread.paths.remove(&path);
+            thread.paths.remove(path);
             thread.bytes = thread.bytes.saturating_sub(record.bytes);
             if !record.protected {
                 thread.unprotected = thread.unprotected.saturating_sub(1);
@@ -364,9 +365,8 @@ impl RetentionIndex {
     }
 
     fn thread_totals(&self, directory: &Path) -> (u64, usize) {
-        let directory = normalized_retention_path(directory);
         self.threads
-            .get(&directory)
+            .get(directory)
             .map_or((0, 0), |thread| (thread.bytes, thread.unprotected))
     }
 
@@ -1280,7 +1280,7 @@ impl RawOutputArtifactWriter {
         }) {
             Ok((bytes, modified)) => {
                 if let Some(token) = self.retention_token.as_ref() {
-                    publish_streaming_size(token, &path, bytes, modified, false);
+                    publish_streaming_size_async(token, &path, bytes, modified, false).await;
                 }
             }
             Err(_) => {
@@ -1373,7 +1373,7 @@ impl RawOutputArtifactWriter {
         if let Some(token) = self.retention_token.as_ref() {
             match metadata {
                 Ok((bytes, modified)) => {
-                    publish_streaming_size(token, &path, bytes, modified, true);
+                    publish_streaming_size_async(token, &path, bytes, modified, true).await;
                 }
                 Err(_) => reject_stale_delta(token),
             }
@@ -5106,6 +5106,7 @@ fn publish_known_remove(
     let Some(generation) = token.generation else {
         return;
     };
+    let path = normalized_retention_path(path);
     let mut registry = lock_retention_registry();
     let Some(state) = registry.roots.get_mut(&token.root) else {
         transition_current_root_to_dirty(&mut registry, &token.root);
@@ -5137,7 +5138,7 @@ fn publish_known_remove(
     }
     match &mut state.mode {
         RetentionRootMode::Indexed(index) => {
-            index.remove(path);
+            index.remove(&path);
             if !eviction {
                 index.note_logical_mutation();
             }
@@ -5149,6 +5150,32 @@ fn publish_known_remove(
         RetentionRootMode::Reconciling { invalidated } => {
             *invalidated = true;
         }
+    }
+}
+
+async fn publish_streaming_size_async(
+    token: &RetentionIndexToken,
+    path: &Path,
+    bytes: u64,
+    modified: SystemTime,
+    completed: bool,
+) {
+    if token.generation.is_none() {
+        return;
+    }
+    let owned_token = token.clone();
+    let path = path.to_path_buf();
+    // Keep normalization and publication in one owned operation so cancelling
+    // the async writer cannot discard an admitted size update.
+    if let Err(error) = run_blocking_artifact_io(move || {
+        let path = normalized_retention_path(&path);
+        publish_streaming_size(&owned_token, &path, bytes, modified, completed);
+        Ok(())
+    })
+    .await
+    {
+        reject_stale_delta(token);
+        tracing::warn!(%error, "streaming artifact size publication worker failed");
     }
 }
 
@@ -5997,6 +6024,7 @@ fn enforce_global_retention_scan_locked_blocking(
 
 fn retention_usage_locked_blocking(directory: &Path) -> RetentionUsage {
     let root = tool_output_root_for_directory(directory);
+    let directory = normalized_retention_path(directory);
     let indexed_usage = {
         let registry = lock_retention_registry();
         registry
@@ -6004,7 +6032,7 @@ fn retention_usage_locked_blocking(directory: &Path) -> RetentionUsage {
             .get(&root)
             .and_then(|state| match &state.mode {
                 RetentionRootMode::Indexed(index) => Some(RetentionUsage {
-                    thread_bytes: index.thread_totals(directory).0,
+                    thread_bytes: index.thread_totals(&directory).0,
                     global_bytes: index.total_bytes,
                 }),
                 RetentionRootMode::Dirty | RetentionRootMode::Reconciling { .. } => {
@@ -6020,7 +6048,7 @@ fn retention_usage_locked_blocking(directory: &Path) -> RetentionUsage {
         return usage;
     }
     RetentionUsage {
-        thread_bytes: log_bytes_in_directory_blocking(directory).unwrap_or(u64::MAX),
+        thread_bytes: log_bytes_in_directory_blocking(&directory).unwrap_or(u64::MAX),
         global_bytes: log_bytes_in_tool_output_root_blocking(&root).unwrap_or(u64::MAX),
     }
 }

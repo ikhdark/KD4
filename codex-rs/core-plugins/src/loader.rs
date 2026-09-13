@@ -141,20 +141,33 @@ async fn load_plugins_from_layer_stack_with_scope(
     remote_global_catalog_active: bool,
     scope: PluginLoadScope<'_>,
 ) -> Vec<LoadedPlugin<McpServerConfig>> {
-    let configured_plugins = merge_configured_plugins_with_remote_installed(
-        configured_plugins_from_stack(config_layer_stack, store.codex_home().as_path()),
-        extra_plugins,
-        store,
-        remote_global_catalog_active,
-    );
-    let mut configured_plugins: Vec<_> = configured_plugins.into_iter().collect();
-    configured_plugins.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+    let config_layer_stack = config_layer_stack.clone();
+    let store_for_config = store.clone();
+    let configured_plugins = tokio::task::spawn_blocking(move || {
+        let configured_plugins = merge_configured_plugins_with_remote_installed(
+            configured_plugins_from_stack(
+                &config_layer_stack,
+                store_for_config.codex_home().as_path(),
+            ),
+            extra_plugins,
+            &store_for_config,
+            remote_global_catalog_active,
+        );
+        let mut configured_plugins: Vec<_> = configured_plugins.into_iter().collect();
+        configured_plugins.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
 
-    let configured_plugin_ids = configured_plugins
-        .iter()
-        .filter_map(|(configured_name, _)| PluginId::parse(configured_name).ok())
-        .collect::<Vec<_>>();
-    store.migrate_legacy_plugin_data_roots(&configured_plugin_ids);
+        let configured_plugin_ids = configured_plugins
+            .iter()
+            .filter_map(|(configured_name, _)| PluginId::parse(configured_name).ok())
+            .collect::<Vec<_>>();
+        store_for_config.migrate_legacy_plugin_data_roots(&configured_plugin_ids);
+        configured_plugins
+    })
+    .await
+    .unwrap_or_else(|err| {
+        warn!("failed to resolve configured plugins: {err}");
+        Vec::new()
+    });
 
     let mut plugins = Vec::with_capacity(configured_plugins.len());
     for (configured_name, plugin) in configured_plugins {
@@ -740,12 +753,17 @@ async fn load_plugin(
     scope: &PluginLoadScope<'_>,
 ) -> LoadedPlugin<McpServerConfig> {
     let plugin_id = PluginId::parse(&config_name);
-    let active_plugin_root = plugin_id
+    let active_plugin_root = if let Ok(plugin_id) = &plugin_id {
+        let plugin_id = plugin_id.clone();
+        let store = store.clone();
+        tokio::task::spawn_blocking(move || store.active_plugin_root(&plugin_id)).await
+    } else {
+        Ok(None)
+    };
+    let root = active_plugin_root
         .as_ref()
         .ok()
-        .and_then(|plugin_id| store.active_plugin_root(plugin_id));
-    let root = active_plugin_root
-        .clone()
+        .and_then(Clone::clone)
         .unwrap_or_else(|| match &plugin_id {
             Ok(plugin_id) => store.plugin_base_root(plugin_id),
             Err(_) => store.root().clone(),
@@ -772,6 +790,13 @@ async fn load_plugin(
         return loaded_plugin;
     }
 
+    let active_plugin_root = match active_plugin_root {
+        Ok(root) => root,
+        Err(err) => {
+            loaded_plugin.error = Some(format!("failed to resolve plugin root: {err}"));
+            return loaded_plugin;
+        }
+    };
     let (loaded_plugin_id, plugin_root) = match plugin_id {
         Ok(plugin_id) => {
             let Some(plugin_root) = active_plugin_root else {
@@ -786,14 +811,29 @@ async fn load_plugin(
         }
     };
 
-    if !plugin_root.as_path().is_dir() {
-        loaded_plugin.error = Some("path does not exist or is not a directory".to_string());
-        return loaded_plugin;
-    }
-
-    let Some(manifest) = load_plugin_manifest(plugin_root.as_path()) else {
-        loaded_plugin.error = Some("missing or invalid plugin.json".to_string());
-        return loaded_plugin;
+    let root_for_manifest = plugin_root.clone();
+    let load_skill_roots = matches!(scope, PluginLoadScope::AllCapabilities { .. });
+    let manifest = tokio::task::spawn_blocking(move || {
+        if !root_for_manifest.as_path().is_dir() {
+            return Err("path does not exist or is not a directory".to_string());
+        }
+        let manifest = load_plugin_manifest(root_for_manifest.as_path())
+            .ok_or_else(|| "missing or invalid plugin.json".to_string())?;
+        let skill_roots = if load_skill_roots {
+            plugin_skill_roots(&root_for_manifest, &manifest.paths)
+        } else {
+            Vec::new()
+        };
+        Ok((manifest, skill_roots))
+    })
+    .await
+    .unwrap_or_else(|err| Err(format!("failed to read plugin manifest: {err}")));
+    let (manifest, skill_roots) = match manifest {
+        Ok(manifest) => manifest,
+        Err(err) => {
+            loaded_plugin.error = Some(err);
+            return loaded_plugin;
+        }
     };
 
     let manifest_paths = &manifest.paths;
@@ -806,7 +846,7 @@ async fn load_plugin(
         } => {
             loaded_plugin.manifest_name = Some(manifest.display_name().to_string());
             loaded_plugin.manifest_description = manifest.description.clone();
-            loaded_plugin.skill_roots = plugin_skill_roots(&plugin_root, manifest_paths);
+            loaded_plugin.skill_roots = skill_roots;
             let resolved_skills = load_plugin_skills(
                 &plugin_root,
                 &loaded_plugin_id,
@@ -830,14 +870,26 @@ async fn load_plugin(
         }
         PluginLoadScope::HooksOnly => {}
     }
-    let (hook_sources, hook_load_warnings) = load_plugin_hooks(
-        &plugin_root,
-        &loaded_plugin_id,
-        &store.plugin_data_root(&loaded_plugin_id),
-        manifest_paths,
-    );
-    loaded_plugin.hook_sources = hook_sources;
-    loaded_plugin.hook_load_warnings = hook_load_warnings;
+    let plugin_data_root = store.plugin_data_root(&loaded_plugin_id);
+    let manifest_paths = manifest.paths;
+    match tokio::task::spawn_blocking(move || {
+        load_plugin_hooks(
+            &plugin_root,
+            &loaded_plugin_id,
+            &plugin_data_root,
+            &manifest_paths,
+        )
+    })
+    .await
+    {
+        Ok((hook_sources, hook_load_warnings)) => {
+            loaded_plugin.hook_sources = hook_sources;
+            loaded_plugin.hook_load_warnings = hook_load_warnings;
+        }
+        Err(err) => {
+            loaded_plugin.error = Some(format!("failed to read plugin hooks: {err}"));
+        }
+    }
     loaded_plugin
 }
 
@@ -931,7 +983,23 @@ pub(crate) async fn load_plugin_skill_inventory(
     restriction_product: Option<Product>,
     plugin_skill_snapshots: Option<&PluginSkillSnapshots>,
 ) -> PluginSkillInventory {
-    let roots = plugin_skill_roots(plugin_root, &manifest.paths)
+    let root_for_discovery = plugin_root.clone();
+    let manifest_paths = manifest.paths.clone();
+    let roots = match tokio::task::spawn_blocking(move || {
+        plugin_skill_roots(&root_for_discovery, &manifest_paths)
+    })
+    .await
+    {
+        Ok(roots) => roots,
+        Err(err) => {
+            warn!("failed to discover plugin skill roots: {err}");
+            return PluginSkillInventory {
+                skills: Vec::new(),
+                had_errors: true,
+            };
+        }
+    };
+    let roots = roots
         .into_iter()
         .map(|path| SkillRoot {
             path,

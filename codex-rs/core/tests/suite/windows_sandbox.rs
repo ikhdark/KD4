@@ -82,12 +82,31 @@ fn codex_home_for_windows_sandbox_test(name: &str) -> anyhow::Result<TestCodexHo
 
 #[test]
 fn windows_sandbox_helper_staging_is_parallel_safe() -> anyhow::Result<()> {
+    let staging = TempDir::new()?;
+    let resources_dir = staging.path().join("codex-resources");
+    let expected_helpers = ["codex-windows-sandbox-setup", "codex-command-runner"]
+        .into_iter()
+        .map(|name| {
+            let source = codex_utils_cargo_bin::cargo_bin(name)?;
+            Ok((format!("{name}.exe"), std::fs::read(source)?))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
     let workers = (0..8)
-        .map(|_| std::thread::spawn(super::stage_windows_sandbox_helpers))
+        .map(|_| {
+            let resources_dir = resources_dir.clone();
+            std::thread::spawn(move || super::stage_windows_sandbox_helpers_in(&resources_dir))
+        })
         .collect::<Vec<_>>();
 
     for worker in workers {
         worker.join().expect("helper staging worker panicked")?;
+    }
+    for (name, expected_bytes) in expected_helpers {
+        let staged_bytes = std::fs::read(resources_dir.join(&name))?;
+        assert!(
+            staged_bytes == expected_bytes,
+            "parallel staging must copy the complete {name} helper"
+        );
     }
     Ok(())
 }

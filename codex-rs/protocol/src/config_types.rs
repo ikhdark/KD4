@@ -526,7 +526,7 @@ const DEFAULT_PROVIDER_AUTH_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_PROVIDER_AUTH_REFRESH_INTERVAL_MS: u64 = 300_000;
 
 /// Configuration for obtaining a provider bearer token from a command.
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema)]
+#[derive(Debug, Clone, Serialize, PartialEq, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct ModelProviderAuthInfo {
     /// Command to execute. Bare names are resolved via `PATH`; paths are resolved against `cwd`.
@@ -546,9 +546,55 @@ pub struct ModelProviderAuthInfo {
     pub refresh_interval_ms: u64,
 
     /// Working directory used when running the token command.
-    #[serde(default = "default_provider_auth_cwd")]
-    #[schemars(skip_serializing_if = "is_default_provider_auth_cwd")]
+    // The omitted value depends on the deserialization context, not the schema environment.
+    #[schemars(
+        default = "provider_auth_cwd_schema_default",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub cwd: AbsolutePathBuf,
+}
+
+impl<'de> Deserialize<'de> for ModelProviderAuthInfo {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Fields {
+            command: String,
+            #[serde(default)]
+            args: Vec<String>,
+            #[serde(default = "default_provider_auth_timeout_ms")]
+            timeout_ms: NonZeroU64,
+            #[serde(default = "default_provider_auth_refresh_interval_ms")]
+            refresh_interval_ms: u64,
+            #[serde(default, deserialize_with = "deserialize_explicit_provider_auth_cwd")]
+            cwd: Option<AbsolutePathBuf>,
+        }
+
+        let fields = Fields::deserialize(deserializer)?;
+        let cwd = match fields.cwd {
+            Some(cwd) => cwd,
+            None => default_provider_auth_cwd().map_err(serde::de::Error::custom)?,
+        };
+        Ok(Self {
+            command: fields.command,
+            args: fields.args,
+            timeout_ms: fields.timeout_ms,
+            refresh_interval_ms: fields.refresh_interval_ms,
+            cwd,
+        })
+    }
+}
+
+fn deserialize_explicit_provider_auth_cwd<'de, D>(
+    deserializer: D,
+) -> Result<Option<AbsolutePathBuf>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // Only an absent field uses the default; an explicit null is still invalid.
+    AbsolutePathBuf::deserialize(deserializer).map(Some)
 }
 
 impl ModelProviderAuthInfo {
@@ -579,20 +625,17 @@ fn non_zero_u64(value: u64, field_name: &str) -> NonZeroU64 {
     }
 }
 
-fn default_provider_auth_cwd() -> AbsolutePathBuf {
+fn default_provider_auth_cwd() -> std::io::Result<AbsolutePathBuf> {
     let deserializer = serde::de::value::StrDeserializer::<serde::de::value::Error>::new(".");
     if let Ok(cwd) = AbsolutePathBuf::deserialize(deserializer) {
-        return cwd;
+        return Ok(cwd);
     }
 
-    match AbsolutePathBuf::current_dir() {
-        Ok(cwd) => cwd,
-        Err(err) => panic!("provider auth cwd must resolve: {err}"),
-    }
+    AbsolutePathBuf::current_dir()
 }
 
-fn is_default_provider_auth_cwd(path: &AbsolutePathBuf) -> bool {
-    path == &default_provider_auth_cwd()
+fn provider_auth_cwd_schema_default() -> Option<AbsolutePathBuf> {
+    None
 }
 
 /// Represents the trust level for a project directory.
@@ -771,6 +814,113 @@ pub struct CollaborationModeMask {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn provider_auth_defaults_use_scoped_directory() {
+        let directory = tempfile::tempdir().expect("create directory");
+        let _guard = codex_utils_absolute_path::AbsolutePathBufGuard::new(directory.path());
+        let auth: ModelProviderAuthInfo =
+            serde_json::from_value(serde_json::json!({ "command": "token-helper" }))
+                .expect("deserialize provider auth");
+
+        assert_eq!(
+            auth,
+            ModelProviderAuthInfo {
+                command: "token-helper".to_owned(),
+                args: Vec::new(),
+                timeout_ms: NonZeroU64::new(5_000).expect("nonzero timeout"),
+                refresh_interval_ms: 300_000,
+                cwd: AbsolutePathBuf::try_from(directory.path()).expect("absolute directory"),
+            }
+        );
+    }
+
+    #[test]
+    fn provider_auth_defaults_use_current_directory_without_scope() {
+        let auth: ModelProviderAuthInfo =
+            serde_json::from_value(serde_json::json!({ "command": "token-helper" }))
+                .expect("deserialize provider auth");
+        assert_eq!(
+            auth.cwd,
+            AbsolutePathBuf::current_dir().expect("current directory")
+        );
+    }
+
+    #[test]
+    fn provider_auth_explicit_values_preserve_validation() {
+        let directory = tempfile::tempdir().expect("create directory");
+        let value = serde_json::json!({
+            "command": "token-helper",
+            "args": ["--token"],
+            "timeout_ms": 7,
+            "refresh_interval_ms": 0,
+            "cwd": directory.path(),
+        });
+        let auth: ModelProviderAuthInfo =
+            serde_json::from_value(value.clone()).expect("deserialize explicit values");
+        assert_eq!(serde_json::to_value(auth).expect("serialize auth"), value);
+
+        for invalid in [
+            serde_json::json!({ "command": "token-helper", "cwd": null }),
+            serde_json::json!({ "command": "token-helper", "cwd": "relative" }),
+            serde_json::json!({ "command": "token-helper", "timeout_ms": 0 }),
+        ] {
+            assert!(
+                serde_json::from_value::<ModelProviderAuthInfo>(invalid.clone()).is_err(),
+                "invalid provider auth was accepted: {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_auth_schema_preserves_optional_cwd_without_environment_default() {
+        let schema = serde_json::to_value(schemars::schema_for!(ModelProviderAuthInfo))
+            .expect("serialize schema");
+        assert_eq!(schema["required"], serde_json::json!(["command"]));
+        let cwd = &schema["properties"]["cwd"];
+        assert!(cwd.is_object(), "cwd must remain in the schema");
+        assert!(cwd.get("default").is_none());
+        assert_eq!(
+            cwd["allOf"],
+            serde_json::json!([{ "$ref": "#/definitions/AbsolutePathBuf" }])
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_auth_missing_current_directory_returns_deserialization_error() {
+        const CHILD_MARKER: &str = "CODEX_TEST_PROVIDER_AUTH_MISSING_CWD";
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            // Isolate the unavailable process cwd from other tests in this process.
+            std::fs::remove_dir(std::env::current_dir().expect("initial child directory"))
+                .expect("remove child directory");
+            let result = serde_json::from_value::<ModelProviderAuthInfo>(
+                serde_json::json!({ "command": "token-helper" }),
+            );
+            assert!(result.is_err(), "unavailable cwd must be a serde error");
+            return;
+        }
+
+        let directory = tempfile::tempdir().expect("create parent directory");
+        let child_directory = directory.path().join("cwd");
+        std::fs::create_dir(&child_directory).expect("create child directory");
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "config_types::tests::provider_auth_missing_current_directory_returns_deserialization_error",
+                "--nocapture",
+            ])
+            .env(CHILD_MARKER, "1")
+            .current_dir(child_directory)
+            .output()
+            .expect("run child test");
+        assert!(
+            output.status.success(),
+            "child test failed: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     #[test]
     fn apply_mask_can_clear_optional_fields() {

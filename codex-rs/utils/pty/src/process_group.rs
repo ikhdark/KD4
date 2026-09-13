@@ -65,7 +65,7 @@ pub fn set_process_group() -> io::Result<()> {
 
 #[cfg(unix)]
 pub fn kill_process_group_by_pid(pid: u32) -> io::Result<()> {
-    let pid = pid as libc::pid_t;
+    let pid = checked_process_id(pid)?;
     // SAFETY: getpgid takes only a scalar PID and reports invalid or missing processes through
     // its return value.
     let pgid = unsafe { libc::getpgid(pid) };
@@ -90,6 +90,19 @@ fn ignore_missing_process(error: io::Error) -> io::Result<()> {
 }
 
 #[cfg(unix)]
+fn checked_process_id(id: u32) -> io::Result<libc::pid_t> {
+    libc::pid_t::try_from(id)
+        .ok()
+        .filter(|id| *id > 0)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "process ID must be positive and fit pid_t",
+            )
+        })
+}
+
+#[cfg(unix)]
 fn signal_process_group_id(pgid: libc::pid_t, signal: libc::c_int) -> io::Result<bool> {
     // SAFETY: killpg takes scalar group and signal identifiers; OS validation errors are
     // returned to the caller.
@@ -105,7 +118,7 @@ fn signal_process_group_id(pgid: libc::pid_t, signal: libc::c_int) -> io::Result
 
 #[cfg(unix)]
 pub fn terminate_process_group(process_group_id: u32) -> io::Result<bool> {
-    signal_process_group_id(process_group_id as libc::pid_t, libc::SIGTERM)
+    signal_process_group_id(checked_process_id(process_group_id)?, libc::SIGTERM)
 }
 
 #[cfg(not(unix))]
@@ -115,7 +128,7 @@ pub fn terminate_process_group(_process_group_id: u32) -> io::Result<bool> {
 
 #[cfg(unix)]
 pub fn interrupt_process_group(process_group_id: u32) -> io::Result<()> {
-    signal_process_group_id(process_group_id as libc::pid_t, libc::SIGINT).map(|_| ())
+    signal_process_group_id(checked_process_id(process_group_id)?, libc::SIGINT).map(|_| ())
 }
 
 #[cfg(not(unix))]
@@ -125,7 +138,7 @@ pub fn interrupt_process_group(_process_group_id: u32) -> io::Result<()> {
 
 #[cfg(unix)]
 pub fn kill_process_group(process_group_id: u32) -> io::Result<()> {
-    signal_process_group_id(process_group_id as libc::pid_t, libc::SIGKILL).map(|_| ())
+    signal_process_group_id(checked_process_id(process_group_id)?, libc::SIGKILL).map(|_| ())
 }
 
 #[cfg(not(unix))]
@@ -144,4 +157,27 @@ pub fn kill_child_process_group(child: &mut Child) -> io::Result<()> {
 #[cfg(not(unix))]
 pub fn kill_child_process_group(_child: &mut Child) -> io::Result<()> {
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::checked_process_id;
+    use std::io;
+
+    #[test]
+    fn process_id_conversion_rejects_group_selectors_and_overflow() {
+        for id in [0, (libc::pid_t::MAX as u32) + 1, u32::MAX] {
+            assert_eq!(
+                checked_process_id(id)
+                    .expect_err("invalid process ID accepted")
+                    .kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+        assert_eq!(checked_process_id(1).unwrap(), 1);
+        assert_eq!(
+            checked_process_id(libc::pid_t::MAX as u32).unwrap(),
+            libc::pid_t::MAX
+        );
+    }
 }

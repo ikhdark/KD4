@@ -330,19 +330,20 @@ async fn wait_for_hook_log(
 
 async fn wait_for_spawned_thread_id(test: &TestCodex) -> Result<String> {
     let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        let ids = test.thread_manager.list_thread_ids().await;
-        if let Some(spawned_id) = ids
-            .iter()
-            .find(|id| **id != test.session_configured.thread_id)
-        {
-            return Ok(spawned_id.to_string());
+    tokio::time::timeout_at(deadline, async {
+        loop {
+            let ids = test.thread_manager.list_thread_ids().await;
+            if let Some(spawned_id) = ids
+                .iter()
+                .find(|id| **id != test.session_configured.thread_id)
+            {
+                return spawned_id.to_string();
+            }
+            sleep(Duration::from_millis(10)).await;
         }
-        if Instant::now() >= deadline {
-            anyhow::bail!("timed out waiting for spawned thread id");
-        }
-        sleep(Duration::from_millis(10)).await;
-    }
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("timed out waiting for spawned thread id"))
 }
 
 async fn wait_for_requests(
@@ -459,32 +460,45 @@ async fn setup_turn_one_with_custom_spawned_child(
     }));
     let test = builder.build(server).await?;
     test.submit_turn(TURN_1_PROMPT).await?;
+    let spawned_id = wait_for_spawned_thread_id(&test).await?;
     if child_response_delay.is_none() && wait_for_parent_notification {
         let _ = wait_for_requests(&child_request_log).await?;
+        let child = test
+            .thread_manager
+            .get_thread(ThreadId::from_string(&spawned_id)?)
+            .await?;
         let rollout_path = test
             .codex
             .rollout_path()
             .ok_or_else(|| anyhow::anyhow!("expected parent rollout path"))?;
         let deadline = Instant::now() + Duration::from_secs(6);
-        loop {
-            // Completion injects an ordered append without a new parent turn.
-            // The disk reader must request the normal durability barrier.
-            test.codex.flush_rollout().await?;
-            let has_notification = tokio::fs::read_to_string(&rollout_path)
-                .await
-                .is_ok_and(|rollout| rollout.contains("<subagent_notification>"));
-            if has_notification {
-                break;
+        let mut last_child_status = None;
+        let mut last_parent_rollout = String::new();
+        let mut last_child_rollout = String::new();
+        tokio::time::timeout_at(deadline, async {
+            loop {
+                // Completion injects an ordered append without a new parent turn.
+                // The disk reader must request the normal durability barrier.
+                test.codex.flush_rollout().await?;
+                last_parent_rollout = tokio::fs::read_to_string(&rollout_path).await?;
+                if last_parent_rollout.contains("<subagent_notification>") {
+                    return Ok::<_, anyhow::Error>(());
+                }
+                last_child_status = Some(child.agent_status().await);
+                if let Some(child_rollout_path) = child.rollout_path() {
+                    child.flush_rollout().await?;
+                    last_child_rollout = tokio::fs::read_to_string(child_rollout_path).await?;
+                }
+                sleep(Duration::from_millis(10)).await;
             }
-            if Instant::now() >= deadline {
-                anyhow::bail!(
-                    "timed out waiting for parent rollout to include subagent notification"
-                );
-            }
-            sleep(Duration::from_millis(10)).await;
-        }
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!(
+            "timed out waiting for parent rollout to include subagent notification; child status: {last_child_status:?}; parent rollout tail: {:?}; child rollout tail: {:?}",
+            last_parent_rollout.lines().rev().take(4).collect::<Vec<_>>(),
+            last_child_rollout.lines().rev().take(4).collect::<Vec<_>>()
+        ))??;
     }
-    let spawned_id = wait_for_spawned_thread_id(&test).await?;
 
     Ok((test, spawned_id, child_request_log))
 }

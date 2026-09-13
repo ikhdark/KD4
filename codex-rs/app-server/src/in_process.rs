@@ -953,22 +953,28 @@ mod tests {
     async fn in_process_start_clamps_zero_channel_capacity() {
         let client =
             start_test_client_with_capacity(SessionSource::Cli, /*channel_capacity*/ 0).await;
-        let response = loop {
-            match client
-                .sender()
-                .request(ClientRequest::ConfigRequirementsRead {
-                    request_id: RequestId::Integer(4),
-                    params: None,
-                })
-                .await
-            {
-                Ok(response) => break response.expect("request should succeed"),
-                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                    tokio::task::yield_now().await;
+        assert_eq!(client.client.client_tx.max_capacity(), 1);
+        assert_eq!(client.event_rx.max_capacity(), 1);
+        let response = timeout(Duration::from_secs(2), async {
+            loop {
+                match client
+                    .sender()
+                    .request(ClientRequest::ConfigRequirementsRead {
+                        request_id: RequestId::Integer(4),
+                        params: None,
+                    })
+                    .await
+                {
+                    Ok(response) => break response.expect("request should succeed"),
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        tokio::task::yield_now().await;
+                    }
+                    Err(err) => panic!("request transport should work: {err}"),
                 }
-                Err(err) => panic!("request transport should work: {err}"),
             }
-        };
+        })
+        .await
+        .expect("clamped channel should accept the request before the deadline");
         let _parsed: ConfigRequirementsReadResponse =
             serde_json::from_value(response).expect("response should match v2 schema");
         client

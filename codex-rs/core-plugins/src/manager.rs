@@ -1012,7 +1012,7 @@ impl PluginsManager {
         )
     }
 
-    pub fn cached_global_remote_discoverable_plugins_for_config(
+    pub async fn cached_global_remote_discoverable_plugins_for_config(
         &self,
         config: &PluginsConfigInput,
         auth: Option<&CodexAuth>,
@@ -1035,6 +1035,7 @@ impl PluginsManager {
             &remote_plugin_service_config(config),
             auth,
         )
+        .await
     }
 
     pub async fn build_and_cache_remote_installed_plugin_marketplaces(
@@ -2086,8 +2087,21 @@ impl PluginsManager {
         )
         .await;
         let plugin_data_root = self.store.plugin_data_root(&plugin_id);
-        let (hook_sources, _hook_load_warnings) =
-            load_plugin_hooks(&source_path, &plugin_id, &plugin_data_root, &manifest.paths);
+        let source_path_for_hooks = source_path.clone();
+        let plugin_id_for_hooks = plugin_id.clone();
+        let manifest_paths_for_hooks = manifest.paths.clone();
+        let (hook_sources, _hook_load_warnings) = tokio::task::spawn_blocking(move || {
+            load_plugin_hooks(
+                &source_path_for_hooks,
+                &plugin_id_for_hooks,
+                &plugin_data_root,
+                &manifest_paths_for_hooks,
+            )
+        })
+        .await
+        .map_err(|err| {
+            MarketplaceError::InvalidPlugin(format!("failed to read plugin hooks: {err}"))
+        })?;
         let hooks = plugin_hook_declarations(&hook_sources)
             .into_iter()
             .map(|hook| PluginHookSummary {

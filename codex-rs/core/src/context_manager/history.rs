@@ -894,13 +894,6 @@ impl ContextManager {
     }
 
     #[cfg(test)]
-    pub(crate) fn register_tool_history_candidate(&mut self, candidate: ToolHistoryCandidate) {
-        // Candidates are projected after canonical prompt preparation, so they do not invalidate
-        // the normalized history cache.
-        Arc::make_mut(&mut self.tool_history).register(candidate);
-    }
-
-    #[cfg(test)]
     pub(crate) fn register_non_workspace_code_mode_call(&mut self, call_id: String) {
         Arc::make_mut(&mut self.tool_history).register_non_workspace_code_mode_call(call_id);
     }
@@ -913,16 +906,6 @@ impl ContextManager {
         // canonical preparation. Re-run that projection against current state
         // while preserving the normalized history and its token estimates.
         mutation.apply(Arc::make_mut(&mut self.tool_history))
-    }
-
-    #[cfg(test)]
-    pub(crate) fn mark_tool_history_consumed(
-        &mut self,
-        input: &[ResponseItem],
-        generation: ModelGenerationId,
-    ) -> bool {
-        // Consumption changes receipt eligibility, which is also applied after the cache lookup.
-        Arc::make_mut(&mut self.tool_history).mark_consumed(input, generation)
     }
 
     pub(crate) fn mark_tool_history_consumed_with_delta(

@@ -135,6 +135,11 @@ impl InferenceTraceContext {
 }
 
 impl InferenceTraceAttempt {
+    /// Whether recording this attempt can write trace data.
+    pub fn is_enabled(&self) -> bool {
+        matches!(&self.state, InferenceTraceAttemptState::Enabled(_))
+    }
+
     /// Builds an attempt that records nothing.
     pub fn disabled() -> Self {
         Self {

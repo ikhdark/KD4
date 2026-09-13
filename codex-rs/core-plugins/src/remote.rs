@@ -1069,12 +1069,13 @@ pub async fn has_cached_global_remote_plugin_catalog(
         .is_some()
 }
 
-pub fn cached_global_remote_discoverable_plugins(
+pub async fn cached_global_remote_discoverable_plugins(
     codex_home: &Path,
     config: &RemotePluginServiceConfig,
     auth: &CodexAuth,
 ) -> Vec<RemoteDiscoverablePlugin> {
-    catalog_cache::load_cached_global_directory_plugins(codex_home, config, auth)
+    catalog_cache::load_cached_global_directory_plugins_async(codex_home, config, auth)
+        .await
         .unwrap_or_default()
         .into_iter()
         .filter_map(|plugin| match remote_discoverable_plugin_from_directory_item(&plugin) {

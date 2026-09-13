@@ -2292,6 +2292,12 @@ where
 }
 
 fn started_inference_attempt(temp: &TempDir) -> anyhow::Result<InferenceTraceAttempt> {
+    Ok(started_inference_attempt_with_writer(temp)?.0)
+}
+
+fn started_inference_attempt_with_writer(
+    temp: &TempDir,
+) -> anyhow::Result<(InferenceTraceAttempt, Arc<TraceWriter>)> {
     let writer = Arc::new(TraceWriter::create(
         temp.path(),
         "trace-1".to_string(),
@@ -2309,7 +2315,7 @@ fn started_inference_attempt(temp: &TempDir) -> anyhow::Result<InferenceTraceAtt
     })?;
 
     let inference_trace = InferenceTraceContext::enabled(
-        writer,
+        Arc::clone(&writer),
         "thread-root".to_string(),
         "turn-1".to_string(),
         "gpt-test".to_string(),
@@ -2324,7 +2330,7 @@ fn started_inference_attempt(temp: &TempDir) -> anyhow::Result<InferenceTraceAtt
             "content": [{"type": "input_text", "text": "hello"}]
         }],
     }));
-    Ok(attempt)
+    Ok((attempt, writer))
 }
 
 fn output_message(id: &str, text: &str) -> ResponseItem {
@@ -2592,6 +2598,108 @@ async fn response_completed_waits_for_pending_request_measurements() {
             .expect("completed mapper must release an open upstream")
             .is_none()
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn completed_response_trace_write_keeps_runtime_responsive() -> anyhow::Result<()> {
+    struct BlockingPayload {
+        locked: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    }
+
+    impl serde::Serialize for BlockingPayload {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            self.locked.send(()).map_err(serde::ser::Error::custom)?;
+            self.release
+                .recv_timeout(Duration::from_secs(10))
+                .map_err(serde::ser::Error::custom)?;
+            serializer.serialize_str("writer contention")
+        }
+    }
+
+    let temp = TempDir::new()?;
+    let (attempt, writer) = started_inference_attempt_with_writer(&temp)?;
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    // Hold the real writer lock from another thread. Its serializer runs under
+    // that lock, so terminal trace persistence cannot finish until release.
+    let writer_thread = std::thread::spawn(move || {
+        writer.write_json_payload(
+            codex_rollout_trace::RawPayloadKind::ProtocolEvent,
+            &BlockingPayload {
+                locked: locked_tx,
+                release: release_rx,
+            },
+        )
+    });
+    locked_rx.recv_timeout(Duration::from_secs(10))?;
+
+    let (runtime_progress_tx, runtime_progress_rx) = std::sync::mpsc::channel();
+    let release_thread = std::thread::spawn(move || {
+        // This timeout also releases a broken synchronous mapper, so the
+        // regression fails an assertion instead of deadlocking the test.
+        let progressed = runtime_progress_rx
+            .recv_timeout(Duration::from_secs(5))
+            .is_ok();
+        let _ = release_tx.send(());
+        progressed
+    });
+    let (terminal_seen_tx, terminal_seen_rx) = tokio::sync::oneshot::channel();
+    let mut terminal_seen_tx = Some(terminal_seen_tx);
+    let api_stream = futures::stream::iter([
+        Ok(ResponseEvent::OutputItemDone(output_message("1", "answer"))),
+        Ok(ResponseEvent::Completed {
+            response_id: "response-traced".to_string(),
+            token_usage: None,
+            end_turn: Some(true),
+        }),
+    ])
+    .inspect(move |event| {
+        if matches!(event, Ok(ResponseEvent::Completed { .. })) {
+            let _ = terminal_seen_tx
+                .take()
+                .expect("one terminal event")
+                .send(());
+        }
+    });
+    let (mut stream, _) = super::map_response_events(
+        Some("request-traced".to_string()),
+        api_stream,
+        test_session_telemetry(),
+        attempt,
+        test_model_provider(),
+        None,
+    );
+    terminal_seen_rx.await?;
+    let _ = runtime_progress_tx.send(());
+    assert!(matches!(
+        stream.next().await.transpose()?,
+        Some(ResponseEvent::OutputItemDone(_))
+    ));
+    assert!(matches!(
+        stream.next().await.transpose()?,
+        Some(ResponseEvent::Completed { response_id, .. }) if response_id == "response-traced"
+    ));
+    assert!(stream.next().await.is_none());
+    assert!(
+        release_thread.join().expect("release thread"),
+        "trace writes must let the current-thread runtime progress while the writer is busy"
+    );
+    writer_thread.join().expect("writer thread")?;
+
+    // Completion is exposed only after the payload and terminal event are on
+    // disk. Immediate replay must contain the response, without polling.
+    let rollout = replay_bundle(temp.path())?;
+    let inference = rollout
+        .inference_calls
+        .values()
+        .next()
+        .expect("traced inference");
+    assert_eq!(inference.execution.status, ExecutionStatus::Completed);
+    assert_eq!(inference.response_id.as_deref(), Some("response-traced"));
+    assert_eq!(inference.response_item_ids.len(), 1);
+    assert_eq!(rollout.raw_payloads.len(), 2);
+    Ok(())
 }
 
 #[tokio::test]

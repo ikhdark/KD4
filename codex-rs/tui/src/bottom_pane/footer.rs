@@ -568,6 +568,10 @@ pub(crate) fn side_conversation_context_line(label: &str) -> Line<'static> {
     }
 }
 
+pub(crate) fn footer_display_width(width: usize) -> u16 {
+    u16::try_from(width).unwrap_or(u16::MAX)
+}
+
 fn right_aligned_x(area: Rect, content_width: u16) -> Option<u16> {
     if area.is_empty() {
         return None;
@@ -612,8 +616,9 @@ pub(crate) fn can_show_left_with_context(area: Rect, left_width: u16, context_wi
     if left_width == 0 {
         return true;
     }
-    let left_extent = FOOTER_INDENT_COLS as u16 + left_width + FOOTER_CONTEXT_GAP_COLS;
-    left_extent <= context_x.saturating_sub(area.x)
+    let left_extent =
+        FOOTER_INDENT_COLS + usize::from(left_width) + usize::from(FOOTER_CONTEXT_GAP_COLS);
+    left_extent <= usize::from(context_x.saturating_sub(area.x))
 }
 
 pub(crate) fn render_context_right(area: Rect, buf: &mut Buffer, line: &Line<'static>) {
@@ -621,7 +626,7 @@ pub(crate) fn render_context_right(area: Rect, buf: &mut Buffer, line: &Line<'st
         return;
     }
 
-    let context_width = line.width() as u16;
+    let context_width = footer_display_width(line.width());
     let Some(mut x) = right_aligned_x(area, context_width) else {
         return;
     };
@@ -632,7 +637,7 @@ pub(crate) fn render_context_right(area: Rect, buf: &mut Buffer, line: &Line<'st
         if x >= max_x {
             break;
         }
-        let span_width = span.width() as u16;
+        let span_width = footer_display_width(span.width());
         if span_width == 0 {
             continue;
         }
@@ -793,7 +798,7 @@ pub(crate) fn footer_line_width(
         show_queue_hint,
     )
     .last()
-    .map(|line| line.width() as u16)
+    .map(|line| footer_display_width(line.width()))
     .unwrap_or(0)
 }
 
@@ -801,7 +806,7 @@ pub(crate) fn footer_hint_items_width(items: &[(String, String)]) -> u16 {
     if items.is_empty() {
         return 0;
     }
-    footer_hint_items_line(items).width() as u16
+    footer_display_width(footer_hint_items_line(items).width())
 }
 
 fn footer_hint_items_line(items: &[(String, String)]) -> Line<'static> {
@@ -1224,6 +1229,18 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::Backend;
     use ratatui::backend::TestBackend;
+
+    #[test]
+    fn oversized_context_span_keeps_visible_prefix() {
+        let area = Rect::new(0, 0, 40, 1);
+        let mut buf = Buffer::empty(area);
+        let line = Line::from(vec![Span::from("C".repeat(65_536)), Span::from("X")]);
+
+        render_context_right(area, &mut buf, &line);
+
+        let rendered: String = (0..area.width).map(|x| buf[(x, 0)].symbol()).collect();
+        assert_eq!(rendered, format!("  {}", "C".repeat(38)));
+    }
 
     #[test]
     fn collaboration_mode_indicator_renders_plan_and_cycle_hint() {

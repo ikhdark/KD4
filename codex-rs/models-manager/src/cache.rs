@@ -126,7 +126,7 @@ impl ModelsCacheManager {
                 expected_version,
             "models cache: attempting load_fresh"
         );
-        let Some(cache) = self.load().await? else {
+        let Some(cache) = self.load(Some(expected_version)).await? else {
             return Ok(None);
         };
         info!(
@@ -345,7 +345,7 @@ impl ModelsCacheManager {
             ));
         }
         let mut cache = self
-            .load()
+            .load(None)
             .await?
             .ok_or_else(|| io::Error::new(ErrorKind::NotFound, "cache not found"))?;
         let current_basis = self.read_write_basis().await?;
@@ -375,9 +375,23 @@ impl ModelsCacheManager {
         self.save_internal(&cache).await
     }
 
-    async fn load(&self) -> io::Result<Option<ModelsCache>> {
+    async fn load(&self, expected_version: Option<&str>) -> io::Result<Option<ModelsCache>> {
         match fs::read(&self.cache_path).await {
             Ok(contents) => {
+                if let Some(expected_version) = expected_version {
+                    #[derive(Deserialize)]
+                    struct CacheVersion {
+                        client_version: Option<String>,
+                    }
+
+                    // Older caches can contain model shapes that no longer decode.
+                    // Reject their version before decoding those obsolete entries.
+                    let version: CacheVersion = serde_json::from_slice(&contents)
+                        .map_err(|err| io::Error::new(ErrorKind::InvalidData, err.to_string()))?;
+                    if version.client_version.as_deref() != Some(expected_version) {
+                        return Ok(None);
+                    }
+                }
                 let cache = serde_json::from_slice(&contents)
                     .map_err(|err| io::Error::new(ErrorKind::InvalidData, err.to_string()))?;
                 Ok(Some(cache))
@@ -445,7 +459,7 @@ impl ModelsCacheManager {
     {
         let _permit = self.acquire_io_permit().await?;
         let _file_lock = self.acquire_file_lock().await?;
-        let mut cache = match self.load().await? {
+        let mut cache = match self.load(None).await? {
             Some(cache) => cache,
             None => return Err(io::Error::new(ErrorKind::NotFound, "cache not found")),
         };
@@ -463,7 +477,7 @@ impl ModelsCacheManager {
     {
         let _permit = self.acquire_io_permit().await?;
         let _file_lock = self.acquire_file_lock().await?;
-        let mut cache = match self.load().await? {
+        let mut cache = match self.load(None).await? {
             Some(cache) => cache,
             None => return Err(io::Error::new(ErrorKind::NotFound, "cache not found")),
         };
@@ -627,6 +641,27 @@ mod tests {
             .load_fresh("client-one")
             .await
             .expect_err("corrupt cache must be distinguishable from a miss");
+        assert_eq!(error.kind(), ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn current_version_cache_with_invalid_models_is_not_reported_as_a_miss() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("models_cache.json");
+        let contents = serde_json::json!({
+            "client_version": "client-one",
+            "provider_cache_identity": "provider",
+            "fetched_at": Utc::now(),
+            "models": [{"slug": "incomplete-model"}],
+        });
+        std::fs::write(&path, contents.to_string()).expect("write invalid current cache");
+        let manager =
+            ModelsCacheManager::new(path, Duration::from_secs(300), fixed_identity("provider"));
+
+        let error = manager
+            .load_fresh("client-one")
+            .await
+            .expect_err("current-version model corruption must remain an error");
         assert_eq!(error.kind(), ErrorKind::InvalidData);
     }
 

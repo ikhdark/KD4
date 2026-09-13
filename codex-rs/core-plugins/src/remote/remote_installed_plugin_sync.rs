@@ -211,8 +211,20 @@ pub async fn sync_remote_installed_plugin_bundles_once(
                 .as_deref()
                 .map(str::trim)
                 .filter(|version| !version.is_empty());
-            if store.active_plugin_version(&plugin_id).as_deref() == release_version {
-                if let Err(err) = store.write_remote_plugin_id(&plugin_id, &plugin.id) {
+            let cached_identity = {
+                let store = store.clone();
+                let plugin_id = plugin_id.clone();
+                let remote_plugin_id = plugin.id.clone();
+                let release_version = release_version.map(str::to_string);
+                tokio::task::spawn_blocking(move || {
+                    (store.active_plugin_version(&plugin_id).as_deref()
+                        == release_version.as_deref())
+                    .then(|| store.write_remote_plugin_id(&plugin_id, &remote_plugin_id))
+                })
+                .await?
+            };
+            if let Some(identity_result) = cached_identity {
+                if let Err(err) = identity_result {
                     warn!(
                         remote_plugin_id = %plugin.id,
                         plugin = %plugin.name,
@@ -483,6 +495,15 @@ mod tests {
 
     #[tokio::test]
     async fn sync_backfills_remote_plugin_install_metadata_for_current_bundle() {
+        check_current_bundle_identity_sync(false).await;
+    }
+
+    #[tokio::test]
+    async fn sync_reports_identity_write_failure_for_current_bundle() {
+        check_current_bundle_identity_sync(true).await;
+    }
+
+    async fn check_current_bundle_identity_sync(block_metadata_write: bool) {
         let server = MockServer::start().await;
         let codex_home = tempfile::tempdir().expect("create codex home");
         let cached_manifest = codex_home
@@ -551,15 +572,6 @@ mod tests {
         );
         let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
 
-        let outcome = sync_remote_installed_plugin_bundles_once(
-            codex_home.path().to_path_buf(),
-            &config,
-            Some(&auth),
-        )
-        .await
-        .expect("sync current remote plugin bundle");
-
-        assert_eq!(outcome, RemoteInstalledPluginBundleSyncOutcome::default());
         let plugin_id = PluginId::new(
             "linear".to_string(),
             REMOTE_GLOBAL_MARKETPLACE_NAME.to_string(),
@@ -568,6 +580,35 @@ mod tests {
         let metadata_path = PluginStore::new(codex_home.path().to_path_buf())
             .plugin_base_root(&plugin_id)
             .join(".codex-remote-plugin-install.json");
+        if block_metadata_write {
+            std::fs::create_dir(metadata_path.as_path())
+                .expect("block metadata file with directory");
+        }
+
+        let outcome = sync_remote_installed_plugin_bundles_once(
+            codex_home.path().to_path_buf(),
+            &config,
+            Some(&auth),
+        )
+        .await
+        .expect("sync current remote plugin bundle");
+
+        assert_eq!(
+            std::fs::read_to_string(&cached_manifest).expect("cached bundle remains installed"),
+            r#"{"name":"linear","version":"1.2.3"}"#,
+        );
+        if block_metadata_write {
+            assert_eq!(
+                outcome,
+                RemoteInstalledPluginBundleSyncOutcome {
+                    failed_remote_plugin_ids: vec![remote_plugin_id.to_string()],
+                    ..Default::default()
+                }
+            );
+            assert!(metadata_path.as_path().is_dir());
+            return;
+        }
+        assert_eq!(outcome, RemoteInstalledPluginBundleSyncOutcome::default());
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(
                 &std::fs::read_to_string(metadata_path.as_path())

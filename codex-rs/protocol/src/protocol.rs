@@ -4853,6 +4853,18 @@ fn migrate_rollout_v0(fields: &mut serde_json::Map<String, Value>) -> Result<(),
         Some("turn_context") => {
             payload.remove("summary");
         }
+        Some("event_msg")
+            if payload.get("type").and_then(Value::as_str) == Some("collab_agent_spawn_end") =>
+        {
+            // Extended rollouts predate spawn model metadata. Use the same
+            // unavailable-metadata defaults as the legacy item projection.
+            payload
+                .entry("model".to_string())
+                .or_insert_with(|| Value::String(String::new()));
+            payload
+                .entry("reasoning_effort".to_string())
+                .or_insert_with(|| Value::String(ReasoningEffortConfig::default().to_string()));
+        }
         _ => {}
     }
     Ok(())
@@ -7608,6 +7620,99 @@ mod tests {
         assert_eq!(meta.meta.session_id.to_string(), thread_id);
         assert_eq!(meta.meta.agent_role.as_deref(), Some("worker"));
         Ok(())
+    }
+
+    #[test]
+    fn rollout_line_migrates_legacy_spawn_metadata() -> Result<()> {
+        let sender_id = "00000000-0000-0000-0000-000000000001";
+        let child_id = "00000000-0000-0000-0000-000000000002";
+        for format_version in [None, Some(0)] {
+            let mut value = json!({
+                "timestamp": "2026-03-01T00:00:00Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "collab_agent_spawn_end",
+                    "call_id": "legacy-spawn",
+                    "sender_thread_id": sender_id,
+                    "new_thread_id": child_id,
+                    "prompt": "inspect the change",
+                    "status": "pending_init"
+                }
+            });
+            if let Some(version) = format_version {
+                value["format_version"] = json!(version);
+            }
+            let line: RolloutLine = serde_json::from_value(value)?;
+            let RolloutItem::EventMsg(EventMsg::CollabAgentSpawnEnd(event)) = line.item else {
+                panic!("expected spawn end event");
+            };
+            assert_eq!(event.call_id, "legacy-spawn");
+            assert_eq!(event.sender_thread_id.to_string(), sender_id);
+            assert_eq!(
+                event.new_thread_id.map(|id| id.to_string()).as_deref(),
+                Some(child_id)
+            );
+            assert_eq!(event.prompt, "inspect the change");
+            assert_eq!(event.status, AgentStatus::PendingInit);
+            assert_eq!(event.model, "");
+            assert_eq!(event.reasoning_effort, ReasoningEffortConfig::Medium);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn rollout_line_preserves_recorded_spawn_metadata() -> Result<()> {
+        let line: RolloutLine = serde_json::from_value(json!({
+            "timestamp": "2026-03-12T00:00:00Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "collab_agent_spawn_end",
+                "call_id": "recorded-spawn",
+                "sender_thread_id": "00000000-0000-0000-0000-000000000001",
+                "prompt": "inspect the change",
+                "status": "not_found",
+                "model": "recorded-model",
+                "reasoning_effort": "high"
+            }
+        }))?;
+        let RolloutItem::EventMsg(EventMsg::CollabAgentSpawnEnd(event)) = line.item else {
+            panic!("expected spawn end event");
+        };
+        assert_eq!(event.model, "recorded-model");
+        assert_eq!(event.reasoning_effort, ReasoningEffortConfig::High);
+        Ok(())
+    }
+
+    #[test]
+    fn rollout_line_requires_current_spawn_metadata() {
+        for missing_field in ["model", "reasoning_effort"] {
+            let mut value = json!({
+                "timestamp": "2026-08-24T00:00:00Z",
+                "format_version": CURRENT_ROLLOUT_FORMAT_VERSION,
+                "type": "event_msg",
+                "payload": {
+                    "type": "collab_agent_spawn_end",
+                    "call_id": "current-spawn",
+                    "sender_thread_id": "00000000-0000-0000-0000-000000000001",
+                    "prompt": "inspect the change",
+                    "status": "not_found",
+                    "model": "recorded-model",
+                    "reasoning_effort": "high"
+                }
+            });
+            value["payload"]
+                .as_object_mut()
+                .unwrap()
+                .remove(missing_field);
+            let error = serde_json::from_value::<RolloutLine>(value)
+                .err()
+                .expect("current rollouts must include spawn metadata");
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("missing field `{missing_field}`"))
+            );
+        }
     }
 
     #[test]

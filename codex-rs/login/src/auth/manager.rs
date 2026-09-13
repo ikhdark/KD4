@@ -167,6 +167,7 @@ pub struct ApiKeyAuth {
 pub struct ChatgptAuth {
     state: ChatgptAuthState,
     storage: Arc<dyn AuthStorageBackend>,
+    persistence: Arc<Mutex<()>>,
 }
 
 #[derive(Debug, Clone)]
@@ -333,7 +334,11 @@ impl CodexAuth {
                     storage_mode,
                     keyring_backend_kind,
                 );
-                Ok(Self::Chatgpt(ChatgptAuth { state, storage }))
+                Ok(Self::Chatgpt(ChatgptAuth {
+                    state,
+                    storage,
+                    persistence: Arc::new(Mutex::new(())),
+                }))
             }
             AuthMode::ChatgptAuthTokens => Ok(Self::ChatgptAuthTokens(ChatgptAuthTokens { state })),
             AuthMode::ApiKey => unreachable!("api key mode is handled above"),
@@ -735,7 +740,11 @@ impl CodexAuth {
             AuthCredentialsStoreMode::Ephemeral,
             AuthKeyringBackendKind::default(),
         );
-        Self::Chatgpt(ChatgptAuth { state, storage })
+        Self::Chatgpt(ChatgptAuth {
+            state,
+            storage,
+            persistence: Arc::new(Mutex::new(())),
+        })
     }
 
     /// Constructs in-memory ChatGPT auth from externally managed tokens.
@@ -822,6 +831,12 @@ impl ChatgptAuth {
         &self,
         record: AgentIdentityAuthRecord,
     ) -> std::io::Result<()> {
+        // Keep storage and cache publication ordered across writers without making
+        // cached-token readers wait for filesystem or keyring operations.
+        let _writer = self
+            .persistence
+            .lock()
+            .map_err(|_| std::io::Error::other("failed to lock auth persistence"))?;
         persist_agent_identity_record(&self.state.auth_dot_json, &self.storage, record)
     }
 }
@@ -831,16 +846,19 @@ fn persist_agent_identity_record(
     storage: &Arc<dyn AuthStorageBackend>,
     record: AgentIdentityAuthRecord,
 ) -> std::io::Result<()> {
-    let mut guard = auth_dot_json
+    let cached_auth = auth_dot_json
         .lock()
-        .map_err(|_| std::io::Error::other("failed to lock auth state"))?;
+        .map_err(|_| std::io::Error::other("failed to lock auth state"))?
+        .clone();
     let mut auth = storage
         .load()?
-        .or_else(|| guard.clone())
+        .or(cached_auth)
         .ok_or_else(|| std::io::Error::other("auth data is not available"))?;
     auth.agent_identity = Some(AgentIdentityStorage::Record(record));
     storage.save(&auth)?;
-    *guard = Some(auth);
+    *auth_dot_json
+        .lock()
+        .map_err(|_| std::io::Error::other("failed to lock auth state"))? = Some(auth);
     Ok(())
 }
 

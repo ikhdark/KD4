@@ -156,8 +156,9 @@ impl PluginsManager {
                 .flat_map(|marketplace| marketplace.plugins.iter())
                 .map(|plugin| plugin.remote_plugin_id.clone())
                 .collect::<HashSet<_>>();
-            for plugin in
-                self.cached_global_remote_discoverable_plugins_for_config(&input.plugins, auth)
+            for plugin in self
+                .cached_global_remote_discoverable_plugins_for_config(&input.plugins, auth)
+                .await
             {
                 let is_configured_plugin = input
                     .configured_plugin_ids

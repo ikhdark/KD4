@@ -3893,6 +3893,10 @@ async fn read_plugin_for_config_uses_marketplace_manifest_fallback_paths_for_loc
         r#"{"apps":{"sample-app":{"id":"connector_sample"}}}"#,
     );
     write_file(
+        &plugin_root.join("hooks/hooks.json"),
+        r#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"echo startup"}]}]}}"#,
+    );
+    write_file(
         &tmp.path().join(CONFIG_TOML_FILE),
         r#"[features]
 plugins = true
@@ -3923,6 +3927,11 @@ plugins = true
         outcome.plugin.mcp_server_names,
         vec!["sample-mcp".to_string()]
     );
+    let expected_hooks = vec![PluginHookSummary {
+        key: "sample-plugin@debug:hooks/hooks.json:session_start:0:0".to_string(),
+        event_name: HookEventName::SessionStart,
+    }];
+    assert_eq!(outcome.plugin.hooks, expected_hooks);
 
     let listed_plugin = manager
         .list_marketplaces_for_config(
@@ -3955,6 +3964,7 @@ plugins = true
         listed_detail.mcp_server_names,
         vec!["sample-mcp".to_string()]
     );
+    assert_eq!(listed_detail.hooks, expected_hooks);
 }
 
 #[tokio::test]

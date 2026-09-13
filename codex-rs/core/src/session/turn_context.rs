@@ -257,6 +257,7 @@ impl TurnContext {
             .extend(contexts);
     }
 
+    #[cfg(test)]
     pub(crate) async fn take_post_tool_contexts(&self, call_id: &str) -> Vec<ResponseItem> {
         self.pending_post_tool_contexts
             .lock()

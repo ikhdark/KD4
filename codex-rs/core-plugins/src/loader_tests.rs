@@ -195,10 +195,57 @@ enabled = true
         .iter()
         .find(|plugin| plugin.config_name == "valid@test")
         .expect("full load should include valid plugin");
-    assert!(full_valid.manifest_name.is_some());
-    assert!(!full_valid.skill_roots.is_empty());
-    assert!(!full_valid.mcp_servers.is_empty());
-    assert!(!full_valid.apps.is_empty());
+    assert_eq!(full_valid.manifest_name.as_deref(), Some("valid"));
+    assert_eq!(full_valid.plugin_namespace.as_deref(), Some("valid"));
+    assert_eq!(
+        full_valid.skill_roots,
+        vec![AbsolutePathBuf::try_from(plugin_root.join("skills")).expect("skills root")]
+    );
+    assert!(full_valid.has_enabled_skills);
+    assert_eq!(
+        full_valid
+            .mcp_servers
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        vec!["example"]
+    );
+    assert_eq!(
+        app_connector_ids_from_declarations(&full_valid.apps),
+        vec![codex_plugin::AppConnectorId(
+            "connector_example".to_string()
+        )]
+    );
+    assert_eq!(full_valid.error, None);
+    assert_eq!(full_valid.hook_sources.len(), 1);
+    let hook_source = &full_valid.hook_sources[0];
+    assert_eq!(hook_source.source_relative_path, "hooks/hooks.json");
+    assert_eq!(hook_source.plugin_id.as_key(), "valid@test");
+    assert_eq!(hook_source.hooks.session_start.len(), 1);
+    assert_eq!(
+        hook_source.hooks.session_start[0].hooks,
+        vec![codex_config::HookHandlerConfig::Command {
+            command: "echo startup".to_string(),
+            command_windows: None,
+            timeout_sec: None,
+            r#async: false,
+            status_message: None,
+        }]
+    );
+    for plugins in [&full, &hooks_only] {
+        for (config_name, expected_error) in [
+            ("disabled@test", None),
+            ("malformed@test", Some("missing or invalid plugin.json")),
+            ("missing@test", Some("plugin is not installed")),
+        ] {
+            let plugin = plugins
+                .iter()
+                .find(|plugin| plugin.config_name == config_name)
+                .expect("configured plugin should be returned");
+            assert_eq!(plugin.error.as_deref(), expected_error);
+            assert!(plugin.hook_sources.is_empty());
+        }
+    }
 
     let hooks_only_valid = hooks_only
         .iter()

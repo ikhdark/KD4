@@ -183,6 +183,7 @@ use super::footer::SummaryLeft;
 use super::footer::can_show_left_with_context;
 use super::footer::context_window_line;
 use super::footer::esc_hint_mode;
+use super::footer::footer_display_width;
 use super::footer::footer_height;
 use super::footer::footer_hint_items_width;
 use super::footer::footer_line_width;
@@ -3999,14 +4000,14 @@ impl ChatComposer {
                         self.footer
                             .flash
                             .as_ref()
-                            .map(|flash| flash.line.width() as u16)
+                            .map(|flash| footer_display_width(flash.line.width()))
                             .unwrap_or(0)
                     } else if let Some(items) = active_footer_hint_override {
                         footer_hint_items_width(items)
                     } else if status_line_active {
                         truncated_status_line
                             .as_ref()
-                            .map(|line| line.width() as u16)
+                            .map(|line| footer_display_width(line.width()))
                             .unwrap_or(0)
                     } else {
                         footer_line_width(
@@ -4025,7 +4026,10 @@ impl ChatComposer {
                         } else if status_line_active {
                             let full = self.mode_indicator_line(show_cycle_hint);
                             let compact = self.mode_indicator_line(/*show_cycle_hint*/ false);
-                            let full_width = full.as_ref().map(|l| l.width() as u16).unwrap_or(0);
+                            let full_width = full
+                                .as_ref()
+                                .map(|line| footer_display_width(line.width()))
+                                .unwrap_or(0);
                             if can_show_left_with_context(hint_rect, left_width, full_width) {
                                 full
                             } else {
@@ -4034,7 +4038,10 @@ impl ChatComposer {
                         } else {
                             Some(self.right_footer_line_with_context())
                         };
-                    let right_width = right_line.as_ref().map(|l| l.width() as u16).unwrap_or(0);
+                    let right_width = right_line
+                        .as_ref()
+                        .map(|line| footer_display_width(line.width()))
+                        .unwrap_or(0);
                     if status_line_active
                         && let Some(max_left) = max_left_width_for_right(hint_rect, right_width)
                         && left_width > max_left
@@ -4042,7 +4049,7 @@ impl ChatComposer {
                             truncate_line_with_ellipsis_if_overflow(line.clone(), max_left as usize)
                         })
                     {
-                        left_width = line.width() as u16;
+                        left_width = footer_display_width(line.width());
                         truncated_status_line = Some(line);
                     }
                     let can_show_left_and_context =
@@ -4267,6 +4274,41 @@ mod tests {
             ),
             rx,
         )
+    }
+
+    #[test]
+    fn oversized_footer_context_keeps_visible_prefix() {
+        let (mut composer, _rx) = new_test_composer();
+        // A draft hides the idle shortcut hint while retaining the context footer row.
+        composer.set_text_content("draft".to_string(), Vec::new(), Vec::new());
+        composer.set_side_conversation_context_label(Some("C".repeat(65_536)));
+
+        let area = Rect::new(0, 0, 40, 6);
+        let mut buf = Buffer::empty(area);
+        composer.render(area, &mut buf);
+
+        let footer: String = (0..area.width)
+            .map(|x| buf[(x, area.bottom() - 1)].symbol())
+            .collect();
+        assert_eq!(footer, format!("  {}", "C".repeat(38)));
+    }
+
+    #[test]
+    fn oversized_footer_hints_keep_right_context_hidden() {
+        let (mut composer, _rx) = new_test_composer();
+        // One leading space, the key, and the label separator make the total width 65,536.
+        composer.set_footer_hint_override(Some(vec![("K".to_string(), "L".repeat(65_533))]));
+        composer.set_side_conversation_context_label(Some("CONTEXT".to_string()));
+
+        let area = Rect::new(0, 0, 40, 6);
+        let mut buf = Buffer::empty(area);
+        composer.render(area, &mut buf);
+
+        let footer: String = (0..area.width)
+            .map(|x| buf[(x, area.bottom() - 1)].symbol())
+            .collect();
+        assert!(footer.contains("K LLLLLLLLLL"), "{footer:?}");
+        assert!(!footer.contains("CONTEXT"), "{footer:?}");
     }
 
     #[test]

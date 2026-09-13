@@ -41,6 +41,20 @@ pub(crate) fn lock_windows_sandbox_tests() -> anyhow::Result<std::fs::File> {
 #[allow(dead_code)]
 pub(crate) fn stage_windows_sandbox_helpers() -> anyhow::Result<()> {
     use anyhow::Context;
+
+    let test_exe = std::env::current_exe().context("resolve current Windows test executable")?;
+    let test_exe_dir = test_exe
+        .parent()
+        .context("Windows test executable should have a parent directory")?;
+    stage_windows_sandbox_helpers_in(&test_exe_dir.join("codex-resources"))
+}
+
+#[cfg(target_os = "windows")]
+#[allow(dead_code)]
+pub(crate) fn stage_windows_sandbox_helpers_in(
+    resources_dir: &std::path::Path,
+) -> anyhow::Result<()> {
+    use anyhow::Context;
     use fs2::FileExt;
     use sha2::Digest;
     use sha2::Sha256;
@@ -75,12 +89,7 @@ pub(crate) fn stage_windows_sandbox_helpers() -> anyhow::Result<()> {
         Ok(digest(source)? == digest(destination)?)
     }
 
-    let test_exe = std::env::current_exe().context("resolve current Windows test executable")?;
-    let test_exe_dir = test_exe
-        .parent()
-        .context("Windows test executable should have a parent directory")?;
-    let resources_dir = test_exe_dir.join("codex-resources");
-    match std::fs::create_dir_all(&resources_dir) {
+    match std::fs::create_dir_all(resources_dir) {
         Ok(()) => {}
         Err(err)
             if err.kind() == std::io::ErrorKind::PermissionDenied && resources_dir.is_dir() => {}

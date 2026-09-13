@@ -886,7 +886,7 @@ plugins = true
 
     let discoverable_plugins = list_discoverable_plugins(
         &plugins_manager,
-        discovery_input(plugins, &[], &[], &["remote-unlisted-app"]),
+        discovery_input(plugins.clone(), &[], &[], &["remote-unlisted-app"]),
         Some(&auth),
     )
     .await;
@@ -902,6 +902,26 @@ plugins = true
             mcp_server_names: Vec::new(),
             app_connector_ids: vec!["remote-unlisted-app".to_string()],
         }]
+    );
+
+    let cache_entries = std::fs::read_dir(codex_home.path().join("cache/remote_plugin_catalog"))
+        .expect("catalog cache directory should exist")
+        .collect::<std::io::Result<Vec<_>>>()
+        .expect("catalog cache entries should be readable");
+    assert_eq!(cache_entries.len(), 1);
+    let cache_path = cache_entries[0].path();
+    std::fs::write(&cache_path, "invalid json").expect("corrupt catalog cache");
+    let after_invalid_cache = list_discoverable_plugins(
+        &plugins_manager,
+        discovery_input(plugins, &[], &[], &["remote-unlisted-app"]),
+        Some(&auth),
+    )
+    .await;
+
+    assert_eq!(after_invalid_cache, Vec::new());
+    assert!(
+        !cache_path.exists(),
+        "invalid catalog cache should be removed"
     );
 }
 
