@@ -20,9 +20,7 @@ pub(crate) enum CommandPreflightIssueCode {
     DirectArgvPowerShellCmdlet,
     GitStatusOptionalLocks,
     KnownFlagTypo,
-    RgGlobPathSeparator,
     RgLiteralGlobPath,
-    PowerShellMeasureObjectScriptBlockProperty,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,11 +112,7 @@ impl CommandPreflightIssueCode {
             Self::DirectArgvPowerShellCmdlet => "direct_argv_powershell_cmdlet",
             Self::GitStatusOptionalLocks => "git_status_optional_locks",
             Self::KnownFlagTypo => "known_flag_typo",
-            Self::RgGlobPathSeparator => "rg_glob_path_separator",
             Self::RgLiteralGlobPath => "rg_literal_glob_path",
-            Self::PowerShellMeasureObjectScriptBlockProperty => {
-                "powershell_measure_object_scriptblock_property"
-            }
         }
     }
 }
@@ -175,14 +169,12 @@ fn preflight_command_issue(
         let script = script.as_ref();
         lint_balanced_quotes(script, preflight_shell_type)?;
         lint_shell_mismatch(script, preflight_shell_type, &argv_commands)?;
-        lint_powershell_measure_object_scriptblock_property(script, preflight_shell_type)?;
         lint_windows_path_shape(script, preflight_shell_type, &argv_commands)?;
     }
 
     for argv in &argv_commands {
         lint_direct_argv_powershell_cmdlet(argv, preflight_shell_type)?;
         lint_known_flag_typos(argv)?;
-        lint_rg_glob_path_separators(argv)?;
         lint_rg_literal_glob_paths(argv, preflight_shell_type)?;
     }
 
@@ -283,9 +275,6 @@ fn preflight_invocation_with_equivalent_repair_detailed(
     let read_only_equivalent = match issue.code {
         CommandPreflightIssueCode::KnownFlagTypo => {
             matches_ignore_ascii_case(program_name, &["rg", "rga", "grep"])
-        }
-        CommandPreflightIssueCode::RgGlobPathSeparator => {
-            matches_ignore_ascii_case(program_name, &["rg", "rga"])
         }
         _ => false,
     };
@@ -436,7 +425,7 @@ fn command_tail(command: &[String], start: usize) -> Option<Cow<'_, str>> {
     }
 }
 
-pub(super) fn infer_direct_shell_type(command: &[String]) -> Option<ShellType> {
+pub(crate) fn infer_direct_shell_type(command: &[String]) -> Option<ShellType> {
     let program = command.first().map(|program| program_name(program))?;
     if program.eq_ignore_ascii_case("pwsh") || program.eq_ignore_ascii_case("powershell") {
         Some(ShellType::PowerShell)
@@ -472,7 +461,7 @@ fn argv_commands(command: &[String], shell_type: Option<ShellType>) -> Option<Ve
     }
 }
 
-pub(super) fn rg_argv_commands(
+pub(crate) fn rg_argv_commands(
     command: &[String],
     shell_type: Option<ShellType>,
 ) -> Result<Vec<Vec<String>>, String> {
@@ -617,12 +606,29 @@ fn posix_unclosed_quotes(script: &str) -> (bool, bool) {
     let mut single = false;
     let mut double = false;
     let mut escaped = false;
+    let mut in_comment = false;
+    let mut word_start = true;
 
     for ch in script.chars() {
-        if escaped {
-            escaped = false;
+        if in_comment {
+            if ch == '\n' {
+                in_comment = false;
+                word_start = true;
+            }
             continue;
         }
+        if escaped {
+            escaped = false;
+            if ch != '\n' {
+                word_start = false;
+            }
+            continue;
+        }
+        if !single && !double && word_start && ch == '#' {
+            in_comment = true;
+            continue;
+        }
+        word_start = !single && !double && (ch.is_whitespace() || ";|&()".contains(ch));
         if ch == '\\' && !single {
             escaped = true;
             continue;
@@ -732,8 +738,7 @@ fn lint_shell_mismatch(
             if argv_commands.iter().any(|argv| {
                 argv.first()
                     .is_some_and(|program| is_powershell_cmdlet_or_alias(program_name(program)))
-            }) || (argv_commands.is_empty() && starts_with_powershell_cmdlet(script))
-                || contains_ignore_ascii_case(script, "$env:") =>
+            }) || (argv_commands.is_empty() && starts_with_powershell_cmdlet(script)) =>
         {
             Err(CommandPreflightIssue::reject(
                 CommandPreflightIssueCode::ShellMismatch,
@@ -858,93 +863,22 @@ fn powershell_path_parameter_requires_literal(argv: &[String]) -> bool {
     false
 }
 
-fn lint_powershell_measure_object_scriptblock_property(
-    script: &str,
-    shell_type: Option<ShellType>,
-) -> Result<(), CommandPreflightIssue> {
-    if shell_type != Some(ShellType::PowerShell) || !has_measure_object_scriptblock_property(script)
-    {
-        return Ok(());
-    }
-
-    Err(CommandPreflightIssue::reject(
-        CommandPreflightIssueCode::PowerShellMeasureObjectScriptBlockProperty,
-        CommandPreflightRejected::Script(script.to_string()),
-        "PowerShell `Measure-Object -Property` expects property names, not a script block."
-            .to_string(),
-        Some(
-            "pipe computed numeric values first, for example `... | ForEach-Object { <number> } | Measure-Object -Sum`; for real properties, use `Measure-Object -Property Count -Sum`."
-                .to_string(),
-        ),
-        None,
-    ))
-}
-
-fn has_measure_object_scriptblock_property(script: &str) -> bool {
-    let lower = script.to_ascii_lowercase();
-    let mut offset = 0;
-    while let Some(index) = lower[offset..].find("measure-object") {
-        let start = offset + index;
-        let after_command = start + "measure-object".len();
-        if !is_word_boundary(lower[..start].chars().next_back())
-            || !is_word_boundary(lower[after_command..].chars().next())
-        {
-            offset = after_command;
-            continue;
-        }
-
-        let command_segment = lower[after_command..]
-            .split(['|', '\n', '\r', ';'])
-            .next()
-            .unwrap_or_default();
-        if measure_object_segment_has_scriptblock_property(command_segment) {
-            return true;
-        }
-        offset = after_command;
-    }
-    false
-}
-
-fn is_word_boundary(ch: Option<char>) -> bool {
-    ch.is_none_or(|ch| !ch.is_ascii_alphanumeric() && ch != '_')
-}
-
-fn measure_object_segment_has_scriptblock_property(segment: &str) -> bool {
-    let mut rest = segment;
-    while let Some(index) = rest.find("-property") {
-        let after_name = &rest[index + "-property".len()..];
-        let Some(next) = after_name.chars().next() else {
-            return false;
-        };
-        if next.is_ascii_alphanumeric() || next == '_' || next == '-' {
-            rest = after_name;
-            continue;
-        }
-
-        let value = after_name
-            .trim_start_matches(|ch: char| ch.is_ascii_whitespace() || ch == ':' || ch == '=');
-        if value.starts_with('{') {
-            return true;
-        }
-        rest = after_name;
-    }
-    false
-}
-
 fn lint_known_flag_typos(argv: &[String]) -> Result<(), CommandPreflightIssue> {
     let Some(program) = argv.first().map(|program| program_name(program)) else {
         return Ok(());
     };
 
-    for arg in argv.iter().skip(1) {
+    let mut index = 1;
+    while let Some(arg) = argv.get(index) {
         if arg == "--" {
             break;
         }
         if !arg.starts_with('-') {
+            index += 1;
             continue;
         }
         if let Some((bad, good)) = known_flag_fix(program, arg) {
-            let suggested = suggested_argv(argv, bad, good);
+            let suggested = suggested_argv(argv, index, good);
             return Err(CommandPreflightIssue::reject(
                 CommandPreflightIssueCode::KnownFlagTypo,
                 CommandPreflightRejected::Argv(argv.to_vec()),
@@ -953,51 +887,51 @@ fn lint_known_flag_typos(argv: &[String]) -> Result<(), CommandPreflightIssue> {
                 retry_argv_from_command(&suggested),
             ));
         }
-    }
-
-    Ok(())
-}
-
-fn lint_rg_glob_path_separators(argv: &[String]) -> Result<(), CommandPreflightIssue> {
-    let Some(program) = argv.first().map(|program| program_name(program)) else {
-        return Ok(());
-    };
-    if !matches_ignore_ascii_case(program, &["rg", "rga"]) {
-        return Ok(());
-    }
-
-    let mut index = 1;
-    while let Some(arg) = argv.get(index) {
-        if arg == "--" {
+        // Only continue through options whose arity is established. In
+        // particular, a dash-prefixed regexp is data after -e/--regexp.
+        if matches_ignore_ascii_case(program, &["rg", "rga", "grep"]) {
+            if rg_option_consumes_next(arg) {
+                index += 2;
+                continue;
+            }
+            if !arg.starts_with("--") && arg.len() > 2 {
+                let mut consumes_next = false;
+                for (offset, flag) in arg[1..].char_indices() {
+                    if rg_option_consumes_next(&format!("-{flag}")) {
+                        consumes_next = offset + flag.len_utf8() == arg.len() - 1;
+                        break;
+                    }
+                }
+                index += if consumes_next { 2 } else { 1 };
+                continue;
+            }
+        }
+        if arg.contains('=')
+            || matches!(
+                arg.as_str(),
+                "-n" | "-i"
+                    | "-l"
+                    | "-L"
+                    | "-F"
+                    | "-w"
+                    | "-x"
+                    | "-v"
+                    | "-q"
+                    | "--files"
+                    | "--hidden"
+                    | "--no-ignore"
+                    | "--ignore-case"
+                    | "--line-number"
+                    | "--fixed-strings"
+                    | "--files-with-matches"
+            )
+        {
+            index += 1;
+        } else {
+            // An unknown option may consume the next argument. Let the actual
+            // program interpret it instead of guessing at a later repair.
             break;
         }
-        let glob = if arg == "--glob" || arg == "-g" {
-            argv.get(index + 1).map(|next| (index + 1, next.as_str()))
-        } else if let Some((flag, value)) = arg.split_once('=') {
-            (flag == "--glob").then_some((index, value))
-        } else {
-            arg.strip_prefix("-g")
-                .filter(|value| !value.is_empty())
-                .map(|value| (index, value))
-        };
-
-        let Some((glob_index, glob)) = glob else {
-            index += 1;
-            continue;
-        };
-        if glob.contains('\\') {
-            let mut suggested = argv.to_vec();
-            suggested[glob_index] = suggested[glob_index].replace('\\', "/");
-            return Err(CommandPreflightIssue::reject(
-                CommandPreflightIssueCode::RgGlobPathSeparator,
-                CommandPreflightRejected::Argv(argv.to_vec()),
-                "`rg` glob patterns use gitignore-style `/` separators, even on Windows."
-                    .to_string(),
-                None,
-                retry_argv_from_command(&suggested),
-            ));
-        }
-        index += 1;
     }
 
     Ok(())
@@ -1128,20 +1062,11 @@ fn known_flag_fix<'a>(program: &str, arg: &'a str) -> Option<(&'a str, &'static 
     }
 }
 
-fn suggested_argv(argv: &[String], bad: &str, good: &str) -> Vec<String> {
+fn suggested_argv(argv: &[String], index: usize, good: &str) -> Vec<String> {
     let mut suggested = argv.to_vec();
-    for arg in suggested.iter_mut().skip(1) {
-        if arg == bad {
-            *arg = good.to_string();
-            break;
-        }
-        if let Some((flag, value)) = arg.split_once('=')
-            && flag == bad
-        {
-            *arg = format!("{good}={value}");
-            break;
-        }
-    }
+    suggested[index] = argv[index]
+        .split_once('=')
+        .map_or_else(|| good.to_string(), |(_, value)| format!("{good}={value}"));
     suggested
 }
 
@@ -1260,16 +1185,6 @@ fn strip_matching_quotes(value: &str) -> &str {
 
 fn is_windows_executable_extension(extension: &str) -> bool {
     matches_ignore_ascii_case(extension, &["bat", "cmd", "com", "exe", "ps1", "psm1"])
-}
-
-fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
-    if needle.is_empty() {
-        return true;
-    }
-    haystack
-        .as_bytes()
-        .windows(needle.len())
-        .any(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
 }
 
 fn starts_with_powershell_cmdlet(script: &str) -> bool {

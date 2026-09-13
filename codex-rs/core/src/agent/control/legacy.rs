@@ -19,6 +19,23 @@ impl AgentControl {
         agent_id: ThreadId,
         shutdown_timeout: std::time::Duration,
     ) -> CodexResult<String> {
+        let control = self.clone();
+        // The owner survives both a foreground timeout and caller cancellation, including
+        // cancellation during persistence or shutdown submission.
+        let shutdown =
+            tokio::spawn(async move { control.shutdown_live_agent_to_completion(agent_id).await });
+        match tokio::time::timeout(shutdown_timeout, shutdown).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => Err(CodexErr::Fatal(format!(
+                "agent {agent_id} shutdown task failed: {error}"
+            ))),
+            Err(_) => Err(CodexErr::Fatal(format!(
+                "timed out waiting for agent {agent_id} to terminate after {shutdown_timeout:?}"
+            ))),
+        }
+    }
+
+    async fn shutdown_live_agent_to_completion(&self, agent_id: ThreadId) -> CodexResult<String> {
         let state = self.upgrade()?;
         let Ok(thread) = state.get_thread(agent_id).await else {
             let result = state.send_op(agent_id, Op::Shutdown {}).await;
@@ -41,40 +58,7 @@ impl AgentControl {
         } else {
             state.send_op(agent_id, Op::Shutdown {}).await
         };
-        if tokio::time::timeout(shutdown_timeout, thread.wait_until_terminated())
-            .await
-            .is_err()
-        {
-            let cleanup_control = self.clone();
-            let cleanup_state = Arc::clone(&state);
-            let cleanup_thread = Arc::clone(&thread);
-            tokio::spawn(async move {
-                cleanup_thread.wait_until_terminated().await;
-                if cleanup_state
-                    .remove_thread_if_same(&agent_id, &cleanup_thread)
-                    .await
-                {
-                    cleanup_control.forget_v2_residency(agent_id);
-                    cleanup_control.state.release_spawned_thread(agent_id);
-                }
-            });
-
-            let mut details = Vec::new();
-            if let Some(err) = flush_error.as_ref() {
-                details.push(format!("rollout flush failed: {err}"));
-            }
-            if let Err(err) = shutdown_result.as_ref() {
-                details.push(format!("shutdown submission failed: {err}"));
-            }
-            let details = if details.is_empty() {
-                String::new()
-            } else {
-                format!(" ({})", details.join("; "))
-            };
-            return Err(CodexErr::Fatal(format!(
-                "timed out waiting for agent {agent_id} to terminate after {shutdown_timeout:?}{details}"
-            )));
-        }
+        thread.wait_until_terminated().await;
 
         if state.remove_thread_if_same(&agent_id, &thread).await {
             self.forget_v2_residency(agent_id);
@@ -154,6 +138,17 @@ impl AgentControl {
 
     /// Shut down `agent_id` and any live descendants reachable from the in-memory spawn tree.
     pub(crate) async fn shutdown_agent_tree(&self, agent_id: ThreadId) -> CodexResult<String> {
+        let control = self.clone();
+        tokio::spawn(async move { control.shutdown_agent_tree_to_completion(agent_id).await })
+            .await
+            .map_err(|error| {
+                CodexErr::Fatal(format!(
+                    "agent tree {agent_id} shutdown task failed: {error}"
+                ))
+            })?
+    }
+
+    async fn shutdown_agent_tree_to_completion(&self, agent_id: ThreadId) -> CodexResult<String> {
         let mut closing_guard = self.state.begin_closing_agent_tree(agent_id);
         let mut known_thread_ids = HashSet::from([agent_id]);
         let mut descendant_ids = Vec::new();

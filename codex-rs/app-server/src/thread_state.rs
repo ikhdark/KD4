@@ -230,9 +230,12 @@ struct ThreadTurnIndex {
 
 impl ThreadTurnIndex {
     fn apply_changes(&mut self, changes: ThreadHistoryChangeSet) {
-        for turn_id in changes.removed_turn_ids {
-            self.turns.remove(&turn_id);
-            self.order.retain(|candidate| candidate != &turn_id);
+        if !changes.removed_turn_ids.is_empty() {
+            for turn_id in changes.removed_turn_ids {
+                self.turns.remove(&turn_id);
+            }
+            self.order
+                .retain(|candidate| self.turns.contains_key(candidate));
             self.rebuild_positions();
         }
 
@@ -296,14 +299,28 @@ impl ThreadTurnIndex {
         turn.reasoning_policy_history = change.reasoning_policy_history;
     }
 
-    fn overlay_turn(&mut self, turn: Turn) {
-        if !self.turns.contains_key(&turn.id) {
-            self.turn_positions
-                .insert(turn.id.clone(), self.order.len());
+    fn overlay_turn(&mut self, mut turn: Turn) {
+        if let Some(persisted) = self.turns.get_mut(&turn.id) {
+            let mut items = std::mem::take(&mut persisted.items);
+            let mut offsets = items
+                .iter()
+                .enumerate()
+                .map(|(offset, item)| (item.id().to_string(), offset))
+                .collect::<HashMap<_, _>>();
+            for item in turn.items {
+                if let Some(&offset) = offsets.get(item.id()) {
+                    items[offset] = item;
+                } else {
+                    offsets.insert(item.id().to_string(), items.len());
+                    items.push(item);
+                }
+            }
+            turn.items = items;
+            turn.started_at = turn.started_at.or(persisted.started_at);
+        } else {
             self.order.push(turn.id.clone());
         }
         self.turns.insert(turn.id.clone(), turn);
-        self.rebuild_positions();
     }
 
     fn turn_mut(&mut self, turn_id: &str) -> &mut Turn {
@@ -698,6 +715,7 @@ impl ThreadState {
                 self.turn_index.overlay_turn(turn);
             }
         }
+        self.turn_index.rebuild_positions();
         self.turn_index.initialized = true;
     }
 
@@ -1180,6 +1198,199 @@ mod tests {
             state.active_turn_snapshot().map(|turn| turn.status),
             Some(codex_app_server_protocol::TurnStatus::Interrupted)
         );
+    }
+
+    #[test]
+    fn seeded_history_merges_partial_live_items_by_identity() {
+        let event = |id: &str, text: &str| {
+            EventMsg::ItemCompleted(codex_protocol::protocol::ItemCompletedEvent {
+                thread_id: ThreadId::new(),
+                turn_id: "turn-1".to_string(),
+                completed_at_ms: 0,
+                item: codex_protocol::items::TurnItem::Plan(codex_protocol::items::PlanItem {
+                    id: id.to_string(),
+                    text: text.to_string(),
+                }),
+            })
+        };
+        let persisted = vec![
+            RolloutItem::EventMsg(event("a", "earlier")),
+            RolloutItem::EventMsg(event("b", "old")),
+        ];
+        let mut state = ThreadState::default();
+        state.track_current_turn_event("turn-1", &event("b", "updated"));
+        state.track_current_turn_event("turn-1", &event("c", "later"));
+        state.seed_turn_index_from_history(&persisted);
+        let page = state
+            .indexed_items_page(None, None, 10, SortDirection::Asc)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            page.items
+                .iter()
+                .map(|entry| entry.item.id())
+                .collect::<Vec<_>>(),
+            vec!["a", "b", "c"]
+        );
+        let codex_app_server_protocol::ThreadItem::Plan { text, .. } = &page.items[1].item else {
+            panic!("expected plan")
+        };
+        assert_eq!(text, "updated");
+        let page = state
+            .indexed_items_page(None, Some(("turn-1", "b", false)), 1, SortDirection::Asc)
+            .unwrap()
+            .unwrap();
+        assert_eq!(page.items[0].item.id(), "c");
+    }
+
+    #[tokio::test]
+    async fn removing_old_thread_state_preserves_replacement_listener() {
+        let manager = ThreadStateManager::default();
+        let id = ThreadId::new();
+        let old_state = manager.thread_state(id).await;
+        let mut held_old = old_state.lock().await;
+        let (old_tx, _old_rx) = thread_listener_command_channel();
+        let old_cancel = CancellationToken::new();
+        held_old.listener_command_tx = Some(old_tx.clone());
+        held_old.listener_cancellation = Some(old_cancel.clone());
+        manager.register_listener_command_tx(id, old_tx);
+
+        let removal = manager.remove_thread_state(id);
+        tokio::pin!(removal);
+        assert!(futures::poll!(&mut removal).is_pending());
+        let replacement = manager.thread_state(id).await;
+        assert!(!Arc::ptr_eq(&old_state, &replacement));
+        let (new_tx, _new_rx) = thread_listener_command_channel();
+        let new_cancel = CancellationToken::new();
+        {
+            let mut state = replacement.lock().await;
+            state.listener_command_tx = Some(new_tx.clone());
+            state.listener_cancellation = Some(new_cancel.clone());
+        }
+        manager.register_listener_command_tx(id, new_tx.clone());
+        drop(held_old);
+        removal.await;
+
+        assert!(old_cancel.is_cancelled());
+        assert!(!new_cancel.is_cancelled());
+        assert!(
+            manager
+                .current_listener_command_tx(id)
+                .unwrap()
+                .same_channel(&new_tx)
+        );
+        assert!(Arc::ptr_eq(&manager.thread_state(id).await, &replacement));
+    }
+
+    #[test]
+    fn multi_turn_rollback_keeps_turn_and_item_pagination_consistent() {
+        let mut history = Vec::new();
+        for id in ["first", "second", "third"] {
+            history.push(RolloutItem::EventMsg(EventMsg::TurnStarted(
+                codex_protocol::protocol::TurnStartedEvent {
+                    turn_id: id.to_string(),
+                    trace_id: None,
+                    started_at: None,
+                    model_context_window: None,
+                    collaboration_mode_kind: ModeKind::Default,
+                },
+            )));
+            history.push(RolloutItem::EventMsg(EventMsg::UserMessage(
+                codex_protocol::protocol::UserMessageEvent {
+                    message: id.to_string(),
+                    ..Default::default()
+                },
+            )));
+            history.push(RolloutItem::EventMsg(terminal_event(id, id)));
+        }
+        let mut state = ThreadState::default();
+        let (tx, _rx) = thread_listener_command_channel();
+        state.listener_command_tx = Some(tx);
+        assert!(state.seed_resume_history_for_listener(&history, 0));
+        let before = state
+            .indexed_items_page(None, None, 10, SortDirection::Asc)
+            .unwrap()
+            .unwrap();
+        let first = before
+            .items
+            .iter()
+            .find(|item| item.turn_id == "first")
+            .unwrap();
+        let removed = before
+            .items
+            .iter()
+            .find(|item| item.turn_id == "second")
+            .unwrap();
+        state.track_current_turn_event(
+            "",
+            &EventMsg::ThreadRolledBack(codex_protocol::protocol::ThreadRolledBackEvent {
+                num_turns: 2,
+            }),
+        );
+        let turns = state
+            .indexed_turns_page(None, 10, SortDirection::Asc)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            turns
+                .turns
+                .iter()
+                .map(|turn| turn.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first"]
+        );
+        let items = state
+            .indexed_items_page(None, None, 10, SortDirection::Desc)
+            .unwrap()
+            .unwrap();
+        assert_eq!(items.items.len(), 1);
+        assert_eq!(items.items[0].turn_id, "first");
+        assert_eq!(items.items[0].item.id(), first.item.id());
+        assert!(
+            state
+                .indexed_items_page(
+                    None,
+                    Some(("second", removed.item.id(), false)),
+                    1,
+                    SortDirection::Asc
+                )
+                .is_err()
+        );
+        assert!(
+            state
+                .indexed_turns_page(Some(("third", false)), 1, SortDirection::Asc)
+                .is_err()
+        );
+        let after_first = state
+            .indexed_items_page(
+                None,
+                Some(("first", first.item.id(), false)),
+                1,
+                SortDirection::Asc,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(after_first.items.is_empty());
+        assert!(!after_first.more_items_available);
+    }
+
+    #[test]
+    fn retiring_listener_does_not_remove_replacement_route() {
+        let manager = ThreadStateManager::default();
+        let id = ThreadId::new();
+        let (old, _old_rx) = thread_listener_command_channel();
+        let (new, _new_rx) = thread_listener_command_channel();
+        manager.register_listener_command_tx(id, old.clone());
+        manager.register_listener_command_tx(id, new.clone());
+        manager.unregister_listener_command_tx(id, &old);
+        assert!(
+            manager
+                .current_listener_command_tx(id)
+                .unwrap()
+                .same_channel(&new)
+        );
+        manager.unregister_listener_command_tx(id, &new);
+        assert!(manager.current_listener_command_tx(id).is_none());
     }
 
     #[test]
@@ -1773,11 +1984,21 @@ impl ThreadStateManager {
             .insert(thread_id, tx);
     }
 
-    pub(crate) fn unregister_listener_command_tx(&self, thread_id: ThreadId) {
-        self.listener_commands
+    pub(crate) fn unregister_listener_command_tx(
+        &self,
+        thread_id: ThreadId,
+        retiring_tx: &mpsc::Sender<ThreadListenerCommand>,
+    ) {
+        let mut routes = self
+            .listener_commands
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&thread_id);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if routes
+            .get(&thread_id)
+            .is_some_and(|tx| tx.same_channel(retiring_tx))
+        {
+            routes.remove(&thread_id);
+        }
     }
 
     pub(crate) async fn remove_thread_state(&self, thread_id: ThreadId) {
@@ -1800,10 +2021,11 @@ impl ThreadStateManager {
                 .retain(|_, entry| entry.thread_id != thread_id);
             thread_state
         };
-        self.unregister_listener_command_tx(thread_id);
-
         if let Some(thread_state) = thread_state {
             let mut thread_state = thread_state.lock().await;
+            if let Some(tx) = thread_state.listener_command_tx.as_ref() {
+                self.unregister_listener_command_tx(thread_id, tx);
+            }
             tracing::debug!(
                 thread_id = %thread_id,
                 listener_generation = thread_state.listener_generation,
@@ -1826,8 +2048,10 @@ impl ThreadStateManager {
         };
 
         for (thread_id, thread_state) in thread_states {
-            self.unregister_listener_command_tx(thread_id);
             let mut thread_state = thread_state.lock().await;
+            if let Some(tx) = thread_state.listener_command_tx.as_ref() {
+                self.unregister_listener_command_tx(thread_id, tx);
+            }
             tracing::debug!(
                 thread_id = %thread_id,
                 listener_generation = thread_state.listener_generation,

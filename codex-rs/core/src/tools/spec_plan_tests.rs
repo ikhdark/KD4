@@ -39,7 +39,6 @@ use pretty_assertions::assert_eq;
 use serde_json::json;
 
 use super::active_collaboration_namespace;
-use super::build_code_mode_executors;
 use super::merge_into_namespaces;
 use crate::agent::task_capabilities::ExternalMutationIntent;
 use crate::agent::task_capabilities::TypedToolClass;
@@ -49,13 +48,8 @@ use crate::session::tests::make_session_and_context;
 use crate::session::turn_context::TurnContext;
 use crate::tools::exposure::AgentSurfaceStage;
 use crate::tools::exposure::ToolExposureIdentity;
-use crate::tools::handlers::ApplyPatchHandler;
-use crate::tools::handlers::CurrentTimeHandler;
-use crate::tools::handlers::ExecCommandHandler;
-use crate::tools::handlers::ExecCommandHandlerOptions;
 use crate::tools::handlers::ToolSearchHandlerCache;
 use crate::tools::handlers::multi_agents_spec::MULTI_AGENT_V1_NAMESPACE;
-use crate::tools::registry::RegisteredTool;
 use crate::tools::router::ToolRouter;
 use crate::tools::router::ToolRouterParams;
 use crate::tools::router::ToolSuggestCandidates;
@@ -815,37 +809,66 @@ async fn wait_is_always_registered_when_code_mode_is_enabled() {
 
 #[tokio::test]
 async fn code_mode_eagerly_exposes_all_direct_nested_tool_contracts() {
-    let (_session, mut turn) = make_session_and_context().await;
-    set_features(&mut turn, &[Feature::CodeMode, Feature::CodeModeOnly]);
-    let registered = [
-        RegisteredTool::new(
-            Arc::new(ExecCommandHandler::new(ExecCommandHandlerOptions {
-                allow_login_shell: true,
-                allow_escalated_sandbox_permissions: false,
-                exec_permission_approvals_enabled: false,
-                include_environment_id: false,
-                include_shell_parameter: true,
-            })),
-            TypedToolClass::Shell,
-        ),
-        RegisteredTool::new(
-            Arc::new(ApplyPatchHandler::new(/*multi_environment*/ false)),
-            TypedToolClass::StructuredEdit,
-        ),
-        RegisteredTool::new(Arc::new(CurrentTimeHandler), TypedToolClass::ReadSearch),
-    ];
-
-    let runtimes =
-        build_code_mode_executors(&turn, &registered).expect("code mode executors should build");
-    let ToolSpec::Freeform(exec) = runtimes[0].spec() else {
-        panic!("expected code mode exec tool");
+    let configure = |turn: &mut TurnContext, code_mode_only| {
+        set_features(
+            turn,
+            &[
+                Feature::CodeMode,
+                Feature::ShellTool,
+                Feature::UnifiedExec,
+                Feature::CurrentTimeReminder,
+            ],
+        );
+        set_feature(turn, Feature::CodeModeOnly, code_mode_only);
+        turn.permission_profile = PermissionProfile::Disabled;
+        turn.model_info.apply_patch_tool_type = Some(ApplyPatchToolType::Freeform);
     };
+    let mixed = probe(|turn| configure(turn, false)).await;
+    let nested_only = probe(|turn| configure(turn, true)).await;
+    mixed.assert_visible_contains(&["exec_command", "apply_patch"]);
+    nested_only.assert_visible_lacks(&["exec_command", "apply_patch"]);
+    for plan in [&mixed, &nested_only] {
+        plan.assert_registered_contains(&["exec_command", "apply_patch"]);
+    }
 
-    assert!(exec.description.contains("Eager nested tool contract:"));
-    assert!(exec.description.contains("exec_command(args:"));
-    assert!(exec.description.contains("yield_time_ms"));
-    assert!(exec.description.contains("apply_patch(input: string"));
-    assert!(exec.description.contains("curr_time(args:"));
+    let ToolSpec::Freeform(mixed_exec) = mixed.visible_spec(codex_code_mode::PUBLIC_TOOL_NAME)
+    else {
+        panic!("expected mixed code mode exec tool");
+    };
+    let ToolSpec::Freeform(nested_exec) =
+        nested_only.visible_spec(codex_code_mode::PUBLIC_TOOL_NAME)
+    else {
+        panic!("expected nested-only code mode exec tool");
+    };
+    for name in ["exec_command", "apply_patch"] {
+        let spec = mixed.visible_spec(name);
+        let description = match spec {
+            ToolSpec::Function(tool) => &tool.description,
+            ToolSpec::Freeform(tool) => &tool.description,
+            _ => panic!("expected direct built-in contract"),
+        };
+        assert!(!description.is_empty());
+        assert!(!mixed_exec.description.contains(description.trim()));
+        assert!(nested_exec.description.contains(description.trim()));
+        // The direct contract plus exec's declaration must retain every byte
+        // of the full nested contract, including parameter and result guidance.
+        let full = codex_tools::tool_spec_to_code_mode_tool_definition(spec).unwrap();
+        let declaration = full
+            .description
+            .strip_prefix(description.trim())
+            .unwrap()
+            .trim_start();
+        assert!(mixed_exec.description.contains(declaration));
+        assert!(nested_exec.description.contains(declaration));
+    }
+    assert!(mixed_exec.description.contains("exec_command(args:"));
+    assert!(mixed_exec.description.contains("yield_time_ms"));
+    assert!(mixed_exec.description.contains("apply_patch(input: string"));
+    for exec in [mixed_exec, nested_exec] {
+        assert!(exec.description.contains("curr_time(args:"));
+        assert!(exec.description.contains("Return the current time in UTC."));
+    }
+    assert!(mixed_exec.description.len() < nested_exec.description.len());
 }
 
 #[tokio::test]
@@ -2055,6 +2078,62 @@ async fn deferred_tools_enable_nested_tool_guidance_without_prompt_inventory() {
             .contains("Some deferred nested tools may be omitted")
     );
     assert!(!exec.description.contains("deferred_lookup(args:"));
+}
+
+#[tokio::test]
+async fn excluded_namespace_stays_directly_visible_in_code_mode_only() {
+    let plan = probe_with(
+        |turn| {
+            set_features(turn, &[Feature::CodeMode, Feature::CodeModeOnly]);
+            update_config(turn, |config| {
+                config.code_mode.excluded_tool_namespaces = vec!["excluded".to_string()]
+            });
+        },
+        ToolPlanInputs {
+            dynamic_tools: vec![dynamic_tool(Some("excluded"), "lookup", false)],
+            ..ToolPlanInputs::default()
+        },
+    )
+    .await;
+    plan.assert_visible_contains(&["excluded"]);
+    assert_eq!(
+        plan.namespace_function_names("excluded"),
+        &["lookup".to_string()]
+    );
+    plan.assert_registered_contains(&[&ToolName::namespaced("excluded", "lookup").to_string()]);
+}
+
+#[tokio::test]
+async fn deferred_namespaces_do_not_consume_visible_description_budget() {
+    let description = "Useful direct namespace documentation. ".repeat(4000);
+    let mut direct = mcp_tool("direct", "mcp__direct", "lookup");
+    direct.namespace_description = Some(description.clone());
+    let mut visible_descriptions = Vec::new();
+    for count in [0, 100] {
+        let deferred = (0..count)
+            .map(|index| {
+                let name = format!("deferred_{index}");
+                let mut tool = mcp_tool(&name, &format!("mcp__{name}"), "lookup");
+                tool.namespace_description = Some(description.clone());
+                tool
+            })
+            .collect();
+        let plan = probe_with(
+            |turn| turn.model_info.supports_search_tool = true,
+            ToolPlanInputs {
+                mcp_tools: Some(vec![direct.clone()]),
+                deferred_mcp_tools: Some(deferred),
+                ..ToolPlanInputs::default()
+            },
+        )
+        .await;
+        let ToolSpec::Namespace(namespace) = plan.visible_spec("mcp__direct") else {
+            panic!("expected namespace")
+        };
+        visible_descriptions.push(namespace.description.clone());
+    }
+    assert!(!visible_descriptions[0].is_empty());
+    assert_eq!(visible_descriptions[0], visible_descriptions[1]);
 }
 
 #[tokio::test]

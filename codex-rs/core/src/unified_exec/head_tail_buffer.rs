@@ -95,7 +95,7 @@ impl HeadTailBuffer {
     /// Bytes are first added to the head until the head budget is full; any
     /// remaining bytes are added to the tail, with older tail bytes being
     /// dropped to preserve the tail budget.
-    pub(crate) fn push_chunk(&mut self, chunk: Vec<u8>) {
+    pub(crate) fn push_chunk(&mut self, chunk: &[u8]) {
         if chunk.is_empty() {
             return;
         }
@@ -111,6 +111,42 @@ impl HeadTailBuffer {
             self.head.extend_from_slice(&chunk[..head_len]);
         }
         self.push_to_tail(&chunk[head_len..]);
+    }
+
+    pub(crate) fn has_unreported_output(&self) -> bool {
+        self.retained_bytes() > 0
+            || self.unreported_omitted_bytes > 0
+            || self.unreported_lagged_chunks > 0
+    }
+
+    /// Drain into another bounded buffer without turning omission notices into
+    /// output bytes. Returns whether this batch contains meaningful progress.
+    pub(crate) fn drain_into(&mut self, target: &mut Self) -> bool {
+        let omitted = self.take_unreported_omitted_bytes();
+        let lagged = self.take_unreported_lagged_chunks();
+        let meaningful = omitted > 0
+            || lagged > 0
+            || self
+                .head
+                .iter()
+                .chain(self.tail.iter())
+                .any(|byte| !byte.is_ascii_whitespace());
+        target.push_chunk(&self.head);
+        if omitted > 0 {
+            // A source gap must remain at the target's head/tail seam. Freeze
+            // a partially filled head and discard the pre-gap tail so bytes
+            // from opposite sides cannot be joined into fabricated output.
+            target.head_budget = target.head.len();
+            target.record_omitted_bytes(omitted.saturating_add(target.tail.len()));
+            target.tail.clear();
+        }
+        let (front, back) = self.tail.as_slices();
+        target.push_chunk(front);
+        target.push_chunk(back);
+        target.record_lagged_chunks(lagged);
+        self.head.clear();
+        self.tail.clear();
+        meaningful
     }
 
     /// Snapshot the retained output as a list of chunks.
@@ -142,7 +178,7 @@ impl HeadTailBuffer {
 
     /// Return retained output with an explicit marker at the head/tail seam.
     pub(crate) fn to_bytes_with_omission_marker(&self, omission_marker: &[u8]) -> Vec<u8> {
-        if self.omitted_bytes == 0 || self.retained_bytes() == 0 {
+        if self.omitted_bytes == 0 {
             return self.to_bytes();
         }
 

@@ -65,9 +65,7 @@ pub fn parse_exec_source(input: &str) -> Result<ParsedExecSource<'_>, String> {
                 "exec pragma must be valid JSON with supported field `max_output_tokens`: {err}"
             )
         } else {
-            format!(
-                "exec pragma field `max_output_tokens` must be a non-negative safe integer: {err}"
-            )
+            format!("exec pragma has an invalid field value: {err}")
         }
     })?;
     if let Some(key) = pragma.unknown_fields.keys().next() {
@@ -97,4 +95,107 @@ pub fn parse_exec_source(input: &str) -> Result<ParsedExecSource<'_>, String> {
         code: rest,
         max_output_tokens: pragma.max_output_tokens,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ParsedExecSource;
+    use super::parse_exec_source;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn valid_pragma_boundaries_preserve_source_and_output_budget() {
+        for (directive, max_output_tokens) in [
+            ("{}", None),
+            (r#"{"max_output_tokens":0}"#, Some(0)),
+            (
+                r#"{"max_output_tokens":9007199254740991}"#,
+                Some(9_007_199_254_740_991),
+            ),
+            (r#"{"yield_time_ms":0,"max_output_tokens":7}"#, Some(7)),
+            (r#"{"yield_time_ms":9007199254740991}"#, None),
+        ] {
+            let source = format!("  // @exec: {directive}\r\ntext('first');\r\ntext('second');");
+            assert_eq!(
+                parse_exec_source(&source),
+                Ok(ParsedExecSource {
+                    code: "text('first');\r\ntext('second');",
+                    max_output_tokens,
+                }),
+                "{directive}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_field_types_report_data_errors_without_blame_on_another_field() {
+        for field in ["yield_time_ms", "max_output_tokens"] {
+            for value in ["-1", "1.5", r#""many""#, "true", "[]", "{}"] {
+                let source = format!("// @exec: {{\"{field}\":{value}}}\ntext('must not run')");
+                let error = parse_exec_source(&source).expect_err(&source);
+                assert!(
+                    error.starts_with("exec pragma has an invalid field value:"),
+                    "{error}"
+                );
+                assert!(!error.contains("must be valid JSON"), "{error}");
+                if field == "yield_time_ms" {
+                    assert!(!error.contains("max_output_tokens"), "{error}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn duplicate_fields_are_rejected_as_duplicates_even_when_values_match() {
+        for field in ["yield_time_ms", "max_output_tokens"] {
+            let source = format!("// @exec: {{\"{field}\":1,\"{field}\":1}}\ntext('must not run')");
+            let error = parse_exec_source(&source).expect_err(&source);
+            assert!(
+                error.starts_with("exec pragma has an invalid field value:"),
+                "{error}"
+            );
+            assert!(
+                error.contains(&format!("duplicate field `{field}`")),
+                "{error}"
+            );
+            assert!(!error.contains("safe integer"), "{error}");
+        }
+    }
+
+    #[test]
+    fn unsafe_integers_identify_the_field_that_exceeded_the_limit() {
+        for field in ["yield_time_ms", "max_output_tokens"] {
+            let source =
+                format!("// @exec: {{\"{field}\":9007199254740992}}\ntext('must not run')");
+            assert_eq!(
+                parse_exec_source(&source).unwrap_err(),
+                format!("exec pragma field `{field}` must be a non-negative safe integer")
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_json_unknown_fields_and_missing_code_remain_distinct() {
+        let error = parse_exec_source("// @exec: {\"max_output_tokens\":\ntext('hi')").unwrap_err();
+        assert!(
+            error.starts_with("exec pragma must be valid JSON"),
+            "{error}"
+        );
+        assert_eq!(
+            parse_exec_source("// @exec: {\"timeout_ms\":1}\ntext('hi')").unwrap_err(),
+            "exec pragma only supports `max_output_tokens`; got `timeout_ms`"
+        );
+        assert_eq!(
+            parse_exec_source("// @exec: {\"max_output_tokens\":1}\n  ").unwrap_err(),
+            "exec pragma must be followed by JavaScript source on subsequent lines"
+        );
+        let code = "text('hi');\n// @exec: {\"max_output_tokens\":1}";
+        assert_eq!(
+            parse_exec_source(code),
+            Ok(ParsedExecSource {
+                code,
+                max_output_tokens: None
+            })
+        );
+    }
 }

@@ -65,9 +65,11 @@ fn renders_agents_instructions_without_directory_header() {
 
 #[test]
 fn detects_subagent_notification_fragment_case_insensitively() {
-    assert!(SubagentNotification::matches_text(
-        "<SUBAGENT_NOTIFICATION>{}</subagent_notification>"
-    ));
+    let text = "<SUBAGENT_NOTIFICATION>{}</subagent_notification>";
+    assert!(SubagentNotification::matches_text(text));
+    assert!(is_contextual_user_fragment(&ContentItem::InputText {
+        text: text.to_string(),
+    }));
 }
 
 #[test]
@@ -144,13 +146,170 @@ fn legacy_compaction_warnings_are_recognized() {
         "Warning: apply_patch was requested via exec_command. Use the apply_patch tool instead of exec_command.",
         "Warning: Your account was flagged for potentially high-risk cyber activity.",
         "Warning: The maximum number of unified exec processes you can keep open is 64.",
+        "Warning: Your account was flagged for potentially high-risk cyber activity and this request was routed to gpt-5.2 as a fallback. To regain access to gpt-5.3-codex, apply for trusted access: https://chatgpt.com/cyber or learn more: https://developers.openai.com/codex/concepts/cyber-safety",
+        "Warning: The maximum number of unified exec processes you can keep open is 60 and you currently have 61 processes open. Reuse older processes or close them to prevent automatic pruning of old processes",
+        "\nWarning: The maximum number of unified exec processes you can keep open is 128 and you currently have 129 processes open. Reuse older processes or close them to prevent automatic pruning of old processes\t",
     ] {
-        assert!(is_legacy_compaction_warning_fragment(
-            &ContentItem::InputText {
-                text: text.to_string(),
-            }
+        let content = ContentItem::InputText {
+            text: text.to_string(),
+        };
+        assert!(is_legacy_compaction_warning_fragment(&content), "{text}");
+        assert!(is_contextual_user_fragment(&content), "{text}");
+        assert!(!is_startup_contextual_user_fragment(&content), "{text}");
+    }
+}
+
+#[test]
+fn model_mismatch_matcher_accepts_only_complete_historical_warnings() {
+    for text in [
+        "Warning: Your account was flagged for potentially high-risk cyber activity.",
+        "Warning: Your account was flagged for potentially high-risk cyber activity and this request was routed to gpt-5.2 as a fallback. To regain access to gpt-5.3-codex, apply for trusted access: https://chatgpt.com/cyber or learn more: https://developers.openai.com/codex/concepts/cyber-safety",
+    ] {
+        assert!(LegacyModelMismatchWarning::matches_text(text));
+        assert!(LegacyModelMismatchWarning::matches_text(&format!(
+            "\n{text}\t"
+        )));
+        assert!(!LegacyModelMismatchWarning::matches_text(&format!(
+            "{text}\nWhat does this mean?"
+        )));
+        assert!(!LegacyModelMismatchWarning::matches_text(&format!(
+            "Explain: {text}"
+        )));
+    }
+    assert!(!LegacyModelMismatchWarning::matches_text(""));
+}
+
+#[test]
+fn process_limit_matcher_accepts_complete_warnings_with_ascii_counts() {
+    for text in [
+        "Warning: The maximum number of unified exec processes you can keep open is 64.",
+        "Warning: The maximum number of unified exec processes you can keep open is 60 and you currently have 61 processes open. Reuse older processes or close them to prevent automatic pruning of old processes",
+        "Warning: The maximum number of unified exec processes you can keep open is 128 and you currently have 129 processes open. Reuse older processes or close them to prevent automatic pruning of old processes",
+    ] {
+        assert!(LegacyUnifiedExecProcessLimitWarning::matches_text(text));
+        assert!(LegacyUnifiedExecProcessLimitWarning::matches_text(
+            &format!("\n{text}\t")
+        ));
+        assert!(!LegacyUnifiedExecProcessLimitWarning::matches_text(
+            &format!("{text}\nExplain this limit.")
+        ));
+        assert!(!LegacyUnifiedExecProcessLimitWarning::matches_text(
+            &format!("Explain: {text}")
         ));
     }
+    assert!(!LegacyUnifiedExecProcessLimitWarning::matches_text(""));
+}
+
+#[test]
+fn rejects_incomplete_legacy_warnings_and_appended_questions() {
+    for text in [
+        "Warning: Your account was flagged for potentially high-risk cyber activity. What does this mean?",
+        "Warning: Your account was flagged for potentially high-risk cyber activity",
+        "Warning: Your account was flagged for potentially high-risk cyber activity and this request was routed to gpt-5.2 as a fallback. To regain access to gpt-5.3-codex, apply for trusted access: https://chatgpt.com/cyber or learn more: https://developers.openai.com/codex/concepts/cyber-safety\nWhat does this mean?",
+        "Warning: The maximum number of unified exec processes you can keep open is 64. Can you explain this limit?",
+        "Warning: The maximum number of unified exec processes you can keep open is .",
+        "Warning: The maximum number of unified exec processes you can keep open is ６４.",
+        "Warning: The maximum number of unified exec processes you can keep open is 64 .",
+        "Warning: The maximum number of unified exec processes you can keep open is 60 and you currently have  processes open. Reuse older processes or close them to prevent automatic pruning of old processes",
+        "Warning: The maximum number of unified exec processes you can keep open is 60 and you currently have ６１ processes open. Reuse older processes or close them to prevent automatic pruning of old processes",
+        "Warning: The maximum number of unified exec processes you can keep open is 60 and you currently have 61 processes open.",
+        "Warning: The maximum number of unified exec processes you can keep open is 60 and you currently have 61 processes open. Reuse older processes or close them to prevent automatic pruning of old processes\nCan you explain this limit?",
+    ] {
+        assert!(!LegacyModelMismatchWarning::matches_text(text), "{text}");
+        assert!(
+            !LegacyUnifiedExecProcessLimitWarning::matches_text(text),
+            "{text}"
+        );
+        let content = ContentItem::InputText {
+            text: text.to_string(),
+        };
+        assert!(!is_legacy_compaction_warning_fragment(&content), "{text}");
+        assert!(!is_contextual_user_fragment(&content), "{text}");
+    }
+}
+
+#[test]
+fn startup_classification_is_a_subset_of_contextual_fragments() {
+    for (text, startup) in [
+        (
+            "# AGENTS.md instructions\n\n<INSTRUCTIONS>body</INSTRUCTIONS>",
+            true,
+        ),
+        ("<environment_context>ctx</environment_context>", true),
+        ("<skill>body</skill>", true),
+        ("<recommended_plugins>body</recommended_plugins>", true),
+        ("<task_model_guidance>body</task_model_guidance>", true),
+        ("<external_browser_info>body</external_browser_info>", false),
+        ("<SUBAGENT_NOTIFICATION>{}</subagent_notification>", false),
+        (
+            "<codex_internal_context source=\"extension\">body</codex_internal_context>",
+            false,
+        ),
+        ("<goal_context>body</goal_context>", false),
+        (
+            "<hook_prompt hook_run_id=\"hook-1\">body</hook_prompt>",
+            false,
+        ),
+    ] {
+        let content = ContentItem::InputText {
+            text: text.to_string(),
+        };
+        assert!(is_contextual_user_fragment(&content), "{text}");
+        assert_eq!(
+            is_startup_contextual_user_fragment(&content),
+            startup,
+            "{text}"
+        );
+    }
+    for content in [
+        ContentItem::InputText {
+            text: "ordinary user request".to_string(),
+        },
+        ContentItem::InputImage {
+            image_url: "data:image/png;base64,abc".to_string(),
+            detail: None,
+        },
+    ] {
+        assert!(!is_contextual_user_fragment(&content));
+        assert!(!is_startup_contextual_user_fragment(&content));
+        assert!(!is_legacy_compaction_warning_fragment(&content));
+    }
+}
+
+#[test]
+fn hook_conversion_preserves_order_and_rejects_mixed_or_hookless_content() {
+    let first = HookPromptFragment::from_single_hook("first & <one>", "hook-1");
+    let second = HookPromptFragment::from_single_hook("second", "hook-2");
+    let ResponseItem::Message { mut content, .. } =
+        build_hook_prompt_message(&[first.clone(), second.clone()]).expect("hooks")
+    else {
+        panic!("expected message");
+    };
+    let context = ContentItem::InputText {
+        text: "<environment_context>ctx</environment_context>".to_string(),
+    };
+    content.insert(1, context.clone());
+    let parsed = parse_visible_hook_prompt_message(Some("message-1"), &content).expect("hooks");
+    assert_eq!(parsed.id, "message-1");
+    assert_eq!(parsed.fragments, vec![first, second]);
+
+    for extra in [
+        ContentItem::InputText {
+            text: "keep this user request".to_string(),
+        },
+        ContentItem::InputImage {
+            image_url: "data:image/png;base64,abc".to_string(),
+            detail: None,
+        },
+    ] {
+        for index in [0, content.len()] {
+            let mut mixed = content.clone();
+            mixed.insert(index, extra.clone());
+            assert!(parse_visible_hook_prompt_message(None, &mixed).is_none());
+        }
+    }
+    assert!(parse_visible_hook_prompt_message(None, &[]).is_none());
+    assert!(parse_visible_hook_prompt_message(None, &[context]).is_none());
 }
 
 #[test]

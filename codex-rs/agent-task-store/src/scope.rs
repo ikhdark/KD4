@@ -51,7 +51,9 @@ pub(crate) async fn normalize_repo_path_async(repo_root: &Path, path: &str) -> S
     let path = path.to_string();
     tokio::task::spawn_blocking(move || normalize_repo_path(&repo_root, &path))
         .await
-        .map_err(|error| StoreError::CorruptData(format!("path normalization task failed: {error}")))?
+        .map_err(|error| {
+            StoreError::CorruptData(format!("path normalization task failed: {error}"))
+        })?
 }
 
 /// Stable repository-lineage identity shared by the coordination store and its callers.
@@ -263,7 +265,11 @@ fn paths_equal(left: &str, right: &str) -> bool {
 }
 
 fn comparison_key(path: &str) -> String {
-    path.to_lowercase()
+    if cfg!(windows) {
+        path.to_lowercase()
+    } else {
+        path.to_owned()
+    }
 }
 
 pub(crate) fn path_comparison_key(path: &str) -> String {
@@ -362,11 +368,25 @@ mod audit_tests {
     use super::*;
 
     #[test]
+    #[cfg(not(windows))]
+    fn audit_workspace_case_identity_keeps_distinct_native_paths() {
+        assert_ne!(comparison_key("Src/Lib.rs"), comparison_key("src/lib.rs"));
+        let scope = RepoScope {
+            path: "Src".to_string(),
+            recursive: true,
+        };
+        assert!(scope.covers_path("Src/Lib.rs"));
+        assert!(!scope.covers_path("src/lib.rs"));
+    }
+
+    #[test]
+    #[cfg(windows)]
     fn audit_workspace_case_identity_is_windows_case_insensitive() {
         assert_eq!(comparison_key("Src/Lib.rs"), comparison_key("src/lib.rs"));
     }
 
     #[test]
+    #[cfg(windows)]
     fn audit_workspace_native_path_encoding_is_lossless() {
         let (left, right) = {
             use std::os::windows::ffi::OsStringExt;

@@ -37,6 +37,7 @@ use super::selected_tool_schema_breakdown;
 use crate::AttestationContext;
 use crate::AttestationProvider;
 use crate::GenerateAttestationFuture;
+use crate::context::PromptContextCategory;
 use crate::context::PromptProvenanceSidecar;
 use crate::responses_metadata::CodexResponsesMetadata;
 use crate::stable_context::StableContextManifest;
@@ -618,6 +619,20 @@ fn responses_lite_prompt_categories_measure_embedded_base_and_tools() {
         categories.local_reconciliation_residual,
         super::signed_difference(categories.local_input_estimate, categories.logical_total)
     );
+    let encoded = serde_json::to_vec(&request).unwrap();
+    let transport = ModelRequestMeasurements::for_responses_request_from_encoded_cancellable(
+        &request,
+        &history_test_provenance(&request),
+        &base_instructions,
+        None,
+        &encoded,
+        encoded.len() as u64,
+    )
+    .unwrap();
+    assert_eq!(
+        measured.prompt_context_categories,
+        transport.prompt_context_categories
+    );
 }
 
 #[test]
@@ -729,6 +744,144 @@ fn model_request_measurements_reuse_encoded_item_and_tool_bytes() {
         measured.tool_schema_breakdown[0].approx_tokens,
         expected.tool_schema_breakdown[0].approx_tokens
     );
+}
+
+#[test]
+fn model_request_measurements_keep_category_overrides_occurrence_specific() {
+    let mut memory = history_test_item("identical developer content", None);
+    if let ResponseItem::Message { role, .. } = &mut memory {
+        *role = "developer".to_string();
+    }
+    let mut request = history_test_request(vec![memory.clone(), memory]);
+    let provenance = history_test_provenance(&request);
+    // The transport may prepend context after provenance assembly.
+    let mut input = vec![history_test_tool_output("prefix", "transport context")];
+    input.extend(request.input.iter().cloned());
+    request.input = input.into();
+    let provenance =
+        provenance.with_response_item_category(&request.input, 2, PromptContextCategory::Memory);
+    let encoded = serde_json::to_vec(&request).unwrap();
+    let logical = ModelRequestMeasurements::for_responses_request(
+        &request,
+        &provenance,
+        &request.instructions,
+    )
+    .unwrap();
+    let transport = ModelRequestMeasurements::for_responses_request_from_encoded_cancellable(
+        &request,
+        &provenance,
+        &request.instructions,
+        None,
+        &encoded,
+        encoded.len() as u64,
+    )
+    .unwrap();
+    assert_eq!(
+        logical.prompt_context_categories,
+        transport.prompt_context_categories
+    );
+    for measured in [logical, transport] {
+        assert_eq!(
+            measured.memory_bytes,
+            serde_json::to_vec(&request.input[2]).unwrap().len() as u64
+        );
+        assert_eq!(
+            measured.conversation_history_bytes,
+            serde_json::to_vec(&request.input[0]).unwrap().len() as u64
+        );
+        assert_eq!(measured.current_input_bytes, 0);
+    }
+}
+
+#[test]
+fn model_request_measurements_agree_on_current_turn_contributions() {
+    for turn_id in [Some("current-turn"), None] {
+        let request = history_test_request(vec![
+            history_test_item("same user content", turn_id),
+            history_test_item("same user content", turn_id),
+        ]);
+        let provenance = history_test_provenance(&request);
+        let encoded = serde_json::to_vec(&request).unwrap();
+        let logical = ModelRequestMeasurements::for_responses_request(
+            &request,
+            &provenance,
+            &request.instructions,
+        )
+        .unwrap();
+        let transport = ModelRequestMeasurements::for_responses_request_from_encoded_cancellable(
+            &request,
+            &provenance,
+            &request.instructions,
+            None,
+            &encoded,
+            encoded.len() as u64,
+        )
+        .unwrap();
+        assert_eq!(
+            logical.prompt_context_categories,
+            transport.prompt_context_categories
+        );
+        let item_bytes = serde_json::to_vec(&request.input[0]).unwrap().len() as u64;
+        for measured in [logical, transport] {
+            assert_eq!(
+                measured.current_input_bytes,
+                item_bytes * if turn_id.is_some() { 2 } else { 1 }
+            );
+            assert_eq!(
+                measured.conversation_history_bytes,
+                if turn_id.is_some() { 0 } else { item_bytes }
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn model_request_measurements_recover_reprojected_input_after_dispatch() {
+    for use_encoded_bytes in [false, true] {
+        let mut memory = history_test_item("remember this", None);
+        if let ResponseItem::Message { role, .. } = &mut memory {
+            *role = "developer".to_string();
+        }
+        let original = vec![
+            history_test_item("prior", Some("old-turn")),
+            memory.clone(),
+            history_test_item("current", Some("current-turn")),
+        ];
+        let provenance = PromptProvenanceSidecar::from_assembled_items(
+            &original,
+            &StableContextManifest::default(),
+        )
+        .with_response_item_category(&original, 1, PromptContextCategory::Memory);
+        let request = history_test_request(vec![memory, original[0].clone(), original[2].clone()]);
+        let expected_memory = serde_json::to_vec(&request.input[0]).unwrap().len() as u64;
+        let expected_history = serde_json::to_vec(&request.input[1]).unwrap().len() as u64;
+        let expected_current = serde_json::to_vec(&request.input[2]).unwrap().len() as u64;
+        let encoded = serde_json::to_vec(&request).unwrap();
+        let prompt = Prompt {
+            input: original.into(),
+            prompt_provenance: provenance,
+            base_instructions: codex_protocol::models::BaseInstructions {
+                text: request.instructions.clone(),
+            },
+            ..Prompt::default()
+        };
+        let result = super::measure_responses_request_after_dispatch(
+            request,
+            prompt,
+            true,
+            tokio_util::sync::CancellationToken::new(),
+            Some(encoded.len() as u64),
+            use_encoded_bytes.then(|| encoded.into()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.measurements.memory_bytes, expected_memory);
+        assert_eq!(
+            result.measurements.conversation_history_bytes,
+            expected_history
+        );
+        assert_eq!(result.measurements.current_input_bytes, expected_current);
+    }
 }
 
 #[test]
@@ -967,6 +1120,54 @@ fn websocket_prefix_hash_ignores_internal_metadata_only() {
 }
 
 #[test]
+fn websocket_verified_current_history_becomes_the_next_baseline() {
+    let client = test_model_client(SessionSource::Cli);
+    let mut session = client.new_session();
+    let first = history_test_request(vec![history_test_item("first", None)]);
+    session.remember_request_history(&first, [1; 32]);
+    session.websocket_session.last_request = Some(first);
+    let current = history_test_request(vec![
+        history_test_item("first", Some("metadata")),
+        history_test_item("new", None),
+    ]);
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    sender
+        .send(LastResponse {
+            response_id: "verified-response".to_string(),
+            items_added: vec![],
+        })
+        .expect("response receiver open");
+    session.websocket_session.last_response_rx = Some(receiver);
+    let (prepared, _, fallback, proof) = session
+        .prepare_websocket_request(
+            ResponseCreateWsRequest::from(&current),
+            &current,
+            [1; 32],
+            &[],
+            None,
+        )
+        .expect("verified continuation");
+    let ResponsesWsRequest::ResponseCreate(prepared) = prepared;
+    assert_eq!(
+        prepared.previous_response_id.as_deref(),
+        Some("verified-response")
+    );
+    assert_eq!(prepared.input.as_ref(), &[history_test_item("new", None)]);
+    assert!(fallback.is_none());
+    assert!(proof.is_some());
+    session.remember_verified_request_history(&current, [1; 32], proof);
+    let baseline = session.websocket_session.last_request_history.unwrap();
+    assert_eq!(
+        baseline.request_prefix,
+        CanonicalPrefixHash::from_items(&current.input).unwrap()
+    );
+    assert_eq!(
+        baseline.request_properties_fingerprint,
+        super::responses_request_properties_fingerprint(&current).unwrap()
+    );
+}
+
+#[test]
 fn websocket_incremental_history_uses_digest_and_preserves_full_compare_fallback() {
     let client = test_model_client(SessionSource::Cli);
     let mut session = client.new_session();
@@ -1048,7 +1249,7 @@ fn websocket_exact_stable_prefix_inherits_existing_response_id() {
         .collect::<Vec<_>>()
         .into();
 
-    let (prepared, _, _) = session
+    let (prepared, _, _, _) = session
         .prepare_websocket_request(
             ResponseCreateWsRequest::from(&current),
             &current,
@@ -1086,7 +1287,7 @@ fn remote_compaction_rebase_preserves_response_lineage_for_next_tail() {
     let delta = history_test_item("next tool result", None);
     let current = history_test_request(vec![stable_prefix, compacted, delta.clone()]);
 
-    let (prepared, _, _) = session
+    let (prepared, _, _, _) = session
         .prepare_websocket_request(
             ResponseCreateWsRequest::from(&current),
             &current,
@@ -1152,7 +1353,7 @@ fn websocket_stable_replacement_rebases_without_stale_inheritance() {
     session.websocket_session.last_response_rx = Some(receiver);
     let current = history_test_request(vec![history_test_item("new stable", None)]);
 
-    let (prepared, _, _) = session
+    let (prepared, _, _, _) = session
         .prepare_websocket_request(
             ResponseCreateWsRequest::from(&current),
             &current,
@@ -1169,7 +1370,7 @@ fn websocket_stable_replacement_rebases_without_stale_inheritance() {
 
     // A failed fresh replay has not installed any new response baseline, so a
     // retry remains a complete, non-inheriting replay.
-    let (retry, _, _) = session
+    let (retry, _, _, _) = session
         .prepare_websocket_request(
             ResponseCreateWsRequest::from(&current),
             &current,
@@ -1223,7 +1424,7 @@ fn tool_history_receipt_inside_provider_prefix_forces_transactional_rebase() {
         substituted_output_sha256: crate::tool_history::sha256(receipt.as_bytes()),
     }];
 
-    let (prepared, _, logical_override) = session
+    let (prepared, _, logical_override, _) = session
         .prepare_websocket_request(
             ResponseCreateWsRequest::from(&current),
             &current,
@@ -1257,7 +1458,7 @@ fn tool_history_receipt_inside_provider_prefix_forces_transactional_rebase() {
 
     // A failed fail-open replay cannot resurrect either the stale provider id
     // or the receipt-bearing input on its retry.
-    let (retry, _, retry_override) = session
+    let (retry, _, retry_override, _) = session
         .prepare_websocket_request(
             ResponseCreateWsRequest::from(&current),
             &current,
@@ -1290,7 +1491,7 @@ fn tool_history_receipt_inside_provider_prefix_forces_transactional_rebase() {
         .expect("response receiver open");
     session.websocket_session.last_response_rx = Some(receiver);
 
-    let (continued, _, continued_override) = session
+    let (continued, _, continued_override, _) = session
         .prepare_websocket_request(
             ResponseCreateWsRequest::from(&current),
             &current,
@@ -1347,7 +1548,7 @@ fn tool_history_receipt_only_in_new_tail_keeps_proven_inheritance() {
     }];
     let fallback_builds = AtomicUsize::new(0);
 
-    let (prepared, _, _) = session
+    let (prepared, _, _, _) = session
         .prepare_websocket_request(
             ResponseCreateWsRequest::from(&current),
             &current,
@@ -1721,6 +1922,49 @@ fn request_schema_cache_reuses_across_responses_lite_modes() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     assert_eq!(cache.diagnostics(), (1, 1, 1));
+}
+
+#[tokio::test]
+async fn non_openai_metadata_cleanup_keeps_unmodified_history_shared() {
+    let client = test_model_client(SessionSource::Cli);
+    assert!(!client.state.provider.info().is_openai());
+    let setup = client.current_client_setup().await.unwrap();
+    let mut model = test_model_info();
+    model.use_responses_lite = false;
+    let metadata = test_responses_metadata_for_client(
+        &client,
+        None,
+        format!("{}:0", client.state.thread_id),
+        None,
+        TestCodexResponsesRequestKind::Turn,
+    );
+    for turn_id in [None, Some("internal")] {
+        let prompt = Prompt {
+            input: vec![history_test_item("task", turn_id)].into(),
+            ..Prompt::default()
+        };
+        let request = client
+            .build_responses_request(
+                &setup.api_provider,
+                &prompt,
+                &model,
+                None,
+                codex_protocol::config_types::ReasoningSummary::None,
+                None,
+                &metadata,
+            )
+            .unwrap();
+        assert!(
+            request.input[0]
+                .internal_chat_message_metadata_passthrough()
+                .is_none()
+        );
+        assert_eq!(
+            Arc::ptr_eq(&request.input, &prompt.input),
+            turn_id.is_none()
+        );
+        assert_eq!(prompt.input[0].turn_id(), turn_id);
+    }
 }
 
 #[tokio::test]
@@ -2311,7 +2555,8 @@ async fn response_completed_waits_for_pending_request_measurements() {
         response_id: "response-id".to_string(),
         token_usage: None,
         end_turn: Some(true),
-    })]);
+    })])
+    .chain(futures::stream::pending());
     let (mut stream, _) = super::map_response_events(
         None,
         api_stream,
@@ -2341,6 +2586,12 @@ async fn response_completed_waits_for_pending_request_measurements() {
         .expect("mapped stream should yield completion")
         .expect("completion should remain successful");
     assert!(matches!(event, ResponseEvent::Completed { .. }));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(250), stream.next())
+            .await
+            .expect("completed mapper must release an open upstream")
+            .is_none()
+    );
 }
 
 #[tokio::test]

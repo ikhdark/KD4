@@ -473,8 +473,18 @@ pub(crate) struct ToolHistoryState {
     /// for legacy ledgers and therefore fails closed.
     #[serde(default)]
     non_workspace_code_mode_calls: BTreeSet<String>,
+    /// Exact, bounded nested results can survive invalidation of their carrier.
+    /// Legacy ledgers have no such provenance and continue to fail closed.
+    #[serde(default)]
+    code_mode_nested_evidence: BTreeMap<String, BTreeMap<String, NestedWorkspaceEvidence>>,
     #[serde(skip)]
     artifact_call_ids: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct NestedWorkspaceEvidence {
+    observation: WorkspaceEvidenceObservation,
+    output: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -494,6 +504,21 @@ pub(crate) struct WorkspaceEvidenceObservation {
 }
 
 impl WorkspaceEvidenceObservation {
+    fn is_current(
+        &self,
+        workspace_identity: Option<&WorkspaceEvidenceIdentity>,
+        git_workspace: Option<&GitWorkspaceCache>,
+    ) -> bool {
+        self.source_dependencies_current
+            && workspace_identity.is_none_or(|identity| !identity.unavailable)
+            && self
+                .revision
+                .as_ref()
+                .is_none_or(|identity| !identity.unavailable)
+            && (self.revision.as_ref() == workspace_identity
+                || self.source_paths_are_current(workspace_identity, git_workspace))
+    }
+
     #[cfg(test)]
     pub(crate) fn from_response_item(
         revision: Option<WorkspaceEvidenceIdentity>,
@@ -572,6 +597,11 @@ pub(crate) enum ToolHistoryMutation {
     RegisterNonWorkspaceCodeModeCall {
         call_id: String,
     },
+    RegisterCodeModeNestedEvidence {
+        parent_call_id: String,
+        call_id: String,
+        output: String,
+    },
     InvalidateSourceDependencies {
         affected_paths: Option<BTreeSet<PathBuf>>,
         current_workspace_identity: Option<WorkspaceEvidenceIdentity>,
@@ -598,6 +628,45 @@ impl ToolHistoryMutation {
                 state.register_non_workspace_code_mode_call(call_id.clone());
                 true
             }
+            Self::RegisterCodeModeNestedEvidence {
+                parent_call_id,
+                call_id,
+                output,
+            } => {
+                let Some(observation) = state.workspace_evidence.get(call_id) else {
+                    return false;
+                };
+                // An opaque command has no independently checkable source scope.
+                // Do not retain partial output or introduce unbounded ledger payloads.
+                if !observation.successful
+                    || observation.source_dependencies.is_empty()
+                    || output.len() > 4_096
+                {
+                    return false;
+                }
+                let results = state
+                    .code_mode_nested_evidence
+                    .entry(parent_call_id.clone())
+                    .or_default();
+                if results.contains_key(call_id)
+                    || results
+                        .values()
+                        .map(|result| result.output.len())
+                        .sum::<usize>()
+                        + output.len()
+                        > 4_096
+                {
+                    return false;
+                }
+                results.insert(
+                    call_id.clone(),
+                    NestedWorkspaceEvidence {
+                        observation: observation.clone(),
+                        output: output.clone(),
+                    },
+                );
+                true
+            }
             Self::InvalidateSourceDependencies {
                 affected_paths,
                 current_workspace_identity,
@@ -620,6 +689,7 @@ impl ToolHistoryState {
         self.candidates.is_empty()
             && self.workspace_evidence.is_empty()
             && self.non_workspace_code_mode_calls.is_empty()
+            && self.code_mode_nested_evidence.is_empty()
     }
 
     pub(crate) fn register(&mut self, mut candidate: ToolHistoryCandidate) {
@@ -722,8 +792,12 @@ impl ToolHistoryState {
                 changed = true;
             }
         }
-        for (call_id, observation) in &mut self.workspace_evidence {
-            if excluded_call_ids.contains(call_id) {
+        for observation in self.workspace_evidence.values_mut().chain(
+            self.code_mode_nested_evidence
+                .values_mut()
+                .flat_map(|results| results.values_mut().map(|result| &mut result.observation)),
+        ) {
+            if excluded_call_ids.contains(&observation.call_id) {
                 continue;
             }
             if !observation.successful || !observation.source_dependencies_current {
@@ -812,6 +886,11 @@ impl ToolHistoryState {
         let exposed = input
             .iter()
             .filter_map(canonical_textual_output_identity)
+            .filter(|(call_id, _)| {
+                self.candidates
+                    .get(*call_id)
+                    .is_some_and(|candidate| candidate.consumed_by_generation.is_none())
+            })
             .map(|(call_id, text)| {
                 let output_sha256 = sha256(text.as_bytes());
                 (
@@ -1243,6 +1322,12 @@ impl ToolHistoryState {
                 }
             } else if let Some((receipt_id, text, receipt_tokens)) = admission_receipt
                 && receipt_tokens <= remaining_tokens
+                // A richer receipt must not spend another result's recovery reserve
+                // when this result has a cheaper exact artifact handle.
+                && (receipt_tokens <= remaining_raw_tokens
+                    || artifact_pin
+                        .as_ref()
+                        .is_none_or(|(_, pin_tokens)| *pin_tokens >= receipt_tokens))
             {
                 remaining_tokens = remaining_tokens.saturating_sub(receipt_tokens);
                 AdmissionDecision {
@@ -1538,15 +1623,7 @@ impl ToolHistoryState {
                     continue;
                 }
                 let revision_matches = observation.is_some_and(|observation| {
-                    observation.source_dependencies_current
-                        && workspace_identity.is_none_or(|identity| !identity.unavailable)
-                        && observation
-                            .revision
-                            .as_ref()
-                            .is_none_or(|identity| !identity.unavailable)
-                        && ((observation.revision.as_ref() == workspace_identity)
-                            || observation
-                                .source_paths_are_current(workspace_identity, git_workspace))
+                    observation.is_current(workspace_identity, git_workspace)
                 });
                 let output_matches = origin_call_id != call_id
                     || observation.is_some_and(|observation| {
@@ -1586,9 +1663,30 @@ impl ToolHistoryState {
                     output_matches,
                     "invalidating stale workspace evidence"
                 );
-                Some((call_id.to_string(), reason))
+                let current_nested_results = if output_matches && origin_call_id == call_id {
+                    self.code_mode_nested_evidence
+                        .get(call_id)
+                        .into_iter()
+                        .flat_map(|results| results.values())
+                        .filter(|result| {
+                            result.observation.successful
+                                && result
+                                    .observation
+                                    .is_current(workspace_identity, git_workspace)
+                        })
+                        .map(|result| {
+                            serde_json::json!({
+                                "call_id": result.observation.call_id,
+                                "output": result.output,
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                };
+                Some((call_id.to_string(), reason, current_nested_results))
             };
-            let Some((call_id, reason)) = replacement else {
+            let Some((call_id, reason, current_nested_results)) = replacement else {
                 continue;
             };
             let Some((_call_id, body)) =
@@ -1596,16 +1694,16 @@ impl ToolHistoryState {
             else {
                 continue;
             };
-            replace_model_visible_output_text(
-                body,
-                serde_json::json!({
-                    "call_id": call_id,
-                    "rerun": { "force_fresh": true },
-                    "reason": reason,
-                    "stale_workspace_evidence": true,
-                })
-                .to_string(),
-            );
+            let mut notice = serde_json::json!({
+                "call_id": call_id,
+                "rerun": { "force_fresh": true },
+                "reason": reason,
+                "stale_workspace_evidence": true,
+            });
+            if !current_nested_results.is_empty() {
+                notice["current_nested_results"] = current_nested_results.into();
+            }
+            replace_model_visible_output_text(body, notice.to_string());
             stale_exec_call_ids.insert(call_id);
         }
 
@@ -1757,20 +1855,51 @@ impl ToolHistoryState {
                 live.insert(origin_call_id.clone());
             }
         }
-        for candidate in self.candidates.values() {
-            if items
-                .iter()
-                .any(|item| response_item_references_artifact(item, candidate))
-            {
-                live.insert(candidate.call_id.clone());
-            }
-        }
+        live.extend(self.artifact_reference_positions(items).into_keys());
         self.candidates.retain(|call_id, _| live.contains(call_id));
         self.workspace_evidence
             .retain(|call_id, _| live.contains(call_id));
         self.non_workspace_code_mode_calls
             .retain(|call_id| live.contains(call_id));
+        self.code_mode_nested_evidence
+            .retain(|call_id, _| live.contains(call_id));
         self.rebuild_artifact_index();
+    }
+
+    fn artifact_reference_positions(&self, items: &[ResponseItem]) -> BTreeMap<String, usize> {
+        let mut by_artifact = BTreeMap::<&str, Vec<&ToolHistoryCandidate>>::new();
+        for candidate in self.candidates.values() {
+            by_artifact
+                .entry(&candidate.artifact_id)
+                .or_default()
+                .push(candidate);
+        }
+        let mut positions = BTreeMap::new();
+        for (index, item) in items.iter().enumerate() {
+            let Ok(value) = serde_json::to_value(item) else {
+                continue;
+            };
+            visit_artifact_reference_objects(&value, &mut |value, object| {
+                if let Some(call_id) = object.get("call_id").and_then(serde_json::Value::as_str)
+                    && let Some(candidate) = self.candidates.get(call_id)
+                    && json_object_matches_artifact_reference(value, object, candidate)
+                {
+                    positions.insert(candidate.call_id.clone(), index);
+                }
+                if let Some(artifact_id) = object
+                    .get("artifact_id")
+                    .and_then(serde_json::Value::as_str)
+                    && let Some(candidates) = by_artifact.get(artifact_id)
+                {
+                    for candidate in candidates {
+                        if json_object_matches_artifact_reference(value, object, candidate) {
+                            positions.insert(candidate.call_id.clone(), index);
+                        }
+                    }
+                }
+            });
+        }
+        positions
     }
 
     pub(crate) fn artifact_references(&self) -> BTreeMap<String, (u64, String)> {
@@ -1790,13 +1919,12 @@ impl ToolHistoryState {
     /// depend on the model copying a receipt byte-for-byte into its summary.
     pub(crate) fn artifact_pin_payload_for_items(&self, items: &[ResponseItem]) -> Option<String> {
         let mut candidates = self
-            .candidates
-            .values()
-            .filter_map(|candidate| {
-                items
-                    .iter()
-                    .rposition(|item| response_item_references_artifact(item, candidate))
-                    .map(|index| (std::cmp::Reverse(index), candidate))
+            .artifact_reference_positions(items)
+            .into_iter()
+            .filter_map(|(call_id, index)| {
+                self.candidates
+                    .get(&call_id)
+                    .map(|candidate| (std::cmp::Reverse(index), candidate))
             })
             .collect::<Vec<_>>();
         candidates.sort_by_key(|(index, _)| *index);
@@ -1910,8 +2038,7 @@ fn normalized_source_path_with_case_sensitivity(path: &Path, case_sensitive: boo
     }
 }
 
-#[cfg(test)]
-fn source_dependency_overlaps(dependency: &SourceDependencyV1, changed: &str) -> bool {
+pub(crate) fn source_dependency_overlaps(dependency: &SourceDependencyV1, changed: &str) -> bool {
     changed == dependency.path
         || dependency.recursive
             && changed
@@ -1957,12 +2084,15 @@ fn affected_paths_overlap_dependency(
 #[derive(Deserialize, Serialize)]
 struct ToolHistoryLedgerFile {
     version: u8,
+    #[serde(default)]
+    journal_sequences: BTreeMap<String, u64>,
     state: ToolHistoryState,
 }
 
 #[derive(Serialize)]
 struct ToolHistoryLedgerRef<'a> {
     version: u8,
+    journal_sequences: &'a BTreeMap<String, u64>,
     state: &'a ToolHistoryState,
 }
 
@@ -2097,11 +2227,11 @@ pub(crate) async fn load_tool_history_state_for_fork(
     thread_id: &str,
 ) -> ToolHistoryLoadOutcome {
     let path = ledger_path(codex_home, thread_id);
-    let (mut state, checkpoint_exists) = match tokio::fs::read(&path).await {
+    let (mut state, checkpoint_exists, mut journal_sequences) = match tokio::fs::read(&path).await {
         Ok(bytes) => match serde_json::from_slice::<ToolHistoryLedgerFile>(&bytes) {
             Ok(mut file) if file.version == LEDGER_VERSION => {
                 file.state.refresh_derived_and_indexes();
-                (file.state, true)
+                (file.state, true, file.journal_sequences)
             }
             Ok(file) => {
                 return ToolHistoryLoadOutcome::UnsupportedVersion {
@@ -2118,7 +2248,7 @@ pub(crate) async fn load_tool_history_state_for_fork(
             }
         },
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            (ToolHistoryState::default(), false)
+            (ToolHistoryState::default(), false, BTreeMap::new())
         }
         Err(error) => {
             return ToolHistoryLoadOutcome::IoFailure {
@@ -2128,28 +2258,31 @@ pub(crate) async fn load_tool_history_state_for_fork(
         }
     };
     let journal_path = journal_path(codex_home, thread_id);
-    let journal_exists = match replay_tool_history_journal(&journal_path, &mut state).await {
-        Ok(exists) => exists,
-        Err(ToolHistoryJournalLoadError::Corrupt(error)) => {
-            return ToolHistoryLoadOutcome::Corrupt {
-                path: journal_path,
-                error,
-            };
-        }
-        Err(ToolHistoryJournalLoadError::UnsupportedVersion(found)) => {
-            return ToolHistoryLoadOutcome::UnsupportedVersion {
-                path: journal_path,
-                found,
-                supported: JOURNAL_VERSION,
-            };
-        }
-        Err(ToolHistoryJournalLoadError::Io(error)) => {
-            return ToolHistoryLoadOutcome::IoFailure {
-                path: journal_path,
-                error,
-            };
-        }
-    };
+    let journal_exists =
+        match replay_tool_history_journal(&journal_path, &mut state, &mut journal_sequences, true)
+            .await
+        {
+            Ok(exists) => exists,
+            Err(ToolHistoryJournalLoadError::Corrupt(error)) => {
+                return ToolHistoryLoadOutcome::Corrupt {
+                    path: journal_path,
+                    error,
+                };
+            }
+            Err(ToolHistoryJournalLoadError::UnsupportedVersion(found)) => {
+                return ToolHistoryLoadOutcome::UnsupportedVersion {
+                    path: journal_path,
+                    found,
+                    supported: JOURNAL_VERSION,
+                };
+            }
+            Err(ToolHistoryJournalLoadError::Io(error)) => {
+                return ToolHistoryLoadOutcome::IoFailure {
+                    path: journal_path,
+                    error,
+                };
+            }
+        };
     if !checkpoint_exists && !journal_exists {
         ToolHistoryLoadOutcome::Missing
     } else {
@@ -2161,6 +2294,8 @@ pub(crate) async fn load_tool_history_state_for_fork(
 async fn replay_tool_history_journal(
     path: &std::path::Path,
     state: &mut ToolHistoryState,
+    checkpoint_sequences: &mut BTreeMap<String, u64>,
+    apply: bool,
 ) -> Result<bool, ToolHistoryJournalLoadError> {
     let bytes = match tokio::fs::read(path).await {
         Ok(bytes) => bytes,
@@ -2203,7 +2338,13 @@ async fn replay_tool_history_journal(
                 record.writer_id, record.sequence
             )));
         }
-        record.mutation.apply(state);
+        let checkpoint = checkpoint_sequences.entry(record.writer_id).or_default();
+        if record.sequence > *checkpoint {
+            if apply {
+                record.mutation.apply(state);
+            }
+            *checkpoint = record.sequence;
+        }
     }
     if offset != bytes.len() {
         tracing::warn!(
@@ -2278,6 +2419,7 @@ pub(crate) async fn remint_tool_history_state_for_fork(
 ) -> (ToolHistoryState, usize) {
     let workspace_evidence = state.workspace_evidence;
     let non_workspace_code_mode_calls = state.non_workspace_code_mode_calls;
+    let code_mode_nested_evidence = state.code_mode_nested_evidence;
     let mut reminted_by_identity = BTreeMap::<(String, u64, String), String>::new();
     let mut reminted_candidates = BTreeMap::new();
     let mut dropped_candidates = 0_usize;
@@ -2327,6 +2469,7 @@ pub(crate) async fn remint_tool_history_state_for_fork(
         candidates: reminted_candidates,
         workspace_evidence,
         non_workspace_code_mode_calls,
+        code_mode_nested_evidence,
         artifact_call_ids: BTreeMap::new(),
     };
     reminted_state.rebuild_artifact_index();
@@ -2345,8 +2488,37 @@ pub(crate) async fn persist_tool_history_state(
     {
         return Ok(());
     }
+    // Production callers hold the per-thread I/O permit: this snapshot
+    // supersedes every record currently in the journal, including old writers.
+    #[derive(Default, Deserialize)]
+    struct CheckpointSequences {
+        #[serde(default)]
+        journal_sequences: BTreeMap<String, u64>,
+    }
+    let mut journal_sequences = match tokio::fs::read(&path).await {
+        Ok(bytes) => {
+            serde_json::from_slice::<CheckpointSequences>(&bytes)
+                .map_err(|error| format!("failed to read checkpoint journal boundary: {error}"))?
+                .journal_sequences
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
+        Err(error) => {
+            return Err(format!(
+                "failed to read checkpoint journal boundary: {error}"
+            ));
+        }
+    };
+    replay_tool_history_journal(
+        &journal_path,
+        &mut ToolHistoryState::default(),
+        &mut journal_sequences,
+        false,
+    )
+    .await
+    .map_err(|_| "failed to validate checkpoint journal boundary".to_string())?;
     let bytes = serde_json::to_vec(&ToolHistoryLedgerRef {
         version: LEDGER_VERSION,
+        journal_sequences: &journal_sequences,
         state,
     })
     .map_err(|err| format!("failed to serialize tool-history ledger: {err}"))?;
@@ -2367,12 +2539,8 @@ pub(crate) async fn persist_tool_history_state(
         temp.as_file_mut()
             .sync_all()
             .map_err(|err| format!("failed to sync tool-history ledger: {err}"))?;
-        let installed = temp
-            .persist(&path)
-            .map_err(|err| format!("failed to install tool-history ledger: {}", err.error))?;
-        installed
-            .sync_all()
-            .map_err(|err| format!("failed to sync installed tool-history ledger: {err}"))?;
+        crate::tools::command_execution::persist_synced_file(temp, &path, directory)
+            .map_err(|err| format!("failed to commit tool-history ledger: {err}"))?;
         match std::fs::remove_file(&journal_path) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -2696,39 +2864,51 @@ fn sync_tool_history_ledger_directory(directory: &std::path::Path) -> Result<(),
     sync_tool_history_ledger_directory_impl(directory)
 }
 
-fn sync_tool_history_ledger_directory_impl(_directory: &std::path::Path) -> Result<(), String> {
-    // The file itself is synced above; Windows does not expose directory fsync through Rust.
+fn sync_tool_history_ledger_directory_impl(directory: &std::path::Path) -> Result<(), String> {
+    #[cfg(unix)]
+    std::fs::File::open(directory)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| format!("failed to sync tool-history directory: {error}"))?;
+    #[cfg(not(unix))]
+    let _ = directory; // The Windows checkpoint rename uses write-through.
     Ok(())
 }
 
-fn response_item_references_artifact(
-    item: &ResponseItem,
-    candidate: &ToolHistoryCandidate,
-) -> bool {
-    serde_json::to_value(item)
-        .is_ok_and(|value| json_value_contains_artifact_reference(&value, candidate))
+fn visit_artifact_reference_objects(
+    value: &serde_json::Value,
+    visit: &mut impl FnMut(&serde_json::Value, &serde_json::Map<String, serde_json::Value>),
+) {
+    match value {
+        serde_json::Value::String(text) => {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
+                visit_artifact_reference_objects(&value, visit);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                visit_artifact_reference_objects(value, visit);
+            }
+        }
+        serde_json::Value::Object(object) => {
+            visit(value, object);
+            for value in object.values() {
+                visit_artifact_reference_objects(value, visit);
+            }
+        }
+        _ => {}
+    }
 }
 
+#[cfg(test)]
 fn json_value_contains_artifact_reference(
     value: &serde_json::Value,
     candidate: &ToolHistoryCandidate,
 ) -> bool {
-    match value {
-        serde_json::Value::String(value) => serde_json::from_str::<serde_json::Value>(value)
-            .is_ok_and(|value| json_value_contains_artifact_reference(&value, candidate)),
-        serde_json::Value::Array(values) => values
-            .iter()
-            .any(|value| json_value_contains_artifact_reference(value, candidate)),
-        serde_json::Value::Object(values) => {
-            json_object_matches_artifact_reference(value, values, candidate)
-                || values
-                    .values()
-                    .any(|value| json_value_contains_artifact_reference(value, candidate))
-        }
-        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
-            false
-        }
-    }
+    let mut found = false;
+    visit_artifact_reference_objects(value, &mut |value, object| {
+        found |= json_object_matches_artifact_reference(value, object, candidate);
+    });
+    found
 }
 
 fn json_object_matches_artifact_reference(
@@ -2996,8 +3176,13 @@ pub(crate) fn tool_search_receipt_item(
         .filter_map(tool_search_result_identity)
         .collect::<Vec<_>>();
     let total_identity_count = ordered_tool_identities.len();
+    ordered_tool_identities.truncate(RECEIPT_MAX_TOKENS);
     let mut arguments = compact_tool_search_arguments(arguments);
 
+    let mut receipt_item = item.clone();
+    if let ResponseItem::ToolSearchOutput { tools, .. } = &mut receipt_item {
+        tools.clear();
+    }
     loop {
         let complete = status == "completed" && omitted_result_count.unwrap_or(0) == 0;
         let omitted_identity_count =
@@ -3031,7 +3216,6 @@ pub(crate) fn tool_search_receipt_item(
             "type": "tool_search_receipt",
             "receipt": receipt,
         });
-        let mut receipt_item = item.clone();
         let ResponseItem::ToolSearchOutput { tools, .. } = &mut receipt_item else {
             return None;
         };
@@ -3315,11 +3499,47 @@ fn source_dependencies_from_arguments(
         return cargo_test_dependencies(arguments, cwd);
     }
     if let Some((command, shell_type)) = dependency_search_command(arguments) {
-        match crate::tools::handlers::command_search::rg_search_path_operands(&command, shell_type)
-        {
-            Ok(Some(scopes)) => return dependencies_for_search_scopes(scopes, cwd),
+        use crate::tools::handlers::command_preflight::infer_direct_shell_type;
+        use crate::tools::handlers::command_preflight::rg_argv_commands;
+        let shell_type = shell_type.or_else(|| infer_direct_shell_type(&command));
+        match rg_argv_commands(&command, shell_type) {
+            Ok(commands) if !commands.is_empty() => {
+                if let Some(scopes) =
+                    crate::tools::handlers::command_search::rg_search_path_operands(&commands)
+                {
+                    return dependencies_for_search_scopes(scopes, cwd);
+                }
+                // Reuse the already parsed argv for quoted paths and batches of
+                // reads. Every command must have a known scope: retaining only
+                // part of an opaque batch could preserve stale evidence.
+                let mut dependencies = BTreeSet::new();
+                for command in commands {
+                    // These parsers retain cmd expansions and bare POSIX word
+                    // escapes rather than resolving them to literal paths.
+                    if command.iter().any(|arg| match shell_type {
+                        Some(crate::shell::ShellType::Cmd) => arg.contains(['%', '!']),
+                        Some(
+                            crate::shell::ShellType::Bash
+                            | crate::shell::ShellType::Zsh
+                            | crate::shell::ShellType::Sh,
+                        ) => arg.contains('\\'),
+                        _ => false,
+                    }) {
+                        return BTreeSet::new();
+                    }
+                    let command_dependencies = dependencies_for_command(&command, cwd);
+                    if command_dependencies.is_empty() {
+                        return BTreeSet::new();
+                    }
+                    dependencies.extend(command_dependencies);
+                    if dependencies.len() > 8 {
+                        return BTreeSet::new();
+                    }
+                }
+                return dependencies;
+            }
             Err(_) => return BTreeSet::from([SourceDependencyV1::new(cwd, true)]),
-            Ok(None) => {}
+            Ok(_) => {}
         }
     }
     let Some(command) = dependency_command(arguments) else {
@@ -3338,7 +3558,9 @@ fn cargo_test_dependencies(
         .map(str::to_string)
         .or_else(|| cargo_test_package_from_args(arguments));
     let Some(package) = package else {
-        return BTreeSet::from([SourceDependencyV1::new(cwd, true)]);
+        // A workspace-wide run can include path dependencies outside cwd.
+        // Without a selected package graph, its source scope is unknown.
+        return BTreeSet::new();
     };
     let workspace = match cargo_workspace_root(cwd) {
         Ok(Some(workspace)) => workspace,
@@ -3432,6 +3654,8 @@ impl CargoManifestRecord {
 
 #[derive(Debug, Default)]
 struct CargoWorkspaceGraph {
+    workspace_root: PathBuf,
+    complete: bool,
     packages: BTreeMap<String, PathBuf>,
     manifests: BTreeMap<PathBuf, CargoManifestRecord>,
 }
@@ -3498,28 +3722,57 @@ fn cargo_workspace_graph_with_manifest_cache(
 ) -> CargoWorkspaceGraph {
     let workspace_root =
         dunce::canonicalize(workspace_root).unwrap_or_else(|_| workspace_root.to_path_buf());
-    let mut graph = CargoWorkspaceGraph::default();
+    let mut graph = CargoWorkspaceGraph {
+        workspace_root: workspace_root.clone(),
+        complete: true,
+        ..Default::default()
+    };
     let mut pending = vec![workspace_root.to_path_buf()];
     let root_manifest = cached_cargo_manifest(
         &workspace_root.join("Cargo.toml"),
         manifest_cache,
         read_manifest,
     );
-    if let Some(members) = root_manifest
+    let root_parsed = root_manifest
         .as_ref()
-        .and_then(|manifest| manifest.parsed.as_ref())
-        .and_then(|parsed| parsed.get("workspace")?.get("members")?.as_array())
-    {
-        pending.extend(
-            members
-                .iter()
-                .filter_map(toml::Value::as_str)
-                // Cargo workspace member globs are still discovered by the
-                // recursive fallback below; explicit members are seeded here
-                // so package discovery is reliable on Windows temp roots.
-                .filter(|member| !member.contains(['*', '?', '[']))
-                .map(|member| workspace_root.join(member)),
-        );
+        .and_then(|manifest| manifest.parsed.as_ref());
+    graph.complete = root_parsed.is_some();
+    if let Some(workspace) = root_parsed.and_then(|parsed| parsed.get("workspace")) {
+        if let Some(members) = workspace.get("members").and_then(toml::Value::as_array) {
+            for member in members {
+                let Some(member) = member.as_str() else {
+                    graph.complete = false;
+                    continue;
+                };
+                let pattern = format!(
+                    "{}/{}",
+                    glob::Pattern::escape(&workspace_root.to_string_lossy().replace('\\', "/")),
+                    member
+                );
+                match glob::glob(&pattern) {
+                    Ok(paths) => {
+                        for path in paths {
+                            match path {
+                                Ok(path) => pending.push(path),
+                                Err(_) => graph.complete = false,
+                            }
+                        }
+                    }
+                    Err(_) => graph.complete = false,
+                }
+            }
+        }
+        if let Some(dependencies) = workspace
+            .get("dependencies")
+            .and_then(toml::Value::as_table)
+        {
+            pending.extend(dependencies.values().filter_map(|specification| {
+                specification
+                    .get("path")?
+                    .as_str()
+                    .map(|path| workspace_root.join(path))
+            }));
+        }
     }
     let mut visited = BTreeSet::new();
     while let Some(directory) = pending.pop() {
@@ -3532,25 +3785,12 @@ fn cargo_workspace_graph_with_manifest_cache(
         if let Some(manifest) = manifest {
             pending.extend(cargo_manifest_path_dependencies(&manifest, &directory));
             if let Some(name) = cargo_manifest_package_name(&manifest) {
-                graph.packages.insert(name, directory.clone());
-            }
-            graph.manifests.insert(directory.clone(), manifest);
-        }
-
-        let Ok(entries) = std::fs::read_dir(&directory) else {
-            continue;
-        };
-        for entry in entries.filter_map(Result::ok) {
-            let path = entry.path();
-            if path.is_dir() {
-                let name = entry.file_name();
-                if !matches!(
-                    name.to_str(),
-                    Some("target" | ".git" | "vendor" | "third_party" | "node_modules")
-                ) {
-                    pending.push(path);
+                if graph.packages.insert(name, directory.clone()).is_some() {
+                    // Distinct manifests cannot establish one unambiguous package identity.
+                    graph.complete = false;
                 }
             }
+            graph.manifests.insert(directory.clone(), manifest);
         }
     }
     graph
@@ -3663,22 +3903,13 @@ fn collect_cargo_package_dependencies(
     let Some(manifest) = manifest else {
         return false;
     };
+    if !workspace_graph.complete {
+        return false;
+    }
+    // Textual discovery can identify candidates, but cannot prove the absence
+    // of dependencies in a manifest that failed to parse.
     let Some(parsed) = manifest.parsed.as_ref() else {
-        for local_root in cargo_manifest_dependency_fallback(
-            &manifest.source,
-            &package_root,
-            &workspace_graph.packages,
-        ) {
-            if !collect_cargo_package_dependencies(
-                &local_root,
-                workspace_graph,
-                visited,
-                dependencies,
-            ) {
-                return false;
-            }
-        }
-        return true;
+        return false;
     };
     let mut dependency_tables = ["dependencies", "dev-dependencies", "build-dependencies"]
         .into_iter()
@@ -3695,22 +3926,31 @@ fn collect_cargo_package_dependencies(
     }
     for table in dependency_tables {
         for (dependency_name, specification) in table {
+            let (specification, dependency_root) = if specification
+                .get("workspace")
+                .and_then(toml::Value::as_bool)
+                == Some(true)
+            {
+                let inherited = workspace_graph
+                    .manifests
+                    .get(&workspace_graph.workspace_root)
+                    .and_then(|manifest| manifest.parsed.as_ref())
+                    .and_then(|root| {
+                        root.get("workspace")?
+                            .get("dependencies")?
+                            .get(dependency_name)
+                    });
+                let Some(inherited) = inherited else {
+                    return false;
+                };
+                (inherited, &workspace_graph.workspace_root)
+            } else {
+                (specification, &package_root)
+            };
             let local_root = specification
-                .as_table()
-                .and_then(|specification| {
-                    specification
-                        .get("path")
-                        .and_then(toml::Value::as_str)
-                        .map(|path| package_root.join(path))
-                        .or_else(|| {
-                            let package_name = specification
-                                .get("package")
-                                .and_then(toml::Value::as_str)
-                                .unwrap_or(dependency_name);
-                            workspace_graph.packages.get(package_name).cloned()
-                        })
-                })
-                .or_else(|| workspace_graph.packages.get(dependency_name).cloned());
+                .get("path")
+                .and_then(toml::Value::as_str)
+                .map(|path| dependency_root.join(path));
             if let Some(local_root) = local_root {
                 if !collect_cargo_package_dependencies(
                     &local_root,
@@ -4056,7 +4296,7 @@ fn dependencies_for_read_command(
             option_value = true;
             continue;
         }
-        if arg.starts_with('-') {
+        if arg.starts_with(['-', '~']) || arg.contains(['*', '?', '[', ']']) {
             return BTreeSet::new();
         }
         paths.push(arg.as_str());

@@ -31,7 +31,12 @@ mod tests {
         };
         assert!(text.starts_with(APPS_INSTRUCTIONS_OPEN_TAG));
         assert!(text.contains("## Apps (Connectors)"));
-        assert!(text.contains("discoverable through `tool_search`"));
+        assert!(text.contains("Use the app's available `codex_apps` tools directly."));
+        assert!(text.contains(
+            "Use `tool_search`, when available, only to discover missing tools needed for the task."
+        ));
+        assert!(text.contains("If the required tools remain unavailable, explain the limitation."));
+        assert!(text.contains("Do not discover apps through MCP resource-listing tools."));
         assert!(!text.contains("tools_search"));
         assert!(text.contains("or clearly matched by the task"));
         assert!(text.ends_with(APPS_INSTRUCTIONS_CLOSE_TAG));

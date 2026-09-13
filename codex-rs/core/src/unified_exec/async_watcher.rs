@@ -393,6 +393,7 @@ pub(crate) fn spawn_exit_watcher(
     known_delta: Option<PreparedKnownDelta>,
     known_delta_executor_started_at: Option<Instant>,
     tool_dispatch_timing: Option<Arc<ToolDispatchTiming>>,
+    network_approval: Option<crate::tools::network_approval::DeferredNetworkApproval>,
 ) {
     let exit_token = process.cancellation_token();
     let output_drained = process.output_drained_token();
@@ -405,6 +406,15 @@ pub(crate) fn spawn_exit_watcher(
         wait_for_sticky_lifecycle_signal(&exit_token).await;
         let exit_observed_at = Instant::now();
         let duration = exit_observed_at.saturating_duration_since(started_at);
+        if let Err(message) =
+            super::process_manager::finish_deferred_network_approval_after_process_exit_for_session(
+                Some(&session_ref),
+                network_approval,
+            )
+            .await
+        {
+            let _ = process.fail_and_terminate(message).await;
+        }
         let failure_message = process.failure_message();
         let exit_code = if failure_message.is_some() {
             -1
@@ -639,30 +649,6 @@ pub(crate) fn spawn_exit_watcher(
     });
 }
 
-#[cfg(test)]
-pub(crate) async fn record_known_delta_from_transcript(
-    codex_home: &std::path::Path,
-    prepared: &PreparedKnownDelta,
-    transcript: &Arc<Mutex<HeadTailBuffer>>,
-    success: bool,
-    executor_cost: Duration,
-) {
-    let exact_output = {
-        let transcript = transcript.lock().await;
-        (transcript.omitted_bytes() == 0 && transcript.lagged_chunks() == 0)
-            .then(|| transcript.to_bytes())
-    };
-    let observation = match (exact_output.as_deref(), success) {
-        (Some(output), true) => KnownDeltaExecutionObservation::CompleteSuccess {
-            output,
-            executor_cost,
-        },
-        (Some(_), false) => KnownDeltaExecutionObservation::CompleteFailure,
-        (None, _) => KnownDeltaExecutionObservation::Incomplete,
-    };
-    known_delta_store::record_execution(codex_home, prepared, observation).await;
-}
-
 pub(crate) async fn record_known_delta_from_process_output(
     codex_home: &std::path::Path,
     prepared: &PreparedKnownDelta,
@@ -758,7 +744,7 @@ async fn handle_lagged_output(
         turn_ref,
         emitted_deltas,
         ExecOutputStream::Stdout,
-        lagged_output_marker(skipped),
+        &lagged_output_marker(skipped),
     )
     .await;
 }
@@ -772,12 +758,16 @@ async fn process_chunk(
     emitted_deltas: &OutputDeltaLimiter,
     chunk: ProcessOutputChunk,
 ) {
-    transcript.lock().await.push_chunk(chunk.bytes.clone());
+    transcript.lock().await.push_chunk(&chunk.bytes);
     let stream = chunk.stream;
     let pending = match &stream {
         ExecOutputStream::Stdout => &mut pending.stdout,
         ExecOutputStream::Stderr => &mut pending.stderr,
     };
+    if emitted_deltas.is_suppressed() {
+        pending.clear();
+        return;
+    }
     pending.extend_from_slice(&chunk.bytes);
     emit_pending(
         pending,
@@ -831,11 +821,15 @@ async fn emit_pending(
     stream: ExecOutputStream,
     flush_incomplete: bool,
 ) {
-    while let Some(prefix) = split_valid_utf8_prefix_with_max(
-        pending,
-        UNIFIED_EXEC_OUTPUT_DELTA_MAX_BYTES,
-        flush_incomplete,
-    ) {
+    let mut remaining = pending.as_slice();
+    while !emitted_deltas.is_suppressed() {
+        let Some(prefix) = split_valid_utf8_prefix_with_max(
+            &mut remaining,
+            UNIFIED_EXEC_OUTPUT_DELTA_MAX_BYTES,
+            flush_incomplete,
+        ) else {
+            break;
+        };
         emit_output_delta(
             call_id,
             session_ref,
@@ -846,6 +840,12 @@ async fn emit_pending(
         )
         .await;
     }
+    let consumed = pending.len() - remaining.len();
+    if emitted_deltas.is_suppressed() {
+        pending.clear();
+    } else {
+        pending.drain(..consumed);
+    }
 }
 
 async fn emit_output_delta(
@@ -854,10 +854,10 @@ async fn emit_output_delta(
     turn_ref: &Arc<TurnContext>,
     emitted_deltas: &OutputDeltaLimiter,
     stream: ExecOutputStream,
-    chunk: Vec<u8>,
+    chunk: &[u8],
 ) {
     let chunk = match emitted_deltas.claim() {
-        OutputDeltaDecision::Emit => chunk,
+        OutputDeltaDecision::Emit => chunk.to_vec(),
         OutputDeltaDecision::EmitCapNotice => EXEC_OUTPUT_DELTA_CAP_NOTICE.to_vec(),
         OutputDeltaDecision::Suppress => return,
     };
@@ -1019,11 +1019,11 @@ pub(crate) async fn emit_failed_exec_end_for_unified_exec(
         .await
 }
 
-fn split_valid_utf8_prefix_with_max(
-    buffer: &mut Vec<u8>,
+fn split_valid_utf8_prefix_with_max<'a>(
+    buffer: &mut &'a [u8],
     max_bytes: usize,
     flush_incomplete: bool,
-) -> Option<Vec<u8>> {
+) -> Option<&'a [u8]> {
     if buffer.is_empty() || max_bytes == 0 {
         return None;
     }
@@ -1046,7 +1046,9 @@ fn split_valid_utf8_prefix_with_max(
         }
     };
 
-    Some(buffer.drain(..split).collect())
+    let (prefix, remaining) = buffer.split_at(split);
+    *buffer = remaining;
+    Some(prefix)
 }
 
 pub(super) async fn resolve_aggregated_output(

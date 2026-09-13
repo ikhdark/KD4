@@ -753,7 +753,9 @@ pub(super) async fn ensure_listener_task_running(
         unloading_state.unregister().await;
         let mut thread_state = thread_state.lock().await;
         if thread_state.listener_generation == listener_generation {
-            thread_state_manager.unregister_listener_command_tx(conversation_id);
+            if let Some(tx) = thread_state.listener_command_tx().as_ref() {
+                thread_state_manager.unregister_listener_command_tx(conversation_id, tx);
+            }
             thread_state.clear_listener();
         }
     });

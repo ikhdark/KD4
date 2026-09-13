@@ -42,11 +42,13 @@ impl WorldStateSection for PluginsInstructionsState {
     ) -> Option<Box<dyn ContextualUserFragment>> {
         if self.available {
             match previous {
-                PreviousSectionState::Absent => Some(Box::new(AvailablePluginsInstructions)),
+                PreviousSectionState::Absent | PreviousSectionState::Unknown => {
+                    Some(Box::new(AvailablePluginsInstructions))
+                }
                 PreviousSectionState::Known(previous) if !*previous => {
                     Some(Box::new(AvailablePluginsInstructions))
                 }
-                PreviousSectionState::Known(_) | PreviousSectionState::Unknown => None,
+                PreviousSectionState::Known(_) => None,
             }
         } else {
             match previous {

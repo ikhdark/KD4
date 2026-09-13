@@ -209,7 +209,7 @@ fn tool_search_code_mode_declaration_matches_structured_result_contract() {
     assert!(
         definition
             .description
-            .contains("omitted_result_count: number | null;")
+            .contains("omitted_result_count: number /* integer; minimum: 0 */ | null;")
     );
     assert!(
         definition

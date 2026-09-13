@@ -1507,12 +1507,12 @@ fn write_cache_document_blocking(
     let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
     temporary.write_all(bytes)?;
     temporary.as_file().sync_all()?;
-    persist_cache_file(temporary, cache_path, parent)?;
+    persist_synced_file(temporary, cache_path, parent)?;
     Ok(DurableCacheCommit)
 }
 
 #[cfg(windows)]
-fn persist_cache_file(
+pub(crate) fn persist_synced_file(
     temporary: tempfile::NamedTempFile,
     cache_path: &Path,
     _parent: &Path,
@@ -1545,7 +1545,7 @@ fn persist_cache_file(
 }
 
 #[cfg(not(windows))]
-fn persist_cache_file(
+pub(crate) fn persist_synced_file(
     temporary: tempfile::NamedTempFile,
     cache_path: &Path,
     parent: &Path,
@@ -2896,11 +2896,11 @@ mod tests {
     #[tokio::test]
     async fn running_metadata_is_not_evicted_while_processes_are_live() {
         let ledger = CommandExecutionLedger::default();
-        let keys = (0..=64)
+        let keys = (0..=MAX_TRACKED_COMMANDS)
             .map(|index| key(&format!("background-{index}.exe")))
             .collect::<Vec<_>>();
 
-        for (process_id, key) in keys.iter().take(64).enumerate() {
+        for (process_id, key) in keys.iter().take(MAX_TRACKED_COMMANDS).enumerate() {
             ledger.begin_attempt(key, false).await.expect("attempt");
             ledger
                 .track_running_process(
@@ -2918,7 +2918,7 @@ mod tests {
             .expect("replacement attempt");
         ledger
             .track_running_process(
-                64,
+                MAX_TRACKED_COMMANDS as u32,
                 replacement_key.clone(),
                 RawOutputArtifact::unavailable("replacement fixture"),
             )
@@ -2929,7 +2929,12 @@ mod tests {
         assert_eq!(ledger.consecutive_failures(&keys[0]).await, 0);
         assert!(ledger.mark_running_process_completed(0, 0).await.accepted());
         assert_eq!(ledger.consecutive_failures(&keys[0]).await, 0);
-        assert!(ledger.running_process(64).await.is_some());
+        assert!(
+            ledger
+                .running_process(MAX_TRACKED_COMMANDS as u32)
+                .await
+                .is_some()
+        );
     }
 
     #[tokio::test]

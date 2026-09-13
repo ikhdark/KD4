@@ -42,7 +42,7 @@ impl CodeModeSessionDelegate for RemoteDelegate {
                 .await?
             {
                 DelegateResponse::ToolResult { result } => Ok(result),
-                DelegateResponse::NotificationDelivered => {
+                DelegateResponse::NotificationDelivered {} => {
                     Err("code-mode client returned an invalid tool result".to_string())
                 }
             }
@@ -70,7 +70,7 @@ impl CodeModeSessionDelegate for RemoteDelegate {
                 )
                 .await?
             {
-                DelegateResponse::NotificationDelivered => Ok(()),
+                DelegateResponse::NotificationDelivered {} => Ok(()),
                 DelegateResponse::ToolResult { .. } => {
                     Err("code-mode client returned an invalid notification result".to_string())
                 }

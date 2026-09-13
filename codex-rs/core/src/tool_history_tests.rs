@@ -686,12 +686,16 @@ async fn watcher_proof_retains_dependency_scoped_evidence_after_external_disjoin
         .with_source_path_observations(vec![path_observation]),
     );
 
-    cache.note_host_workspace_mutation_paths(root.path(), &["README.md".to_string()]).await;
+    cache
+        .note_host_workspace_mutation_paths(root.path(), &["README.md".to_string()])
+        .await;
     let unrelated =
         state.project_with_workspace_cache(Arc::clone(&canonical), Some(&changed), cache.as_ref());
     assert_eq!(unrelated.items, canonical);
 
-    cache.note_host_workspace_mutation_paths(root.path(), &["src/foo.rs".to_string()]).await;
+    cache
+        .note_host_workspace_mutation_paths(root.path(), &["src/foo.rs".to_string()])
+        .await;
     let stale = state.project_with_workspace_cache(canonical, Some(&changed), cache.as_ref());
     let (_, stale_output) = textual_output_identity(&stale.items[1]).expect("stale output");
     assert!(stale_output.contains("stale_workspace_evidence"));
@@ -719,6 +723,70 @@ fn dependency_scoped_workspace_evidence_invalidates_on_external_revision_change(
         .project_with_workspace_identity(canonical, Some(&workspace_identity("external-edit")));
     let (_, stale_output) = textual_output_identity(&stale.items[1]).expect("stale output");
     assert!(stale_output.contains("\"stale_workspace_evidence\":true"));
+}
+
+#[test]
+fn nested_workspace_evidence_retains_only_current_results_after_resume() {
+    let mut state = ToolHistoryState::default();
+    let before = workspace_identity("before");
+    let after = workspace_identity("after");
+    let parent = text_output("parent", "combined A and B".into());
+    let canonical: Arc<[ResponseItem]> = Arc::from([function_call("parent"), parent.clone()]);
+    state.register_workspace_evidence(
+        WorkspaceEvidenceObservation::from_response_item(
+            Some(before.clone()),
+            &parent,
+            BTreeSet::new(),
+        )
+        .expect("parent"),
+    );
+    for (id, path, output) in [("a", "/repo/a", "old A"), ("b", "/repo/b", "current B")] {
+        let nested = text_output(id, output.into());
+        state.register_workspace_evidence(
+            WorkspaceEvidenceObservation::from_response_item(
+                Some(before.clone()),
+                &nested,
+                BTreeSet::from([SourceDependencyV1::new(Path::new(path), false)]),
+            )
+            .expect("nested"),
+        );
+        assert!(
+            ToolHistoryMutation::RegisterCodeModeNestedEvidence {
+                parent_call_id: "parent".into(),
+                call_id: id.into(),
+                output: output.into(),
+            }
+            .apply(&mut state)
+        );
+    }
+    state.retain_for_history(&canonical);
+    // The nested calls are not standalone history items. Their evidence must
+    // survive pruning and durable serialization with the live parent.
+    let encoded = serde_json::to_vec(&state).expect("serialize ledger");
+    let mut state: ToolHistoryState = serde_json::from_slice(&encoded).expect("resume ledger");
+    state.invalidate_source_dependencies(
+        Some(&BTreeSet::from([PathBuf::from("/repo/a")])),
+        Some(&after),
+    );
+    let projected = state.project_with_workspace_identity(Arc::clone(&canonical), Some(&after));
+    let (_, output) = textual_output_identity(&projected.items[1]).expect("parent result");
+    let notice: serde_json::Value = serde_json::from_str(output).expect("freshness notice");
+    assert_eq!(
+        notice["current_nested_results"],
+        serde_json::json!([
+            {"call_id": "b", "output": "current B"}
+        ])
+    );
+    assert!(!output.contains("old A"));
+    assert!(!output.contains("combined A and B"));
+
+    // An unobserved external revision has no proof that B stayed unchanged.
+    let projected =
+        state.project_with_workspace_identity(canonical, Some(&workspace_identity("external")));
+    let (_, output) = textual_output_identity(&projected.items[1]).expect("stale parent");
+    assert!(!output.contains("current B"));
+    state.retain_for_history(&[]);
+    assert!(state.is_persisted_empty());
 }
 
 #[test]
@@ -798,6 +866,67 @@ fn command_dependencies_cover_search_test_and_ownership_inputs() {
             false,
         )])
     );
+}
+
+#[test]
+fn quoted_and_batched_file_reads_keep_all_source_dependencies() {
+    let cwd = Path::new("/repo");
+    let mut commands = vec![("bash", "cat 'contract one.txt'; cat 'contract two.txt'")];
+    if cfg!(windows) {
+        commands.push((
+            "powershell",
+            "Get-Content -LiteralPath 'contract one.txt'; Get-Content -LiteralPath 'contract two.txt'",
+        ));
+    }
+    for (shell, command) in commands {
+        let payload = ToolPayload::Function {
+            arguments: serde_json::json!({"cmd": command, "shell": shell}).to_string(),
+        };
+        let classification = classify_workspace_tool_call("exec_command", &payload, cwd);
+        assert!(classification.observes_workspace);
+        assert_eq!(
+            classification.source_dependencies,
+            BTreeSet::from([
+                SourceDependencyV1::new(&cwd.join("contract one.txt"), false),
+                SourceDependencyV1::new(&cwd.join("contract two.txt"), false),
+            ]),
+            "{shell}: {command}",
+        );
+    }
+}
+
+#[test]
+fn file_read_dependencies_require_complete_literal_bounded_scope() {
+    let cwd = Path::new("/repo");
+    for (shell, command) in [
+        ("bash", "cat 'contract.txt'; python check.py"),
+        ("bash", "cat 'contract.txt'; cat \"$OTHER_FILE\""),
+        ("bash", "cat 'contract.txt'; cat $(printf other.txt)"),
+        ("bash", "cat 'contract.txt'; cat *.txt"),
+        ("bash", "cat 'contract.txt'; cat ~/other.txt"),
+        (
+            "powershell",
+            "Get-Content 'contract.txt'; Get-Content '~/other.txt'",
+        ),
+        ("bash", r"cat 'contract.txt'; cat other\ file.txt"),
+        ("bash", "cd subdir; cat 'contract.txt'"),
+        ("cmd", r#"type "contract.txt" & type "%OTHER_FILE%""#),
+        ("cmd", r#"type "contract.txt" & type "!OTHER_FILE!""#),
+        (
+            "bash",
+            "cat a; cat b; cat c; cat d; cat e; cat f; cat g; cat h; cat i",
+        ),
+    ] {
+        let payload = ToolPayload::Function {
+            arguments: serde_json::json!({"cmd": command, "shell": shell}).to_string(),
+        };
+        let classification = classify_workspace_tool_call("exec_command", &payload, cwd);
+        assert!(classification.observes_workspace);
+        assert!(
+            classification.source_dependencies.is_empty(),
+            "{shell}: {command}"
+        );
+    }
 }
 
 #[test]
@@ -910,7 +1039,12 @@ fn duplicate_repository_reads_cargo_index_reuses_each_manifest() {
     std::fs::remove_file(app_root.join("Cargo.toml")).expect("remove indexed manifest");
     let mut visited = BTreeSet::new();
     let mut dependencies = BTreeSet::new();
-    collect_cargo_package_dependencies(&app_root, &index, &mut visited, &mut dependencies);
+    assert!(collect_cargo_package_dependencies(
+        &app_root,
+        &index,
+        &mut visited,
+        &mut dependencies
+    ));
     assert!(
         dependencies.contains(&SourceDependencyV1::new(
             index.packages.get("support").expect("support package"),
@@ -1429,13 +1563,14 @@ fn tool_history_admission_reserves_competing_results_before_spending_the_shared_
     );
 }
 
-#[test]
-fn token_backfire_tool_history_pressure_keeps_every_result_recoverable() {
+#[test_case::test_case(20_000; "oversized results")]
+#[test_case::test_case(1_000; "individually fitting results")]
+fn token_backfire_tool_history_pressure_keeps_every_result_recoverable(repetitions: usize) {
     let mut state = ToolHistoryState::default();
     let mut items = Vec::new();
     for index in 0..80 {
         let call_id = format!("call-{index}");
-        let output = format!("result-{index} ").repeat(20_000);
+        let output = format!("result-{index} ").repeat(repetitions);
         let mut registered = candidate(&call_id, output.clone());
         registered.artifact_id = format!("artifact-{index}");
         state.register(registered);
@@ -1445,33 +1580,34 @@ fn token_backfire_tool_history_pressure_keeps_every_result_recoverable() {
 
     let projection = state.project(Arc::from(items));
 
-    assert_eq!(projection.items.len(), 160);
-    assert_eq!(projection.unreplaced_items.len(), 160);
-    for index in 0..80 {
-        let call_id = format!("call-{index}");
-        let output = projection
-            .items
+    for items in [&projection.items, &projection.unreplaced_items] {
+        assert_eq!(items.len(), 160);
+        let outputs = items
             .iter()
             .filter_map(textual_output_identity)
-            .find(|(projected_call_id, _)| *projected_call_id == call_id.as_str())
-            .map(|(_, output)| output)
-            .expect("every admitted tool result must retain a model-visible recovery path");
+            .collect::<Vec<_>>();
         assert!(
-            output.starts_with(&format!("result-{index} "))
-                || output.contains(&format!("artifact-{index}")),
-            "result {index} must remain raw or expose its exact artifact handle"
+            outputs
+                .iter()
+                .map(|(_, output)| approx_token_count(output))
+                .sum::<usize>()
+                <= 10_000,
+            "recoverability must not increase the aggregate token budget"
         );
-        let fallback_output = projection
-            .unreplaced_items
-            .iter()
-            .filter_map(textual_output_identity)
-            .find(|(projected_call_id, _)| *projected_call_id == call_id.as_str())
-            .map(|(_, output)| output)
-            .expect("fallback projection must retain the same recovery path");
-        assert!(
-            fallback_output.starts_with(&format!("result-{index} "))
-                || fallback_output.contains(&format!("artifact-{index}"))
-        );
+        for index in 0..80 {
+            let call_id = format!("call-{index}");
+            let output = outputs
+                .iter()
+                .find(|(projected_call_id, _)| *projected_call_id == call_id.as_str())
+                .map(|(_, output)| *output)
+                .expect(
+                    "every result must retain a model-visible recovery path in both projections",
+                );
+            if !output.starts_with(&format!("result-{index} ")) {
+                let recovery: serde_json::Value = serde_json::from_str(output).unwrap();
+                assert_eq!(recovery["artifact_id"], format!("artifact-{index}"));
+            }
+        }
     }
 }
 
@@ -2086,6 +2222,7 @@ fn legacy_tool_history_ledger_keys_remain_compatible() {
         candidates: BTreeMap::from([("call-1".to_string(), candidate("call-1", bounded))]),
         workspace_evidence: BTreeMap::new(),
         non_workspace_code_mode_calls: BTreeSet::new(),
+        code_mode_nested_evidence: BTreeMap::new(),
         artifact_call_ids: BTreeMap::new(),
     };
     let mut serialized = serde_json::to_value(&state).expect("serialize ledger state");
@@ -2215,6 +2352,7 @@ async fn tool_history_ledger_load_distinguishes_absence_corruption_and_version_m
     std::fs::write(
         unsupported_path,
         serde_json::to_vec(&ToolHistoryLedgerFile {
+            journal_sequences: BTreeMap::new(),
             version: LEDGER_VERSION.saturating_add(1),
             state: ToolHistoryState::default(),
         })
@@ -2750,11 +2888,13 @@ fn borrowed_ledger_serialization_matches_owned_compatibility_shape() {
     let mut state = ToolHistoryState::default();
     state.register(candidate("serialized-call", bounded_output()));
     let owned = serde_json::to_vec(&ToolHistoryLedgerFile {
+        journal_sequences: BTreeMap::new(),
         version: LEDGER_VERSION,
         state: state.clone(),
     })
     .expect("serialize owned compatibility envelope");
     let borrowed = serde_json::to_vec(&ToolHistoryLedgerRef {
+        journal_sequences: &BTreeMap::new(),
         version: LEDGER_VERSION,
         state: &state,
     })
@@ -2776,12 +2916,12 @@ fn cargo_manifest_read_failures_invalidate_receipts_without_losing_selective_reu
     }
     std::fs::write(
         workspace.join("Cargo.toml"),
-        "[workspace]\nmembers = [\"app\"]\nresolver = \"2\"\n",
+        "[workspace]\nmembers = [\"app\"]\nresolver = \"2\"\n[workspace.dependencies]\nrenamed = { package = \"support\", path = \"../support\" }\n",
     )
     .expect("workspace manifest");
     std::fs::write(
         app.join("Cargo.toml"),
-        "[package]\nname = \"app\"\nversion = \"0.1.0\"\n[dependencies]\nsupport = { path = \"../../support\" }\n",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\n[target.'cfg(windows)'.build-dependencies]\nrenamed.workspace = true\n",
     )
     .expect("app manifest");
     std::fs::write(
@@ -2794,13 +2934,9 @@ fn cargo_manifest_read_failures_invalidate_receipts_without_losing_selective_reu
         "[package]\nname = \"transitive\"\nversion = \"0.1.0\"\n",
     )
     .expect("transitive manifest");
-    let arguments = serde_json::json!({"package": "app", "workdir": workspace});
-    let payload = ToolPayload::Function {
-        arguments: arguments.to_string(),
-    };
-
     for (case, failed_manifest, missing) in [
         ("complete", None, false),
+        ("workspace-wide", None, false),
         (
             "workspace-unreadable",
             Some(workspace.join("Cargo.toml")),
@@ -2812,16 +2948,36 @@ fn cargo_manifest_read_failures_invalidate_receipts_without_losing_selective_reu
             true,
         ),
         ("selected-unreadable", Some(app.join("Cargo.toml")), false),
+        ("selected-malformed", Some(app.join("Cargo.toml")), false),
+        ("duplicate-package", Some(support.join("Cargo.toml")), false),
         (
             "intermediate-unreadable",
             Some(support.join("Cargo.toml")),
             false,
         ),
     ] {
+        let complete = case == "complete";
+        let arguments = if case == "workspace-wide" {
+            serde_json::json!({"workdir": workspace})
+        } else {
+            serde_json::json!({"package": "app", "workdir": workspace})
+        };
+        let payload = ToolPayload::Function {
+            arguments: arguments.to_string(),
+        };
         let original = failed_manifest.as_ref().map(|path| {
             let original = std::fs::read(path).expect("save manifest");
             if missing {
                 std::fs::remove_file(path).expect("temporarily remove manifest");
+            } else if case == "duplicate-package" {
+                std::fs::write(path, "[package]\nname = 'app'\nversion = '0.2.0'\n")
+                    .expect("ambiguous package identity");
+            } else if case == "selected-malformed" {
+                std::fs::write(
+                    path,
+                    "[package]\nname = 'app'\n[dependencies]\nrenamed = { workspace = true\n",
+                )
+                .expect("temporarily malformed manifest");
             } else {
                 // Invalid UTF-8 makes the actual read_to_string fail on every platform.
                 std::fs::write(path, [0xff]).expect("temporarily unreadable manifest");
@@ -2835,7 +2991,7 @@ fn cargo_manifest_read_failures_invalidate_receipts_without_losing_selective_reu
         }
         assert!(classification.observes_workspace, "{case}");
         assert_eq!(classification.workspace_cwd, workspace, "{case}");
-        if failed_manifest.is_none() {
+        if complete {
             assert!(
                 classification
                     .source_dependencies
@@ -2890,10 +3046,7 @@ fn cargo_manifest_read_failures_invalidate_receipts_without_losing_selective_reu
         assert_eq!(receipt.artifact_id, "artifact-1");
         assert_eq!(receipt.bytes, 96_000);
 
-        for (path, must_be_stale) in [
-            (&unrelated, failed_manifest.is_some()),
-            (&transitive.join("lib.rs"), true),
-        ] {
+        for (path, must_be_stale) in [(&unrelated, !complete), (&transitive.join("lib.rs"), true)] {
             let changed = workspace_identity("changed");
             state.invalidate_source_dependencies(
                 Some(&BTreeSet::from([path.clone()])),
@@ -2989,4 +3142,98 @@ fn tool_history_admission_recovers_legacy_non_text_cost_from_response_content() 
     assert_eq!(projection.items, canonical);
     assert_eq!(projection.unreplaced_items, canonical);
     assert!(projection.substitutions.is_empty());
+}
+
+#[test]
+fn cargo_dependencies_resolve_inherited_renamed_external_paths_and_fail_closed() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("workspace");
+    for path in [
+        "workspace/crates/app",
+        "external",
+        "workspace/unrelated/hidden",
+    ] {
+        std::fs::create_dir_all(temp.path().join(path)).unwrap();
+    }
+    std::fs::write(root.join("Cargo.toml"), "[workspace]\nmembers = ['crates/*']\n[workspace.dependencies]\nrenamed = { package = 'support', path = '../external' }\n").unwrap();
+    let app = root.join("crates/app/Cargo.toml");
+    std::fs::write(&app, "[package]\nname = 'app'\nversion = '0.1.0'\n[target.'cfg(windows)'.build-dependencies]\nrenamed.workspace = true\n").unwrap();
+    std::fs::write(
+        temp.path().join("external/Cargo.toml"),
+        "[package]\nname = 'support'\nversion = '0.1.0'\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("unrelated/hidden/Cargo.toml"),
+        "[package]\nname = 'hidden'\nversion = '0.1.0'\n",
+    )
+    .unwrap();
+    let payload = ToolPayload::Function {
+        arguments: serde_json::json!({"package": "app"}).to_string(),
+    };
+    let dependencies = source_dependencies_for_tool_call("cargo_test", &payload, &root);
+    assert!(dependencies.contains(&SourceDependencyV1::new(
+        &temp.path().join("external"),
+        true
+    )));
+    assert!(dependencies.contains(&SourceDependencyV1::new(&root.join("crates/app"), true)));
+    let mut reads = Vec::new();
+    let graph = cargo_package_index_with_manifest_reader(
+        &root,
+        Some(std::fs::read_to_string(root.join("Cargo.toml")).unwrap()),
+        |path| {
+            reads.push(path.to_path_buf());
+            std::fs::read_to_string(path).ok()
+        },
+    );
+    assert_eq!(reads.len(), 2);
+    assert!(!graph.packages.contains_key("hidden"));
+    std::fs::write(&app, "[package]\nname = 'app'\nversion = '0.1.0'\n[dependencies]\nrenamed = { workspace = true\n").unwrap();
+    assert!(source_dependencies_for_tool_call("cargo_test", &payload, &root).is_empty());
+}
+
+#[tokio::test]
+async fn checkpoint_ignores_old_journal_after_crash_but_replays_new_records() {
+    let temp = tempfile::tempdir().unwrap();
+    let thread_id = "checkpoint-crash";
+    for writer in ["old-writer", "new-writer"] {
+        persist_tool_history_mutations(
+            temp.path(),
+            thread_id,
+            writer,
+            &[(
+                1,
+                ToolHistoryMutation::RegisterNonWorkspaceCodeModeCall {
+                    call_id: format!("obsolete-{writer}"),
+                },
+            )],
+        )
+        .await
+        .unwrap();
+    }
+    let old_journal = std::fs::read(journal_path(temp.path(), thread_id)).unwrap();
+    persist_tool_history_state(temp.path(), thread_id, &ToolHistoryState::default())
+        .await
+        .unwrap();
+    // Crash between the durable checkpoint rename and journal unlink.
+    std::fs::write(journal_path(temp.path(), thread_id), old_journal).unwrap();
+    persist_tool_history_mutations(
+        temp.path(),
+        thread_id,
+        "new-writer",
+        &[(
+            2,
+            ToolHistoryMutation::RegisterNonWorkspaceCodeModeCall {
+                call_id: "current".to_string(),
+            },
+        )],
+    )
+    .await
+    .unwrap();
+    let restored =
+        expect_loaded_tool_history(load_tool_history_state_for_fork(temp.path(), thread_id).await);
+    assert_eq!(
+        restored.non_workspace_code_mode_calls,
+        BTreeSet::from(["current".to_string()])
+    );
 }

@@ -26,19 +26,15 @@
 - Add no new frameworks, redesigns, cleanup projects, or extra acceptance checks unless a confirmed failure requires them.
 
 ### Validation
-*All three of the following are mandatory*
-1. Do not create a test that does not prove direct behavior and/or logic. 
-2. Every test must prove direct behavior and/or logic. 
-3. If you find a test that does not follow this policy, fix it.
-
-If you need a more detailed verison:
-- For behavior changes, identify the normal entry point, input, expected observable result, and a plausible incorrect implementation the test rejects. Strengthen the nearest sufficient scenario with independent contract expectations and consumer-visible effects, including forbidden side effects on failure. Use normal registration for wiring claims; doubles may replace external dependencies, not the behavior under test. Run the existing narrow target/filter and report the behavior proved; unavailable prerequisites are unverified. For documentation-only changes, run the nearest relevant existing validation instead of creating a test.
+* Both of the following are mandatory*
+1. Every test must assert an expected result and fail for a plausible incorrect implementation of the behavior or logic under test.
+2. Fix any test you encounter that does not meet these requirements.
 
 - If blocked by tests, do not repeat, simply finish the full task then report blocked by tests.
 
 - Never run the full test suite unless specfically told to.
 
-- When validating do not fix errors one by one, wait until the test completes, then you are allowed to fix them in batches.
+Let each validation run finish before fixing failures. Review the complete results, then fix failures in batches rather than one at a time as they appear.
 
 
 ## Routing and task scope

@@ -38,6 +38,7 @@ pub fn parse_mcp_tool(tool: &rmcp::model::Tool) -> Result<ToolDefinition, serde_
 
 pub fn mcp_call_tool_result_output_schema(structured_content_schema: JsonValue) -> JsonValue {
     json!({
+        (codex_code_mode::MCP_RESULT_SCHEMA_MARKER): true,
         "type": "object",
         "properties": {
             "content": {

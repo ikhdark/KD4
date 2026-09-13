@@ -3,7 +3,6 @@ use crate::context::world_state::WorldStateSnapshot;
 use crate::context_manager::is_user_turn_boundary;
 use codex_protocol::models::ContentItem;
 use codex_protocol::protocol::SessionContextWindow;
-use std::collections::BTreeSet;
 use std::collections::HashSet;
 use uuid::Uuid;
 
@@ -28,56 +27,48 @@ pub(super) fn append_unified_exec_resume_invalidation(history: &mut Vec<Response
     let unified_exec_call_ids = history
         .iter()
         .filter_map(|item| match item {
-            ResponseItem::FunctionCall { name, call_id, .. }
-                if matches!(name.as_str(), "exec_command" | "write_stdin") =>
-            {
-                Some(call_id.as_str())
-            }
+            ResponseItem::FunctionCall {
+                name,
+                namespace: None,
+                call_id,
+                ..
+            } if matches!(name.as_str(), "exec_command" | "write_stdin") => Some(call_id.as_str()),
             _ => None,
         })
         .collect::<HashSet<_>>();
-    let already_invalidated = history
-        .iter()
-        .filter_map(|item| match item {
-            ResponseItem::Message { role, content, .. } if role == "developer" => Some(content),
-            _ => None,
-        })
-        .flat_map(|content| content.iter())
-        .filter_map(|content| match content {
-            ContentItem::InputText { text }
-                if text.starts_with(UNIFIED_EXEC_RESUME_INVALIDATION_START) =>
-            {
-                Some(text.as_str())
-            }
-            _ => None,
-        })
-        .flat_map(unified_exec_session_ids_from_invalidation)
-        .collect::<BTreeSet<_>>();
-    let session_ids = history
-        .iter()
-        .filter_map(|item| match item {
-            ResponseItem::FunctionCallOutput {
-                call_id, output, ..
-            } if unified_exec_call_ids.contains(call_id.as_str()) => output.text_content(),
-            _ => None,
-        })
-        .flat_map(unified_exec_session_ids_from_output)
-        .filter(|session_id| !already_invalidated.contains(session_id))
-        .collect::<BTreeSet<_>>();
-    if session_ids.is_empty() {
+    let has_old_sessions = history.iter().any(|item| match item {
+        ResponseItem::FunctionCallOutput {
+            call_id, output, ..
+        } if unified_exec_call_ids.contains(call_id.as_str()) => {
+            output.text_content().is_some_and(|output| {
+                output.lines().any(|line| {
+                    line.strip_prefix(UNIFIED_EXEC_SESSION_ID_PREFIX)
+                        .is_some_and(|id| id.trim().parse::<u32>().is_ok())
+                })
+            })
+        }
+        _ => false,
+    });
+    // Replace earlier runtime notices so this notice scopes invalidation to the
+    // current resume boundary, including when a numeric process ID is reused.
+    let mut had_notice = false;
+    history.retain(|item| {
+        let is_notice = matches!(item, ResponseItem::Message { role, content, .. }
+            if role == "developer" && matches!(content.as_slice(),
+                [ContentItem::InputText { text }]
+                    if text.starts_with(UNIFIED_EXEC_RESUME_INVALIDATION_START)));
+        had_notice |= is_notice;
+        !is_notice
+    });
+    if !has_old_sessions && !had_notice {
         return;
     }
-
-    let session_list = session_ids
-        .iter()
-        .map(|session_id| format!("- {session_id}"))
-        .collect::<Vec<_>>()
-        .join("\n");
     let text = format!(
         "{UNIFIED_EXEC_RESUME_INVALIDATION_START}\n\
-The unified-exec sessions below became unavailable when this conversation resumed:\n\
-{session_list}\n\
-Do not call write_stdin with these session IDs. Rerun the commands to start new processes.\n\
+Process session IDs in the pre-resume history are no longer live. Do not poll those old sessions. \
+Newly returned session IDs are valid, even when a number is reused. \
+Start another process only when the current task still requires execution; \
+do not rerun completed commands merely because this conversation resumed.\n\
 </unified_exec_resume_invalidated>"
     );
     history.push(ResponseItem::Message {
@@ -87,20 +78,6 @@ Do not call write_stdin with these session IDs. Rerun the commands to start new 
         phase: None,
         internal_chat_message_metadata_passthrough: None,
     });
-}
-
-fn unified_exec_session_ids_from_output(output: &str) -> impl Iterator<Item = i64> + '_ {
-    output.lines().filter_map(|line| {
-        line.strip_prefix(UNIFIED_EXEC_SESSION_ID_PREFIX)?
-            .trim()
-            .parse::<i64>()
-            .ok()
-    })
-}
-
-fn unified_exec_session_ids_from_invalidation(text: &str) -> impl Iterator<Item = i64> + '_ {
-    text.lines()
-        .filter_map(|line| line.strip_prefix("- ")?.trim().parse::<i64>().ok())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -254,6 +231,9 @@ impl Session {
         let mut surviving_compaction_count = 0u64;
         let mut has_surviving_legacy_compaction_without_window_number = false;
         let mut window = None;
+        let has_turn_started = rollout_items
+            .iter()
+            .any(|item| matches!(item, RolloutItem::EventMsg(EventMsg::TurnStarted(_))));
         let has_segmented_turn_boundaries = rollout_items.iter().any(|item| {
             matches!(
                 item,
@@ -446,6 +426,30 @@ impl Session {
                 | RolloutItem::SessionMeta(_)
                 | RolloutItem::ToolManifest(_)
                 | RolloutItem::InterAgentCommunicationMetadata { .. } => {}
+            }
+
+            // Older rollouts used UserMessage as the start event. Finalize at
+            // that same boundary so rollback discards one turn and its metadata.
+            if !has_turn_started
+                && matches!(item, RolloutItem::EventMsg(EventMsg::UserMessage(_)))
+                && let Some(active_segment) = active_segment.take()
+            {
+                finalize_active_segment(
+                    active_segment,
+                    FinalizedReplayState {
+                        base_replacement_history: &mut base_replacement_history,
+                        rollout_suffix: &mut rollout_suffix,
+                        discarded_history_effect_indexes: &mut discarded_history_effect_indexes,
+                        previous_turn_settings: &mut previous_turn_settings,
+                        reference_context_item: &mut reference_context_item,
+                        world_state_replay: &mut world_state_replay,
+                        surviving_compaction_count: &mut surviving_compaction_count,
+                        has_surviving_legacy_compaction_without_window_number:
+                            &mut has_surviving_legacy_compaction_without_window_number,
+                        window: &mut window,
+                        pending_rollback_turns: &mut pending_rollback_turns,
+                    },
+                );
             }
 
             if base_replacement_history.is_some()

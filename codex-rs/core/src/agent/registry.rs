@@ -167,6 +167,22 @@ impl AgentRegistry {
             .cloned()
     }
 
+    pub(crate) fn agent_metadata_for_threads(
+        &self,
+        thread_ids: &HashSet<ThreadId>,
+    ) -> HashMap<ThreadId, AgentMetadata> {
+        self.active_agents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .agent_tree
+            .values()
+            .filter_map(|metadata| {
+                let id = metadata.agent_id?;
+                thread_ids.contains(&id).then(|| (id, metadata.clone()))
+            })
+            .collect()
+    }
+
     pub(crate) fn live_agents(&self) -> Vec<AgentMetadata> {
         self.active_agents
             .lock()
@@ -203,7 +219,7 @@ impl AgentRegistry {
             .values_mut()
             .find(|metadata| metadata.agent_id == Some(thread_id))
         {
-            metadata.last_task_message = Some(last_task_message);
+            metadata.last_task_message = Some(bounded_task_message(last_task_message));
         }
     }
 
@@ -223,11 +239,13 @@ impl AgentRegistry {
 
     fn register_spawned_thread(
         &self,
-        agent_metadata: AgentMetadata,
+        mut agent_metadata: AgentMetadata,
         parent_thread_id: Option<ThreadId>,
     ) -> Result<()> {
         let Some(thread_id) = agent_metadata.agent_id else {
-            return Ok(());
+            return Err(CodexErr::Fatal(
+                "cannot register a spawned agent without a thread id".to_string(),
+            ));
         };
         let mut active_agents = self
             .active_agents
@@ -240,6 +258,8 @@ impl AgentRegistry {
         {
             return Err(parent_closing_error(parent_thread_id));
         }
+        agent_metadata.last_task_message =
+            agent_metadata.last_task_message.map(bounded_task_message);
         let key = agent_metadata
             .agent_path
             .as_ref()
@@ -522,6 +542,23 @@ impl Drop for SpawnReservation {
             self.state.total_count.fetch_sub(1, Ordering::AcqRel);
         }
     }
+}
+
+// Display metadata is bounded independently of the authoritative delivered message.
+const MAX_TASK_MESSAGE_BYTES: usize = 2_048;
+
+fn bounded_task_message(mut message: String) -> String {
+    const SUFFIX: &str = "\n[truncated]";
+    if message.len() > MAX_TASK_MESSAGE_BYTES {
+        let mut end = MAX_TASK_MESSAGE_BYTES - SUFFIX.len();
+        while !message.is_char_boundary(end) {
+            end -= 1;
+        }
+        message.truncate(end);
+        message.push_str(SUFFIX);
+        message.shrink_to_fit();
+    }
+    message
 }
 
 #[cfg(test)]

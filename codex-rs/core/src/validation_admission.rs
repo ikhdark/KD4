@@ -555,6 +555,18 @@ pub(crate) fn classify_validation(invocation: &CommandInvocation) -> ValidationC
 }
 
 fn classify_powershell_script(script: &str) -> ValidationClassification {
+    // Preserve control-flow information before the PowerShell parser flattens
+    // pipelines and command chains into argv leaves.
+    let simple = classify_simple_script(script, 0);
+    if matches!(
+        simple,
+        ValidationClassification::Validation {
+            exit_code_is_authoritative: true,
+            ..
+        }
+    ) {
+        return simple;
+    }
     let command = vec![
         "pwsh".to_string(),
         "-Command".to_string(),
@@ -643,28 +655,53 @@ fn classify_simple_script(script: &str, depth: usize) -> ValidationClassificatio
     if depth > MAX_WRAPPER_DEPTH {
         return ValidationClassification::Opaque;
     }
-    let Some(commands) = split_deterministic_script(script) else {
+    let Some((commands, success_chain)) = split_deterministic_script(script) else {
         return ValidationClassification::Opaque;
     };
-    let classifications = commands.into_iter().filter_map(|command| {
-        let Some(words) = shlex::split(command.trim()) else {
-            return Some(ValidationClassification::Opaque);
-        };
-        let first_command = words
-            .iter()
-            .position(|word| !is_shell_assignment(word))
-            .unwrap_or(words.len());
-        let program = words.get(first_command)?;
-        Some(classify_argv_at_depth(
-            program,
-            &words[first_command + 1..],
-            depth + 1,
-        ))
-    });
-    combine_validation_classifications(classifications)
+    let classifications = commands
+        .into_iter()
+        .filter_map(|command| {
+            let Some(words) = shlex::split(command.trim()) else {
+                return Some(ValidationClassification::Opaque);
+            };
+            let first_command = words
+                .iter()
+                .position(|word| !is_shell_assignment(word))
+                .unwrap_or(words.len());
+            let program = words.get(first_command)?;
+            Some(classify_argv_at_depth(
+                program,
+                &words[first_command + 1..],
+                depth + 1,
+            ))
+        })
+        .collect::<Vec<_>>();
+    // Only an all-validation && chain proves every suite ran successfully.
+    // Semicolons, ||, opaque setup, and trailing commands can mask failures or
+    // change the workspace after validation. Keep those conservative.
+    let authoritative_chain = success_chain
+        && classifications.iter().all(|classification| {
+            matches!(
+                classification,
+                ValidationClassification::Validation {
+                    exit_code_is_authoritative: true,
+                    has_unclassified_targets: false,
+                    ..
+                }
+            )
+        });
+    let mut combined = combine_validation_classifications(classifications);
+    if let ValidationClassification::Validation {
+        exit_code_is_authoritative,
+        ..
+    } = &mut combined
+    {
+        *exit_code_is_authoritative |= authoritative_chain;
+    }
+    combined
 }
 
-fn split_deterministic_script(script: &str) -> Option<Vec<&str>> {
+fn split_deterministic_script(script: &str) -> Option<(Vec<&str>, bool)> {
     if script.contains("$(") || script.contains("${") || script.contains('`') {
         return None;
     }
@@ -674,6 +711,7 @@ fn split_deterministic_script(script: &str) -> Option<Vec<&str>> {
     let mut index = 0;
     let mut quote = None;
     let mut escaped = false;
+    let mut success_chain = true;
     while index < bytes.len() {
         let byte = bytes[index];
         if escaped {
@@ -710,6 +748,7 @@ fn split_deterministic_script(script: &str) -> Option<Vec<&str>> {
             index += 1;
             continue;
         }
+        success_chain &= byte == b'&';
         commands.push(&script[start..index]);
         index += separator_length;
         if byte == b'\r' && bytes.get(index) == Some(&b'\n') {
@@ -721,7 +760,7 @@ fn split_deterministic_script(script: &str) -> Option<Vec<&str>> {
         return None;
     }
     commands.push(&script[start..]);
-    Some(commands)
+    Some((commands, success_chain))
 }
 
 fn classify_argv(program: &str, args: &[String]) -> ValidationClassification {

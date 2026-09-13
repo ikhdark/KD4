@@ -372,7 +372,13 @@ fn world_state_baseline_deduplicates_until_history_is_replaced() {
     let mut history = ContextManager::new();
 
     let (initial_fragments, initial_item) = history.update_world_state(&world_state());
-    assert_eq!(1, initial_fragments.len());
+    assert_eq!(
+        initial_fragments
+            .iter()
+            .map(|fragment| fragment.render())
+            .collect::<Vec<_>>(),
+        vec!["# AGENTS.md instructions\n\n<INSTRUCTIONS>\ntest\n</INSTRUCTIONS>"]
+    );
     assert!(initial_item.is_some_and(|item| item.full));
 
     let (unchanged_fragments, unchanged_item) = history.update_world_state(&world_state());
@@ -382,7 +388,13 @@ fn world_state_baseline_deduplicates_until_history_is_replaced() {
     history.replace(Vec::new());
 
     let (replacement_fragments, replacement_item) = history.update_world_state(&world_state());
-    assert_eq!(1, replacement_fragments.len());
+    assert_eq!(
+        replacement_fragments
+            .iter()
+            .map(|fragment| fragment.render())
+            .collect::<Vec<_>>(),
+        vec!["# AGENTS.md instructions\n\n<INSTRUCTIONS>\ntest\n</INSTRUCTIONS>"]
+    );
     assert!(replacement_item.is_some_and(|item| item.full));
 }
 
@@ -793,6 +805,22 @@ fn for_prompt_evicts_multiple_completed_groups_and_keeps_current_reasoning() {
         history.for_prompt(&default_input_modalities()),
         vec![first_boundary, second_boundary, current]
     );
+}
+
+#[test]
+fn for_prompt_treats_mixed_context_and_user_input_as_a_turn_boundary() {
+    let mut mixed = crate::context::ContextualUserFragment::into(UserInstructions {
+        directory: None,
+        text: "context only".to_string(),
+    });
+    let ResponseItem::Message { content, .. } = &mut mixed else {
+        panic!("expected message");
+    };
+    content.push(ContentItem::InputText {
+        text: "new user instruction".to_string(),
+    });
+    let history = create_history_with_items(vec![reasoning_msg("resolved"), mixed.clone()]);
+    assert_eq!(history.for_prompt(&default_input_modalities()), vec![mixed]);
 }
 
 #[test]
@@ -2430,6 +2458,113 @@ fn sampling_preparation_projects_stable_context_but_generic_preparation_fails_op
 }
 
 #[test]
+fn sampling_tool_projection_reuses_shared_input_and_preserves_fail_open_context() {
+    let old_repository =
+        "# AGENTS.md instructions for /repo\n\n<INSTRUCTIONS>\nold\n</INSTRUCTIONS>";
+    let current_repository =
+        "# AGENTS.md instructions for /repo\n\n<INSTRUCTIONS>\ncurrent\n</INSTRUCTIONS>";
+    let incomplete_repository = "# AGENTS.md instructions for /repo\n\n<INSTRUCTIONS>\ncurrent";
+    let call = ResponseItem::FunctionCall {
+        id: None,
+        name: "exec_command".to_string(),
+        namespace: None,
+        arguments: r#"{"cmd":"cat source.rs"}"#.to_string(),
+        call_id: "read-source".to_string(),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let output = ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: "read-source".to_string(),
+        output: FunctionCallOutputPayload::from_text("unverified source contents".to_string()),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let workspace = crate::git_workspace::GitWorkspaceCache::new();
+    for fail_open in [false, true] {
+        let mut items = vec![call.clone(), output.clone()];
+        let latest_repository = if fail_open {
+            incomplete_repository
+        } else {
+            current_repository
+        };
+        for text in [old_repository, latest_repository] {
+            let mut item = user_input_text_msg(text);
+            crate::stable_context::mark_trusted_stable_context_item(&mut item);
+            items.push(item);
+        }
+        let mut history = ContextManager::new();
+        history.record_items(items.iter(), TruncationPolicy::Tokens(10_000));
+        for completed_tool_projection in [false, true] {
+            let prepared = if completed_tool_projection {
+                history
+                    .clone()
+                    .prepare_for_sampling_prompt_with_completed_tool_projection(
+                        &default_input_modalities(),
+                        StableContextTarget::Sampling,
+                        None,
+                        &workspace,
+                    )
+            } else {
+                history
+                    .clone()
+                    .prepare_for_sampling_prompt_with_workspace_freshness(
+                        &default_input_modalities(),
+                        StableContextTarget::Sampling,
+                        None,
+                        &workspace,
+                    )
+            };
+            let sampling = prepared.shared_items();
+            let fallback = prepared.shared_fallback_items();
+            assert_eq!(Arc::ptr_eq(&sampling, &fallback), !fail_open);
+            assert_eq!(prepared.stable_context_manifest().fail_open(), fail_open);
+            for projected in [&sampling, &fallback] {
+                let call_index = projected
+                    .iter()
+                    .position(|item| matches!(item, ResponseItem::FunctionCall { .. }))
+                    .expect("source read call");
+                let ResponseItem::FunctionCall { arguments, .. } = &projected[call_index] else {
+                    panic!("tool call must remain paired");
+                };
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(arguments).unwrap(),
+                    serde_json::json!({"cmd": "cat source.rs", "force_fresh": true})
+                );
+                let ResponseItem::FunctionCallOutput { output, .. } = &projected[call_index + 1]
+                else {
+                    panic!("tool output must remain paired");
+                };
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(output.text_content().unwrap())
+                        .unwrap(),
+                    serde_json::json!({
+                        "call_id": "read-source", "rerun": {"force_fresh": true},
+                        "reason": "no workspace observation was recorded for this tool result; rerun the tool before relying on it",
+                        "stale_workspace_evidence": true,
+                    })
+                );
+                let context = projected
+                    .iter()
+                    .filter(
+                        |item| matches!(item, ResponseItem::Message { role, .. } if role == "user"),
+                    )
+                    .cloned()
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    context,
+                    if fail_open {
+                        items[2..].to_vec()
+                    } else {
+                        vec![user_input_text_msg(current_repository)]
+                    }
+                );
+                assert_eq!(projected.len(), 2 + context.len());
+            }
+        }
+        assert_eq!(history.raw_items(), items);
+    }
+}
+
+#[test]
 fn prepared_prompt_cache_does_not_cross_divergent_clone_branches() {
     let mut left = create_history_with_items(vec![agent_message("shared")]);
     let mut right = left.clone();
@@ -2718,25 +2853,30 @@ fn tool_history_budget_drops_complete_local_shell_pairs() {
     }
     let mut history = ContextManager::new();
     history.record_items(canonical.iter(), TruncationPolicy::Tokens(24_000));
-    let prepared = history
-        .clone()
-        .prepare_for_prompt_with_completed_tool_projection_target(
-            &default_input_modalities(),
-            StableContextTarget::FailOpen,
-            None,
-            None,
-        );
-
     // Two 6,000-token results exceed the 10,000-token aggregate ceiling. Keep
     // the newer complete pair in every transport form, including raw fallback.
     let expected = &canonical[2..];
-    assert_eq!(prepared.items(), expected);
-    assert_eq!(prepared.shared_unreplaced_items().as_ref(), expected);
-    assert_eq!(prepared.shared_fallback_items().as_ref(), expected);
-    assert_eq!(
-        prepared.shared_unreplaced_fallback_items().as_ref(),
-        expected
-    );
+    for target in [StableContextTarget::FailOpen, StableContextTarget::Sampling] {
+        let prepared = history
+            .clone()
+            .prepare_for_prompt_with_completed_tool_projection_target(
+                &default_input_modalities(),
+                target,
+                None,
+                None,
+            );
+        assert_eq!(prepared.items(), expected);
+        assert_eq!(prepared.shared_unreplaced_items().as_ref(), expected);
+        assert_eq!(prepared.shared_fallback_items().as_ref(), expected);
+        assert_eq!(
+            Arc::ptr_eq(&prepared.shared_items(), &prepared.shared_fallback_items()),
+            target == StableContextTarget::Sampling
+        );
+        assert_eq!(
+            prepared.shared_unreplaced_fallback_items().as_ref(),
+            expected
+        );
+    }
     assert_eq!(history.raw_items(), canonical);
 }
 
@@ -2800,7 +2940,9 @@ fn tool_history_candidate_lifecycle_preserves_prepared_base_and_refreshes_projec
         derived: crate::tool_history::ToolHistoryCandidateDerived::default(),
     };
 
-    history.register_tool_history_candidate(candidate);
+    assert!(history.apply_tool_history_mutation(
+        &crate::tool_history::ToolHistoryMutation::RegisterCandidate { candidate },
+    ));
     let mut delta_history = history.clone();
     assert_eq!(history.projection_revision, initial_revision);
     let cached_after_registration = history
@@ -2814,11 +2956,13 @@ fn tool_history_candidate_lifecycle_preserves_prepared_base_and_refreshes_projec
     assert!(Arc::ptr_eq(&cached_after_registration, &prepared_base));
 
     let prompt_input = history.raw_items().to_vec();
-    assert!(history.mark_tool_history_consumed(
-        &prompt_input,
-        ModelGenerationId {
-            turn_id: "turn-cached-tool-history".to_string(),
-            ordinal: 1,
+    assert!(history.apply_tool_history_mutation(
+        &crate::tool_history::ToolHistoryMutation::MarkConsumed {
+            call_ids: BTreeSet::from([call_id.to_string()]),
+            generation: ModelGenerationId {
+                turn_id: "turn-cached-tool-history".to_string(),
+                ordinal: 1,
+            },
         },
     ));
     assert_eq!(history.projection_revision, initial_revision);
@@ -2855,6 +2999,14 @@ fn tool_history_candidate_lifecycle_preserves_prepared_base_and_refreshes_projec
 
     let projected = delta_history
         .for_compaction_prompt_with_completed_tool_projection(&default_input_modalities(), None);
+    assert_eq!(
+        history.for_compaction_prompt_with_completed_tool_projection(
+            &default_input_modalities(),
+            None
+        ),
+        projected,
+        "production mutations and direct consumption must refresh the same receipt projection",
+    );
     assert!(
         projected
             .iter()
@@ -3504,4 +3656,57 @@ fn text_only_items_unchanged() {
     let raw_len = serde_json::to_string(&item).unwrap().len() as i64;
 
     assert_eq!(estimated, raw_len);
+}
+
+#[test]
+fn prepared_appends_release_materialized_ancestors() {
+    let mut history = create_history_with_items(vec![agent_message("first")]);
+    let first = history
+        .clone()
+        .prepare_for_prompt(&default_input_modalities());
+    let ancestor = Arc::downgrade(&first.items.0);
+    let first_flattened = Arc::downgrade(&first.shared_items());
+    history.record_items([&reasoning_msg("second")], TruncationPolicy::Tokens(10_000));
+    drop(first);
+    assert!(ancestor.upgrade().is_none());
+    let second = history
+        .clone()
+        .prepare_for_prompt(&default_input_modalities());
+    assert_eq!(
+        second.items(),
+        &[agent_message("first"), reasoning_msg("second")]
+    );
+    let second_ancestor = Arc::downgrade(&second.items.0);
+    history.record_items([&reasoning_msg("third")], TruncationPolicy::Tokens(10_000));
+    drop(second);
+    assert!(second_ancestor.upgrade().is_none());
+    assert!(
+        first_flattened.upgrade().is_none(),
+        "the original flattened copy must be released after the next materialized append"
+    );
+    assert_eq!(
+        history.for_prompt(&default_input_modalities()),
+        vec![
+            agent_message("first"),
+            reasoning_msg("second"),
+            reasoning_msg("third")
+        ],
+    );
+}
+
+#[test]
+fn tool_history_mutations_preserve_canonical_preparation() {
+    let mut history = create_history_with_items(vec![agent_message("hello")]);
+    let first = history
+        .clone()
+        .prepare_for_prompt(&default_input_modalities());
+    assert!(history.apply_tool_history_mutation(
+        &crate::tool_history::ToolHistoryMutation::RegisterNonWorkspaceCodeModeCall {
+            call_id: "metadata-only".to_string(),
+        },
+    ));
+    history.set_tool_history_state(history.tool_history_state());
+    let second = history.prepare_for_prompt(&default_input_modalities());
+    assert!(Arc::ptr_eq(&first.shared_items(), &second.shared_items()));
+    assert_eq!(first.fingerprint(), second.fingerprint());
 }

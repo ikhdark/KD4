@@ -167,6 +167,8 @@ struct AgentControlTestHooks {
 enum V2AgentLoadCompletion {
     Loading,
     Succeeded,
+    CapacityExceeded { max_threads: usize },
+    ThreadNotFound(ThreadId),
     Failed(Arc<str>),
     Cancelled,
 }
@@ -693,15 +695,15 @@ impl AgentControl {
         session_source: Option<SessionSource>,
         child_reference: String,
         child_agent_path: Option<AgentPath>,
-    ) {
+    ) -> Option<tokio::task::JoinHandle<()>> {
         let Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
             parent_thread_id, ..
         })) = session_source
         else {
-            return;
+            return None;
         };
         let control = self.clone();
-        tokio::spawn(async move {
+        Some(tokio::spawn(async move {
             let mut status = match control.subscribe_status(child_thread_id).await {
                 Ok(mut status_rx) => {
                     let mut status = status_rx.borrow().clone();
@@ -729,10 +731,14 @@ impl AgentControl {
                 let task_coordinator = control.task_coordinator();
                 let assignment_id = task_coordinator
                     .binding_for_agent_path(child_agent_path)
+                    .filter(|binding| {
+                        binding.thread_id.as_deref() == Some(child_thread_id.to_string().as_str())
+                    })
                     .map(|binding| binding.assignment_id);
                 match task_coordinator
                     .seal_missing_receipt(
                         child_agent_path,
+                        child_thread_id,
                         format!(
                             "typed agent {child_agent_path} finished with status {status:?} without submitting a receipt"
                         ),
@@ -828,7 +834,7 @@ impl AgentControl {
             parent_thread
                 .inject_user_message_without_turn(message)
                 .await;
-        });
+        }))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -930,7 +936,9 @@ impl AgentControl {
         &self,
         parent_thread_id: ThreadId,
     ) -> CodexResult<Vec<(ThreadId, AgentMetadata)>> {
-        let mut children_by_parent = self.live_thread_spawn_children().await?;
+        let mut children_by_parent = self
+            .live_thread_spawn_children(Some(parent_thread_id))
+            .await?;
         Ok(children_by_parent
             .remove(&parent_thread_id)
             .unwrap_or_default())
@@ -938,22 +946,29 @@ impl AgentControl {
 
     async fn live_thread_spawn_children(
         &self,
+        requested_parent: Option<ThreadId>,
     ) -> CodexResult<HashMap<ThreadId, Vec<(ThreadId, AgentMetadata)>>> {
         let state = self.upgrade()?;
         let mut children_by_parent = HashMap::<ThreadId, Vec<(ThreadId, AgentMetadata)>>::new();
 
-        for (parent_thread_id, child_thread_id) in state.list_live_thread_spawn_edges().await {
+        let edges = state
+            .list_live_thread_spawn_edges()
+            .await
+            .into_iter()
+            .filter(|(parent, _)| requested_parent.is_none_or(|requested| requested == *parent))
+            .collect::<Vec<_>>();
+        let child_ids = edges.iter().map(|(_, child)| *child).collect();
+        let mut metadata = self.state.agent_metadata_for_threads(&child_ids);
+        for (parent_thread_id, child_thread_id) in edges {
             children_by_parent
                 .entry(parent_thread_id)
                 .or_default()
                 .push((
                     child_thread_id,
-                    self.state
-                        .agent_metadata_for_thread(child_thread_id)
-                        .unwrap_or(AgentMetadata {
-                            agent_id: Some(child_thread_id),
-                            ..Default::default()
-                        }),
+                    metadata.remove(&child_thread_id).unwrap_or(AgentMetadata {
+                        agent_id: Some(child_thread_id),
+                        ..Default::default()
+                    }),
                 ));
         }
 
@@ -1002,7 +1017,7 @@ impl AgentControl {
         &self,
         root_thread_id: ThreadId,
     ) -> CodexResult<Vec<ThreadId>> {
-        let mut children_by_parent = self.live_thread_spawn_children().await?;
+        let mut children_by_parent = self.live_thread_spawn_children(None).await?;
         let mut descendants = Vec::new();
         let mut stack = children_by_parent
             .remove(&root_thread_id)

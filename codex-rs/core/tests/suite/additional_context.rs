@@ -696,6 +696,18 @@ async fn task_model_guidance_is_injected_only_when_the_feature_is_enabled() -> R
         "exactly one guidance fragment per request"
     );
     assert!(guidance[0].contains("direct_file_read"));
+    assert!(guidance[0].contains("Form competing hypotheses only when uncertainty between explanations affects the next action."));
+    assert!(guidance[0].contains("Track repository ownership and runtime relationships only as needed to establish the requested behavior."));
+    assert!(guidance[0].contains(
+        "These are internal evidence labels, not a mandatory user-facing reporting format."
+    ));
+    assert!(
+        guidance[0].contains(
+            "Inspect implementation detail when needed to establish the requested behavior"
+        )
+    );
+    assert!(!guidance[0].contains("one to three plausible hypotheses"));
+    assert!(!guidance[0].contains("stay at module-level abstraction"));
     assert!(guidance[0].ends_with("</task_model_guidance>"));
 
     Ok(())

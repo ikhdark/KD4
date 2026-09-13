@@ -17,7 +17,7 @@ fn render_plugins_section_keeps_plugin_usage_guidance_without_listing_plugins() 
     }])
     .expect("plugin section should render");
 
-    let expected = "<plugins_instructions>\n## Plugins\nPlugins contribute skills (`plugin_name:skill`), MCP tools, or apps; invoke the contributed capability, not the bundle. Prefer a named plugin's relevant capabilities. If none are callable, say so briefly and use the best fallback.\n</plugins_instructions>";
+    let expected = "<plugins_instructions>\n## Plugins\nPlugins contribute skills (`plugin_name:skill`), MCP tools, or apps; use the contributed capability, not the bundle. Prefer a named plugin's relevant capability, loading or discovering it through its existing route when needed. If unavailable, explain the limitation; use a fallback only if it preserves the requested source and scope.\n</plugins_instructions>";
 
     assert_eq!(rendered, expected);
 }

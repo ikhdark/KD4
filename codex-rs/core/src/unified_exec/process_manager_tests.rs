@@ -108,6 +108,245 @@ fn coherent_packet_budget_uses_bounded_defaults_and_honors_override() {
     );
 }
 
+#[tokio::test]
+async fn explicitly_released_reservation_cannot_remove_a_reused_id() {
+    let manager = UnifiedExecProcessManager::default();
+    let mut first = manager.reserve_process_id().await;
+    let id = first.process_id();
+    manager.release_process_id_reservation(&mut first).await;
+    let second = manager.reserve_process_id().await;
+    assert_eq!(second.process_id(), id);
+    drop(first);
+    // Let the original reservation's cleanup task consume its disarm signal.
+    tokio::task::yield_now().await;
+    assert!(
+        manager
+            .process_store
+            .lock()
+            .await
+            .reserved_process_ids
+            .contains(&id)
+    );
+    let third = manager.reserve_process_id().await;
+    assert_ne!(third.process_id(), id);
+}
+
+#[tokio::test(start_paused = true)]
+async fn collection_bounds_successive_drains_with_exact_omission_accounting() {
+    use crate::unified_exec::UNIFIED_EXEC_OUTPUT_MAX_BYTES;
+    let (session, turn, _events) = crate::session::tests::make_session_and_context_with_rx().await;
+    let manager = &session.services.unified_exec_manager;
+    let process = crate::unified_exec::process_tests::remote_process(
+        codex_exec_server::WriteStatus::Accepted,
+        None,
+    )
+    .await;
+    crate::unified_exec::process_tests::store_process_for_test(
+        manager,
+        &session,
+        &turn,
+        1000,
+        Arc::clone(&process),
+    )
+    .await;
+    let handles = process.output_handles();
+    let buffer = &handles.output_buffer;
+    let collected = manager.write_stdin(WriteStdinRequest {
+        process_id: 1000,
+        input: "",
+        yield_time_ms: 10_000,
+        max_output_tokens: None,
+        truncation_policy: codex_utils_output_truncation::TruncationPolicy::Bytes(1000),
+    });
+    tokio::pin!(collected);
+    assert!(futures::poll!(&mut collected).is_pending());
+    let cap = UNIFIED_EXEC_OUTPUT_MAX_BYTES;
+    for byte in b"ABC" {
+        buffer.lock().await.push_chunk(&vec![*byte; cap]);
+        handles.output_notify.notify_waiters();
+        assert!(futures::poll!(&mut collected).is_pending());
+        assert_eq!(buffer.lock().await.retained_bytes(), 0);
+    }
+    process.signal_exit_for_test(Some(0));
+    handles.output_closed.store(true, Ordering::Release);
+    handles.output_closed_notify.notify_waiters();
+    let result = collected.await.expect("normal poll collects every drain");
+    assert_eq!(result.exit_code, Some(0));
+    assert_eq!(result.process_id, None);
+    assert!(
+        !manager
+            .process_store
+            .lock()
+            .await
+            .processes
+            .contains_key(&1000)
+    );
+    let output = result.raw_output;
+    let marker = omitted_output_marker(2 * cap);
+    let mut expected = vec![b'A'; cap / 2];
+    expected.extend_from_slice(&marker);
+    expected.extend(std::iter::repeat_n(b'C', cap - cap / 2));
+    assert_eq!(output.len(), cap + marker.len());
+    assert_eq!(output, expected);
+}
+
+#[tokio::test]
+async fn refresh_rejects_reused_identity_and_keeps_unread_closed_output() {
+    use crate::session::tests::make_session_and_context;
+    use crate::unified_exec::process_tests::remote_process;
+    use crate::unified_exec::process_tests::store_process_for_test;
+    use codex_exec_server::WriteStatus;
+    let (session, turn) = make_session_and_context().await;
+    let session = Arc::new(session);
+    let manager = &session.services.unified_exec_manager;
+    let original = remote_process(WriteStatus::Accepted, None).await;
+    let replacement = remote_process(WriteStatus::Accepted, None).await;
+    let id = 1000;
+    store_process_for_test(manager, &session, &turn, id, Arc::clone(&replacement)).await;
+    replacement.signal_exit_for_test(Some(0));
+    let handles = replacement.output_handles();
+    handles
+        .output_buffer
+        .lock()
+        .await
+        .push_chunk(b"final tail\n");
+    handles.output_closed.store(true, Ordering::Release);
+
+    assert!(matches!(
+        manager.refresh_process_state(id, &original).await,
+        ProcessStatus::Unknown
+    ));
+    assert!(matches!(
+        manager.refresh_process_state(id, &replacement).await,
+        ProcessStatus::OutputPending { .. }
+    ));
+    assert!(
+        manager
+            .process_store
+            .lock()
+            .await
+            .processes
+            .contains_key(&id)
+    );
+    let result = manager
+        .write_stdin(WriteStdinRequest {
+            process_id: id,
+            input: "",
+            yield_time_ms: 1000,
+            max_output_tokens: None,
+            truncation_policy: codex_utils_output_truncation::TruncationPolicy::Bytes(1000),
+        })
+        .await
+        .expect("normal polling must recover the final bytes");
+    assert_eq!(result.raw_output, b"final tail\n");
+    assert_eq!(result.process_id, None);
+    assert_eq!(result.exit_code, Some(0));
+    assert!(
+        !manager
+            .process_store
+            .lock()
+            .await
+            .processes
+            .contains_key(&id)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn polling_completion_cannot_adopt_or_drain_a_reused_process_id() {
+    use crate::unified_exec::process_tests::remote_process;
+    use crate::unified_exec::process_tests::store_process_for_test;
+    use codex_exec_server::WriteStatus;
+
+    let (session, turn, _events) = crate::session::tests::make_session_and_context_with_rx().await;
+    let manager = &session.services.unified_exec_manager;
+    let original = remote_process(WriteStatus::Accepted, None).await;
+    let replacement = remote_process(WriteStatus::Accepted, None).await;
+    store_process_for_test(manager, &session, &turn, 1000, Arc::clone(&original)).await;
+    let request = || WriteStdinRequest {
+        process_id: 1000,
+        input: "",
+        yield_time_ms: 1000,
+        max_output_tokens: None,
+        truncation_policy: codex_utils_output_truncation::TruncationPolicy::Bytes(1000),
+    };
+    let poll = manager.write_stdin(request());
+    tokio::pin!(poll);
+    assert!(futures::poll!(&mut poll).is_pending());
+
+    // Reuse the number after the normal polling path has acquired the original
+    // process and started collecting. Its final refresh must retain that identity.
+    store_process_for_test(manager, &session, &turn, 1000, Arc::clone(&replacement)).await;
+    replacement
+        .publish_output_for_test(b"replacement output\n".to_vec())
+        .await;
+    original
+        .publish_output_for_test(b"original output\n".to_vec())
+        .await;
+    original.signal_exit_for_test(Some(7));
+    let handles = original.output_handles();
+    handles.output_closed.store(true, Ordering::Release);
+    handles.output_closed_notify.notify_waiters();
+    let result = poll.await.expect("original poll completes");
+    assert_eq!(result.raw_output, b"original output\n");
+    assert_eq!(result.exit_code, Some(7));
+    assert_eq!(result.process_id, None);
+    assert!(Arc::ptr_eq(
+        &manager.process_store.lock().await.processes[&1000].process,
+        &replacement
+    ));
+
+    replacement.signal_exit_for_test(Some(0));
+    let handles = replacement.output_handles();
+    handles.output_closed.store(true, Ordering::Release);
+    handles.output_closed_notify.notify_waiters();
+    let result = manager
+        .write_stdin(request())
+        .await
+        .expect("replacement retains its output");
+    assert_eq!(result.raw_output, b"replacement output\n");
+    assert_eq!(result.exit_code, Some(0));
+    assert_eq!(result.process_id, None);
+    assert!(
+        !manager
+            .process_store
+            .lock()
+            .await
+            .processes
+            .contains_key(&1000)
+    );
+}
+
+#[tokio::test]
+async fn pruning_preserves_an_active_initial_response() {
+    use crate::session::tests::make_session_and_context;
+    use crate::unified_exec::process_tests::remote_process;
+    use crate::unified_exec::process_tests::store_process_for_test;
+    use codex_exec_server::WriteStatus;
+    let (session, turn) = make_session_and_context().await;
+    let session = Arc::new(session);
+    let manager = &session.services.unified_exec_manager;
+    let process = remote_process(WriteStatus::Accepted, None).await;
+    process.signal_exit_for_test(Some(0));
+    for id in 0..MAX_UNIFIED_EXEC_PROCESSES as u32 {
+        store_process_for_test(manager, &session, &turn, id, Arc::clone(&process)).await;
+    }
+    let mut store = manager.process_store.lock().await;
+    for entry in store.processes.values() {
+        entry
+            .initial_exec_command_active
+            .store(true, Ordering::Release);
+    }
+    assert!(UnifiedExecProcessManager::prune_processes_if_needed(&mut store).is_none());
+    assert_eq!(store.processes.len(), MAX_UNIFIED_EXEC_PROCESSES);
+    store.processes[&0]
+        .initial_exec_command_active
+        .store(false, Ordering::Release);
+    let pruned = UnifiedExecProcessManager::prune_processes_if_needed(&mut store)
+        .expect("finished initial response is eligible");
+    assert_eq!(pruned.process_id, 0);
+    assert_eq!(store.processes.len(), MAX_UNIFIED_EXEC_PROCESSES - 1);
+}
+
 #[test]
 fn unified_exec_env_injects_defaults() {
     let env = apply_unified_exec_env(HashMap::new(), &ShellEnvironmentPolicy::default());
@@ -189,7 +428,7 @@ async fn lag_survives_drain_for_finalization_without_duplicate_interim_reports()
     let output_buffer = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::new(32)));
     {
         let mut guard = output_buffer.lock().await;
-        guard.push_chunk(b"PARTIAL_OUTPUT".to_vec());
+        guard.push_chunk(b"PARTIAL_OUTPUT");
         guard.record_lagged_chunks(4);
     }
     let output_notify = Arc::new(Notify::new());
@@ -249,7 +488,7 @@ async fn initial_output_yields_after_meaningful_output_quiet_period() {
     let cancellation_token = CancellationToken::new();
     let started_at = Instant::now();
 
-    output_buffer.lock().await.push_chunk(b"ready\n".to_vec());
+    output_buffer.lock().await.push_chunk(b"ready\n");
 
     let collected = UnifiedExecProcessManager::collect_initial_output_until_deadline(
         &output_buffer,
@@ -275,7 +514,7 @@ async fn background_wait_yields_after_meaningful_output_quiet_period() {
     let cancellation_token = CancellationToken::new();
     let started_at = Instant::now();
 
-    output_buffer.lock().await.push_chunk(b"ready\n".to_vec());
+    output_buffer.lock().await.push_chunk(b"ready\n");
 
     let collected = UnifiedExecProcessManager::collect_output_until_progress_or_deadline(
         &output_buffer,
@@ -322,11 +561,106 @@ async fn orchestration_correctness_output_notification_wakes_owner_wait() {
     });
     tokio::task::yield_now().await;
 
-    output_buffer.lock().await.push_chunk(b"ready\n".to_vec());
+    output_buffer.lock().await.push_chunk(b"ready\n");
     output_notify.notify_waiters();
 
     assert_eq!(waiter.await.unwrap(), b"ready\n");
     assert_eq!(Instant::now() - started_at, Duration::from_millis(250));
+}
+
+#[tokio::test(start_paused = true)]
+async fn output_wait_does_not_spin_on_resume_or_closed_pause_channel() {
+    use crate::tools::tool_dispatch_trace::ToolDispatchTiming;
+    use crate::tools::tool_dispatch_trace::scope_tool_dispatch_timing;
+
+    for state in ["resumed", "closed-running", "closed-paused"] {
+        let output_buffer = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::new(1024)));
+        let output_notify = Arc::new(Notify::new());
+        let output_closed = Arc::new(AtomicBool::new(false));
+        let output_closed_notify = Arc::new(Notify::new());
+        let cancellation_token = CancellationToken::new();
+        let (pause_sender, pause_receiver) = watch::channel(false);
+        pause_sender.send(state == "closed-paused").unwrap();
+        let _keep_sender = (state == "resumed").then_some(pause_sender);
+        let started_at = Instant::now();
+        let timing = Arc::new(ToolDispatchTiming::new(started_at, false));
+        let collected = scope_tool_dispatch_timing(
+            Arc::clone(&timing),
+            UnifiedExecProcessManager::collect_output_until_progress_or_deadline(
+                &output_buffer,
+                &output_notify,
+                &output_closed,
+                &output_closed_notify,
+                &cancellation_token,
+                Some(pause_receiver),
+                started_at + Duration::from_secs(10),
+            ),
+        );
+        tokio::pin!(collected);
+
+        assert!(futures::poll!(&mut collected).is_pending());
+        assert!(
+            timing.snapshot(Instant::now()).timer_waits.is_empty(),
+            "{state}: an unchanged/closed pause watch must leave the output wait asleep"
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        output_buffer
+            .lock()
+            .await
+            .push_chunk(b"complete evidence\n");
+        output_notify.notify_waiters();
+
+        assert_eq!(collected.await, b"complete evidence\n", "{state}");
+        assert_eq!(Instant::now() - started_at, Duration::from_millis(1_250));
+        let waits = timing.snapshot(Instant::now()).timer_waits;
+        assert_eq!(
+            waits.len(),
+            2,
+            "{state}: only output and quiet deadline should wake the wait"
+        );
+        assert_eq!(waits[0].wake_reason, ToolLifecycleWakeReason::Completed);
+        assert_eq!(waits[1].wake_reason, ToolLifecycleWakeReason::Timeout);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn initial_output_preserves_quiet_deadline_and_evidence_across_pause() {
+    let output_buffer = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::new(1024)));
+    let output_notify = Arc::new(Notify::new());
+    let output_closed = Arc::new(AtomicBool::new(false));
+    let output_closed_notify = Arc::new(Notify::new());
+    let cancellation_token = CancellationToken::new();
+    let (pause_sender, pause_receiver) = watch::channel(false);
+    let started_at = Instant::now();
+    let producer = tokio::spawn({
+        let output_buffer = Arc::clone(&output_buffer);
+        let output_notify = Arc::clone(&output_notify);
+        async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            pause_sender.send(true).unwrap();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            pause_sender.send(false).unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            output_buffer.lock().await.push_chunk(b"after approval\n");
+            output_notify.notify_waiters();
+            pause_sender
+        }
+    });
+
+    let collected = UnifiedExecProcessManager::collect_initial_output_until_deadline(
+        &output_buffer,
+        &output_notify,
+        &output_closed,
+        &output_closed_notify,
+        &cancellation_token,
+        Some(pause_receiver),
+        started_at + Duration::from_secs(10),
+    )
+    .await;
+
+    assert_eq!(collected, b"after approval\n");
+    assert_eq!(Instant::now() - started_at, Duration::from_millis(1_450));
+    drop(producer.await.unwrap());
 }
 
 #[tokio::test(start_paused = true)]
@@ -338,12 +672,12 @@ async fn background_wait_ignores_whitespace_until_meaningful_progress() {
     let cancellation_token = CancellationToken::new();
     let started_at = Instant::now();
 
-    output_buffer.lock().await.push_chunk(b" \r\n".to_vec());
+    output_buffer.lock().await.push_chunk(b" \r\n");
     let progress_buffer = Arc::clone(&output_buffer);
     let progress_notify = Arc::clone(&output_notify);
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_secs(1)).await;
-        progress_buffer.lock().await.push_chunk(b"ready\n".to_vec());
+        progress_buffer.lock().await.push_chunk(b"ready\n");
         progress_notify.notify_waiters();
     });
 
@@ -395,7 +729,7 @@ async fn initial_output_quiet_yield_is_clamped_to_hard_deadline() {
     let cancellation_token = CancellationToken::new();
     let started_at = Instant::now();
 
-    output_buffer.lock().await.push_chunk(b"ready\n".to_vec());
+    output_buffer.lock().await.push_chunk(b"ready\n");
 
     let collected = UnifiedExecProcessManager::collect_initial_output_until_deadline(
         &output_buffer,
@@ -421,10 +755,7 @@ async fn nonempty_write_collection_honors_the_requested_deadline() {
     let cancellation_token = CancellationToken::new();
     let started_at = Instant::now();
 
-    output_buffer
-        .lock()
-        .await
-        .push_chunk(b"progress\n".to_vec());
+    output_buffer.lock().await.push_chunk(b"progress\n");
 
     let collected = UnifiedExecProcessManager::collect_output_until_deadline(
         &output_buffer,
@@ -450,7 +781,7 @@ async fn initial_output_post_exit_uses_quiet_deadline_instead_of_full_yield() {
     let cancellation_token = CancellationToken::new();
     let started_at = Instant::now();
 
-    output_buffer.lock().await.push_chunk(b"done\n".to_vec());
+    output_buffer.lock().await.push_chunk(b"done\n");
     cancellation_token.cancel();
 
     let collected = UnifiedExecProcessManager::collect_initial_output_until_deadline(
@@ -508,7 +839,7 @@ async fn initial_output_post_exit_quiet_deadline_resets_after_tail_output() {
     let tail_notify = Arc::clone(&output_notify);
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(200)).await;
-        tail_buffer.lock().await.push_chunk(b"tail\n".to_vec());
+        tail_buffer.lock().await.push_chunk(b"tail\n");
         tail_notify.notify_waiters();
     });
 
@@ -536,7 +867,7 @@ async fn initial_output_whitespace_returns_a_live_handle_promptly() {
     let cancellation_token = CancellationToken::new();
     let started_at = Instant::now();
 
-    output_buffer.lock().await.push_chunk(b" \r\n\t".to_vec());
+    output_buffer.lock().await.push_chunk(b" \r\n\t");
 
     let collected = UnifiedExecProcessManager::collect_initial_output_until_deadline(
         &output_buffer,
@@ -556,10 +887,7 @@ async fn initial_output_whitespace_returns_a_live_handle_promptly() {
 #[tokio::test]
 async fn capacity_omission_is_reported_once_per_drain_and_preserved_for_finalization() {
     let output_buffer = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::new(8)));
-    output_buffer
-        .lock()
-        .await
-        .push_chunk(b"0123456789abcdef".to_vec());
+    output_buffer.lock().await.push_chunk(b"0123456789abcdef");
     let output_notify = Arc::new(Notify::new());
     let output_closed = Arc::new(AtomicBool::new(true));
     let output_closed_notify = Arc::new(Notify::new());
@@ -1391,10 +1719,14 @@ async fn remote_startup_cleanup_failure_retains_native_child_until_session_shutd
         WAIT_TIMEOUT
     );
     assert_eq!(start["method"], "process/start");
-    assert_eq!(start["params"]["argv"], serde_json::json!([
-        "powershell.exe", "-Command",
-        "try { [Console]::OutputEncoding=[System.Text.Encoding]::UTF8 } catch {}\nStart-Sleep -Seconds 60",
-    ]));
+    assert_eq!(
+        start["params"]["argv"],
+        serde_json::json!([
+            "powershell.exe",
+            "-Command",
+            "try { [Console]::OutputEncoding=[System.Text.Encoding]::UTF8 } catch {}\nStart-Sleep -Seconds 60",
+        ])
+    );
     for _ in 0..2 {
         let terminate = requests_rx
             .try_recv()
@@ -1599,10 +1931,7 @@ async fn failed_initial_end_for_unstored_process_uses_fallback_output() {
     };
 
     let transcript = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::default()));
-    transcript
-        .lock()
-        .await
-        .push_chunk(b"PARTIAL_TRANSCRIPT".to_vec());
+    transcript.lock().await.push_chunk(b"PARTIAL_TRANSCRIPT");
 
     emit_failed_initial_exec_end_if_unstored(
         /*process_started_alive*/ false,

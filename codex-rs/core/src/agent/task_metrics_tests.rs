@@ -53,14 +53,14 @@ fn metric_input() -> TaskMetricInput {
         ],
         first_pass_validation_succeeded: false,
         acceptance_total: 4,
-        acceptance_first_pass_closed: 3,
+        acceptance_first_pass_closed: Some(3),
         acceptance_final_closed: 4,
-        duplicate_work: 2,
+        duplicate_work: Some(2),
         conflicts: 1,
         drift: 3,
         reviewer_findings: FindingTotals {
             confirmed: 2,
-            rejected: 1,
+            rejected: Some(1),
             unresolved: 1,
         },
         corrections: 1,
@@ -277,7 +277,7 @@ fn evaluates_complete_privacy_safe_metric_set() {
     let metrics = TaskMetrics::evaluate(metric_input()).expect("valid metrics");
     assert_eq!(metrics.critical_path_idle_basis_points, 2_500);
     assert_eq!(metrics.concurrency_utilization_basis_points, 6_000);
-    assert_eq!(metrics.first_pass_acceptance_basis_points, 7_500);
+    assert_eq!(metrics.first_pass_acceptance_basis_points, Some(7_500));
     assert_eq!(metrics.final_acceptance_basis_points, 10_000);
     assert_eq!(
         metrics.total_usage,
@@ -305,7 +305,7 @@ fn evaluates_complete_privacy_safe_metric_set() {
             metrics.waivers,
             metrics.violations,
         ),
-        (2, 1, 3, 1, 2, 1)
+        (Some(2), 1, 3, 1, 2, 1)
     );
     assert_eq!(metrics.reviewer_findings, metric_input().reviewer_findings);
     assert_eq!(metrics.final_outcome, FinalOutcome::NeedsMain);
@@ -323,7 +323,7 @@ fn rejects_inconsistent_or_unbounded_inputs() {
     );
 
     let invalid_closure = TaskMetricInput {
-        acceptance_first_pass_closed: 4,
+        acceptance_first_pass_closed: Some(4),
         acceptance_final_closed: 3,
         ..metric_input()
     };
@@ -448,7 +448,7 @@ fn recorder_finishes_and_invokes_terminal_emitter_at_most_once() {
 }
 
 #[test]
-fn recorder_rejects_invalid_transitions_and_enforces_event_bound() {
+fn recorder_rejects_invalid_transitions_and_keeps_aggregating_after_counter_saturates() {
     assert_eq!(
         TaskMetricRecorder::new(OpaqueId::new(11), 6, 5).expect_err("invalid initial state"),
         MetricsError::InvalidConcurrencySlice
@@ -476,22 +476,30 @@ fn recorder_rejects_invalid_transitions_and_enforces_event_bound() {
 
     let mut bounded =
         TaskMetricRecorder::new(OpaqueId::new(13), 1, 5).expect("valid initial state");
-    for _ in 0..MAX_RECORDED_EVENTS - 1 {
+    for _ in 0..MAX_RECORDED_EVENTS + 1 {
         bounded
-            .record_role_usage(RoleLabel::Worker, CapabilityLabel::ScopedWrite, 0, 0)
-            .expect("event within the bound");
+            .record_role_usage(RoleLabel::Worker, CapabilityLabel::ScopedWrite, 1, 1)
+            .expect("updates keep aggregating");
     }
-    assert_eq!(bounded.recorded_events(), MAX_RECORDED_EVENTS - 1);
+    bounded
+        .record_role_usage(RoleLabel::Worker, CapabilityLabel::ScopedWrite, 99, 2)
+        .expect("late usage");
+    bounded
+        .transition_concurrency(Duration::from_secs(5), 0, 5)
+        .expect("late idle transition");
+    let metrics = bounded
+        .finish(Duration::from_secs(10), terminal_input())
+        .expect("finish")
+        .expect("terminal metrics");
     assert_eq!(
-        bounded.record_role_usage(RoleLabel::Worker, CapabilityLabel::ScopedWrite, 0, 0),
-        Err(MetricsError::TooManyEvents)
+        metrics.total_usage,
+        UsageTotals {
+            tokens: MAX_RECORDED_EVENTS as u64 + 100,
+            calls: MAX_RECORDED_EVENTS as u64 + 3
+        }
     );
-    assert!(
-        bounded
-            .finish(Duration::from_secs(1), terminal_input())
-            .expect("the bound reserves room for a terminal event")
-            .is_some()
-    );
+    assert_eq!(metrics.critical_path_idle_time, Duration::from_secs(5));
+    assert_eq!(metrics.concurrency_utilization_basis_points, 1_000);
     assert_eq!(bounded.recorded_events(), MAX_RECORDED_EVENTS);
 }
 
@@ -682,4 +690,45 @@ fn emitter_vocabulary_is_static_and_low_cardinality() {
         i64::MAX
     );
     assert_eq!(saturating_metric_value(u64::MAX), i64::MAX);
+}
+
+#[test]
+fn first_pass_validation_rejects_stale_or_mismatched_structured_evidence() {
+    let task = completed_task_with_validation(
+        &["validation-1"],
+        &[("validation-1", ValidationCallStatus::Succeeded)],
+    );
+    assert!(super::terminal_input(&task).first_pass_validation_succeeded);
+    let mut stale = task.clone();
+    stale.validation_calls[0].evidence.end_epoch = Some(1);
+    assert!(!super::terminal_input(&stale).first_pass_validation_succeeded);
+    let mut mismatched = task.clone();
+    mismatched.validation_calls[0]
+        .evidence
+        .validation_result
+        .as_mut()
+        .unwrap()["callId"] = "wrong-call".into();
+    assert!(!super::terminal_input(&mismatched).first_pass_validation_succeeded);
+    let mut failed = task;
+    failed.validation_calls[0]
+        .evidence
+        .validation_result
+        .as_mut()
+        .unwrap()["status"] = "failed".into();
+    assert!(!super::terminal_input(&failed).first_pass_validation_succeeded);
+}
+
+#[test]
+fn terminal_adapter_preserves_unavailable_measurements() {
+    let mut task = completed_task_with_validation(&[], &[]);
+    assert_eq!(
+        super::terminal_input(&task).acceptance_first_pass_closed,
+        Some(1)
+    );
+    task.current_attempt.ordinal = 1;
+    let terminal = super::terminal_input(&task);
+    assert_eq!(terminal.acceptance_first_pass_closed, None);
+    assert_eq!(terminal.duplicate_work, None);
+    assert_eq!(terminal.reviewer_findings.rejected, None);
+    assert_eq!(terminal.acceptance_final_closed, 1);
 }

@@ -42,7 +42,17 @@ impl ContextualUserFragment for UserShellCommand {
     fn body(&self) -> String {
         format!(
             "\n<command>\n{}\n</command>\n<result>\nExit code: {}\nDuration: {:.4} seconds\nOutput:\n{}\n</result>\n",
-            self.command, self.exit_code, self.duration_seconds, self.output,
+            escape_xml_text(&self.command),
+            self.exit_code,
+            self.duration_seconds,
+            escape_xml_text(&self.output),
         )
     }
+}
+
+fn escape_xml_text(input: &str) -> String {
+    input
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }

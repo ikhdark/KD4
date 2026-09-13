@@ -357,25 +357,28 @@ impl ModelRequestMeasurements {
             Some(bytes) => bytes,
             None => serialized_len_cancellable(request, cancellation)?,
         };
-        let measurement_provenance = if base_instructions.is_empty()
-            || !request.instructions.is_empty()
-        {
-            provenance.clone()
-        } else if let Some(embedded_base) = request.input.first().filter(|item| {
-            matches!(
-                item,
-                ResponseItem::Message { role, content, .. }
-                    if role == "developer"
-                        && matches!(
-                            content.as_slice(),
-                            [ContentItem::InputText { text }] if text == base_instructions
-                        )
-            )
-        }) {
-            provenance.with_response_item_category(embedded_base, PromptContextCategory::BaseSystem)
-        } else {
-            provenance.clone()
-        };
+        let measurement_provenance =
+            if base_instructions.is_empty() || !request.instructions.is_empty() {
+                provenance.clone()
+            } else if request.input.first().is_some_and(|item| {
+                matches!(
+                    item,
+                    ResponseItem::Message { role, content, .. }
+                        if role == "developer"
+                            && matches!(
+                                content.as_slice(),
+                                [ContentItem::InputText { text }] if text == base_instructions
+                            )
+                )
+            }) {
+                provenance.with_response_item_category(
+                    &request.input,
+                    0,
+                    PromptContextCategory::BaseSystem,
+                )
+            } else {
+                provenance.clone()
+            };
         let mut context =
             PromptContextBreakdown::from_response_items(&request.input, &measurement_provenance)?;
         ensure_measurement_not_cancelled(cancellation)?;
@@ -939,6 +942,7 @@ struct PostDispatchRequestMeasurements {
 fn measure_responses_request_after_dispatch(
     request: ResponsesApiRequest,
     prompt: Prompt,
+    input_reprojected: bool,
     cancellation: CancellationToken,
     logical_request_bytes: Option<u64>,
     encoded_request: Option<Bytes>,
@@ -947,6 +951,13 @@ fn measure_responses_request_after_dispatch(
         let fallback_stable_context_manifest = prompt.stable_context_manifest.clone();
         let blocking_cancellation = cancellation.clone();
         let result = tokio::task::spawn_blocking(move || {
+            let provenance = if input_reprojected {
+                prompt
+                    .prompt_provenance
+                    .for_reprojected_items(&request.input)
+            } else {
+                prompt.prompt_provenance.clone()
+            };
             let measurements = (|| {
                 let wire_request_bytes = encoded_request.as_ref().map_or(0, |encoded| {
                     u64::try_from(encoded.len()).unwrap_or(u64::MAX)
@@ -955,7 +966,7 @@ fn measure_responses_request_after_dispatch(
                     Some(encoded) => {
                         ModelRequestMeasurements::for_responses_request_from_encoded_cancellable(
                             &request,
-                            &prompt.prompt_provenance,
+                            &provenance,
                             &prompt.base_instructions.text,
                             Some(&blocking_cancellation),
                             encoded,
@@ -964,7 +975,7 @@ fn measure_responses_request_after_dispatch(
                         .or_else(|_| {
                             ModelRequestMeasurements::for_responses_request_cancellable(
                                 &request,
-                                &prompt.prompt_provenance,
+                                &provenance,
                                 &prompt.base_instructions.text,
                                 Some(&blocking_cancellation),
                                 logical_request_bytes,
@@ -973,7 +984,7 @@ fn measure_responses_request_after_dispatch(
                     }
                     None => ModelRequestMeasurements::for_responses_request_cancellable(
                         &request,
-                        &prompt.prompt_provenance,
+                        &provenance,
                         &prompt.base_instructions.text,
                         Some(&blocking_cancellation),
                         logical_request_bytes,
@@ -1795,6 +1806,13 @@ impl CanonicalPrefixHash {
     }
 }
 
+/// Hashes verified against the exact current request during preparation. This
+/// value travels with that request and is discarded whenever its input changes.
+struct VerifiedRequestHistory {
+    prefix: CanonicalPrefixHash,
+    properties: [u8; 32],
+}
+
 #[derive(Debug, Clone, Copy)]
 struct WebsocketHistoryBaseline {
     /// Monotonic diagnostic identity for the immutable request prefix. Equality
@@ -2576,7 +2594,11 @@ impl ModelClient {
             prompt.get_formatted_input_for_request(model_info.use_responses_lite)
         };
         let is_openai = self.state.provider.info().is_openai();
-        if !is_openai {
+        if !is_openai
+            && input
+                .iter()
+                .any(|item| item.internal_chat_message_metadata_passthrough().is_some())
+        {
             Arc::make_mut(&mut input)
                 .iter_mut()
                 .for_each(ResponseItem::clear_internal_chat_message_metadata_passthrough);
@@ -3006,8 +3028,22 @@ impl ModelClientSession {
         request: &ResponsesApiRequest,
         stable_context_fingerprint: [u8; 32],
     ) {
-        let request_prefix = CanonicalPrefixHash::from_items(&request.input);
-        let request_properties_fingerprint = responses_request_properties_fingerprint(request);
+        self.remember_verified_request_history(request, stable_context_fingerprint, None);
+    }
+
+    fn remember_verified_request_history(
+        &mut self,
+        request: &ResponsesApiRequest,
+        stable_context_fingerprint: [u8; 32],
+        verified: Option<VerifiedRequestHistory>,
+    ) {
+        let (request_prefix, request_properties_fingerprint) = match verified {
+            Some(verified) => (Ok(verified.prefix), Ok(verified.properties)),
+            None => (
+                CanonicalPrefixHash::from_items(&request.input),
+                responses_request_properties_fingerprint(request),
+            ),
+        };
         self.websocket_session.next_history_generation = self
             .websocket_session
             .next_history_generation
@@ -3100,12 +3136,23 @@ impl ModelClientSession {
     /// We only reuse an incremental input delta when non-input request fields are unchanged and
     /// `input` is a strict extension of the previous known input. Server-returned output items
     /// are treated as part of the baseline so we do not resend them.
+    #[cfg(test)]
     fn get_incremental_items(
         &self,
         request: &ResponsesApiRequest,
         last_response: Option<&LastResponse>,
         allow_empty_delta: bool,
     ) -> Option<Vec<ResponseItem>> {
+        self.get_incremental_items_with_history(request, last_response, allow_empty_delta)
+            .map(|(items, _)| items)
+    }
+
+    fn get_incremental_items_with_history(
+        &self,
+        request: &ResponsesApiRequest,
+        last_response: Option<&LastResponse>,
+        allow_empty_delta: bool,
+    ) -> Option<(Vec<ResponseItem>, Option<VerifiedRequestHistory>)> {
         let previous_request = self.websocket_session.last_request.as_ref()?;
         if !responses_request_properties_match(previous_request, request) {
             trace!("incremental request failed, websocket reuse properties didn't match");
@@ -3125,7 +3172,8 @@ impl ModelClientSession {
                     request,
                     last_response,
                     allow_empty_delta,
-                );
+                )
+                .map(|items| (items, None));
             };
             if current_properties_fingerprint != baseline.request_properties_fingerprint {
                 trace!(
@@ -3148,7 +3196,8 @@ impl ModelClientSession {
                     request,
                     last_response,
                     allow_empty_delta,
-                );
+                )
+                .map(|items| (items, None));
             }
             let Some((request_items_to_compare, incremental_items)) =
                 request.input.split_at_checked(expected_prefix.item_count)
@@ -3168,7 +3217,8 @@ impl ModelClientSession {
                         request,
                         last_response,
                         allow_empty_delta,
-                    );
+                    )
+                    .map(|items| (items, None));
                 }
             };
             if request_prefix != expected_prefix {
@@ -3181,7 +3231,16 @@ impl ModelClientSession {
             if !allow_empty_delta && incremental_items.is_empty() {
                 return None;
             }
-            return Some(incremental_items.to_vec());
+            let mut prefix = request_prefix;
+            let verified =
+                prefix
+                    .extend_items(incremental_items)
+                    .ok()
+                    .map(|()| VerifiedRequestHistory {
+                        prefix,
+                        properties: current_properties_fingerprint,
+                    });
+            return Some((incremental_items.to_vec(), verified));
         }
 
         Self::get_incremental_items_full_compare(
@@ -3190,6 +3249,7 @@ impl ModelClientSession {
             last_response,
             allow_empty_delta,
         )
+        .map(|items| (items, None))
     }
 
     /// Correctness fallback for missing/unknown hash state. This retains the
@@ -3260,7 +3320,12 @@ impl ModelClientSession {
         mut build_tool_history_fail_open_request: Option<
             Box<dyn FnOnce() -> Result<ResponsesApiRequest> + '_>,
         >,
-    ) -> Result<(ResponsesWsRequest, bool, Option<ResponsesApiRequest>)> {
+    ) -> Result<(
+        ResponsesWsRequest,
+        bool,
+        Option<ResponsesApiRequest>,
+        Option<VerifiedRequestHistory>,
+    )> {
         let baseline_is_stale = self
             .websocket_session
             .last_request
@@ -3298,6 +3363,7 @@ impl ModelClientSession {
                 ResponsesWsRequest::ResponseCreate(payload),
                 false,
                 logical_request_override,
+                None,
             ));
         };
         let previous_response_id_from_untraced_warmup =
@@ -3344,10 +3410,11 @@ impl ModelClientSession {
                     ResponsesWsRequest::ResponseCreate(payload),
                     false,
                     Some(fallback_request),
+                    None,
                 ));
             }
         }
-        let Some(incremental_items) = self.get_incremental_items(
+        let Some((incremental_items, verified_history)) = self.get_incremental_items_with_history(
             effective_request,
             Some(&last_response),
             /*allow_empty_delta*/ true,
@@ -3356,6 +3423,7 @@ impl ModelClientSession {
                 ResponsesWsRequest::ResponseCreate(payload),
                 false,
                 logical_request_override,
+                None,
             ));
         };
 
@@ -3365,6 +3433,7 @@ impl ModelClientSession {
                 ResponsesWsRequest::ResponseCreate(payload),
                 false,
                 logical_request_override,
+                None,
             ));
         }
 
@@ -3376,6 +3445,7 @@ impl ModelClientSession {
             }),
             previous_response_id_from_untraced_warmup,
             logical_request_override,
+            verified_history,
         ))
     }
 
@@ -3665,6 +3735,7 @@ impl ModelClientSession {
                 AbortOnDropHandle::new(measure_responses_request_after_dispatch(
                     request,
                     prompt.clone(),
+                    /*input_reprojected*/ false,
                     measurement_cancellation.clone(),
                     logical_request_bytes,
                     dispatched_request,
@@ -3989,6 +4060,7 @@ impl ModelClientSession {
                 mut ws_request,
                 previous_response_id_from_untraced_warmup,
                 tool_history_fail_open_override,
+                mut verified_history,
             ) = self.prepare_websocket_request(
                 ws_payload,
                 &request,
@@ -3996,8 +4068,10 @@ impl ModelClientSession {
                 tool_history_substitutions,
                 build_tool_history_fail_open_request,
             )?;
+            let mut input_reprojected = false;
             if let Some(fallback_request) = tool_history_fail_open_override {
                 request = fallback_request;
+                input_reprojected = true;
             }
             let inherited_stable_context_matches = self
                 .websocket_session
@@ -4026,6 +4100,8 @@ impl ModelClientSession {
                     .prepare_response_items_for_request(&mut fallback_request.input);
                 final_payload.input = fallback_request.input.clone();
                 request = fallback_request;
+                verified_history = None;
+                input_reprojected = true;
             }
             // `prepare_websocket_request` may invalidate a superseded stable
             // context baseline. Read the generation only after that decision
@@ -4158,6 +4234,7 @@ impl ModelClientSession {
                         AbortOnDropHandle::new(measure_responses_request_after_dispatch(
                             logical_request,
                             prompt.clone(),
+                            input_reprojected,
                             measurement_cancellation.clone(),
                             /*logical_request_bytes*/ None,
                             dispatched_request,
@@ -4250,7 +4327,11 @@ impl ModelClientSession {
                     return Err(err);
                 }
             };
-            self.remember_request_history(&request, prompt.stable_context_manifest.fingerprint());
+            self.remember_verified_request_history(
+                &request,
+                prompt.stable_context_manifest.fingerprint(),
+                verified_history,
+            );
             self.websocket_session.last_request = Some(request);
             self.websocket_session.last_response_from_untraced_warmup = warmup;
             let (stream, last_request_rx) = map_response_stream(
@@ -4707,17 +4788,16 @@ where
                             &items_added,
                         );
                     }
-                    if tx_event
+                    let _ = tx_event
                         .send(Ok(ResponseEvent::Completed {
                             response_id: response_id.clone(),
                             token_usage: token_usage.clone(),
                             end_turn,
                         }))
-                        .await
-                        .is_err()
-                    {
-                        return;
-                    }
+                        .await;
+                    // Completion is terminal. Dropping the upstream stream here
+                    // releases it without recording a second, failed terminal state.
+                    return;
                 }
                 Ok(event) => {
                     if matches!(&event, ResponseEvent::OutputItemAdded(_)) && ttft_ms.is_none() {

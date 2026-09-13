@@ -249,8 +249,94 @@ async fn durability_regression_resume_invalidates_unified_exec_session() {
         })
         .collect::<Vec<_>>();
     assert_eq!(invalidations.len(), 1);
-    assert!(invalidations[0].contains("- 1000"));
-    assert!(invalidations[0].contains("Do not call write_stdin"));
+    assert!(invalidations[0].contains("Newly returned session IDs are valid"));
+    assert!(invalidations[0].contains("do not rerun completed commands"));
+    assert!(!invalidations[0].contains("1000"));
+}
+
+#[tokio::test]
+async fn legacy_user_boundaries_rollback_history_and_metadata_together() {
+    let (session, turn_context) = make_session_and_context().await;
+    let first = accepted_context(turn_context.to_turn_context_item());
+    let mut second = first.clone();
+    second.turn_id = Some("legacy-second".to_string());
+    second.model = "discarded-model".to_string();
+    for include_completion in [false, true] {
+        let mut items = completed_user_turn_rollout(
+            first.clone(),
+            vec![
+                RolloutItem::WorldState(WorldStateItem::full(json!({"turn": 1}))),
+                RolloutItem::ResponseItem(user_message("first")),
+                RolloutItem::ResponseItem(assistant_message("first reply")),
+            ],
+        );
+        items.extend(completed_user_turn_rollout(
+            second.clone(),
+            vec![
+                RolloutItem::WorldState(WorldStateItem::patch(json!({"turn": 2}))),
+                RolloutItem::ResponseItem(user_message("second")),
+                RolloutItem::ResponseItem(assistant_message("second reply")),
+            ],
+        ));
+        items.retain(|item| {
+            !matches!(item, RolloutItem::EventMsg(EventMsg::TurnStarted(_)))
+                && (include_completion
+                    || !matches!(item, RolloutItem::EventMsg(EventMsg::TurnComplete(_))))
+        });
+        items.push(RolloutItem::EventMsg(EventMsg::ThreadRolledBack(
+            codex_protocol::protocol::ThreadRolledBackEvent { num_turns: 1 },
+        )));
+        let rebuilt = session
+            .reconstruct_history_from_rollout(&turn_context, &items)
+            .await;
+        assert_eq!(
+            rebuilt.history,
+            vec![user_message("first"), assistant_message("first reply")]
+        );
+        assert_eq!(rebuilt.previous_turn_settings.unwrap().model, first.model);
+        assert_eq!(
+            serde_json::to_value(rebuilt.reference_context_item).unwrap(),
+            serde_json::to_value(Some(&first)).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(rebuilt.world_state_baseline.unwrap()).unwrap(),
+            json!({"turn": 1})
+        );
+    }
+}
+
+#[test]
+fn resume_notice_is_scoped_and_ignores_other_namespaces() {
+    use super::rollout_reconstruction::append_unified_exec_resume_invalidation;
+    let call = ResponseItem::FunctionCall {
+        id: None,
+        name: "exec_command".to_string(),
+        namespace: Some("other".to_string()),
+        arguments: "{}".to_string(),
+        call_id: "call".to_string(),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let output = ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: "call".to_string(),
+        output: FunctionCallOutputPayload::from_text(
+            "Process running with session ID 1000".to_string(),
+        ),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let mut history = vec![call, output];
+    append_unified_exec_resume_invalidation(&mut history);
+    assert_eq!(history.len(), 2);
+    if let ResponseItem::FunctionCall { namespace, .. } = &mut history[0] {
+        *namespace = None;
+    }
+    append_unified_exec_resume_invalidation(&mut history);
+    let notice = history.last().unwrap().clone();
+    history.push(user_message("after first resume"));
+    append_unified_exec_resume_invalidation(&mut history);
+    assert_eq!(history.len(), 4);
+    assert_eq!(history.last(), Some(&notice));
+    assert_eq!(history[2], user_message("after first resume"));
 }
 
 #[tokio::test]
@@ -283,6 +369,7 @@ async fn record_initial_history_reconstructs_typed_inter_agent_message() {
 #[tokio::test]
 async fn record_initial_history_restores_world_state_baseline() {
     let (session, turn_context) = make_session_and_context().await;
+    let session = Arc::new(session);
     let turn_context = Arc::new(turn_context);
     let world_state = build_world_state_from_turn_context(&session, &turn_context).await;
     let mut accepted_turn_context = turn_context.to_turn_context_item();

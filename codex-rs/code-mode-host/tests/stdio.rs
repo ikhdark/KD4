@@ -14,6 +14,7 @@ use codex_code_mode::CodeModeSessionProvider;
 use codex_code_mode::CodeModeToolKind;
 use codex_code_mode::ExecuteRequest;
 use codex_code_mode::FunctionCallOutputContentItem;
+use codex_code_mode::InProcessCodeModeSessionProvider;
 use codex_code_mode::NotificationFuture;
 use codex_code_mode::ProcessOwnedCodeModeSessionProvider;
 use codex_code_mode::RuntimeResponse;
@@ -246,6 +247,124 @@ async fn next_callback_event(
         .await
         .expect("callback event timeout")
         .expect("callback event stream closed")
+}
+
+#[tokio::test]
+async fn nested_tool_input_presence_reaches_local_and_remote_delegates() {
+    let remote_provider = ProcessOwnedCodeModeSessionProvider::with_host_program(
+        codex_utils_cargo_bin::cargo_bin("codex-code-mode-host").expect("host binary"),
+    );
+    let local_provider = InProcessCodeModeSessionProvider;
+    for provider in [
+        &local_provider as &dyn CodeModeSessionProvider,
+        &remote_provider as &dyn CodeModeSessionProvider,
+    ] {
+        let delegate = Arc::new(RecordingDelegate::default());
+        let session = provider
+            .create_session(delegate.clone())
+            .await
+            .expect("create session");
+        let response = execute_to_terminal(
+            &session,
+            ExecuteRequest {
+                enabled_tools: vec![ToolDefinition {
+                    name: "echo".to_string(),
+                    tool_name: ToolName::plain("echo"),
+                    description: String::new(),
+                    kind: CodeModeToolKind::Function,
+                    input_schema: None,
+                    output_schema: None,
+                }],
+                ..execute_request(
+                    r#"
+const absent = await tools.echo();
+const explicitNull = await tools.echo(null);
+const object = await tools.echo({ value: null });
+text([absent.value, explicitNull.value, object.value].join(","));
+"#,
+                )
+            },
+        )
+        .await;
+        assert_eq!(
+            response,
+            RuntimeResponse::Result {
+                cell_id: cell_id("1"),
+                content_items: vec![FunctionCallOutputContentItem::InputText {
+                    text: "output,output,output".to_string(),
+                }],
+                error_text: None,
+            }
+        );
+        let inputs = delegate
+            .invocations
+            .lock()
+            .expect("invocations lock")
+            .iter()
+            .map(|invocation| invocation.input.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            inputs,
+            vec![None, Some(json!(null)), Some(json!({ "value": null }))]
+        );
+        session.shutdown().await.expect("shutdown session");
+    }
+}
+
+#[tokio::test]
+async fn remote_dropped_initial_response_keeps_the_cell_available_for_termination() {
+    let provider = ProcessOwnedCodeModeSessionProvider::with_host_program(
+        codex_utils_cargo_bin::cargo_bin("codex-code-mode-host").expect("host binary"),
+    );
+    let (delegate, mut events_rx) = CancellationDelegate::new();
+    let session = provider
+        .create_session(delegate)
+        .await
+        .expect("create remote session");
+    let started = session
+        .execute(ExecuteRequest {
+            enabled_tools: vec![ToolDefinition {
+                name: "tool_call_slow".to_string(),
+                tool_name: ToolName::plain("tool_call_slow"),
+                description: String::new(),
+                kind: CodeModeToolKind::Function,
+                input_schema: None,
+                output_schema: None,
+            }],
+            yield_time_ms: Some(60_000),
+            ..execute_request("await tools.tool_call_slow({});")
+        })
+        .await
+        .expect("start cell");
+    let running_cell_id = started.cell_id.clone();
+    let initial_response = started.initial_response();
+    assert_eq!(
+        next_callback_event(&mut events_rx).await,
+        CallbackEvent::Started("tool_call_slow".to_string())
+    );
+    drop(initial_response);
+
+    assert_eq!(
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            session.terminate(running_cell_id.clone()),
+        )
+        .await
+        .expect("termination timeout")
+        .expect("terminate cell after dropping its response"),
+        WaitOutcome::LiveCell(RuntimeResponse::Terminated {
+            cell_id: running_cell_id.clone(),
+            content_items: Vec::new(),
+        })
+    );
+    // Remote cancellation and closure delivery may arrive in either order.
+    let events = [
+        next_callback_event(&mut events_rx).await,
+        next_callback_event(&mut events_rx).await,
+    ];
+    assert!(events.contains(&CallbackEvent::Cancelled("tool_call_slow".to_string())));
+    assert!(events.contains(&CallbackEvent::CellClosed(running_cell_id)));
+    session.shutdown().await.expect("shutdown remote session");
 }
 
 #[tokio::test]

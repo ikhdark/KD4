@@ -54,6 +54,7 @@ fn renders_only_changed_environments() -> Result<()> {
     previous.add_section(EnvironmentsState {
         environments: [
             ("laptop".to_string(), available("file:///repo", "bash")?),
+            ("unchanged".to_string(), available("file:///same", "sh")?),
             ("devbox".to_string(), starting("file:///workspace")?),
             ("old".to_string(), available("file:///old", "sh")?),
         ]
@@ -65,6 +66,7 @@ fn renders_only_changed_environments() -> Result<()> {
     current.add_section(EnvironmentsState {
         environments: [
             ("laptop".to_string(), available("file:///repo", "zsh")?),
+            ("unchanged".to_string(), available("file:///same", "sh")?),
             (
                 "devbox".to_string(),
                 available("file:///workspace", "powershell")?,
@@ -161,9 +163,22 @@ fn persisted_turn_context_values_render_a_diff() -> Result<()> {
 
 #[test]
 fn subagent_only_changes_render_a_diff() {
-    let no_subagents = EnvironmentsState::default();
+    let no_subagents = EnvironmentsState {
+        filesystem: Some(FileSystemContext::from_permission_profile(
+            &PermissionProfile::Disabled,
+            &[],
+        )),
+        network: Some(NetworkContext::new(
+            true,
+            vec!["example.com".to_string()],
+            vec![],
+        )),
+        ..Default::default()
+    };
     let previous = WorldStateSection::snapshot(&no_subagents);
-    let atlas = EnvironmentsState::default().with_subagents("- agent-1: atlas".to_string());
+    let atlas = no_subagents
+        .clone()
+        .with_subagents("- agent-1: atlas".to_string());
 
     assert_eq!(
         Some(user_message(
@@ -180,7 +195,9 @@ fn subagent_only_changes_render_a_diff() {
     );
 
     let previous = WorldStateSection::snapshot(&atlas);
-    let nova = EnvironmentsState::default().with_subagents("- agent-2: nova".to_string());
+    let nova = no_subagents
+        .clone()
+        .with_subagents("- agent-2: nova".to_string());
     assert_eq!(
         Some(user_message(
             r#"<environment_context>
@@ -199,6 +216,9 @@ fn subagent_only_changes_render_a_diff() {
     assert_eq!(
         Some(user_message(
             r#"<environment_context>
+  <subagents>
+    none
+  </subagents>
 </environment_context>"#,
         )),
         render_fragment(WorldStateSection::render_diff(
@@ -244,7 +264,7 @@ fn persisted_snapshot_uses_model_visible_path_and_context_values() -> Result<()>
 }
 
 #[test]
-fn single_environment_diff_ignores_unknown_shell() -> Result<()> {
+fn single_environment_diff_reports_newly_known_shell() -> Result<()> {
     let previous = EnvironmentsState {
         environments: [(
             LOCAL_ENVIRONMENT_ID.to_string(),
@@ -270,7 +290,9 @@ fn single_environment_diff_ignores_unknown_shell() -> Result<()> {
     let previous = WorldStateSection::snapshot(&previous);
 
     assert_eq!(
-        None,
+        Some(user_message(
+            "<environment_context>\n  <cwd>/repo</cwd>\n  <shell>zsh</shell>\n</environment_context>"
+        )),
         render_fragment(WorldStateSection::render_diff(
             &current,
             PreviousSectionState::Known(&previous),
@@ -304,6 +326,190 @@ fn removed_legacy_environment_renders_unavailable() -> Result<()> {
             &EnvironmentsState::default(),
             PreviousSectionState::Known(&previous),
         )),
+    );
+    Ok(())
+}
+
+#[test]
+fn known_unknown_and_changed_shell_are_communicated_before_snapshot_advances() -> Result<()> {
+    let make_state = |shell: Option<&str>| -> Result<WorldState> {
+        let mut state = WorldState::default();
+        state.add_section(EnvironmentsState {
+            environments: [(
+                LOCAL_ENVIRONMENT_ID.to_string(),
+                EnvironmentState {
+                    cwd: PathUri::parse("file:///repo")?,
+                    status: EnvironmentStatus::Available,
+                    shell: shell.map(str::to_string),
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        });
+        Ok(state)
+    };
+    let mut history = crate::context_manager::ContextManager::new();
+    for (shell, expected) in [
+        (Some("bash"), "bash"),
+        (None, "unknown"),
+        (Some("powershell"), "powershell"),
+    ] {
+        let state = make_state(shell)?;
+        let (fragments, item) = history.update_world_state(&state);
+        assert_eq!(
+            render_fragments(fragments),
+            vec![user_message(&format!(
+                "<environment_context>\n  <cwd>/repo</cwd>\n  <shell>{expected}</shell>\n</environment_context>"
+            ))]
+        );
+        assert!(item.is_some());
+        assert_eq!(history.world_state_baseline(), Some(state.snapshot()));
+        let (unchanged, item) = history.update_world_state(&state);
+        assert!(unchanged.is_empty());
+        assert_eq!(item, None);
+    }
+    Ok(())
+}
+
+#[test]
+fn removed_global_values_are_explicitly_cleared() {
+    let mut previous = WorldState::default();
+    previous.add_section(EnvironmentsState {
+        current_date: Some("2026-09-13".to_string()),
+        timezone: Some("UTC".to_string()),
+        network: Some(NetworkContext::new(true, vec![], vec![])),
+        filesystem: Some(FileSystemContext::from_permission_profile(
+            &PermissionProfile::Disabled,
+            &[],
+        )),
+        subagents: Some("agent-1".to_string()),
+        ..Default::default()
+    });
+    let (_, accepted) = previous.render_full_with_snapshot();
+    let mut current = WorldState::default();
+    current.add_section(EnvironmentsState::default());
+    let (fragments, cleared) = current.render_diff_with_snapshot(&accepted);
+    assert_eq!(
+        render_fragments(fragments),
+        vec![user_message(
+            "<environment_context>\n  <current_date>unknown</current_date>\n  <timezone>unknown</timezone>\n  <network status=\"unspecified\" />\n  <filesystem status=\"unspecified\" />\n  <subagents>\n    none\n  </subagents>\n</environment_context>"
+        )]
+    );
+    assert_eq!(cleared, current.snapshot());
+    assert!(current.render_diff(&cleared).is_empty());
+}
+
+#[test]
+fn unknown_environment_snapshot_is_authoritatively_replaced() {
+    let mut state = WorldState::default();
+    state.add_section(EnvironmentsState::default());
+    let malformed =
+        serde_json::from_value(json!({"environments": "unreadable"})).expect("snapshot");
+    let (fragments, accepted) = state.render_diff_with_snapshot(&malformed);
+    assert_eq!(
+        render_fragments(fragments),
+        vec![user_message(
+            "<environment_context>\n  This environment context replaces all previously provided environment context. Unlisted environments are unavailable; omitted fields are unspecified; omitted subagents means none.\n</environment_context>"
+        )]
+    );
+    assert_eq!(accepted, state.snapshot());
+    assert!(state.render_diff(&accepted).is_empty());
+
+    let legacy = user_message(
+        "<environment_context>\n  <cwd>/old</cwd>\n  <subagents>old-agent</subagents>\n</environment_context>",
+    );
+    let (restored, snapshot) = state.render_history_diff_with_snapshot(None, &[legacy]);
+    assert_eq!(
+        render_fragments(restored),
+        vec![user_message(
+            "<environment_context>\n  This environment context replaces all previously provided environment context. Unlisted environments are unavailable; omitted fields are unspecified; omitted subagents means none.\n</environment_context>"
+        )]
+    );
+    assert_eq!(snapshot, accepted);
+}
+
+#[test]
+fn clearing_each_global_field_emits_only_its_clear_and_persists_it() {
+    let populated = EnvironmentsState {
+        current_date: Some("2026-09-13".to_string()),
+        timezone: Some("UTC".to_string()),
+        network: Some(NetworkContext::new(true, vec![], vec![])),
+        filesystem: Some(FileSystemContext::from_permission_profile(
+            &PermissionProfile::Disabled,
+            &[],
+        )),
+        subagents: Some("agent-1".to_string()),
+        ..Default::default()
+    };
+    for (field, expected) in [
+        ("current_date", "  <current_date>unknown</current_date>"),
+        ("timezone", "  <timezone>unknown</timezone>"),
+        ("network", "  <network status=\"unspecified\" />"),
+        ("filesystem", "  <filesystem status=\"unspecified\" />"),
+        ("subagents", "  <subagents>\n    none\n  </subagents>"),
+    ] {
+        let mut history = crate::context_manager::ContextManager::new();
+        let mut previous = WorldState::default();
+        previous.add_section(populated.clone());
+        let (fragments, _) = history.update_world_state(&previous);
+        history.record_items(
+            &render_fragments(fragments),
+            codex_utils_output_truncation::TruncationPolicy::Bytes(100_000),
+        );
+        let mut cleared = populated.clone();
+        match field {
+            "current_date" => cleared.current_date = None,
+            "timezone" => cleared.timezone = None,
+            "network" => cleared.network = None,
+            "filesystem" => cleared.filesystem = None,
+            "subagents" => cleared.subagents = None,
+            _ => unreachable!(),
+        }
+        let mut current = WorldState::default();
+        current.add_section(cleared);
+        let (fragments, rollout) = history.update_world_state(&current);
+        assert_eq!(
+            render_fragments(fragments),
+            vec![user_message(&format!(
+                "<environment_context>\n{expected}\n</environment_context>"
+            ))],
+            "clearing {field} must not resend unchanged global fields"
+        );
+        assert_eq!(
+            rollout,
+            Some(codex_protocol::protocol::WorldStateItem::patch(
+                json!({"environments": {(field): null}})
+            ))
+        );
+        assert_eq!(history.world_state_baseline(), Some(current.snapshot()));
+        let (unchanged, rollout) = history.update_world_state(&current);
+        assert!(unchanged.is_empty(), "{field} clear should be sent once");
+        assert_eq!(rollout, None);
+    }
+}
+
+#[test]
+fn environment_ids_are_escaped_in_current_and_removed_entries() -> Result<()> {
+    let mut previous = WorldState::default();
+    previous.add_section(EnvironmentsState {
+        environments: [("old\"&".to_string(), available("file:///old", "bash")?)]
+            .into_iter()
+            .collect(),
+        ..Default::default()
+    });
+    let mut current = WorldState::default();
+    current.add_section(EnvironmentsState {
+        environments: [("new\"&".to_string(), available("file:///new", "bash")?)]
+            .into_iter()
+            .collect(),
+        ..Default::default()
+    });
+    assert_eq!(
+        render_fragments(current.render_diff(&previous.snapshot())),
+        vec![user_message(
+            "<environment_context>\n  <environments>\n    <environment id=\"new&quot;&amp;\">\n      <cwd>/new</cwd>\n      <shell>bash</shell>\n    </environment>\n    <environment id=\"old&quot;&amp;\" status=\"unavailable\" />\n  </environments>\n</environment_context>"
+        )]
     );
     Ok(())
 }

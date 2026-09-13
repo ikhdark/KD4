@@ -105,6 +105,10 @@ pub(crate) struct OutputDeltaLimiter {
 }
 
 impl OutputDeltaLimiter {
+    pub(crate) fn is_suppressed(&self) -> bool {
+        self.cap_notice_emitted.load(Ordering::Acquire)
+    }
+
     pub(crate) fn claim(&self) -> OutputDeltaDecision {
         if self.emitted.fetch_add(1, Ordering::Relaxed) < MAX_EXEC_OUTPUT_DELTAS_PER_CALL {
             OutputDeltaDecision::Emit

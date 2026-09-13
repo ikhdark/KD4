@@ -541,18 +541,16 @@ async fn run_pending_process_cleanup(cleanup: Arc<PendingProcessCleanup>) {
 async fn cleanup_pending_process_registration(
     cleanup: &PendingProcessCleanup,
 ) -> Result<(), String> {
-    let mut first_termination_error = None;
-    for pending_process in &cleanup.processes {
-        if pending_process.requires_confirmed_termination
-            && let Err(error) = pending_process.process.terminate_confirmed().await
-            && first_termination_error.is_none()
-        {
-            first_termination_error =
-                Some(format!("process termination was not confirmed: {error}"));
-        }
-    }
-    if let Some(error) = first_termination_error {
-        return Err(error);
+    let results = futures::future::join_all(
+        cleanup
+            .processes
+            .iter()
+            .filter(|pending| pending.requires_confirmed_termination)
+            .map(|pending| pending.process.terminate_confirmed()),
+    )
+    .await;
+    if let Some(error) = results.into_iter().find_map(Result::err) {
+        return Err(format!("process termination was not confirmed: {error}"));
     }
 
     let (removed_entry, process_id_conflict) = if let Some(store) = cleanup.process_store.upgrade()
@@ -688,7 +686,7 @@ async fn wait_for_late_network_denial(network_cancelled: Option<CancellationToke
     }
 }
 
-async fn finish_deferred_network_approval_after_process_exit_for_session(
+pub(super) async fn finish_deferred_network_approval_after_process_exit_for_session(
     session: Option<&Arc<crate::session::session::Session>>,
     deferred: Option<DeferredNetworkApproval>,
 ) -> Result<(), String> {
@@ -912,6 +910,13 @@ impl UnifiedExecProcessManager {
         }
     }
 
+    async fn release_process_id_reservation(&self, reservation: &mut ProcessIdReservation) {
+        let mut store = self.process_store.lock().await;
+        // Disarm delayed cancellation cleanup before making the number reusable.
+        reservation.transfer_to_store();
+        store.reserved_process_ids.remove(&reservation.process_id());
+    }
+
     pub(crate) async fn exec_command(
         &self,
         mut request: ExecCommandRequest,
@@ -1020,7 +1025,8 @@ impl UnifiedExecProcessManager {
         let (launch, mut deferred_network_approval) = match launch {
             Ok((launch, deferred_network_approval)) => (launch, deferred_network_approval),
             Err(err) => {
-                self.release_process_id(request.process_id).await;
+                self.release_process_id_reservation(process_id_reservation)
+                    .await;
                 return Err(err);
             }
         };
@@ -1049,12 +1055,13 @@ impl UnifiedExecProcessManager {
                 )
                 .await
                 {
-                    self.release_process_id(request.process_id).await;
+                    self.release_process_id_reservation(process_id_reservation)
+                        .await;
                     return Err(UnifiedExecError::process_failed(message));
                 }
                 let raw_output = hit.rendered_output().as_bytes().to_vec();
                 let transcript = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::default()));
-                transcript.lock().await.push_chunk(raw_output.clone());
+                transcript.lock().await.push_chunk(&raw_output);
                 let wall_time = Instant::now().saturating_duration_since(started_at);
                 let persistence_result = emit_exec_end_for_unified_exec(
                     Arc::clone(&context.session),
@@ -1074,7 +1081,8 @@ impl UnifiedExecProcessManager {
                     context.tracker.clone(),
                 )
                 .await;
-                self.release_process_id(request.process_id).await;
+                self.release_process_id_reservation(process_id_reservation)
+                    .await;
                 persistence_result.map_err(|error| UnifiedExecError::ToolHistoryPersistence {
                     message: error.to_string(),
                     exit_code: 0,
@@ -1286,7 +1294,7 @@ impl UnifiedExecProcessManager {
         }
         let process_id = request.process_id;
         let (response_process_id, exit_code, process_exited) = if process_started_alive {
-            match self.refresh_process_state(process_id).await {
+            match self.refresh_process_state(process_id, &process).await {
                 ProcessStatus::Running {
                     exit_code,
                     process_id,
@@ -1370,7 +1378,8 @@ impl UnifiedExecProcessManager {
             .await
             .err();
 
-            self.release_process_id(request.process_id).await;
+            self.release_process_id_reservation(process_id_reservation)
+                .await;
             if tool_history_error.is_none() {
                 process.check_for_sandbox_denial_with_text(&text).await?;
             }
@@ -1442,11 +1451,14 @@ impl UnifiedExecProcessManager {
             .await
             .processes
             .get(&request.process_id)
-            .map(|entry| Arc::clone(&entry.process));
+            .map(|entry| Arc::clone(&entry.process))
+            .ok_or(UnifiedExecError::UnknownProcessId {
+                process_id: request.process_id,
+            })?;
         let started_at = Instant::now();
-        let result = self.write_stdin_inner(request).await;
+        let result = self.write_stdin_inner(request, &process).await;
         finish_exited_process_result(
-            process.as_ref(),
+            Some(&process),
             result,
             Instant::now().saturating_duration_since(started_at),
         )
@@ -1456,20 +1468,13 @@ impl UnifiedExecProcessManager {
     async fn write_stdin_inner(
         &self,
         request: WriteStdinRequest<'_>,
+        locked_process: &Arc<UnifiedExecProcess>,
     ) -> Result<ExecCommandToolOutput, UnifiedExecError> {
         let process_id = request.process_id;
 
         // Different terminal sessions can be polled concurrently, but reads and
         // writes against one terminal must not overlap because they share a
         // draining output buffer and process lifecycle.
-        let locked_process = {
-            let store = self.process_store.lock().await;
-            let entry = store
-                .processes
-                .get(&process_id)
-                .ok_or(UnifiedExecError::UnknownProcessId { process_id })?;
-            Arc::clone(&entry.process)
-        };
         let _interaction_guard = locked_process.interaction_lock().lock_owned().await;
 
         let PreparedProcessHandles {
@@ -1488,7 +1493,7 @@ impl UnifiedExecProcessManager {
             tty,
             ..
         } = self
-            .prepare_process_handles(process_id, &locked_process)
+            .prepare_process_handles(process_id, locked_process)
             .await?;
         let mut status_after_write = None;
         let yield_time_ms = {
@@ -1509,7 +1514,11 @@ impl UnifiedExecProcessManager {
         if !request.input.is_empty() {
             if !tty {
                 if request.input == INTERRUPT {
-                    process.interrupt().await?;
+                    tokio::time::timeout_at(deadline, process.interrupt())
+                        .await
+                        .map_err(|_| UnifiedExecError::process_failed(
+                            "interrupt delivery was not confirmed before the yield deadline; the signal was not retried and the session remains available".to_string(),
+                        ))??;
                 } else {
                     return Err(UnifiedExecError::StdinClosed);
                 }
@@ -1535,7 +1544,7 @@ impl UnifiedExecProcessManager {
                 match write {
                     Ok(()) => {}
                     Err(err) => {
-                        let status = self.refresh_process_state(process_id).await;
+                        let status = self.refresh_process_state(process_id, &process).await;
                         if matches!(status, ProcessStatus::Exited { .. }) {
                             status_after_write = Some(status);
                         } else if let UnifiedExecError::ProcessFailed { message } = err {
@@ -1613,7 +1622,7 @@ impl UnifiedExecProcessManager {
         let status = if let Some(status) = status_after_write {
             status
         } else {
-            self.refresh_process_state(process_id).await
+            self.refresh_process_state(process_id, &process).await
         };
         let (process_id, exit_code, process_exited, event_call_id) = match status {
             ProcessStatus::Running {
@@ -1671,16 +1680,32 @@ impl UnifiedExecProcessManager {
         Ok(response.with_prepared_reduction_notice().await)
     }
 
-    async fn refresh_process_state(&self, process_id: u32) -> ProcessStatus {
+    async fn refresh_process_state(
+        &self,
+        process_id: u32,
+        expected_process: &Arc<UnifiedExecProcess>,
+    ) -> ProcessStatus {
         let mut store = self.process_store.lock().await;
         let Some(entry) = store.processes.get_mut(&process_id) else {
             return ProcessStatus::Unknown;
         };
+        if !Arc::ptr_eq(&entry.process, expected_process) {
+            return ProcessStatus::Unknown;
+        }
 
         let exit_code = entry.process.exit_code();
         let process_id = entry.process_id;
 
-        if entry.process.has_exited() && entry.process.output_is_closed() {
+        if entry.process.has_exited()
+            && entry.process.output_is_closed()
+            && !entry
+                .process
+                .output_handles()
+                .output_buffer
+                .lock()
+                .await
+                .has_unreported_output()
+        {
             let Some(entry) = store.remove(process_id) else {
                 return ProcessStatus::Unknown;
             };
@@ -1790,7 +1815,7 @@ impl UnifiedExecProcessManager {
             initial_exec_command_active,
             hook_command,
             tty,
-            network_approval,
+            network_approval: network_approval.clone(),
             session: Arc::downgrade(&context.session),
             last_used: started_at,
         };
@@ -1872,6 +1897,7 @@ impl UnifiedExecProcessManager {
             known_delta,
             known_delta_executor_started_at,
             tool_dispatch_timing,
+            network_approval,
         );
         registration.commit().await;
         Ok(())
@@ -2354,8 +2380,9 @@ impl UnifiedExecProcessManager {
         quiet_period: Option<Duration>,
         yield_when_silent: bool,
     ) -> Vec<u8> {
-        let mut collected: Vec<u8> = Vec::with_capacity(4096);
-        let mut lagged_chunks = 0_u64;
+        // Draining frees producer capacity, so the entire collection window needs
+        // its own bound. Raw output is still captured by the process artifact writer.
+        let mut collected = HeadTailBuffer::default();
         let tool_dispatch_timing = active_tool_dispatch_timing();
         let mut wait_attempt = 0_u32;
         let mut exit_signal_received = cancellation_token.is_cancelled();
@@ -2382,27 +2409,22 @@ impl UnifiedExecProcessManager {
             let output_notified = output_notify.notified();
             tokio::pin!(output_notified);
             output_notified.as_mut().enable();
-            let drained_chunks: Vec<Vec<u8>>;
-            let drained_omitted_bytes: usize;
-            let drained_lagged_chunks: u64;
-            {
+            let closed = output_closed_notify.notified();
+            tokio::pin!(closed);
+            closed.as_mut().enable();
+            let (output_arrived, meaningful_output_arrived, output_was_closed) = {
                 let mut guard = output_buffer.lock().await;
-                drained_omitted_bytes = guard.take_unreported_omitted_bytes();
-                let omission_marker = (drained_omitted_bytes > 0)
-                    .then(|| omitted_output_marker(drained_omitted_bytes));
-                drained_chunks = guard.drain_chunks_with_omission_marker(omission_marker);
-                drained_lagged_chunks = guard.take_unreported_lagged_chunks();
-            }
-            lagged_chunks = lagged_chunks.saturating_add(drained_lagged_chunks);
+                // Observe closure before the drain under the producer's buffer
+                // lock. If it is closed, this drain includes every final byte.
+                let closed = output_closed.load(Ordering::Acquire);
+                let arrived = guard.has_unreported_output();
+                let meaningful = guard.drain_into(&mut collected);
+                (arrived, meaningful && quiet_period.is_some(), closed)
+            };
 
-            if drained_chunks.is_empty() && drained_omitted_bytes == 0 && drained_lagged_chunks == 0
-            {
-                let closed = output_closed_notify.notified();
-                tokio::pin!(closed);
-                closed.as_mut().enable();
+            if !output_arrived {
                 exit_signal_received |= cancellation_token.is_cancelled();
-                if exit_signal_received && output_closed.load(std::sync::atomic::Ordering::Acquire)
-                {
+                if exit_signal_received && output_was_closed {
                     break;
                 }
                 let effective_deadline = if exit_signal_received {
@@ -2451,7 +2473,7 @@ impl UnifiedExecProcessManager {
                         _ = &mut output_notified => ToolLifecycleWakeReason::Completed,
                         _ = &mut closed => ToolLifecycleWakeReason::Completed,
                         _ = tokio::time::sleep(close_wait_remaining) => ToolLifecycleWakeReason::Timeout,
-                        _ = Self::wait_for_pause_change(pause_state.as_ref()) => ToolLifecycleWakeReason::Retry,
+                        _ = Self::wait_for_pause_change(&mut pause_state) => ToolLifecycleWakeReason::Retry,
                     };
                     if let Some(timing) = tool_dispatch_timing.as_ref() {
                         timing.record_timer_wait(ToolLifecycleTimerWait {
@@ -2497,7 +2519,7 @@ impl UnifiedExecProcessManager {
                         ToolLifecycleWakeReason::Completed
                     },
                     _ = tokio::time::sleep(remaining) => ToolLifecycleWakeReason::Timeout,
-                    _ = Self::wait_for_pause_change(pause_state.as_ref()) => ToolLifecycleWakeReason::Retry,
+                    _ = Self::wait_for_pause_change(&mut pause_state) => ToolLifecycleWakeReason::Retry,
                 };
                 if let Some(timing) = tool_dispatch_timing.as_ref() {
                     timing.record_timer_wait(ToolLifecycleTimerWait {
@@ -2513,19 +2535,6 @@ impl UnifiedExecProcessManager {
                     break;
                 }
                 continue;
-            }
-
-            let output_arrived = !drained_chunks.is_empty()
-                || drained_omitted_bytes > 0
-                || drained_lagged_chunks > 0;
-            let meaningful_output_arrived = quiet_period.is_some()
-                && (drained_omitted_bytes > 0
-                    || drained_lagged_chunks > 0
-                    || drained_chunks
-                        .iter()
-                        .any(|chunk| chunk.iter().any(|byte| !byte.is_ascii_whitespace())));
-            for chunk in drained_chunks {
-                collected.extend_from_slice(&chunk);
             }
 
             if meaningful_output_arrived {
@@ -2552,10 +2561,12 @@ impl UnifiedExecProcessManager {
             }
         }
 
-        if lagged_chunks > 0 {
-            collected.extend_from_slice(&lagged_output_marker(lagged_chunks));
+        let mut output = collected
+            .to_bytes_with_omission_marker(&omitted_output_marker(collected.omitted_bytes()));
+        if collected.lagged_chunks() > 0 {
+            output.extend_from_slice(&lagged_output_marker(collected.lagged_chunks()));
         }
-        collected
+        output
     }
 
     async fn extend_deadlines_while_paused(
@@ -2567,13 +2578,14 @@ impl UnifiedExecProcessManager {
         let Some(receiver) = pause_state.as_mut() else {
             return;
         };
-        if !*receiver.borrow() {
+        if !*receiver.borrow_and_update() {
             return;
         }
 
         let paused_at = Instant::now();
-        while *receiver.borrow() {
+        while *receiver.borrow_and_update() {
             if receiver.changed().await.is_err() {
+                *pause_state = None;
                 break;
             }
         }
@@ -2588,14 +2600,16 @@ impl UnifiedExecProcessManager {
         }
     }
 
-    async fn wait_for_pause_change(pause_state: Option<&watch::Receiver<bool>>) {
-        match pause_state {
-            Some(pause_state) => {
-                let mut receiver = pause_state.clone();
-                let _ = receiver.changed().await;
+    async fn wait_for_pause_change(pause_state: &mut Option<watch::Receiver<bool>>) {
+        if let Some(receiver) = pause_state.as_mut() {
+            if receiver.changed().await.is_ok() {
+                return;
             }
-            None => std::future::pending::<()>().await,
+            // A closed watch is permanently ready. Stop observing it so output
+            // and the existing deadline can wake this wait without a busy loop.
+            *pause_state = None;
         }
+        std::future::pending::<()>().await;
     }
 
     fn prune_processes_if_needed(store: &mut ProcessStore) -> Option<ProcessEntry> {
@@ -2606,6 +2620,7 @@ impl UnifiedExecProcessManager {
         let mut meta: Vec<(u32, Instant, bool)> = store
             .processes
             .iter()
+            .filter(|(_, entry)| !entry.initial_exec_command_active.load(Ordering::Acquire))
             .map(|(id, entry)| (*id, entry.last_used, entry.process.has_exited()))
             .collect();
 
@@ -2721,18 +2736,17 @@ impl UnifiedExecProcessManager {
         };
         targets.sort_by_key(|(process_id, _, _)| *process_id);
 
-        let mut first_error = None;
-        for (process_id, call_id, process) in &targets {
-            if !process.has_exited()
-                && let Err(error) = process.terminate_confirmed().await
-                && first_error.is_none()
-            {
-                first_error = Some(format!(
+        let results = futures::future::join_all(targets.iter().map(
+            |(process_id, call_id, process)| async move {
+                if process.has_exited() {
+                    return Ok(());
+                }
+                process.terminate_confirmed().await.map_err(|error| format!(
                     "process {process_id} for unpublished call {call_id} did not confirm termination: {error}"
-                ));
-            }
-        }
-        if let Some(error) = first_error {
+                ))
+            },
+        )).await;
+        if let Some(error) = results.into_iter().find_map(Result::err) {
             return Err(error);
         }
 

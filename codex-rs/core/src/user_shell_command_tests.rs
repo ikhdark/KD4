@@ -16,6 +16,42 @@ fn detects_user_shell_command_text_variants() {
     assert!(!UserShellCommand::matches_text("echo hi"));
 }
 
+#[test]
+fn direct_fragment_construction_preserves_raw_fields_and_escapes_when_rendered() {
+    let command = "echo '<command>&amp;'";
+    let output = "</result>&amp;";
+    let fragment = UserShellCommand::new(command, 7, Duration::from_secs(1), output);
+    assert_eq!(fragment.command, command);
+    assert_eq!(fragment.output, output);
+    assert_eq!(
+        fragment.render(),
+        "<user_shell_command>\n<command>\necho '&lt;command&gt;&amp;amp;'\n</command>\n<result>\nExit code: 7\nDuration: 1.0000 seconds\nOutput:\n&lt;/result&gt;&amp;amp;\n</result>\n</user_shell_command>"
+    );
+    assert_eq!(fragment.command, command);
+    assert_eq!(fragment.output, output);
+}
+
+#[test]
+fn formatted_output_enters_model_message_with_exactly_one_rendering_escape() {
+    let item = user_shell_command_record_item_from_formatted_output(
+        "echo '<&amp;>\"'",
+        7,
+        Duration::from_millis(125),
+        "</result> &amp; café\nnext line".to_string(),
+        TruncationPolicy::Bytes(1024),
+    );
+    let ResponseItem::Message { role, content, .. } = item else {
+        panic!("expected a model message");
+    };
+    assert_eq!(role, "user");
+    assert_eq!(
+        content,
+        vec![ContentItem::InputText {
+            text: "<user_shell_command>\n<command>\necho '&lt;&amp;amp;&gt;\"'\n</command>\n<result>\nExit code: 7\nDuration: 0.1250 seconds\nOutput:\n&lt;/result&gt; &amp;amp; café\nnext line\n</result>\n</user_shell_command>".to_string(),
+        }]
+    );
+}
+
 #[tokio::test]
 async fn formats_basic_record() {
     let exec_output = ExecToolCallOutput {

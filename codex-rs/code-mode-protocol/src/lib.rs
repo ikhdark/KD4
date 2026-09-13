@@ -17,6 +17,10 @@ pub use description::normalize_code_mode_identifier;
 pub use description::parse_exec_source;
 pub use description::render_code_mode_sample;
 pub use description::render_json_schema_to_typescript;
+
+/// Marks the locally constructed MCP envelope. Its structuredContent schema is
+/// an independent schema resource supplied by the server, including local refs.
+pub const MCP_RESULT_SCHEMA_MARKER: &str = "x-codex-mcp-result";
 pub use response::DEFAULT_IMAGE_DETAIL;
 pub use response::FunctionCallOutputContentItem;
 pub use response::ImageDetail;

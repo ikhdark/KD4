@@ -930,6 +930,32 @@ fn collect_guardian_transcript_entries_skips_contextual_user_messages() {
 }
 
 #[test]
+fn collect_guardian_transcript_entries_preserves_user_text_mixed_with_context() {
+    let items = vec![ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: vec![
+            ContentItem::InputText {
+                text: "<environment_context>ctx</environment_context>".to_string(),
+            },
+            ContentItem::InputText {
+                text: "only inspect the files".to_string(),
+            },
+        ],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    }];
+    assert_eq!(
+        collect_guardian_transcript_entries(&items),
+        vec![GuardianTranscriptEntry {
+            kind: GuardianTranscriptEntryKind::User,
+            text: "<environment_context>ctx</environment_context>\nonly inspect the files"
+                .to_string(),
+        }],
+    );
+}
+
+#[test]
 fn collect_guardian_transcript_entries_keeps_manual_approval_developer_message() {
     let approval_text =
         format!("{AUTO_REVIEW_DENIED_ACTION_APPROVAL_DEVELOPER_PREFIX}\n\nApproved action:\n{{}}");

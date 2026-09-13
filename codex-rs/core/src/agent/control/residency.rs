@@ -120,6 +120,22 @@ impl V2Residency {
         capacity: usize,
         protected_thread_id: Option<ThreadId>,
     ) -> CodexResult<V2ResidencySlot> {
+        self.reserve_slot_with_shutdown_timeout(
+            manager,
+            capacity,
+            protected_thread_id,
+            RESIDENCY_SHUTDOWN_TIMEOUT,
+        )
+        .await
+    }
+
+    async fn reserve_slot_with_shutdown_timeout(
+        self: Arc<Self>,
+        manager: &Arc<ThreadManagerState>,
+        capacity: usize,
+        protected_thread_id: Option<ThreadId>,
+        shutdown_timeout: Duration,
+    ) -> CodexResult<V2ResidencySlot> {
         loop {
             if self.try_reserve_pending_slot(capacity) {
                 return Ok(V2ResidencySlot {
@@ -128,14 +144,21 @@ impl V2Residency {
                 });
             }
             match self
-                .try_unload_one_resident(manager, protected_thread_id)
+                .try_unload_one_resident_with_shutdown_timeout(
+                    manager,
+                    protected_thread_id,
+                    shutdown_timeout,
+                )
                 .await
             {
                 UnloadOneResult::Reserved(slot) => return Ok(slot),
-                UnloadOneResult::WaitingForLateShutdown(completion) => match completion.await {
-                    Ok(CompletedUnloadResult::Reserved(slot)) => return Ok(slot),
-                    Ok(CompletedUnloadResult::Retry) | Err(_) => continue,
-                },
+                UnloadOneResult::WaitingForLateShutdown(completion) => {
+                    // Cleanup retains occupancy. An undelivered slot releases itself on drop.
+                    drop(completion);
+                    return Err(CodexErr::AgentLimitReached {
+                        max_threads: capacity,
+                    });
+                }
                 UnloadOneResult::Retry => continue,
                 UnloadOneResult::Unavailable => {
                     return Err(CodexErr::AgentLimitReached {
@@ -162,19 +185,6 @@ impl V2Residency {
         }
         state.pending_slots += 1;
         true
-    }
-
-    async fn try_unload_one_resident(
-        self: &Arc<Self>,
-        manager: &Arc<ThreadManagerState>,
-        protected_thread_id: Option<ThreadId>,
-    ) -> UnloadOneResult {
-        self.try_unload_one_resident_with_shutdown_timeout(
-            manager,
-            protected_thread_id,
-            RESIDENCY_SHUTDOWN_TIMEOUT,
-        )
-        .await
     }
 
     async fn try_unload_one_resident_with_shutdown_timeout(
@@ -220,45 +230,38 @@ impl V2Residency {
                     continue;
                 }
             }
-            if let Err(err) = candidate_thread.request_shutdown().await {
-                warn!(
-                    "failed to submit shutdown for v2 resident thread {candidate_thread_id}: {err}"
-                );
-                claim.restore();
-                continue;
-            }
-            if timeout(shutdown_timeout, candidate_thread.wait_until_terminated())
-                .await
-                .is_err()
-            {
-                warn!(
-                    "timed out shutting down v2 resident thread {candidate_thread_id}; waiting for late termination"
-                );
-                let (completion_tx, completion_rx) = oneshot::channel();
-                let manager = Arc::clone(manager);
-                tokio::spawn(async move {
-                    candidate_thread.wait_until_terminated().await;
-                    let result = finish_completed_unload(
-                        &manager,
-                        candidate_thread_id,
-                        &candidate_thread,
-                        claim,
-                    )
-                    .await;
-                    let _ = completion_tx.send(result);
-                });
-                return UnloadOneResult::WaitingForLateShutdown(completion_rx);
-            }
-            return match finish_completed_unload(
-                manager,
-                candidate_thread_id,
-                &candidate_thread,
-                claim,
-            )
-            .await
-            {
-                CompletedUnloadResult::Reserved(slot) => UnloadOneResult::Reserved(slot),
-                CompletedUnloadResult::Retry => UnloadOneResult::Retry,
+            let (completion_tx, mut completion_rx) = oneshot::channel();
+            let manager = Arc::clone(manager);
+            // Transfer the claim before shutdown can be accepted. Cancellation of the
+            // requester must never restore a runtime whose shutdown is underway.
+            tokio::spawn(async move {
+                if let Err(err) = candidate_thread.request_shutdown().await {
+                    warn!(
+                        "failed to submit shutdown for v2 resident thread {candidate_thread_id}: {err}"
+                    );
+                    claim.restore();
+                    let _ = completion_tx.send(CompletedUnloadResult::Retry);
+                    return;
+                }
+                candidate_thread.wait_until_terminated().await;
+                let result = finish_completed_unload(
+                    &manager,
+                    candidate_thread_id,
+                    &candidate_thread,
+                    claim,
+                )
+                .await;
+                let _ = completion_tx.send(result);
+            });
+            return match timeout(shutdown_timeout, &mut completion_rx).await {
+                Ok(Ok(CompletedUnloadResult::Reserved(slot))) => UnloadOneResult::Reserved(slot),
+                Ok(Ok(CompletedUnloadResult::Retry)) | Ok(Err(_)) => UnloadOneResult::Retry,
+                Err(_) => {
+                    warn!(
+                        "timed out shutting down v2 resident thread {candidate_thread_id}; cleanup retains occupancy"
+                    );
+                    UnloadOneResult::WaitingForLateShutdown(completion_rx)
+                }
             };
         }
         UnloadOneResult::Unavailable

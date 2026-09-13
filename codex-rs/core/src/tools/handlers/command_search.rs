@@ -12,7 +12,6 @@ use sha2::Sha256;
 
 use crate::shell::ShellType;
 
-use super::command_preflight::infer_direct_shell_type;
 use super::command_preflight::matches_ignore_ascii_case;
 use super::command_preflight::program_name;
 use super::command_preflight::rg_argv_commands;
@@ -566,14 +565,7 @@ pub(crate) fn search_path_normalization_count() -> usize {
     SEARCH_PATH_NORMALIZATION_COUNT.with(std::cell::Cell::get)
 }
 
-pub(crate) fn rg_search_path_operands(
-    command: &[String],
-    shell_type: Option<ShellType>,
-) -> Result<Option<Vec<String>>, String> {
-    let commands = rg_argv_commands(
-        command,
-        shell_type.or_else(|| infer_direct_shell_type(command)),
-    )?;
+pub(crate) fn rg_search_path_operands(commands: &[Vec<String>]) -> Option<Vec<String>> {
     let mut saw_search = false;
     let mut operands = Vec::new();
     for argv in commands {
@@ -581,18 +573,18 @@ pub(crate) fn rg_search_path_operands(
             .first()
             .map(|program| program_name(program))
             .is_some_and(|program| matches_ignore_ascii_case(program, &["rg", "rga", "ripgrep"]))
-            && rg_invocation_searches(&argv);
+            && rg_invocation_searches(argv);
         if !is_rg_search {
             continue;
         }
         saw_search = true;
         operands.extend(
-            rg_path_operand_indices(&argv)
+            rg_path_operand_indices(argv)
                 .into_iter()
                 .filter_map(|index| argv.get(index).cloned()),
         );
     }
-    Ok(saw_search.then_some(operands))
+    saw_search.then_some(operands)
 }
 
 fn rg_path_operand_indices(argv: &[String]) -> Vec<usize> {

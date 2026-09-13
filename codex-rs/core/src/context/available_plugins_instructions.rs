@@ -26,7 +26,7 @@ impl ContextualUserFragment for AvailablePluginsInstructions {
     }
 
     fn body(&self) -> String {
-        "\n## Plugins\nPlugins contribute skills (`plugin_name:skill`), MCP tools, or apps; invoke the contributed capability, not the bundle. Prefer a named plugin's relevant capabilities. If none are callable, say so briefly and use the best fallback.\n".to_string()
+        "\n## Plugins\nPlugins contribute skills (`plugin_name:skill`), MCP tools, or apps; use the contributed capability, not the bundle. Prefer a named plugin's relevant capability, loading or discovering it through its existing route when needed. If unavailable, explain the limitation; use a fallback only if it preserves the requested source and scope.\n".to_string()
     }
 }
 
@@ -49,5 +49,22 @@ impl ContextualUserFragment for PluginsInstructionsUnavailable {
     fn body(&self) -> String {
         "\n## Plugins\nPlugins are currently unavailable. Previously provided plugin guidance no longer applies.\n"
             .to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn renders_capability_routing_and_source_preserving_fallback_guidance() {
+        let expected_body = "\n## Plugins\nPlugins contribute skills (`plugin_name:skill`), MCP tools, or apps; use the contributed capability, not the bundle. Prefer a named plugin's relevant capability, loading or discovering it through its existing route when needed. If unavailable, explain the limitation; use a fallback only if it preserves the requested source and scope.\n";
+        assert_eq!(AvailablePluginsInstructions.body(), expected_body);
+        assert_eq!(AvailablePluginsInstructions.role(), "developer");
+        assert_eq!(
+            AvailablePluginsInstructions.render(),
+            format!("<plugins_instructions>{expected_body}</plugins_instructions>")
+        );
     }
 }

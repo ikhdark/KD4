@@ -158,7 +158,7 @@ fn independent_review_sources_include_automatic_and_builtin_reviewers() {
 }
 
 #[test]
-fn independent_review_shell_policy_is_read_only_on_every_shell_route() {
+fn independent_review_shell_policy_rejects_mutation_and_permission_overrides() {
     let reviewer = SessionSource::SubAgent(SubAgentSource::Review);
     assert!(validate_independent_review_shell(&reviewer, true, false, false).is_ok());
     let err = validate_independent_review_shell(&reviewer, false, false, false)
@@ -420,4 +420,127 @@ fn integrator_and_invalid_risk_evidence_fail_closed() {
         ),
         Err(CapabilityPolicyError::InvalidRepoPath { .. })
     ));
+}
+
+#[test]
+fn absolute_paths_resolve_inside_the_repository_and_reject_siblings() {
+    let fixture = RepoFixture::new();
+    let inside = fixture.path().join("src/new.rs");
+    assert_eq!(
+        normalize_absolute_repo_path(fixture.path(), &inside).unwrap(),
+        "src/new.rs"
+    );
+    let sibling = tempfile::tempdir().expect("sibling directory");
+    assert!(matches!(
+        normalize_absolute_repo_path(fixture.path(), &sibling.path().join("new.rs")),
+        Err(CapabilityPolicyError::InvalidRepoPath { .. })
+    ));
+}
+
+#[test]
+#[cfg(windows)]
+fn absolute_paths_accept_windows_case_aliases() {
+    let fixture = RepoFixture::new();
+    let alias = PathBuf::from(fixture.path().to_str().unwrap().to_uppercase()).join("src/new.rs");
+    assert_eq!(
+        normalize_absolute_repo_path(fixture.path(), &alias).unwrap(),
+        "src/new.rs"
+    );
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn case_distinct_sibling_and_symlink_cannot_supply_repository_evidence() {
+    let directory = tempfile::tempdir().expect("directory");
+    let root = directory.path().join("Repo");
+    let sibling = directory.path().join("repo");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::create_dir(&sibling).unwrap();
+    std::os::unix::fs::symlink(&sibling, root.join("escape")).unwrap();
+    assert!(normalize_absolute_repo_path(&root, &sibling.join("new.rs")).is_err());
+    assert!(normalize_absolute_repo_path(&root, &root.join("escape/new.rs")).is_err());
+    let canonical_root = canonical_repository_root(&root).unwrap();
+    assert!(normalize_repo_relative_path(&canonical_root, "escape/new.rs").is_err());
+}
+
+#[test]
+fn risk_policy_validates_all_scopes_even_after_a_match_or_without_changes() {
+    let fixture = RepoFixture::new();
+    let assignment = fixture.assignment(CapabilityProfile::ScopedSourceWrite, vec![]);
+    let scopes = [recursive_scope("src"), recursive_scope("../invalid")];
+    for changed_paths in [vec!["src/lib.rs".to_string()], vec![]] {
+        assert!(matches!(
+            derive_risk_policy(
+                &assignment,
+                fixture.path(),
+                RiskPolicyInput {
+                    changed_paths: &changed_paths,
+                    configured_high_risk_paths: &scopes,
+                    ..base_risk_input()
+                }
+            ),
+            Err(CapabilityPolicyError::InvalidRepoPath { .. })
+        ));
+    }
+}
+
+#[test]
+fn cold_review_write_identity_uses_platform_case_rules_and_rejects_duplicates() {
+    let fixture = RepoFixture::new();
+    let assignment = fixture.assignment(CapabilityProfile::ScopedSourceWrite, vec![]);
+    let attempt_id = AttemptId::new();
+    let evidence = |path: &str| MutationEvidence {
+        assignment_id: assignment.assignment_id,
+        attempt_id,
+        path: path.to_string(),
+        pre_write_hash: None,
+        pre_write_existed: false,
+        final_hash: None,
+        final_write_existed: Some(false),
+        mutation_event_ids: vec![],
+        attribution_confidence: AttributionConfidence::Definitive,
+        snapshot_retained: true,
+        first_observed_at: chrono::Utc::now(),
+        finalized_at: Some(chrono::Utc::now()),
+        start_epoch: 0,
+        end_epoch: Some(1),
+    };
+    let input = ColdReviewContextInput {
+        assignment: assignment.clone(),
+        attempt_id,
+        applicable_instructions: vec![],
+        attempt_specific_diff: String::new(),
+        observed_writes: vec![evidence("src/A.rs"), evidence("src/a.rs")],
+        relevant_contracts: vec![],
+        nearest_tests: vec![],
+    };
+    let result = build_cold_review_context(fixture.path(), input.clone());
+    if cfg!(windows) {
+        assert!(matches!(
+            result,
+            Err(CapabilityPolicyError::DuplicateColdReviewWritePath(_))
+        ));
+    } else {
+        assert_eq!(
+            result
+                .unwrap()
+                .observed_writes
+                .iter()
+                .map(|write| write.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["src/A.rs", "src/a.rs"]
+        );
+    }
+    let duplicate = ColdReviewContextInput {
+        observed_writes: vec![evidence("src/A.rs"), evidence("src/A.rs")],
+        ..input
+    };
+    assert!(matches!(
+        build_cold_review_context(fixture.path(), duplicate),
+        Err(CapabilityPolicyError::DuplicateColdReviewWritePath(_))
+    ));
+    assert_eq!(
+        scope_covers_path("src/A.rs", false, "src/a.rs"),
+        cfg!(windows)
+    );
 }

@@ -151,12 +151,13 @@ impl TryFrom<ExecuteRequest> for WireExecuteRequest {
     type Error = TryFromIntError;
 
     fn try_from(value: ExecuteRequest) -> Result<Self, Self::Error> {
+        let max_output_tokens = value.max_output_tokens.map(i32::try_from).transpose()?;
         Ok(Self {
             tool_call_id: value.tool_call_id,
             enabled_tools: value.enabled_tools.into_iter().map(Into::into).collect(),
             source: value.source,
             yield_time_ms: value.yield_time_ms,
-            max_output_tokens: value.max_output_tokens.map(i32::try_from).transpose()?,
+            max_output_tokens,
         })
     }
 }
@@ -165,12 +166,13 @@ impl TryFrom<WireExecuteRequest> for ExecuteRequest {
     type Error = TryFromIntError;
 
     fn try_from(value: WireExecuteRequest) -> Result<Self, Self::Error> {
+        let max_output_tokens = value.max_output_tokens.map(usize::try_from).transpose()?;
         Ok(Self {
             tool_call_id: value.tool_call_id,
             enabled_tools: value.enabled_tools.into_iter().map(Into::into).collect(),
             source: value.source,
             yield_time_ms: value.yield_time_ms,
-            max_output_tokens: value.max_output_tokens.map(usize::try_from).transpose()?,
+            max_output_tokens,
         })
     }
 }
@@ -404,6 +406,14 @@ pub struct WireNestedToolCall {
     pub runtime_tool_call_id: String,
     pub tool_name: WireToolName,
     pub tool_kind: WireToolKind,
+    /// Omit absent input; a present null remains an explicit tool argument.
+    /// Both peers must preserve presence: legacy senders encoded absent input
+    /// as null, which cannot be distinguished from an explicit null on receipt.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::runtime::deserialize_present_input"
+    )]
     pub input: Option<JsonValue>,
 }
 

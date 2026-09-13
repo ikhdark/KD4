@@ -57,7 +57,7 @@ fn environment_state(
 }
 
 #[test]
-fn serialize_workspace_write_environment_context() {
+fn serialize_environment_context_with_shell_date_and_timezone() {
     let cwd = test_path_buf("/repo");
     let context = environment_state(
         [environment(
@@ -232,7 +232,7 @@ fn serialize_environment_context_with_full_filesystem_profile() {
 }
 
 #[test]
-fn serialize_read_only_environment_context() {
+fn serialize_environment_context_with_date_and_timezone_only() {
     let context = environment_state(
         Vec::new(),
         Some("2026-02-26".to_string()),

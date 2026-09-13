@@ -157,3 +157,81 @@ fn pending_execution_permit_releases_or_transfers_by_raii() {
         Ok(Some(_))
     ));
 }
+
+#[test]
+fn duplicate_registration_preserves_original_execution_permit() {
+    let control = control_with_limit(2);
+    let source = SessionSource::SubAgent(SubAgentSource::Other("worker".to_string()));
+    let thread_id = ThreadId::new();
+    let first = control
+        .reserve_execution_capacity(MultiAgentVersion::V2, &source)
+        .unwrap();
+    let second = control
+        .reserve_execution_capacity(MultiAgentVersion::V2, &source)
+        .unwrap();
+    control
+        .register_execution_permit(thread_id, "same", first)
+        .unwrap()
+        .commit();
+    assert!(
+        control
+            .register_execution_permit(thread_id, "same", second)
+            .is_err()
+    );
+    let spare = control
+        .reserve_execution_capacity(MultiAgentVersion::V2, &source)
+        .unwrap();
+    assert!(matches!(
+        control.reserve_execution_capacity(MultiAgentVersion::V2, &source),
+        Err(CodexErr::AgentLimitReached { max_threads: 2 })
+    ));
+    let original = control
+        .execution_guard_for_task(thread_id, "same", MultiAgentVersion::V2, &source)
+        .expect("original permit still transfers even at capacity");
+    drop(original);
+    assert!(matches!(
+        control.reserve_execution_capacity(MultiAgentVersion::V2, &source),
+        Ok(Some(_))
+    ));
+    drop(spare);
+}
+
+#[test]
+fn thread_cleanup_releases_only_its_pending_execution_permits() {
+    let control = control_with_limit(3);
+    let source = SessionSource::SubAgent(SubAgentSource::Other("worker".to_string()));
+    let first = ThreadId::new();
+    let second = ThreadId::new();
+    for (thread_id, submission) in [(first, "pending"), (first, "running"), (second, "pending")] {
+        let guard = control
+            .reserve_execution_capacity(MultiAgentVersion::V2, &source)
+            .unwrap();
+        control
+            .register_execution_permit(thread_id, submission, guard)
+            .unwrap()
+            .commit();
+    }
+    let running = control
+        .execution_guard_for_task(first, "running", MultiAgentVersion::V2, &source)
+        .unwrap();
+    drop(control.execution_permit_thread_cleanup(first));
+    let spare = control
+        .reserve_execution_capacity(MultiAgentVersion::V2, &source)
+        .unwrap();
+    assert!(matches!(
+        control.reserve_execution_capacity(MultiAgentVersion::V2, &source),
+        Err(CodexErr::AgentLimitReached { max_threads: 3 })
+    ));
+    let other = control
+        .execution_guard_for_task(second, "pending", MultiAgentVersion::V2, &source)
+        .expect("other thread's pending permit must still transfer at capacity");
+    drop(running);
+    let released_running = control
+        .reserve_execution_capacity(MultiAgentVersion::V2, &source)
+        .unwrap();
+    assert!(matches!(
+        control.reserve_execution_capacity(MultiAgentVersion::V2, &source),
+        Err(CodexErr::AgentLimitReached { max_threads: 3 })
+    ));
+    drop((spare, other, released_running));
+}

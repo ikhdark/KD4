@@ -341,7 +341,7 @@ fn client_to_host_v1_variants_are_pinned() {
         (
             delegate_request_id(/*value*/ 7),
             WireResult::Ok {
-                value: DelegateResponse::NotificationDelivered,
+                value: DelegateResponse::NotificationDelivered {},
             },
             json!({
                 "status": "ok",
@@ -506,6 +506,31 @@ fn host_to_client_v1_variants_are_pinned() {
     );
 
     assert_wire_round_trip(
+        HostToClient::InitialResponse {
+            id: request_id(/*value*/ 12),
+            result: WireResult::Ok {
+                value: WireRuntimeResponse::ExplicitYield {
+                    cell_id: cell_id("cell-1"),
+                    content_items: content_items(),
+                },
+            },
+        },
+        json!({
+            "type": "execute/initialResponse",
+            "id": 12,
+            "result": {
+                "status": "ok",
+                "value": {
+                    "ExplicitYield": {
+                        "cell_id": "cell-1",
+                        "content_items": content_items_json(),
+                    },
+                },
+            },
+        }),
+    );
+
+    assert_wire_round_trip(
         HostToClient::DelegateRequest {
             id: delegate_request_id(/*value*/ 9),
             session_id: session_id(),
@@ -585,6 +610,94 @@ fn host_to_client_v1_variants_are_pinned() {
 }
 
 #[test]
+fn runtime_response_conversions_preserve_variants_and_payloads() {
+    use crate::CellId;
+    use crate::FunctionCallOutputContentItem;
+    use crate::ImageDetail;
+    use crate::RuntimeResponse;
+
+    let domain_cell = CellId::new("cell-conversion".to_string());
+    let wire_cell = cell_id("cell-conversion");
+    let domain_items = vec![
+        FunctionCallOutputContentItem::InputText {
+            text: "output".to_string(),
+        },
+        FunctionCallOutputContentItem::InputImage {
+            image_url: "data:image/png;base64,image".to_string(),
+            detail: Some(ImageDetail::Original),
+        },
+    ];
+    let wire_items = vec![
+        WireContentItem::InputText {
+            text: "output".to_string(),
+        },
+        WireContentItem::InputImage {
+            image_url: "data:image/png;base64,image".to_string(),
+            detail: Some(WireImageDetail::Original),
+        },
+    ];
+    for (domain, wire) in [
+        (
+            RuntimeResponse::Yielded {
+                cell_id: domain_cell.clone(),
+                content_items: domain_items.clone(),
+            },
+            WireRuntimeResponse::Yielded {
+                cell_id: wire_cell.clone(),
+                content_items: wire_items.clone(),
+            },
+        ),
+        (
+            RuntimeResponse::ExplicitYield {
+                cell_id: domain_cell.clone(),
+                content_items: domain_items.clone(),
+            },
+            WireRuntimeResponse::ExplicitYield {
+                cell_id: wire_cell.clone(),
+                content_items: wire_items.clone(),
+            },
+        ),
+        (
+            RuntimeResponse::Terminated {
+                cell_id: domain_cell.clone(),
+                content_items: domain_items.clone(),
+            },
+            WireRuntimeResponse::Terminated {
+                cell_id: wire_cell.clone(),
+                content_items: wire_items.clone(),
+            },
+        ),
+        (
+            RuntimeResponse::Result {
+                cell_id: domain_cell.clone(),
+                content_items: domain_items.clone(),
+                error_text: Some("runtime error".to_string()),
+            },
+            WireRuntimeResponse::Result {
+                cell_id: wire_cell.clone(),
+                content_items: wire_items.clone(),
+                error_text: Some("runtime error".to_string()),
+            },
+        ),
+        (
+            RuntimeResponse::Result {
+                cell_id: domain_cell,
+                content_items: domain_items,
+                error_text: None,
+            },
+            WireRuntimeResponse::Result {
+                cell_id: wire_cell,
+                content_items: wire_items,
+                error_text: None,
+            },
+        ),
+    ] {
+        assert_eq!(WireRuntimeResponse::from(domain.clone()), wire);
+        assert_eq!(RuntimeResponse::from(wire), domain);
+    }
+}
+
+#[test]
 fn execute_request_integer_bounds_are_enforced() {
     let wire_request = execute_request();
     let domain_request = ExecuteRequest::try_from(wire_request.clone())
@@ -594,6 +707,25 @@ fn execute_request_integer_bounds_are_enforced() {
             .expect("valid domain request converts to the wire"),
         wire_request
     );
+
+    for (wire_limit, domain_limit) in [
+        (None, None),
+        (Some(0), Some(0)),
+        (Some(i32::MAX), Some(i32::MAX as usize)),
+    ] {
+        let converted = ExecuteRequest::try_from(WireExecuteRequest {
+            max_output_tokens: wire_limit,
+            ..wire_request.clone()
+        })
+        .expect("valid wire boundary");
+        assert_eq!(converted.max_output_tokens, domain_limit);
+        let converted = WireExecuteRequest::try_from(ExecuteRequest {
+            max_output_tokens: domain_limit,
+            ..domain_request.clone()
+        })
+        .expect("valid domain boundary");
+        assert_eq!(converted.max_output_tokens, wire_limit);
+    }
 
     let too_large = ExecuteRequest {
         max_output_tokens: Some(usize::try_from(i32::MAX).expect("i32::MAX fits usize") + 1),
@@ -662,7 +794,7 @@ fn invalid_protocol_states_cannot_be_constructed_or_decoded() {
 }
 
 #[test]
-fn every_nested_v1_object_rejects_unknown_fields() {
+fn selected_nested_v1_objects_reject_unknown_fields() {
     assert!(
         serde_json::from_value::<ClientToHost>(json!({
             "type": "operation/request",
@@ -760,4 +892,18 @@ fn every_nested_v1_object_rejects_unknown_fields() {
         }))
         .is_err()
     );
+}
+
+#[test]
+fn notification_acknowledgment_rejects_unknown_fields() {
+    let message = json!({
+        "type": "delegate/response",
+        "id": 7,
+        "result": {
+            "status": "ok",
+            "value": { "type": "notification/delivered", "unexpected": true },
+        },
+    });
+    assert!(serde_json::from_value::<ClientToHost>(message.clone()).is_err());
+    assert!(serde_json::from_str::<ClientToHost>(&message.to_string()).is_err());
 }

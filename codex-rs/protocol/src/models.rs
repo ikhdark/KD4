@@ -1265,7 +1265,7 @@ impl ResponseItem {
         }
     }
 
-    fn internal_chat_message_metadata_passthrough(
+    pub fn internal_chat_message_metadata_passthrough(
         &self,
     ) -> Option<&InternalChatMessageMetadataPassthrough> {
         match self {

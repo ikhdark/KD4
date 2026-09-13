@@ -27,6 +27,7 @@ use codex_agent_task_store::WorkspaceActorRegistration;
 use codex_agent_task_store::WorkspaceStrategy;
 use codex_otel::SessionTelemetry;
 use codex_protocol::AgentPath;
+use codex_protocol::ThreadId;
 use codex_protocol::protocol::SessionSource;
 use codex_state::StateRuntime;
 use std::collections::HashMap;
@@ -60,15 +61,20 @@ struct TaskMetricIndex {
 
 const MAX_DIAGNOSTIC_ATTEMPT_IDENTITIES: usize = 4_096;
 
+struct InitializedTaskStore {
+    store: Arc<LocalAgentTaskStore>,
+    root_session_id: String,
+}
+
 /// Shared typed-task persistence and identity index for one root agent tree.
 ///
 /// The coordinator is cloned with [`super::AgentControl`], so every child resolves the same
 /// assignment/attempt identity. Legacy agents simply have no binding and bypass this layer.
 #[derive(Clone, Default)]
 pub(crate) struct AgentTaskCoordinator {
-    store: Arc<OnceCell<Arc<LocalAgentTaskStore>>>,
+    store: Arc<OnceCell<InitializedTaskStore>>,
     fallback_state_runtime: Arc<OnceCell<Arc<StateRuntime>>>,
-    root_session_id: Arc<OnceCell<String>>,
+    binding_updates: Arc<tokio::sync::Mutex<()>>,
     bindings: Arc<RwLock<BindingIndex>>,
     metrics: Arc<Mutex<TaskMetricIndex>>,
 }
@@ -88,37 +94,28 @@ impl AgentTaskCoordinator {
         state_runtime: Arc<StateRuntime>,
         root_session_id: String,
     ) -> StoreResult<()> {
-        let store = self
+        let initialized = self
             .store
-            .get_or_try_init(|| async move {
-                let store = LocalAgentTaskStore::initialize(state_runtime.as_ref()).await?;
-                Ok::<Arc<LocalAgentTaskStore>, StoreError>(Arc::new(store))
+            .get_or_try_init(|| async {
+                let store =
+                    Arc::new(LocalAgentTaskStore::initialize(state_runtime.as_ref()).await?);
+                let persisted = store
+                    .list_agent_task_bindings(root_session_id.clone(), None)
+                    .await?;
+                // No store consumer can mutate bindings until this entire initializer is published.
+                for binding in persisted {
+                    self.remember_binding(binding);
+                }
+                Ok::<_, StoreError>(InitializedTaskStore {
+                    store,
+                    root_session_id: root_session_id.clone(),
+                })
             })
-            .await?
-            .clone();
-        let initialized_root_session_id = self
-            .root_session_id
-            .get_or_init(|| std::future::ready(root_session_id.clone()))
-            .await;
-        if initialized_root_session_id != &root_session_id {
+            .await?;
+        if initialized.root_session_id != root_session_id {
             return Err(StoreError::CorruptData(
                 "agent task coordinator was initialized for a different root session".to_string(),
             ));
-        }
-        let persisted = store
-            .list_agent_task_bindings(initialized_root_session_id.clone(), /*limit*/ None)
-            .await?;
-        let mut bindings = self
-            .bindings
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for binding in persisted {
-            bindings
-                .by_agent_path
-                .insert(binding.agent_path.clone(), binding.clone());
-            bindings
-                .by_assignment
-                .insert(binding.assignment_id, binding);
         }
         Ok(())
     }
@@ -146,11 +143,15 @@ impl AgentTaskCoordinator {
     }
 
     pub(crate) fn store(&self) -> Option<Arc<LocalAgentTaskStore>> {
-        self.store.get().cloned()
+        self.store
+            .get()
+            .map(|initialized| initialized.store.clone())
     }
 
     pub(crate) fn root_session_id(&self) -> Option<String> {
-        self.root_session_id.get().cloned()
+        self.store
+            .get()
+            .map(|initialized| initialized.root_session_id.clone())
     }
 
     pub(crate) fn initialize_metric_capacity(&self, max_threads: usize) {
@@ -275,6 +276,7 @@ impl AgentTaskCoordinator {
         &self,
         draft: AgentTaskBindingDraft,
     ) -> StoreResult<AgentTaskBinding> {
+        let _update = self.binding_updates.lock().await;
         let binding = self.required_store()?.bind_agent_task(draft).await?;
         self.remember_binding(binding.clone());
         self.set_task_metric_active(binding.assignment_id, true);
@@ -285,6 +287,7 @@ impl AgentTaskCoordinator {
         &self,
         assignment_id: AssignmentId,
     ) -> StoreResult<bool> {
+        let _update = self.binding_updates.lock().await;
         let removed = self
             .required_store()?
             .remove_agent_task_binding(TaskActor::Root, assignment_id)
@@ -370,12 +373,15 @@ impl AgentTaskCoordinator {
         &self,
         assignment_id: AssignmentId,
     ) -> StoreResult<Option<AgentTaskBinding>> {
+        let _update = self.binding_updates.lock().await;
         let binding = self
             .required_store()?
             .get_agent_task_binding(assignment_id)
             .await?;
         if let Some(binding) = &binding {
             self.remember_binding(binding.clone());
+        } else {
+            self.forget_binding(assignment_id);
         }
         Ok(binding)
     }
@@ -411,11 +417,22 @@ impl AgentTaskCoordinator {
         self.set_task_metric_active(assignment_id, false);
     }
 
+    pub(crate) fn has_task_metric_runtime(&self, assignment_id: AssignmentId) -> bool {
+        self.metrics
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .runtimes
+            .contains_key(&assignment_id)
+    }
+
     pub(crate) async fn maybe_emit_terminal_metrics(
         &self,
         assignment_id: AssignmentId,
         session_telemetry: &SessionTelemetry,
     ) {
+        if !self.has_task_metric_runtime(assignment_id) {
+            return;
+        }
         let task = match self.get_agent_task(assignment_id, Some(0)).await {
             Ok(task) => task,
             Err(error) => {
@@ -438,11 +455,15 @@ impl AgentTaskCoordinator {
         let Some(mut runtime) = metrics.runtimes.remove(&assignment_id) else {
             return;
         };
-        metrics.active.remove(&assignment_id);
-        transition_metric_runtimes(&mut metrics);
-        match runtime.finish_and_emit(&task, session_telemetry) {
-            Ok(true) => {}
-            Ok(false) => {
+        if metrics.active.remove(&assignment_id) {
+            transition_metric_runtimes(&mut metrics);
+        }
+        match runtime.finish(&task) {
+            Ok(Some(finalized)) => {
+                drop(metrics);
+                finalized.emit(session_telemetry);
+            }
+            Ok(None) => {
                 warn!(%assignment_id, "typed-task metrics were already terminal");
             }
             Err(error) => {
@@ -459,9 +480,13 @@ impl AgentTaskCoordinator {
     pub(crate) async fn seal_missing_receipt(
         &self,
         agent_path: &AgentPath,
+        expected_thread_id: ThreadId,
         summary: String,
     ) -> StoreResult<Option<AgentReceipt>> {
-        let Some(binding) = self.binding_for_agent_path(agent_path) else {
+        // Retain the complete identity across awaits; a reused path must never select a new child.
+        let Some(binding) = self.binding_for_agent_path(agent_path).filter(|binding| {
+            binding.thread_id.as_deref() == Some(expected_thread_id.to_string().as_str())
+        }) else {
             return Ok(None);
         };
         let store = self.required_store()?;
@@ -538,6 +563,12 @@ impl AgentTaskCoordinator {
             .bindings
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(previous) = bindings.by_assignment.remove(&binding.assignment_id) {
+            bindings.by_agent_path.remove(&previous.agent_path);
+        }
+        if let Some(previous) = bindings.by_agent_path.remove(&binding.agent_path) {
+            bindings.by_assignment.remove(&previous.assignment_id);
+        }
         bindings
             .by_agent_path
             .insert(binding.agent_path.clone(), binding.clone());

@@ -164,7 +164,7 @@ impl DelegateRuntime {
                     } => delegate
                         .notify(call_id, cell_id, text, task_cancellation)
                         .await
-                        .map(|()| DelegateResponse::NotificationDelivered),
+                        .map(|()| DelegateResponse::NotificationDelivered {}),
                 }
             };
             let delegate_future = AssertUnwindSafe(delegate_future).catch_unwind();

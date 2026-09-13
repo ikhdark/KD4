@@ -538,6 +538,50 @@ fn unresolved_tail_preserves_turn_stamped_warning_shaped_input() {
 }
 
 #[test]
+fn collect_user_messages_preserves_warning_questions_and_mixed_content() {
+    let warning = "Warning: The maximum number of unified exec processes you can keep open is 60 and you currently have 61 processes open. Reuse older processes or close them to prevent automatic pruning of old processes";
+    let question = format!("{warning}\nCan you explain this limit?");
+    let cyber_question = "Warning: Your account was flagged for potentially high-risk cyber activity. What does this mean?";
+    let mut mixed = user_message(warning);
+    let ResponseItem::Message { content, .. } = &mut mixed else {
+        panic!("expected message");
+    };
+    content.push(ContentItem::InputText {
+        text: "keep my request".to_string(),
+    });
+    let expected_mixed = CompactedUserMessage {
+        source_item_id: None,
+        content: vec![
+            UserInput::Text {
+                text: warning.to_string(),
+                text_elements: Vec::new(),
+            },
+            UserInput::Text {
+                text: "keep my request".to_string(),
+                text_elements: Vec::new(),
+            },
+        ],
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let items = vec![
+        user_message(warning),
+        user_message(&question),
+        user_message(cyber_question),
+        mixed,
+    ];
+    assert_eq!(
+        collect_user_messages(&items),
+        vec![
+            compacted_user_message(&question),
+            compacted_user_message(cyber_question),
+            expected_mixed
+        ],
+    );
+    let (unresolved, _) = build_unresolved_user_history(&items);
+    assert_eq!(unresolved, items[1..]);
+}
+
+#[test]
 fn build_token_limited_compacted_history_truncates_overlong_user_messages() {
     // Use a small truncation limit so the test remains fast while still validating
     // that oversized user content is truncated.
@@ -1594,4 +1638,81 @@ fn insert_initial_context_before_last_real_user_or_summary_keeps_compaction_last
         },
     ];
     assert_eq!(refreshed, expected);
+}
+
+#[test]
+fn compaction_omission_metadata_has_a_fixed_budget() {
+    let items = (0..5000)
+        .map(|_| user_message("unresolved constraint "))
+        .collect::<Vec<_>>();
+    let (bounded, _, _, omitted) = build_bounded_unresolved_input_history(&items);
+    assert!(omitted);
+    let receipts = bounded
+        .iter()
+        .filter(|item| {
+            serde_json::to_string(item)
+                .unwrap()
+                .contains(COMPACT_TEXT_OMISSION_MARKER)
+        })
+        .collect::<Vec<_>>();
+    assert!(receipts.iter().any(|item| {
+        serde_json::to_string(item)
+            .unwrap()
+            .contains("additional_omitted_messages")
+    }));
+    assert!(
+        receipts
+            .iter()
+            .map(|item| response_item_text_tokens(item))
+            .sum::<usize>()
+            < 1200
+    );
+    let canonical = compaction_text_recovery_canonical(&items, &bounded).unwrap();
+    assert_eq!(
+        canonical.value.as_ref().unwrap()["items"]
+            .as_array()
+            .unwrap()
+            .len(),
+        5000
+    );
+}
+
+#[tokio::test]
+async fn compaction_recovery_failure_keeps_unresolved_text() {
+    let (session, turn) = crate::session::tests::make_session_and_context().await;
+    let text = "exact unresolved constraint ".repeat(COMPACT_USER_MESSAGE_MAX_TOKENS);
+    session
+        .record_conversation_items(&turn, &[user_message(&text)])
+        .await;
+    let history = session.clone_history().await;
+    let (_, _, _, omitted) = build_bounded_unresolved_input_history(history.raw_items());
+    assert!(omitted);
+    // Block the artifact directory with a file, forcing the real storage path to fail.
+    std::fs::write(turn.config.codex_home.join("tool-output"), "blocked").unwrap();
+    let session = Arc::new(session);
+    let window_before = session.current_window_id().await;
+    let result = run_compact_task_inner(
+        Arc::clone(&session),
+        Arc::new(turn),
+        None,
+        None,
+        vec![UserInput::Text {
+            text: SUMMARIZATION_PROMPT.to_string(),
+            text_elements: Vec::new(),
+        }],
+        InitialContextInjection::DoNotInject,
+        CompactionTrigger::Manual,
+        CompactionReason::UserRequested,
+        CompactionPhase::StandaloneTurn,
+        true,
+        &CancellationToken::new(),
+    )
+    .await;
+    assert_eq!(session.current_window_id().await, window_before);
+    assert!(matches!(result, Err(CodexErr::Fatal(message)) if message ==
+        "Compaction could not preserve exact unresolved text; original history was retained."));
+    assert_eq!(
+        session.clone_history().await.raw_items(),
+        history.raw_items()
+    );
 }

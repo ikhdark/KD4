@@ -2,7 +2,7 @@ use super::append_output_loss_markers;
 use super::lagged_output_marker;
 use super::observe_process_exit;
 use super::omitted_output_marker;
-use super::record_known_delta_from_transcript;
+use super::record_known_delta_from_process_output;
 use super::resolve_aggregated_output;
 use super::split_valid_utf8_prefix_with_max;
 use super::wait_for_process_output_drain;
@@ -115,7 +115,7 @@ async fn transcript_drain_does_not_overtake_raw_output_finalization() {
 }
 
 #[tokio::test]
-async fn direct_runtime_result_does_not_wait_for_raw_output_finalization() {
+async fn direct_runtime_terminal_event_does_not_wait_for_raw_output_finalization() {
     let output_drained = CancellationToken::new();
     let output_closed = AtomicBool::new(false);
     let output_closed_notify = Notify::new();
@@ -135,7 +135,7 @@ async fn direct_runtime_result_does_not_wait_for_raw_output_finalization() {
 
     assert!(
         !output_closed.load(Ordering::Acquire),
-        "the result must be deliverable while artifact finalization is still pending"
+        "the terminal-event wait may finish while artifact finalization is still pending"
     );
 }
 
@@ -164,6 +164,7 @@ async fn published_candidate(
     root: &std::path::Path,
     name: &str,
     force_fresh: bool,
+    output: &str,
 ) -> (
     std::path::PathBuf,
     std::path::PathBuf,
@@ -174,7 +175,7 @@ async fn published_candidate(
     let home = root.join(format!("home-{name}"));
     std::fs::create_dir_all(&repo).expect("create git repo");
     run_git(&repo, &["init"]);
-    std::fs::write(repo.join("read.txt"), "immutable\n").expect("write immutable fixture");
+    std::fs::write(repo.join("read.txt"), output).expect("write immutable fixture");
     run_git(&repo, &["add", "read.txt"]);
     run_git(&repo, &["commit", "-m", "initial"]);
     let blob = run_git(&repo, &["rev-parse", "HEAD:read.txt"]);
@@ -194,7 +195,7 @@ async fn published_candidate(
         &home,
         &first,
         KnownDeltaExecutionObservation::CompleteSuccess {
-            output: b"immutable\n",
+            output: output.as_bytes(),
             executor_cost: Duration::from_secs(1),
         },
     )
@@ -215,7 +216,7 @@ async fn published_candidate(
 
 #[test]
 fn split_valid_utf8_prefix_respects_max_bytes_for_ascii() {
-    let mut buf = b"hello word!".to_vec();
+    let mut buf = b"hello word!".as_slice();
 
     let first = split_valid_utf8_prefix_with_max(
         &mut buf, /*max_bytes*/ 5, /*flush_incomplete*/ false,
@@ -235,7 +236,7 @@ fn split_valid_utf8_prefix_respects_max_bytes_for_ascii() {
 #[test]
 fn split_valid_utf8_prefix_avoids_splitting_utf8_codepoints() {
     // "é" is 2 bytes in UTF-8. With a max of 3 bytes, we should only emit 1 char (2 bytes).
-    let mut buf = "ééé".as_bytes().to_vec();
+    let mut buf = "ééé".as_bytes();
 
     let first = split_valid_utf8_prefix_with_max(
         &mut buf, /*max_bytes*/ 3, /*flush_incomplete*/ false,
@@ -247,7 +248,7 @@ fn split_valid_utf8_prefix_avoids_splitting_utf8_codepoints() {
 
 #[test]
 fn split_valid_utf8_prefix_makes_progress_on_invalid_utf8() {
-    let mut buf = vec![0xff, b'a', b'b'];
+    let mut buf: &[u8] = &[0xff, b'a', b'b'];
 
     let first = split_valid_utf8_prefix_with_max(
         &mut buf, /*max_bytes*/ 2, /*flush_incomplete*/ false,
@@ -259,7 +260,8 @@ fn split_valid_utf8_prefix_makes_progress_on_invalid_utf8() {
 
 #[test]
 fn split_valid_utf8_prefix_waits_for_a_codepoint_split_across_chunks() {
-    let mut buf = vec![0xc3];
+    let mut bytes = vec![0xc3];
+    let mut buf = bytes.as_slice();
 
     assert_eq!(
         split_valid_utf8_prefix_with_max(
@@ -269,7 +271,8 @@ fn split_valid_utf8_prefix_waits_for_a_codepoint_split_across_chunks() {
     );
     assert_eq!(buf, vec![0xc3]);
 
-    buf.push(0xa9);
+    bytes.push(0xa9);
+    buf = bytes.as_slice();
 
     let completed = split_valid_utf8_prefix_with_max(
         &mut buf, /*max_bytes*/ 8, /*flush_incomplete*/ false,
@@ -281,7 +284,7 @@ fn split_valid_utf8_prefix_waits_for_a_codepoint_split_across_chunks() {
 
 #[test]
 fn split_valid_utf8_prefix_flushes_permanently_incomplete_bytes_at_end_of_stream() {
-    let mut buf = vec![0xe2, 0x82];
+    let mut buf: &[u8] = &[0xe2, 0x82];
 
     let first = split_valid_utf8_prefix_with_max(
         &mut buf, /*max_bytes*/ 8, /*flush_incomplete*/ true,
@@ -342,9 +345,9 @@ async fn final_loss_markers_survive_head_tail_eviction_without_duplication() {
     let transcript = Arc::new(Mutex::new(HeadTailBuffer::new(16)));
     {
         let mut guard = transcript.lock().await;
-        guard.push_chunk(vec![b'a'; 16]);
+        guard.push_chunk(&vec![b'a'; 16]);
         guard.record_lagged_chunks(7);
-        guard.push_chunk(vec![b'b'; 64]);
+        guard.push_chunk(&vec![b'b'; 64]);
     }
 
     let aggregated = resolve_aggregated_output(&transcript, String::new()).await;
@@ -367,7 +370,7 @@ async fn final_loss_markers_survive_head_tail_eviction_without_duplication() {
 #[tokio::test]
 async fn final_capacity_marker_separates_nonadjacent_head_and_tail() {
     let transcript = Arc::new(Mutex::new(HeadTailBuffer::new(8)));
-    transcript.lock().await.push_chunk(b"pass---word".to_vec());
+    transcript.lock().await.push_chunk(b"pass---word");
 
     let aggregated = resolve_aggregated_output(&transcript, String::new()).await;
 
@@ -382,16 +385,30 @@ async fn final_capacity_marker_separates_nonadjacent_head_and_tail() {
 }
 
 #[tokio::test]
-async fn known_delta_background_completion_promotes_only_exact_transcripts() {
+async fn known_delta_background_completion_promotes_exact_process_output() {
     let root = tempfile::tempdir().expect("test root");
-    let (repo, home, blob, prepared) = published_candidate(root.path(), "exact", false).await;
+    let (repo, home, blob, prepared) =
+        published_candidate(root.path(), "exact", false, "immutable\n").await;
     assert!(prepared.has_candidate());
     assert!(!prepared.is_hit());
-    let transcript = Arc::new(Mutex::new(HeadTailBuffer::default()));
-    transcript.lock().await.push_chunk(b"immutable\n".to_vec());
-
-    record_known_delta_from_transcript(&home, &prepared, &transcript, true, Duration::from_secs(1))
+    let process = crate::unified_exec::process_tests::remote_process(
+        codex_exec_server::WriteStatus::Accepted,
+        None,
+    )
+    .await;
+    process
+        .publish_output_for_test(b"immutable\n".to_vec())
         .await;
+    let transcript = process.snapshot_completion_output().await;
+
+    record_known_delta_from_process_output(
+        &home,
+        &prepared,
+        &transcript,
+        true,
+        Duration::from_secs(1),
+    )
+    .await;
 
     let promoted = known_delta_store::prepare_immutable_git_show(
         &home,
@@ -412,10 +429,21 @@ async fn known_delta_background_completion_skips_lossy_output_and_quarantines_fr
     let root = tempfile::tempdir().expect("test root");
 
     let (omitted_repo, omitted_home, omitted_blob, omitted_prepared) =
-        published_candidate(root.path(), "omitted", false).await;
-    let omitted = Arc::new(Mutex::new(HeadTailBuffer::new(4)));
-    omitted.lock().await.push_chunk(b"immutable\n".to_vec());
-    record_known_delta_from_transcript(
+        published_candidate(root.path(), "omitted", false, "immutable\n").await;
+    let process = crate::unified_exec::process_tests::remote_process(
+        codex_exec_server::WriteStatus::Accepted,
+        None,
+    )
+    .await;
+    process
+        .publish_output_for_test(vec![
+            b'x';
+            crate::unified_exec::UNIFIED_EXEC_OUTPUT_MAX_BYTES + 1
+        ])
+        .await;
+    let omitted = process.snapshot_completion_output().await;
+    assert!(!omitted.aggregated_output_is_exact);
+    record_known_delta_from_process_output(
         &omitted_home,
         &omitted_prepared,
         &omitted,
@@ -438,14 +466,25 @@ async fn known_delta_background_completion_skips_lossy_output_and_quarantines_fr
     assert!(!after_omission.is_hit());
 
     let (lagged_repo, lagged_home, lagged_blob, lagged_prepared) =
-        published_candidate(root.path(), "lagged", false).await;
-    let lagged = Arc::new(Mutex::new(HeadTailBuffer::default()));
-    {
-        let mut transcript = lagged.lock().await;
-        transcript.push_chunk(b"immutable\n".to_vec());
-        transcript.record_lagged_chunks(1);
+        published_candidate(root.path(), "lagged", false, &"immutable\n".repeat(128)).await;
+    let process = crate::unified_exec::process_tests::remote_process(
+        codex_exec_server::WriteStatus::Accepted,
+        None,
+    )
+    .await;
+    let mut receiver = process.take_output_receiver().expect("live receiver");
+    for _ in 0..128 {
+        process
+            .publish_output_for_test(b"immutable\n".to_vec())
+            .await;
     }
-    record_known_delta_from_transcript(
+    assert!(matches!(
+        receiver.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_))
+    ));
+    let lagged = process.snapshot_completion_output().await;
+    assert!(lagged.aggregated_output_is_exact);
+    record_known_delta_from_process_output(
         &lagged_home,
         &lagged_prepared,
         &lagged,
@@ -463,19 +502,22 @@ async fn known_delta_background_completion_skips_lossy_output_and_quarantines_fr
         false,
     )
     .await
-    .expect("lagged evidence remains eligible as a miss");
-    assert!(after_lag.has_candidate());
-    assert!(!after_lag.is_hit());
+    .expect("live-event loss preserves exact process-owned evidence");
+    assert!(after_lag.is_hit());
 
     let (fresh_repo, fresh_home, fresh_blob, fresh_prepared) =
-        published_candidate(root.path(), "force-fresh", true).await;
+        published_candidate(root.path(), "force-fresh", true, "immutable\n").await;
     assert!(fresh_prepared.has_candidate());
-    let exact_failure = Arc::new(Mutex::new(HeadTailBuffer::default()));
-    exact_failure
-        .lock()
-        .await
-        .push_chunk(b"fatal: object unavailable\n".to_vec());
-    record_known_delta_from_transcript(
+    let process = crate::unified_exec::process_tests::remote_process(
+        codex_exec_server::WriteStatus::Accepted,
+        None,
+    )
+    .await;
+    process
+        .publish_output_for_test(b"fatal: object unavailable\n".to_vec())
+        .await;
+    let exact_failure = process.snapshot_completion_output().await;
+    record_known_delta_from_process_output(
         &fresh_home,
         &fresh_prepared,
         &exact_failure,
@@ -496,4 +538,288 @@ async fn known_delta_background_completion_skips_lossy_output_and_quarantines_fr
     .expect("quarantined identity remains structurally eligible");
     assert!(!quarantined.has_candidate());
     assert!(!quarantined.is_hit());
+}
+
+#[tokio::test]
+async fn capped_live_output_preserves_transcript_without_growing_pending_buffers() {
+    use crate::exec::EXEC_OUTPUT_DELTA_CAP_NOTICE;
+    use crate::exec::MAX_EXEC_OUTPUT_DELTAS_PER_CALL;
+    use crate::exec::OutputDeltaDecision;
+    use crate::exec::OutputDeltaLimiter;
+    use crate::unified_exec::process::ProcessOutputChunk;
+    use codex_protocol::protocol::EventMsg;
+    use codex_protocol::protocol::ExecOutputStream;
+    let (session, turn, events) = crate::session::tests::make_session_and_context_with_rx().await;
+    let limiter = OutputDeltaLimiter::default();
+    for _ in 0..MAX_EXEC_OUTPUT_DELTAS_PER_CALL - 1 {
+        assert_eq!(limiter.claim(), OutputDeltaDecision::Emit);
+    }
+    let transcript = Arc::new(Mutex::new(HeadTailBuffer::default()));
+    let mut pending = super::PendingOutput::default();
+    for bytes in [b"last live\n".to_vec(), b"cap trigger\n".to_vec()] {
+        super::process_chunk(
+            &mut pending,
+            &transcript,
+            "cap-test",
+            &session,
+            &turn,
+            &limiter,
+            ProcessOutputChunk {
+                stream: ExecOutputStream::Stdout,
+                bytes,
+            },
+        )
+        .await;
+    }
+    assert!(limiter.is_suppressed());
+    let capacities = (pending.stdout.capacity(), pending.stderr.capacity());
+    let payload = vec![b'x'; 32_768];
+    for stream in [ExecOutputStream::Stdout, ExecOutputStream::Stderr] {
+        super::process_chunk(
+            &mut pending,
+            &transcript,
+            "cap-test",
+            &session,
+            &turn,
+            &limiter,
+            ProcessOutputChunk {
+                stream,
+                bytes: payload.clone(),
+            },
+        )
+        .await;
+    }
+    super::flush_pending(
+        &mut pending,
+        &transcript,
+        "cap-test",
+        &session,
+        &turn,
+        &limiter,
+    )
+    .await;
+    assert!(pending.stdout.is_empty());
+    assert!(pending.stderr.is_empty());
+    assert_eq!(
+        (pending.stdout.capacity(), pending.stderr.capacity()),
+        capacities
+    );
+    let mut expected = b"last live\ncap trigger\n".to_vec();
+    expected.extend_from_slice(&payload);
+    expected.extend_from_slice(&payload);
+    assert_eq!(
+        resolve_aggregated_output(&transcript, String::new())
+            .await
+            .as_bytes(),
+        expected
+    );
+    let mut chunks = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if let EventMsg::ExecCommandOutputDelta(delta) = event.msg {
+            assert_eq!(delta.call_id, "cap-test");
+            chunks.push(delta.chunk);
+        }
+    }
+    assert_eq!(
+        chunks,
+        vec![
+            b"last live\n".to_vec(),
+            EXEC_OUTPUT_DELTA_CAP_NOTICE.to_vec()
+        ]
+    );
+}
+
+#[tokio::test]
+async fn exit_watcher_applies_late_network_denial_before_terminal_event_and_cache_promotion()
+-> anyhow::Result<()> {
+    use crate::tools::network_approval::NetworkApprovalMode;
+    use crate::tools::network_approval::NetworkApprovalSpec;
+    use crate::tools::network_approval::begin_network_approval;
+    use codex_protocol::protocol::EventMsg;
+    for denied in [false, true] {
+        let root = tempfile::tempdir()?;
+        let (repo, home, blob, prepared) =
+            published_candidate(root.path(), "late-denial", false, "immutable\n").await;
+        assert!(prepared.has_candidate());
+        assert!(!prepared.is_hit());
+        let (session, mut turn, events) =
+            crate::session::tests::make_session_and_context_with_rx().await;
+        Arc::make_mut(&mut Arc::get_mut(&mut turn).expect("unique fixture turn").config)
+            .codex_home = codex_utils_absolute_path::AbsolutePathBuf::try_from(home.clone())?;
+        let proxy_spec = crate::config::NetworkProxySpec::from_config_and_constraints(
+            codex_network_proxy::NetworkProxyConfig {
+                enabled: true,
+                proxy_url: "http://127.0.0.1:0".to_string(),
+                enable_socks5: false,
+                allow_local_binding: true,
+                allow_upstream_proxy: false,
+                ..Default::default()
+            },
+            None,
+            &turn.permission_profile(),
+        )?;
+        let proxy_owner = proxy_spec
+            .start_proxy(
+                &home,
+                &turn.permission_profile(),
+                None,
+                None,
+                true,
+                codex_network_proxy::NetworkProxyAuditMetadata::default(),
+            )
+            .await?;
+        let command = vec!["git".to_string(), "show".to_string(), blob.clone()];
+        let deferred = begin_network_approval(
+            &session,
+            &turn.sub_id,
+            true,
+            Some(NetworkApprovalSpec {
+                network: Some(proxy_owner.proxy().clone()),
+                mode: NetworkApprovalMode::Deferred,
+                trigger: crate::guardian::GuardianNetworkAccessTrigger {
+                    call_id: "late-denial".to_string(),
+                    tool_name: "exec_command".to_string(),
+                    command: command.clone(),
+                    cwd: turn.cwd().clone().into(),
+                    sandbox_permissions: crate::sandboxing::SandboxPermissions::UseDefault,
+                    additional_permissions: None,
+                    justification: None,
+                    tty: None,
+                },
+                command: command.join(" "),
+                environment_id: "local".to_string(),
+                approval_scope_id: "local".to_string(),
+            }),
+        )
+        .await
+        .expect("register network approval")
+        .expect("active approval")
+        .into_deferred()
+        .expect("deferred approval");
+        let process = crate::unified_exec::process_tests::remote_process(
+            codex_exec_server::WriteStatus::Accepted,
+            None,
+        )
+        .await;
+        process
+            .publish_output_for_test(b"immutable\n".to_vec())
+            .await;
+        let ledger = &session.services.command_execution;
+        let execution = ledger.allocate_execution_id();
+        let parent = ToolExecutionId("late-denial-parent".to_string());
+        ledger
+            .track_running_process_with_execution_id(
+                execution,
+                parent.clone(),
+                73,
+                CommandAttemptKey::new("exec_command", "local", "fixture", &command),
+                RawOutputArtifact::unavailable("watcher fixture"),
+            )
+            .await
+            .expect("tracked execution");
+        tokio::time::pause();
+        let started = tokio::time::Instant::now() - Duration::from_secs(1);
+        super::spawn_exit_watcher(
+            Arc::clone(&process),
+            Arc::clone(&session),
+            Arc::clone(&turn),
+            "late-denial".to_string(),
+            command,
+            turn.cwd().clone().into(),
+            "local".to_string(),
+            73,
+            execution,
+            parent,
+            Arc::new(Mutex::new(HeadTailBuffer::default())),
+            started,
+            crate::tools::context::ToolCallSource::Direct,
+            None,
+            Some(prepared),
+            Some(started),
+            None,
+            Some(deferred.clone()),
+        );
+        process.signal_exit_for_test(Some(0));
+        // Let the real watcher observe exit; retain the output-drain barrier so an
+        // implementation that snapshots success too early cannot finish first.
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(10)).await;
+        assert!(futures::poll!(Box::pin(process.wait_for_terminal_completion())).is_pending());
+        if denied {
+            let mut blocked =
+                codex_network_proxy::BlockedRequest::new(codex_network_proxy::BlockedRequestArgs {
+                    host: "denied.example".to_string(),
+                    reason: "not_allowed".to_string(),
+                    client: None,
+                    method: None,
+                    mode: None,
+                    protocol: "http".to_string(),
+                    decision: Some("deny".to_string()),
+                    source: Some("decider".to_string()),
+                    port: Some(80),
+                });
+            blocked.execution_id = Some(deferred.registration_id().to_string());
+            session
+                .services
+                .network_approval
+                .record_blocked_request(blocked)
+                .await;
+            assert!(deferred.is_cancelled());
+        }
+        let handles = process.output_handles();
+        handles.output_closed.store(true, Ordering::Release);
+        handles.output_closed_notify.notify_waiters();
+        process.output_drained_token().cancel();
+        tokio::time::resume();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            process.wait_for_terminal_completion(),
+        )
+        .await?
+        .map_err(anyhow::Error::msg)?;
+        let mut terminal_events = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if let EventMsg::ExecCommandEnd(end) = event.msg {
+                if end.call_id == "late-denial" {
+                    terminal_events.push(end);
+                }
+            }
+        }
+        assert_eq!(terminal_events.len(), 1);
+        assert_eq!(terminal_events[0].exit_code, if denied { -1 } else { 0 });
+        if denied {
+            assert!(
+                terminal_events[0]
+                    .aggregated_output
+                    .contains("denied.example")
+            );
+            assert!(
+                process
+                    .failure_message()
+                    .expect("denial persisted")
+                    .contains("denied.example")
+            );
+        } else {
+            assert_eq!(terminal_events[0].aggregated_output, "immutable\n");
+            assert_eq!(process.failure_message(), None);
+        }
+        let next = known_delta_store::prepare_immutable_git_show(
+            &home,
+            "next-thread",
+            &repo,
+            "git",
+            &["show".to_string(), blob],
+            known_delta_store::ProjectNamespaceHint::Discover,
+            false,
+        )
+        .await
+        .expect("eligible command");
+        assert_eq!(
+            next.is_hit(),
+            !denied,
+            "only successful approved execution may promote the candidate"
+        );
+        assert!(ledger.running_process(73).await.is_none());
+    }
+    Ok(())
 }

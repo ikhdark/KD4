@@ -42,11 +42,13 @@ impl WorldStateSection for AppsInstructionsState {
     ) -> Option<Box<dyn ContextualUserFragment>> {
         if self.available {
             match previous {
-                PreviousSectionState::Absent => Some(Box::new(AppsInstructions)),
+                PreviousSectionState::Absent | PreviousSectionState::Unknown => {
+                    Some(Box::new(AppsInstructions))
+                }
                 PreviousSectionState::Known(previous) if !*previous => {
                     Some(Box::new(AppsInstructions))
                 }
-                PreviousSectionState::Known(_) | PreviousSectionState::Unknown => None,
+                PreviousSectionState::Known(_) => None,
             }
         } else {
             match previous {

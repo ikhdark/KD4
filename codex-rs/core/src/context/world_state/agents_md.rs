@@ -105,6 +105,20 @@ impl WorldStateSection for AgentsMdState {
         if matches!(previous, PreviousSectionState::Known(previous) if previous == &current) {
             return None;
         }
+        if let PreviousSectionState::Known(previous) = previous
+            && current.directory == previous.directory
+            && current.freshness != previous.freshness
+            && let Some(current_body) = instruction_body(&current)
+            && instruction_body(previous) == Some(current_body)
+        {
+            return Some(Box::new(UserInstructions {
+                directory: current.directory,
+                text: format!(
+                    "AGENTS.md observation update: {}\nThe previously provided instruction body is unchanged.",
+                    current.freshness.model_visible_description(),
+                ),
+            }));
+        }
 
         let previous_may_contain_instructions = match previous {
             PreviousSectionState::Known(previous) => previous.text.is_some(),
@@ -128,6 +142,14 @@ impl WorldStateSection for AgentsMdState {
         };
         Some(Box::new(instructions))
     }
+}
+
+fn instruction_body(snapshot: &AgentsMdSnapshot) -> Option<&str> {
+    snapshot
+        .text
+        .as_deref()?
+        .strip_prefix(snapshot.freshness.model_visible_description())?
+        .strip_prefix("\n\n")
 }
 
 #[cfg(test)]

@@ -751,17 +751,38 @@ async fn code_mode_preserves_read_history_until_its_source_changes() -> Result<(
         "Contract details required while implementing the following source change.\n".repeat(40)
     );
     fs::write(test.cwd_path().join("contract.txt"), &contract)?;
+    let extra_contract = "Keep empty-input behavior unchanged.\n";
+    fs::write(test.cwd_path().join("contract extra.txt"), extra_contract)?;
+    let expected_read = format!("{contract}{extra_contract}");
     fs::write(test.cwd_path().join("unrelated.txt"), "before\n")?;
     let unrelated_patch =
         "*** Begin Patch\n*** Update File: unrelated.txt\n@@\n-before\n+after\n*** End Patch\n";
     let later_unrelated_patch =
         "*** Begin Patch\n*** Update File: unrelated.txt\n@@\n-after\n+later\n*** End Patch\n";
     let source_patch = "*** Begin Patch\n*** Update File: contract.txt\n@@\n-Reject non-ASCII input with ValueError.\n+Accept non-ASCII input.\n*** End Patch\n";
+    let read_commands = if cfg!(windows) {
+        [
+            "Get-Content -LiteralPath 'contract.txt'",
+            "Get-Content -LiteralPath 'contract extra.txt'",
+        ]
+    } else {
+        ["cat 'contract.txt'", "cat 'contract extra.txt'"]
+    };
     let scripts = [
         format!(
-            r#"const result = await tools.exec_command({{kind: "script", cmd: "Get-Content contract.txt", max_output_tokens: 5000, yield_time_ms: 30000}});
+            r#"const reads = await Promise.allSettled({read_commands:?}.map(async cmd => {{
+let result = await tools.exec_command({{kind: "script", cmd, max_output_tokens: 5000, yield_time_ms: 30000}});
+let output = result.original_token_count > 0 ? (result.result?.selected_text ?? result.output) : "";
+while (result.session_id) {{
+  result = await tools.write_stdin({{session_id: result.session_id, chars: "", max_output_tokens: 5000, yield_time_ms: 30000}});
+  if (result.original_token_count > 0) output += result.result?.selected_text ?? result.output;
+}}
+if (result.exit_code !== 0) throw new Error("contract read failed");
+return output;
+}}));
+for (const read of reads) if (read.status === "rejected") throw read.reason;
 await tools.apply_patch({unrelated_patch:?});
-text(result.result?.selected_text ?? result.output);"#
+text(reads.map(read => read.value).join(""));"#
         ),
         "text('Continue implementing the contract.');".to_string(),
         format!("text(await tools.apply_patch({later_unrelated_patch:?}));"),
@@ -794,10 +815,19 @@ text(result.result?.selected_text ?? result.output);"#
 
     // Check the actual subsequent model requests, including after consumption
     // and after an exact mutation to a different source dependency.
+    let initial_request = requests[0].single_request();
+    let initial_input = initial_request.input();
+    let initial_tools = initial_request.body_json()["tools"].clone();
     for (index, request) in requests.iter().enumerate().skip(1) {
-        let output = custom_tool_output_last_non_empty_text(&request.single_request(), "call-0")
+        let request = request.single_request();
+        assert_eq!(request.body_json()["tools"], initial_tools);
+        assert!(
+            request.input().starts_with(&initial_input),
+            "unchanged request prefix {index}"
+        );
+        let output = custom_tool_output_last_non_empty_text(&request, "call-0")
             .expect("the original read must remain available to the model");
-        assert_eq!(output.trim(), contract.trim(), "model request {index}");
+        assert_eq!(output.trim(), expected_read.trim(), "model request {index}");
     }
     let stale = custom_tool_output_last_non_empty_text(&final_request.single_request(), "call-0")
         .expect("changed source must leave a freshness notice");
@@ -806,6 +836,11 @@ text(result.result?.selected_text ?? result.output);"#
         "{stale}"
     );
     assert!(!stale.contains("Reject non-ASCII"));
+    assert!(
+        stale.contains("Keep empty-input behavior unchanged."),
+        "{stale}"
+    );
+    assert!(stale.contains("current_nested_results"), "{stale}");
     let final_request = final_request.single_request();
     assert_eq!(
         custom_tool_output_last_non_empty_text(&final_request, "call-1").as_deref(),
@@ -824,6 +859,214 @@ text(result.result?.selected_text ?? result.output);"#
         fs::read_to_string(test.cwd_path().join("contract.txt"))?
             .ends_with("Accept non-ASCII input.\n")
     );
+    Ok(())
+}
+
+#[test_case::test_case(false; "without completed history projection")]
+#[test_case::test_case(true; "with completed history projection")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn code_mode_preserves_post_patch_validation_but_invalidates_earlier_reads(
+    project_completed_history: bool,
+) -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = responses::start_mock_server().await;
+    let test = test_codex()
+        .with_config(move |config| {
+            let _ = config.features.enable(Feature::CodeMode);
+            config.completed_tool_history_projection = project_completed_history;
+        })
+        .build(&server)
+        .await?;
+    fs::write(test.cwd_path().join("source.txt"), "before\n")?;
+    let read_command = if cfg!(windows) {
+        "Get-Content source.txt"
+    } else {
+        "cat source.txt"
+    };
+    let read = format!(
+        "await tools.exec_command({{kind: 'script', cmd: {read_command:?}, yield_time_ms: 30000}})"
+    );
+    let patch =
+        "*** Begin Patch\n*** Update File: source.txt\n@@\n-before\n+after\n*** End Patch\n";
+    let later_patch =
+        "*** Begin Patch\n*** Update File: source.txt\n@@\n-after\n+later\n*** End Patch\n";
+    // The real command checks the edited file and records how often validation
+    // ran. Its output must reach the next provider request without a rerun.
+    let validation = r#"python -c "from pathlib import Path; assert Path('source.txt').read_text() == 'after\n'; Path('validation-runs.txt').open('a', newline='').write('checked\n'); print('validated after')""#;
+    let scripts = [
+        format!("text({read});"),
+        format!(
+            "text(await tools.apply_patch({patch:?})); text(await tools.exec_command({{kind: 'script', cmd: {validation:?}, yield_time_ms: 30000}}));"
+        ),
+        format!(
+            "const earlier = {read}; await tools.apply_patch({later_patch:?}); text({read}); text(earlier);"
+        ),
+    ];
+    let mut requests = Vec::new();
+    for (index, script) in scripts.iter().enumerate() {
+        requests.push(
+            responses::mount_sse_once(
+                &server,
+                sse(vec![
+                    ev_response_created(&format!("resp-{index}")),
+                    ev_custom_tool_call(&format!("call-{index}"), "exec", script),
+                    ev_completed(&format!("resp-{index}")),
+                ]),
+            )
+            .await,
+        );
+    }
+    let final_request = responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_assistant_message("done", "done"),
+            ev_completed("final"),
+        ]),
+    )
+    .await;
+    test.submit_turn(
+        "Read the source, patch and validate it once, then read it before a final patch.",
+    )
+    .await?;
+
+    let after_validation = requests[2].single_request();
+    let validated = custom_tool_output_last_non_empty_text(&after_validation, "call-1")
+        .expect("post-patch validation must reach the next model request");
+    assert!(validated.contains("validated after"), "{validated}");
+    assert!(
+        !validated.contains("stale_workspace_evidence"),
+        "{validated}"
+    );
+    let initial = custom_tool_output_last_non_empty_text(&after_validation, "call-0")
+        .expect("the old read must retain a freshness notice");
+    assert!(
+        initial.contains(r#""stale_workspace_evidence":true"#),
+        "{initial}"
+    );
+
+    let final_request = final_request.single_request();
+    for call_id in ["call-1", "call-2"] {
+        let stale = custom_tool_output_last_non_empty_text(&final_request, call_id)
+            .expect("an observation preceding a later mutation must become stale");
+        assert!(
+            stale.contains(r#""stale_workspace_evidence":true"#),
+            "{call_id}: {stale}"
+        );
+        assert!(!stale.contains("validated after"));
+    }
+    assert_eq!(
+        fs::read_to_string(test.cwd_path().join("source.txt"))?,
+        "later\n"
+    );
+    assert_eq!(
+        fs::read_to_string(test.cwd_path().join("validation-runs.txt"))?,
+        "checked\n"
+    );
+    Ok(())
+}
+
+#[test_case::test_case("completed", false, false, false, true; "completed required suites")]
+#[test_case::test_case("pending", false, false, false, false; "unfinished work")]
+#[test_case::test_case("absent", false, false, false, false; "unconfirmed completion")]
+#[test_case::test_case("completed", true, true, false, false; "masked failure")]
+#[test_case::test_case("completed", true, false, false, false; "failed first suite")]
+#[test_case::test_case("completed", false, false, true, false; "edit after validation")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn code_mode_terminal_prompt_requires_fresh_suites_and_completed_work(
+    plan_status: &str,
+    fail: bool,
+    mask_failure: bool,
+    later_edit: bool,
+    terminal: bool,
+) -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = responses::start_mock_server().await;
+    let test = test_codex()
+        .with_config(|config| {
+            config.features.enable(Feature::CodeMode).unwrap();
+        })
+        .build(&server)
+        .await?;
+    fs::write(test.cwd_path().join("source.txt"), "before\n")?;
+    fs::write(
+        test.cwd_path().join("test_contract.py"),
+        "import unittest\nfrom pathlib import Path\nclass Contract(unittest.TestCase):\n    def test_contract(self):\n        self.assertEqual(Path('source.txt').read_text(), 'after\\n')\n        with Path('suite-runs.txt').open('a') as f: f.write('passed\\n')\n",
+    )?;
+    fs::write(
+        test.cwd_path().join("test_failure.py"),
+        "import unittest\nclass Failure(unittest.TestCase):\n    def test_failure(self):\n        self.fail('required suite failed')\n",
+    )?;
+    let patch =
+        "*** Begin Patch\n*** Update File: source.txt\n@@\n-before\n+after\n*** End Patch\n";
+    let first_suite = if fail {
+        "test_failure"
+    } else {
+        "test_contract"
+    };
+    let command = if mask_failure {
+        format!("python -m unittest {first_suite} -q; exit 0")
+    } else {
+        format!("python -m unittest {first_suite} -q && python -m unittest test_contract -q")
+    };
+    let mut script = format!(
+        "text(await tools.apply_patch({patch:?})); text(await tools.exec_command({{cmd: {command:?}, yield_time_ms: 30000}}));"
+    );
+    if plan_status != "absent" {
+        script.push_str(&format!("text(await tools.update_plan({{plan: [{{step: 'Implement and verify the requested contract', status: {plan_status:?}}}]}}));"));
+    }
+    if later_edit {
+        let patch =
+            "*** Begin Patch\n*** Update File: source.txt\n@@\n-after\n+later\n*** End Patch\n";
+        script.push_str(&format!("text(await tools.apply_patch({patch:?}));"));
+    }
+    let initial = responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_custom_tool_call("validate", "exec", &script),
+            ev_completed("first"),
+        ]),
+    )
+    .await;
+    let final_request = responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_assistant_message("done", "done"),
+            ev_completed("final"),
+        ]),
+    )
+    .await;
+    test.submit_turn("Implement the contract and run both required suites; finish only when all work is complete.").await?;
+    let initial = initial.single_request().body_json();
+    let final_request = final_request.single_request();
+    let final_body = final_request.body_json();
+    assert!(!initial["tools"].as_array().unwrap().is_empty());
+    assert_eq!(
+        final_body["tools"].as_array().unwrap().is_empty(),
+        terminal,
+        "{final_body}"
+    );
+    if terminal {
+        assert_eq!(final_body["parallel_tool_calls"], false);
+        let evidence = custom_tool_output_last_non_empty_text(&final_request, "validate").unwrap();
+        assert!(evidence.contains("OK"), "{evidence}");
+        assert!(!evidence.contains("stale_workspace_evidence"), "{evidence}");
+    }
+    assert_eq!(
+        fs::read_to_string(test.cwd_path().join("source.txt"))?,
+        if later_edit { "later\n" } else { "after\n" }
+    );
+    if fail {
+        assert!(
+            !test.cwd_path().join("suite-runs.txt").exists(),
+            "failed or masked validation must not run the subsequent suite"
+        );
+    } else {
+        assert_eq!(
+            fs::read_to_string(test.cwd_path().join("suite-runs.txt"))?,
+            "passed\npassed\n",
+            "each required suite executes once"
+        );
+    }
     Ok(())
 }
 
@@ -912,6 +1155,125 @@ async fn code_mode_tool_history_has_a_hard_aggregate_budget() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn code_mode_tool_history_pressure_preserves_recoverable_results() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = responses::start_mock_server().await;
+    let test = test_codex()
+        .with_config(|config| {
+            config.features.enable(Feature::CodeMode).unwrap();
+            config.completed_tool_history_projection = true;
+            config.model_auto_compact_token_limit = Some(1_000_000);
+        })
+        .build(&server)
+        .await?;
+    let mut events = vec![ev_response_created("recovery-pressure")];
+    for index in 0..80 {
+        events.push(ev_custom_tool_call(
+            &format!("recoverable-{index:03}"),
+            "exec",
+            &format!("text('recovery-{index:03}\\n' + 'evidence\\n'.repeat(1000));"),
+        ));
+    }
+    events.push(ev_completed("recovery-pressure"));
+    let first = responses::mount_sse_once(&server, sse(events)).await;
+    let projected = responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_assistant_message("done", "done"),
+            ev_completed("projected"),
+        ]),
+    )
+    .await;
+    test.submit_turn("Collect all requested results.").await?;
+    assert_eq!(first.requests().len(), 1);
+    let request = projected.single_request();
+    let body = request.body_json();
+    let input = body["input"].as_array().unwrap();
+    assert_eq!(
+        input
+            .iter()
+            .filter(|item| item["type"] == "custom_tool_call")
+            .count(),
+        80
+    );
+    assert_eq!(
+        input
+            .iter()
+            .filter(|item| item["type"] == "custom_tool_call_output")
+            .count(),
+        80
+    );
+    let mut total_tokens = 0;
+    let mut pinned = None;
+    let mut artifact_ids = HashSet::new();
+    for index in 0..80 {
+        let call_id = format!("recoverable-{index:03}");
+        let output = request.custom_tool_call_output(&call_id);
+        let text = match &output["output"] {
+            Value::String(text) => text.clone(),
+            Value::Array(content) => content
+                .iter()
+                .filter_map(|item| item["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n"),
+            value => panic!("unexpected output: {value}"),
+        };
+        total_tokens += codex_utils_output_truncation::approx_token_count(&text);
+        if let Ok(recovery) = serde_json::from_str::<Value>(&text) {
+            let artifact_id = recovery["artifact_id"]
+                .as_str()
+                .expect("exact recovery handle");
+            assert!(
+                artifact_ids.insert(artifact_id.to_string()),
+                "each result has its own artifact"
+            );
+            if recovery["kind"] == "tool_history_artifact_pin" {
+                assert_eq!(recovery["retrieval"]["tool"], "read_tool_output");
+                pinned = Some((index, artifact_id.to_string()));
+            }
+        } else {
+            assert!(
+                text.contains(&format!("recovery-{index:03}")),
+                "{call_id}: {text}"
+            );
+        }
+    }
+    assert!(
+        total_tokens <= 10_000,
+        "provider-visible results consumed {total_tokens} tokens"
+    );
+    let (index, artifact_id) = pinned.expect("pressure must exercise cheaper artifact pins");
+    let recovery_script = format!(
+        "const recovered = await tools.read_tool_output({{artifact_id: {artifact_id:?}, selectors: [{{kind: 'bytes', start: 0, end: 256}}]}}); text(recovered.results.map(part => part.text ?? '').join(''));"
+    );
+    responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_custom_tool_call("recover-pin", "exec", &recovery_script),
+            ev_completed("recover"),
+        ]),
+    )
+    .await;
+    let recovered = responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_assistant_message("recovered", "recovered"),
+            ev_completed("recovered"),
+        ]),
+    )
+    .await;
+    test.submit_turn("Recover the retained result.").await?;
+    let output = custom_tool_output_last_non_empty_text(&recovered.single_request(), "recover-pin")
+        .expect("registered recovery tool must return the stored output");
+    assert!(
+        output.contains(&format!("recovery-{index:03}\n")),
+        "{output}"
+    );
+    assert!(output.contains("evidence\n"), "{output}");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_can_return_exec_command_output() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -960,6 +1322,156 @@ text(JSON.stringify(result));
     assert!(result.get("wall_time_seconds").is_some(), "{result}");
     assert!(result.get("session_id").is_none(), "{result}");
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn code_mode_deduplicates_advice_and_preserves_nested_result_evidence() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = responses::start_mock_server().await;
+    let test = test_codex()
+        .with_config(|config| {
+            let _ = config.features.enable(Feature::CodeMode);
+            config.completed_tool_history_projection = false;
+        })
+        .build(&server)
+        .await?;
+    let small = "required contract evidence";
+    let large = format!("{}END_OF_REQUIRED_EVIDENCE", "🙂".repeat(1_600));
+    fs::write(test.cwd_path().join("small.txt"), small)?;
+    fs::write(test.cwd_path().join("large.txt"), &large)?;
+    let small_command = if cfg!(windows) {
+        serde_json::json!({"kind": "argv", "program": "powershell.exe", "args": ["-NoLogo", "-NoProfile", "-Command", "Get-Content -Raw -Encoding utf8 small.txt"], "yield_time_ms": 30000})
+    } else {
+        serde_json::json!({"kind": "argv", "program": "cat", "args": ["small.txt"], "yield_time_ms": 30000})
+    };
+    let read_small = format!(
+        r#"const result = await tools.exec_command({small_command});
+if (result.session_id) throw new Error('expected completed read');
+text(result.result?.selected_text ?? result.output);"#
+    );
+    let large_command = if cfg!(windows) {
+        "Get-Content -Raw -Encoding utf8 large.txt"
+    } else {
+        "cat large.txt"
+    };
+    let scripts = [
+        read_small.clone(),
+        format!(r#"const result = await tools.exec_command({{kind: "script", cmd: {large_command:?}, max_output_tokens: 6000, yield_time_ms: 30000}});
+if (result.session_id) throw new Error('expected completed read');
+store('large', result);"#),
+        read_small.replace(
+            "text(result.result?.selected_text ?? result.output);",
+            "const large = load('large'); text({small: result.result?.selected_text ?? result.output, large: large.result?.selected_text ?? large.output});",
+        ),
+    ];
+    let mut requests = Vec::new();
+    for (index, script) in scripts.iter().enumerate() {
+        requests.push(
+            responses::mount_sse_once(
+                &server,
+                sse(vec![
+                    ev_response_created(&format!("resp-{index}")),
+                    ev_custom_tool_call(&format!("call-{index}"), "exec", script),
+                    ev_completed(&format!("resp-{index}")),
+                ]),
+            )
+            .await,
+        );
+    }
+    let final_request = responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_assistant_message("done", "done"),
+            ev_completed("final"),
+        ]),
+    )
+    .await;
+    test.submit_turn("Read both evidence files, then reuse the captured results.")
+        .await?;
+
+    let first_items = custom_tool_output_items(&requests[1].single_request(), "call-0");
+    let first_body =
+        custom_tool_output_last_non_empty_text(&requests[1].single_request(), "call-0")
+            .expect("the first read must reach the provider");
+    let advisory_offset = first_body.find("Low-density packet:").unwrap_or_else(|| {
+        panic!("the first small read must retain the batching guidance: {first_items:?}")
+    });
+    let (first_evidence, advisory) = first_body.split_at(advisory_offset);
+    assert_eq!(first_evidence.trim_end(), small);
+    let request = final_request.single_request();
+    let final_first = custom_tool_output_items(&request, "call-0");
+    let final_last = custom_tool_output_items(&request, "call-2");
+    assert_eq!(
+        final_first, first_items,
+        "the first read and guidance stay in history"
+    );
+    let replayed: Value = serde_json::from_str(
+        &custom_tool_output_last_non_empty_text(&request, "call-2")
+            .expect("the captured evidence must be printed"),
+    )?;
+    assert_eq!(replayed["small"].as_str().map(str::trim_end), Some(small));
+    assert_eq!(
+        replayed["large"].as_str().map(str::trim_end),
+        Some(large.as_str()),
+        "bounded retention must not alter the actual nested result stored in JavaScript"
+    );
+    assert!(
+        !final_last
+            .iter()
+            .filter_map(|item| item["text"].as_str())
+            .any(|text| text.contains("Low-density packet:")),
+        "a large packet must not cause the same advice to be appended again"
+    );
+
+    let retained_items = custom_tool_output_items(&requests[2].single_request(), "call-1");
+    let retained = retained_items
+        .iter()
+        .filter_map(|item| item["text"].as_str())
+        .find_map(|text| text.strip_prefix("Nested tool result:\n"))
+        .expect("a silent cell must expose its retained nested evidence");
+    let retained: Value = serde_json::from_str(retained)?;
+    assert_eq!(retained["output_truncated"], true);
+    let prefix = retained["output"].as_str().expect("retained JSON prefix");
+    assert!(prefix.len() <= 4_096);
+    assert!(prefix.contains('🙂'));
+    assert!(!prefix.contains("END_OF_REQUIRED_EVIDENCE"));
+
+    responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("next-turn"),
+            ev_custom_tool_call("next-read", "exec", &read_small),
+            ev_completed("next-turn"),
+        ]),
+    )
+    .await;
+    let next_request = responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_assistant_message("next-done", "done"),
+            ev_completed("next-final"),
+        ]),
+    )
+    .await;
+    test.submit_turn("Read the small evidence file in this new turn.")
+        .await?;
+    let next_body =
+        custom_tool_output_last_non_empty_text(&next_request.single_request(), "next-read")
+            .expect("the next turn must receive the read and guidance");
+    assert_eq!(
+        next_body.strip_suffix(advisory).map(str::trim_end),
+        Some(small),
+        "the same evidence and guidance must remain available in the next turn"
+    );
+    assert_eq!(
+        fs::read_to_string(test.cwd_path().join("small.txt"))?,
+        small
+    );
+    assert_eq!(
+        fs::read_to_string(test.cwd_path().join("large.txt"))?,
+        large
+    );
     Ok(())
 }
 
@@ -3564,39 +4076,63 @@ image(imageItem);
 async fn code_mode_can_apply_patch_via_nested_tool() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
-    let server = responses::start_mock_server().await;
     let file_name = "code_mode_apply_patch.txt";
     let patch = format!(
         "*** Begin Patch\n*** Add File: {file_name}\n+hello from code_mode\n*** End Patch\n"
     );
-    let code = format!("text(await tools.apply_patch({patch:?}));\n");
-
-    let (test, second_mock) =
-        run_code_mode_turn(&server, "use exec to run apply_patch", &code).await?;
-
-    let req = second_mock.single_request();
-    let items = custom_tool_output_items(&req, "call-1");
-    let (_, success) = req
-        .custom_tool_call_output_content_and_success("call-1")
-        .expect("custom tool output should be present");
-    assert_ne!(
-        success,
-        Some(false),
-        "exec apply_patch call failed unexpectedly: {items:?}"
+    let code = format!(
+        "text({{ description: resolve_tool('apply_patch').description, result: await tools.apply_patch({patch:?}) }});\n"
     );
-    let output = items
-        .iter()
-        .filter_map(|item| item.get("text").and_then(Value::as_str))
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(
-        output.contains("Success. Updated the following files:") && output.contains(file_name),
-        "nested apply_patch output should report the update: {output}"
-    );
+    for code_mode_only in [false, true] {
+        let server = responses::start_mock_server().await;
+        let (test, second_mock) = run_code_mode_turn_with_config(
+            &server,
+            "use exec to run apply_patch",
+            &code,
+            move |config| {
+                if code_mode_only {
+                    config.features.enable(Feature::CodeModeOnly).unwrap();
+                } else {
+                    config.features.disable(Feature::CodeModeOnly).unwrap();
+                }
+            },
+        )
+        .await?;
+        let req = second_mock.single_request();
+        let (output, success) = custom_tool_output_body_and_success(&req, "call-1");
+        assert_ne!(success, Some(false), "nested apply_patch failed: {output}");
+        let output: Value = serde_json::from_str(&output)?;
+        let runtime_description = output["description"].as_str().expect("runtime contract");
+        let (description, declaration) = runtime_description
+            .split_once("\n\nexec tool declaration:\n")
+            .expect("typed contract");
+        assert!(description.contains("This is a FREEFORM tool"));
+        assert!(declaration.contains("apply_patch(input: string"));
+        let body = req.body_json();
+        let tools = body["tools"].as_array().expect("model-visible tools");
+        let exec_description =
+            tools.iter().find(|tool| tool["name"] == "exec").unwrap()["description"]
+                .as_str()
+                .unwrap();
+        let direct = tools.iter().find(|tool| tool["name"] == "apply_patch");
+        assert_eq!(direct.is_none(), code_mode_only);
+        assert!(exec_description.contains(declaration));
+        if let Some(direct) = direct {
+            assert_eq!(direct["description"], description);
+            assert!(!exec_description.contains(description));
+        } else {
+            assert!(exec_description.contains(runtime_description));
+        }
+        let result = output["result"].as_str().expect("patch result");
+        assert!(
+            result.contains("Success. Updated the following files:") && result.contains(file_name)
+        );
 
-    let file_path = test.cwd_path().join(file_name);
-    assert_eq!(fs::read_to_string(&file_path)?, "hello from code_mode\n");
-
+        assert_eq!(
+            fs::read_to_string(test.cwd_path().join(file_name))?,
+            "hello from code_mode\n"
+        );
+    }
     Ok(())
 }
 

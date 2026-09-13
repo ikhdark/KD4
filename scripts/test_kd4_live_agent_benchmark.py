@@ -1836,7 +1836,7 @@ def render_report(text: str) -> str:
         self.assertEqual(run["terminalEvent"], "turn.completed")
         self.assertTrue(run["outcomeCorrect"], run["failureReasons"])
         self.assertTrue(run["taskContractCompliant"])
-        self.assertNotIn("unverified", run["finalMessage"])
+        self.assertEqual(run["finalMessage"], final_message)
         self.assertIn(
             "final_verification_complaint",
             [diagnostic["category"] for diagnostic in run["diagnostics"]],
@@ -2566,14 +2566,32 @@ def render_report(text: str) -> str:
             output = root / "report.json"
             stub = root / "agent.py"
             stub.write_text(
-                "import json, sys\n"
+                "import json, sys, os\n"
+                "from pathlib import Path\n"
+                "bundle = Path(os.environ['CODEX_ROLLOUT_TRACE_ROOT']) / 'bundle'\n"
+                "(bundle / 'payloads').mkdir(parents=True)\n"
+                "events = []\n"
+                "for i in range(2):\n"
+                "    request = {'model': 'test', 'input': [{'role': 'user', 'content': 'request-' + 'x' * 5000}]}\n"
+                "    response = {'response_id': str(i), 'token_usage': {'input_tokens': 50, 'cached_input_tokens': 30, 'cache_write_input_tokens': 5, 'output_tokens': 10, 'reasoning_output_tokens': 6}, 'output_items': [{'type': 'message', 'channel': 'commentary', 'content': [{'type': 'output_text', 'text': 'commentary-' + 'y' * 5000}]}, {'type': 'custom_tool_call', 'name': 'apply_patch', 'input': 'patch-' + 'z' * 5000}]}\n"
+                "    for name, value in [('request', request), ('response', response)]:\n"
+                "        relative = f'payloads/{name}-{i}.json'\n"
+                "        (bundle / relative).write_text(json.dumps(value), encoding='utf-8')\n"
+                "        events.append({'seq': len(events) + 1, 'payload': {'type': 'inference_started' if name == 'request' else 'inference_completed', 'inference_call_id': str(i), name + '_payload': {'raw_payload_id': name + str(i), 'path': relative}}})\n"
+                "(bundle / 'trace.jsonl').write_text(''.join(json.dumps(e) + '\\n' for e in events), encoding='utf-8')\n"
+                "print(json.dumps({'type': 'item.completed', 'item': {'id': 'comment', 'type': 'agent_message', 'text': 'commentary-' + 'y' * 5000}}), flush=True)\n"
+                "print(json.dumps({'type': 'item.completed', 'item': {'id': 'command', 'type': 'command_execution', 'command': 'command-' + 'c' * 5000, 'aggregated_output': 'output-' + 'o' * 5000, 'exit_code': 0}}), flush=True)\n"
+                "print('diagnostic-' + 'd' * 5000, file=sys.stderr, flush=True)\n"
                 "receipt = {'configs': [sys.argv[i + 1] for i, arg in "
                 "enumerate(sys.argv) if arg == '-c'], "
                 f"'promptMatches': sys.argv[-1] == {benchmark.TASK_PROMPT!r}}}\n"
                 "print(json.dumps({'type': 'item.completed', 'item': {"
                 "'id': 'answer', 'type': 'agent_message', "
                 "'text': json.dumps(receipt)}}), flush=True)\n"
-                "print(json.dumps({'type': 'turn.completed', 'usage': {}}), flush=True)\n",
+                "print(json.dumps({'type': 'turn.completed', 'usage': {"
+                "'input_tokens': 100, 'cached_input_tokens': 60, "
+                "'cache_write_input_tokens': 10, 'output_tokens': 20, "
+                "'reasoning_output_tokens': 12}}), flush=True)\n",
                 encoding="utf-8",
             )
             argv = [
@@ -2612,6 +2630,34 @@ def render_report(text: str) -> str:
             ):
                 benchmark.main()
             report = json.loads(output.read_text(encoding="utf-8"))
+            # Assert through the CLI boundary while retained files still exist.
+            capture_roots = set()
+            for pair in report["results"]["pairs"]:
+                for role in ("currentFork", "upstreamC"):
+                    trace = pair[role]["inferenceTrace"]
+                    self.assertEqual(trace["issues"], [])
+                    self.assertEqual(trace["status"], "complete")
+                    self.assertTrue(trace["usageReconciled"])
+                    capture_roots.add(trace["root"])
+                    self.assertEqual(trace["requestTokenTotals"]["totalTokens"], 120)
+                    self.assertEqual(len(trace["requests"]), 2)
+                    for request in trace["requests"]:
+                        self.assertEqual(request["tokenUsage"]["cachedInputTokens"], 30)
+                        raw_request = json.loads(Path(request["requestPath"]).read_text(encoding="utf-8"))
+                        self.assertEqual(raw_request["input"][0]["content"], "request-" + "x" * 5000)
+                        raw_response = json.loads(Path(request["responsePath"]).read_text(encoding="utf-8"))
+                        self.assertEqual(raw_response["output_items"][0]["content"][0]["text"], "commentary-" + "y" * 5000)
+                        self.assertEqual(raw_response["output_items"][1]["input"], "patch-" + "z" * 5000)
+                    capture = Path(trace["root"])
+                    raw_cli = [json.loads(line) for line in (capture / "cli.stdout.jsonl").read_text(encoding="utf-8").splitlines()]
+                    self.assertEqual(raw_cli[0]["item"]["text"], "commentary-" + "y" * 5000)
+                    self.assertEqual(raw_cli[1]["item"]["command"], "command-" + "c" * 5000)
+                    self.assertEqual(raw_cli[1]["item"]["aggregated_output"], "output-" + "o" * 5000)
+                    self.assertEqual((capture / "cli.stderr.log").read_text(encoding="utf-8"), "diagnostic-" + "d" * 5000 + "\n")
+                    self.assertEqual((capture / "workspace.diff").read_bytes(), b"")
+                    for artifact in trace["files"]:
+                        self.assertEqual(artifact["sha256"], benchmark.sha256(Path(artifact["path"])))
+            self.assertEqual(len(capture_roots), 4)
 
         expected = {
             "currentFork": [
@@ -2645,6 +2691,69 @@ def render_report(text: str) -> str:
                 # and an experiment label must not certify the task.
                 self.assertFalse(run["outcomeCorrect"])
                 self.assertFalse(run["taskContractCompliant"])
+
+                self.assertEqual(run["tokenUsage"], {
+                    "source": "terminal.usage", "inputTokens": 100,
+                    "cachedInputTokens": 60, "cacheWriteInputTokens": 10,
+                    "outputTokens": 20, "reasoningOutputTokens": 12,
+                    "totalTokens": 120,
+                })
+                self.assertIsNone(run["modelWaitMs"])
+        for role in expected:
+            summary = report["results"][role]
+            self.assertEqual(summary["totalTokens"]["median"], 120)
+            self.assertEqual(summary["totalTokens"]["count"], 2)
+            self.assertEqual(summary["tokenUsage"]["cachedInputTokens"]["median"], 60)
+            self.assertEqual(summary["inferenceTrace"], {
+                "completeRuns": 2, "incompleteRuns": 0, "requestCount": 4, "requestsWithUsage": 4,
+            })
+
+    def test_inference_capture_reports_missing_and_unreconciled_payloads(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            missing = benchmark.collect_inference_trace(root, None, readers_drained=False)
+            self.assertEqual(missing["status"], "incomplete")
+            self.assertIn("no native trace bundle emitted", missing["issues"])
+            self.assertIn("CLI readers did not drain", missing["issues"])
+            bundle = root / "runtime" / "bundle"
+            bundle.mkdir(parents=True)
+            (bundle / "trace.jsonl").write_text(json.dumps({
+                "seq": 1, "payload": {"type": "inference_started", "inference_call_id": "one",
+                "request_payload": {"raw_payload_id": "request", "path": "missing.json"}},
+            }) + "\n", encoding="utf-8")
+            incomplete = benchmark.collect_inference_trace(root, benchmark.turn_token_usage({
+                "usage": {"input_tokens": 10, "output_tokens": 2},
+            }), readers_drained=True)
+            self.assertEqual(incomplete["status"], "incomplete")
+            self.assertFalse(incomplete["usageReconciled"])
+            self.assertIn("missing or invalid payload reference: missing.json", incomplete["issues"])
+            self.assertIn("inference request has no terminal trace event", incomplete["issues"])
+            self.assertIsNone(incomplete["requests"][0]["requestPath"])
+
+    def test_standard_token_usage_pairing_and_missing_values(self) -> None:
+        a = _gate_run()
+        b = _gate_run()
+        a["tokenUsage"] = benchmark.turn_token_usage({"usage": {
+            "input_tokens": 100, "output_tokens": 20,
+            "cached_input_tokens": 90, "reasoning_output_tokens": 15,
+        }})
+        b["tokenUsage"] = benchmark.turn_token_usage({"usage": {
+            "input_tokens": 80, "output_tokens": 10,
+        }})
+        b.pop("latencyExplanation", None)
+        result = benchmark.paired_comparison([
+            {"repetition": 1, "currentFork": a, "upstreamC": b}
+        ], fork_label="A", upstream_label="B")
+        self.assertEqual(result["metrics"]["totalTokens"]["medianDelta"], 30)
+        self.assertEqual(result["metrics"]["totalTokens"]["usablePairs"], 1)
+        self.assertIsNone(b["tokenUsage"]["cachedInputTokens"])
+        self.assertEqual(benchmark.turn_token_usage({"usage": {
+            "input_tokens": 0, "output_tokens": 0,
+        }})["totalTokens"], 0)
+        for usage in ({}, {"input_tokens": True, "output_tokens": 1},
+                      {"input_tokens": -1, "output_tokens": 1}):
+            self.assertIsNone(benchmark.turn_token_usage({"usage": usage}))
+        self.assertIsNone(benchmark.turn_token_usage(None))
 
     def test_invalid_config_override_is_rejected_before_launch_or_report(self) -> None:
         for overrides in (

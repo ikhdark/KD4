@@ -429,13 +429,10 @@ fn apply_namespace_description_budget(planned_tools: &mut PlannedTools) {
             *description = default_namespace_description(namespace_name);
         }
     }
-    let mut ordered_descriptions = namespace_order
-        .iter()
-        .map(|name| descriptions[name].clone())
-        .collect::<Vec<_>>();
-    apply_fair_description_budget(&mut ordered_descriptions);
-    for (namespace_name, description) in namespace_order.into_iter().zip(ordered_descriptions) {
-        descriptions.insert(namespace_name, description);
+    // Bound each source description independently. The final visible projection
+    // applies its shared budget after hidden and deferred tools are filtered out.
+    for description in descriptions.values_mut() {
+        apply_fair_description_budget(std::slice::from_mut(description));
     }
 
     for spec in planned_tools
@@ -655,6 +652,7 @@ fn is_hidden_by_code_mode_only(
     let tool_mode = effective_tool_mode(turn_context);
     tool_mode == ToolMode::CodeModeOnly
         && exposure != ToolExposure::DirectModelOnly
+        && !is_excluded_from_code_mode(turn_context, tool_name)
         && codex_code_mode::is_code_mode_nested_tool(&codex_tools::code_mode_name_for_tool_name(
             tool_name,
         ))
@@ -709,13 +707,35 @@ fn build_code_mode_executors(
             deferred_code_mode_nested_tool_specs.push(spec);
         } else {
             // Built-in direct tools have stable contracts, so ship their
-            // typed declarations with `exec`. MCP, plugin, extension, and
+            // typed declarations with `exec`. Keep descriptions once when
+            // the same tool is also exposed directly. MCP, plugin, extension, and
             // other dynamic-external tools remain discoverable at runtime but
             // keep their schemas lazy to avoid rebuilding the prompt around
             // an external inventory that can change between turns.
             if executor.authorization_class() != TypedToolClass::DynamicExternal
-                && let Some(definition) = codex_tools::tool_spec_to_code_mode_tool_definition(&spec)
+                && let Some(mut definition) =
+                    codex_tools::tool_spec_to_code_mode_tool_definition(&spec)
             {
+                let direct_description =
+                    if is_hidden_by_code_mode_only(turn_context, executor.tool_name(), exposure) {
+                        None
+                    } else {
+                        match &spec {
+                            ToolSpec::Function(tool) => Some(tool.description.as_str()),
+                            ToolSpec::Freeform(tool) => Some(tool.description.as_str()),
+                            _ => None,
+                        }
+                    };
+                if let Some(description) = direct_description
+                    && let Some(declaration) =
+                        definition.description.strip_prefix(description.trim())
+                {
+                    let duplicate_prefix_len =
+                        definition.description.len() - declaration.trim_start().len();
+                    definition
+                        .description
+                        .replace_range(..duplicate_prefix_len, "");
+                }
                 eager_nested_tool_descriptions.push(definition.description);
             }
             code_mode_nested_tool_specs.push(spec);

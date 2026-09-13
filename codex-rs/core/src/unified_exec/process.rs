@@ -358,8 +358,9 @@ impl UnifiedExecProcess {
                     Ok(response) => match response.status {
                         WriteStatus::Accepted => Ok(()),
                         WriteStatus::UnknownProcess | WriteStatus::StdinClosed => {
-                            let state = self.state_rx.borrow().clone();
-                            let _ = self.state_tx.send_replace(state.exited(state.exit_code));
+                            self.state_tx.send_modify(|state| {
+                                *state = state.exited(state.exit_code);
+                            });
                             self.cancellation_token.cancel();
                             Err(UnifiedExecError::WriteToStdin)
                         }
@@ -419,14 +420,14 @@ impl UnifiedExecProcess {
         stream: ExecOutputStream,
         chunk: Vec<u8>,
     ) {
-        self.output_buffer.lock().await.push_chunk(chunk.clone());
+        self.output_buffer.lock().await.push_chunk(&chunk);
         self.completion_output_buffer
             .lock()
             .await
-            .push_chunk(chunk.clone());
+            .push_chunk(&chunk);
         match &stream {
-            ExecOutputStream::Stdout => self.stdout_buffer.lock().await.push_chunk(chunk.clone()),
-            ExecOutputStream::Stderr => self.stderr_buffer.lock().await.push_chunk(chunk.clone()),
+            ExecOutputStream::Stdout => self.stdout_buffer.lock().await.push_chunk(&chunk),
+            ExecOutputStream::Stderr => self.stderr_buffer.lock().await.push_chunk(&chunk),
         }
         self.output_tx
             .send(ProcessOutputChunk {
@@ -607,11 +608,13 @@ impl UnifiedExecProcess {
     }
 
     pub(super) async fn fail_and_terminate(&self, message: String) -> Result<(), UnifiedExecError> {
-        let mut state = self.state_rx.borrow().clone();
-        if state.failure_message.is_none() {
+        self.state_tx.send_if_modified(|state| {
+            if state.failure_message.is_some() {
+                return false;
+            }
             state.failure_message = Some(message);
-            let _ = self.state_tx.send_replace(state);
-        }
+            true
+        });
         self.terminate_confirmed().await
     }
 
@@ -855,10 +858,10 @@ impl UnifiedExecProcess {
                     Ok(event) => Some(event),
                     Err(broadcast::error::RecvError::Lagged(_)) => None,
                     Err(broadcast::error::RecvError::Closed) => {
-                        let state = state_tx.borrow().clone();
-                        let _ = state_tx.send_replace(
-                            state.failed("exec-server process event stream closed".to_string()),
-                        );
+                        state_tx.send_modify(|state| {
+                            *state =
+                                state.failed("exec-server process event stream closed".to_string());
+                        });
                         break;
                     }
                 };
@@ -892,8 +895,7 @@ impl UnifiedExecProcess {
                     let response = match response {
                         Ok(response) => response,
                         Err(err) => {
-                            let state = state_tx.borrow().clone();
-                            let _ = state_tx.send_replace(state.failed(err.to_string()));
+                            state_tx.send_modify(|state| *state = state.failed(err.to_string()));
                             break;
                         }
                     };
@@ -912,13 +914,10 @@ impl UnifiedExecProcess {
                             task.write_chunk(&bytes);
                         }
                         {
-                            output_buffer.lock().await.push_chunk(bytes.clone());
+                            output_buffer.lock().await.push_chunk(&bytes);
                         }
-                        completion_output_buffer
-                            .lock()
-                            .await
-                            .push_chunk(bytes.clone());
-                        stdout_buffer.lock().await.push_chunk(bytes.clone());
+                        completion_output_buffer.lock().await.push_chunk(&bytes);
+                        stdout_buffer.lock().await.push_chunk(&bytes);
                         let _ = output_tx.send(ProcessOutputChunk {
                             stream: ExecOutputStream::Stdout,
                             bytes,
@@ -927,17 +926,15 @@ impl UnifiedExecProcess {
                     }
                     last_seq = last_seq.max(next_seq.saturating_sub(1));
                     if let Some(message) = failure {
-                        let state = state_tx.borrow().clone();
-                        let _ = state_tx.send_replace(state.failed(message));
+                        state_tx.send_modify(|state| *state = state.failed(message));
                         break;
                     }
                     if sandbox_denied || exited {
-                        let mut state = state_tx.borrow().clone();
-                        state.sandbox_denied |= sandbox_denied;
-                        let _ = state_tx.send_replace(if exited {
-                            state.exited(exit_code)
-                        } else {
-                            state
+                        state_tx.send_modify(|state| {
+                            state.sandbox_denied |= sandbox_denied;
+                            if exited {
+                                *state = state.exited(exit_code);
+                            }
                         });
                         if exited {
                             cancellation_token.cancel();
@@ -963,13 +960,10 @@ impl UnifiedExecProcess {
                             task.write_chunk(&bytes);
                         }
                         {
-                            output_buffer.lock().await.push_chunk(bytes.clone());
+                            output_buffer.lock().await.push_chunk(&bytes);
                         }
-                        completion_output_buffer
-                            .lock()
-                            .await
-                            .push_chunk(bytes.clone());
-                        stdout_buffer.lock().await.push_chunk(bytes.clone());
+                        completion_output_buffer.lock().await.push_chunk(&bytes);
+                        stdout_buffer.lock().await.push_chunk(&bytes);
                         let _ = output_tx.send(ProcessOutputChunk {
                             stream: ExecOutputStream::Stdout,
                             bytes,
@@ -985,9 +979,10 @@ impl UnifiedExecProcess {
                             continue;
                         }
                         last_seq = seq;
-                        let mut state = state_tx.borrow().clone();
-                        state.sandbox_denied |= sandbox_denied.unwrap_or(false);
-                        let _ = state_tx.send_replace(state.exited(Some(exit_code)));
+                        state_tx.send_modify(|state| {
+                            state.sandbox_denied |= sandbox_denied.unwrap_or(false);
+                            *state = state.exited(Some(exit_code));
+                        });
                         cancellation_token.cancel();
                     }
                     ExecProcessEvent::Closed { seq } => {
@@ -997,8 +992,7 @@ impl UnifiedExecProcess {
                         break;
                     }
                     ExecProcessEvent::Failed(message) => {
-                        let state = state_tx.borrow().clone();
-                        let _ = state_tx.send_replace(state.failed(message));
+                        state_tx.send_modify(|state| *state = state.failed(message));
                         break;
                     }
                 }
@@ -1062,18 +1056,18 @@ impl UnifiedExecProcess {
                         task.write_chunk(&output.bytes);
                     }
                     {
-                        output_buffer.lock().await.push_chunk(output.bytes.clone());
+                        output_buffer.lock().await.push_chunk(&output.bytes);
                     }
                     completion_output_buffer
                         .lock()
                         .await
-                        .push_chunk(output.bytes.clone());
+                        .push_chunk(&output.bytes);
                     match &output.stream {
                         ExecOutputStream::Stdout => {
-                            stdout_buffer.lock().await.push_chunk(output.bytes.clone())
+                            stdout_buffer.lock().await.push_chunk(&output.bytes)
                         }
                         ExecOutputStream::Stderr => {
-                            stderr_buffer.lock().await.push_chunk(output.bytes.clone())
+                            stderr_buffer.lock().await.push_chunk(&output.bytes)
                         }
                     }
                     let _ = output_tx.send(output);
@@ -1089,14 +1083,14 @@ impl UnifiedExecProcess {
     }
 
     fn signal_exit(&self, exit_code: Option<i32>) {
-        let state = self.state_rx.borrow().clone();
-        let _ = self.state_tx.send_replace(state.exited(exit_code));
+        self.state_tx
+            .send_modify(|state| *state = state.exited(exit_code));
         self.cancellation_token.cancel();
     }
 
     fn signal_exit_failure(&self, message: String) {
-        let state = self.state_rx.borrow().clone();
-        let _ = self.state_tx.send_replace(state.failed(message));
+        self.state_tx
+            .send_modify(|state| *state = state.failed(message));
         self.cancellation_token.cancel();
     }
 

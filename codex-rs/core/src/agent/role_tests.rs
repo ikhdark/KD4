@@ -504,7 +504,12 @@ fn spawn_tool_spec_build_deduplicates_user_defined_built_in_roles() {
     assert!(spec.contains("researcher: no description"));
     assert!(spec.contains("explorer: {\nuser override\n}"));
     assert!(spec.contains("default: {\nDefault agent.\n}"));
-    assert!(!spec.contains("Explorers are fast and authoritative."));
+    assert_eq!(
+        spec.lines()
+            .filter(|line| line.starts_with("explorer:"))
+            .count(),
+        1
+    );
 }
 
 #[test]
@@ -623,4 +628,26 @@ fn built_in_read_only_roles_resolve_embedded_config() {
         built_in::config_file_contents(Path::new("missing.toml")),
         None
     );
+}
+
+#[test]
+fn spawn_tool_spec_keeps_locks_without_optional_description() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let role_path = tempdir.path().join("locked.toml");
+    fs::write(
+        &role_path,
+        "model = \"gpt-5\"\nmodel_reasoning_effort = \"high\"\nservice_tier = \"priority\"\n",
+    )
+    .expect("write role");
+    let roles = BTreeMap::from([(
+        "locked".to_string(),
+        AgentRoleConfig {
+            description: None,
+            config_file: Some(role_path),
+            nickname_candidates: None,
+        },
+    )]);
+    let spec = spawn_tool_spec::build(&roles);
+    assert!(spec.contains("locked: {\nno description\n- This role's model is set to `gpt-5` and its reasoning effort is set to `high`. These settings cannot be changed."));
+    assert!(spec.contains("This role's service tier is set to `priority`."));
 }

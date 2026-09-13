@@ -25,18 +25,21 @@ fn renders_only_when_plugins_become_available() {
         render(unavailable, PreviousSectionState::Absent),
         Vec::<String>::new()
     );
-    assert_eq!(render(available, PreviousSectionState::Absent).len(), 1);
     assert_eq!(
-        render(available, PreviousSectionState::Known(&false_snapshot)).len(),
-        1
+        render(available, PreviousSectionState::Absent),
+        vec![AvailablePluginsInstructions.render()]
+    );
+    assert_eq!(
+        render(available, PreviousSectionState::Known(&false_snapshot)),
+        vec![AvailablePluginsInstructions.render()]
     );
     assert_eq!(
         render(available, PreviousSectionState::Known(&true_snapshot)),
         Vec::<String>::new()
     );
     assert_eq!(
-        render(unavailable, PreviousSectionState::Known(&true_snapshot)).len(),
-        1
+        render(unavailable, PreviousSectionState::Known(&true_snapshot)),
+        vec![PluginsInstructionsUnavailable.render()]
     );
 }
 
@@ -48,21 +51,55 @@ fn renders_revocation_when_plugins_become_unavailable() {
         PreviousSectionState::Known(&true_snapshot),
     );
 
-    assert_eq!(rendered.len(), 1);
-    assert!(rendered[0].contains("Previously provided plugin guidance no longer applies"));
+    assert_eq!(rendered, vec![PluginsInstructionsUnavailable.render()]);
 }
 
 #[test]
-fn legacy_guidance_is_not_injected_again() {
-    let mut world_state = super::super::WorldState::default();
-    world_state.add_section(PluginsInstructionsState::new(/*available*/ true));
-    let legacy: ResponseItem = ContextualUserFragment::into(AvailablePluginsInstructions);
-
-    assert!(
-        world_state
-            .render_history_diff(/*previous*/ None, &[legacy])
-            .is_empty()
+fn unknown_state_reasserts_current_availability() {
+    assert_eq!(
+        render(
+            PluginsInstructionsState::new(true),
+            PreviousSectionState::Unknown
+        ),
+        vec![AvailablePluginsInstructions.render()]
     );
+    assert_eq!(
+        render(
+            PluginsInstructionsState::new(false),
+            PreviousSectionState::Unknown
+        ),
+        vec![PluginsInstructionsUnavailable.render()]
+    );
+}
+
+#[test]
+fn unknown_history_reasserts_guidance_once_even_after_revocation() {
+    for revoked in [false, true] {
+        let mut world_state = super::super::WorldState::default();
+        world_state.add_section(PluginsInstructionsState::new(true));
+        let mut history: Vec<ResponseItem> =
+            vec![ContextualUserFragment::into(AvailablePluginsInstructions)];
+        if revoked {
+            history.push(ContextualUserFragment::into(PluginsInstructionsUnavailable));
+        }
+        let (fragments, snapshot) = world_state.render_history_diff_with_snapshot(None, &history);
+        assert_eq!(
+            fragments
+                .iter()
+                .map(|fragment| fragment.render())
+                .collect::<Vec<_>>(),
+            vec![AvailablePluginsInstructions.render()]
+        );
+        history.extend(
+            fragments
+                .into_iter()
+                .map(ContextualUserFragment::into_boxed_response_item),
+        );
+        let (fragments, next) =
+            world_state.render_history_diff_with_snapshot(Some(&snapshot), &history);
+        assert!(fragments.is_empty());
+        assert_eq!(next, snapshot);
+    }
 }
 
 #[test]
@@ -73,8 +110,12 @@ fn persisted_guidance_is_restored_only_when_missing_from_history() {
     let retained: ResponseItem = ContextualUserFragment::into(AvailablePluginsInstructions);
 
     assert_eq!(
-        world_state.render_history_diff(Some(&snapshot), &[]).len(),
-        1
+        world_state
+            .render_history_diff(Some(&snapshot), &[])
+            .iter()
+            .map(|fragment| fragment.render())
+            .collect::<Vec<_>>(),
+        vec![AvailablePluginsInstructions.render()]
     );
     assert!(
         world_state

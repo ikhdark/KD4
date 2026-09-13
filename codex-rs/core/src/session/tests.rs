@@ -2889,6 +2889,9 @@ async fn record_inter_agent_communication_sets_turn_id_in_rollout_and_resume() {
     let mut expected_item = communication.to_model_input_item();
     expected_item.set_turn_id_if_missing(&turn_context.sub_id);
 
+    let session = Arc::new(session);
+    let turn_context = Arc::new(turn_context);
+
     session
         .record_inter_agent_communication(&turn_context, communication)
         .await;
@@ -3267,6 +3270,8 @@ async fn resumed_history_injects_initial_context_on_first_context_update_only() 
     );
 
     let step_context = StepContext::for_test(Arc::clone(&turn_context));
+
+    let session = Arc::new(session);
     session
         .record_context_updates_and_set_reference_context_item(&step_context)
         .await;
@@ -7085,6 +7090,68 @@ fn strict_auto_review_session_scope_grants_no_permissions() {
             strict_auto_review: false,
         }
     );
+}
+
+#[tokio::test]
+async fn stale_permission_request_cannot_register_in_a_replacement_turn() {
+    for auto_review in [false, true] {
+        let (session, mut turn) = make_session_and_context().await;
+        turn.approval_policy
+            .set(AskForApproval::OnRequest)
+            .expect("allow request");
+        if auto_review {
+            Arc::make_mut(&mut turn.config).approvals_reviewer =
+                codex_config::types::ApprovalsReviewer::AutoReview;
+        }
+        assert_eq!(
+            crate::guardian::routes_approval_to_guardian(&turn),
+            auto_review
+        );
+        let active = ActiveTurn {
+            terminal: Some(crate::state::TurnTerminalCoordinator::new(
+                "replacement-turn".to_string(),
+            )),
+            ..Default::default()
+        };
+        let state = Arc::clone(&active.turn_state);
+        *session.active_turn.lock().await = Some(active);
+        let environment = turn
+            .environments
+            .primary()
+            .expect("primary environment")
+            .selection();
+        let session = Arc::new(session);
+        let turn = Arc::new(turn);
+        let result = timeout(
+            Duration::from_secs(1),
+            session.request_permissions_for_environment(
+                &turn,
+                "stale-permission".to_string(),
+                codex_protocol::request_permissions::RequestPermissionsArgs {
+                    environment_id: None,
+                    reason: Some("originating turn already replaced".to_string()),
+                    permissions: RequestPermissionProfile {
+                        network: Some(codex_protocol::models::NetworkPermissions {
+                            enabled: Some(true),
+                        }),
+                        ..Default::default()
+                    },
+                },
+                environment,
+                CancellationToken::new(),
+            ),
+        )
+        .await
+        .expect("stale request cannot wait for user or guardian");
+        assert_eq!(result, None);
+        assert!(
+            !state
+                .lock()
+                .await
+                .has_pending_request_permissions("stale-permission")
+        );
+        assert!(!*session.services.elicitations.subscribe().borrow());
+    }
 }
 
 #[tokio::test]
@@ -10915,6 +10982,7 @@ async fn record_context_updates_emits_environment_item_for_network_changes() {
         .expect("build network proxy spec from updated requirements");
     current_context.config = Arc::new(config);
 
+    let session = Arc::new(session);
     let update_items =
         record_context_update_items(&session, previous_context, current_context).await;
 
@@ -10946,6 +11014,7 @@ async fn record_context_updates_emits_environment_item_for_cwd_changes() {
         environment.shell,
     );
 
+    let session = Arc::new(session);
     let update_items =
         record_context_update_items(&session, previous_context, current_context).await;
 
@@ -10973,6 +11042,7 @@ async fn record_context_updates_emits_environment_item_for_time_changes() {
     current_context.current_date = Some("2026-02-27".to_string());
     current_context.timezone = Some("Europe/Berlin".to_string());
 
+    let session = Arc::new(session);
     let update_items =
         record_context_update_items(&session, previous_context, current_context).await;
 
@@ -11005,6 +11075,7 @@ async fn record_context_updates_omits_environment_item_when_disabled() {
         environment.shell,
     );
 
+    let session = Arc::new(session);
     let update_items =
         record_context_update_items(&session, previous_context, current_context).await;
 
@@ -11018,7 +11089,7 @@ async fn record_context_updates_omits_environment_item_when_disabled() {
 }
 
 async fn record_context_update_items(
-    session: &Session,
+    session: &Arc<Session>,
     previous_context: Arc<TurnContext>,
     current_context: TurnContext,
 ) -> Vec<ResponseItem> {
@@ -11452,6 +11523,103 @@ async fn prepared_context_update_polls_contributors_once_across_planning_and_com
     assert_eq!(thread_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert_eq!(turn_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert_eq!(world_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let history = session.clone_history().await;
+    let texts = developer_input_texts(history.raw_items());
+    assert!(texts.contains(&"prepared thread context"));
+    assert!(texts.contains(
+        &crate::stable_context::turn_contribution_text(0, "prepared turn context").as_str()
+    ));
+}
+
+#[tokio::test]
+async fn prepared_context_update_replaces_and_removes_turn_fragments_without_startup_reinjection() {
+    struct ChangingContributor(Arc<std::sync::atomic::AtomicUsize>);
+    impl codex_extension_api::ContextContributor for ChangingContributor {
+        fn contribute_turn_context<'a>(
+            &'a self,
+            _input: codex_extension_api::TurnContextContributionInput<'a>,
+        ) -> codex_extension_api::ExtensionFuture<'a, Vec<codex_extension_api::PromptFragment>>
+        {
+            Box::pin(async move {
+                match self.0.load(std::sync::atomic::Ordering::SeqCst) {
+                    0 => vec![codex_extension_api::PromptFragment::developer_policy(
+                        "old turn contribution",
+                    )],
+                    1 => vec![codex_extension_api::PromptFragment::developer_policy(
+                        "new turn contribution",
+                    )],
+                    _ => Vec::new(),
+                }
+            })
+        }
+    }
+    let (mut session, mut turn) = make_session_and_context().await;
+    turn.developer_instructions = Some("startup instructions must occur once".to_string());
+    let revision = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut builder = codex_extension_api::ExtensionRegistryBuilder::new();
+    builder.prompt_contributor(Arc::new(ChangingContributor(Arc::clone(&revision))));
+    session.services.extensions = Arc::new(builder.build());
+    let session = Arc::new(session);
+    let step = StepContext::for_test(Arc::new(turn));
+    for phase in 0..3 {
+        revision.store(phase, std::sync::atomic::Ordering::SeqCst);
+        let before = session.clone_history().await.raw_items().len();
+        let prepared = session.prepare_context_update(&step).await;
+        // Mutating the contributor after preparation cannot change the accepted candidate.
+        revision.store(99, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            session
+                .compare_and_record_context_updates(
+                    prepared,
+                    session.services.planning_generation()
+                )
+                .await
+                .is_some()
+        );
+        let history = session.clone_history().await;
+        let added = developer_input_texts(&history.raw_items()[before..]);
+        if phase > 0 {
+            assert!(!added.contains(&"startup instructions must occur once"));
+            assert_eq!(added.len(), 1);
+        }
+        assert!(
+            added.contains(
+                &match phase {
+                    0 => crate::stable_context::turn_contribution_text(0, "old turn contribution"),
+                    1 => crate::stable_context::turn_contribution_text(0, "new turn contribution"),
+                    _ => crate::stable_context::turn_contribution_removal(0),
+                }
+                .as_str()
+            )
+        );
+        let projection = crate::stable_context::project_stable_context(
+            history.raw_items().to_vec().into(),
+            crate::stable_context::StableContextTarget::Sampling,
+        );
+        let texts = developer_input_texts(&projection.items);
+        assert_eq!(
+            texts
+                .iter()
+                .filter(|text| **text == "startup instructions must occur once")
+                .count(),
+            1
+        );
+        assert_eq!(
+            texts
+                .iter()
+                .filter(|text| text.contains("old turn contribution"))
+                .count(),
+            usize::from(phase == 0)
+        );
+        assert_eq!(
+            texts
+                .iter()
+                .filter(|text| text.contains("new turn contribution"))
+                .count(),
+            usize::from(phase == 1)
+        );
+        assert!(!texts.iter().any(|text| text.contains("state=\"removed\"")));
+    }
 }
 
 #[tokio::test]
@@ -11490,7 +11658,15 @@ async fn extension_prompt_budget_charges_message_envelopes_and_ignores_empty_sep
         .build_initial_context_with_world_state_and_mcp(turn_context.as_ref(), &world_state, false)
         .await;
 
-    assert!(developer_input_texts(&built.items).contains(&"useful envelope-budget contribution"));
+    assert!(
+        developer_input_texts(&built.items).contains(
+            &crate::stable_context::turn_contribution_text(
+                0,
+                "useful envelope-budget contribution"
+            )
+            .as_str()
+        )
+    );
     assert!(built.turn_context_items.len() > 1);
     assert!(built.turn_context_items.iter().all(|item| matches!(
         item,
@@ -11502,12 +11678,14 @@ async fn extension_prompt_budget_charges_message_envelopes_and_ignores_empty_sep
     )));
     assert_eq!(
         developer_input_texts(&built.turn_context_items)[0],
-        "useful envelope-budget contribution"
+        crate::stable_context::turn_contribution_text(0, "useful envelope-budget contribution")
     );
     assert!(
         developer_input_texts(&built.turn_context_items)[1..]
             .iter()
-            .all(|text| *text == "x")
+            .enumerate()
+            .all(|(index, text)| *text
+                == crate::stable_context::turn_contribution_text(index + 1, "x"))
     );
     let serialized_bytes: usize = built
         .turn_context_items
@@ -11532,7 +11710,7 @@ async fn extension_prompt_budget_charges_message_envelopes_and_ignores_empty_sep
                 ResponseItem::Message { role, content, .. }
                     if role == "developer" && matches!(
                         content.as_slice(),
-                        [ContentItem::InputText { text }] if text == "x"
+                        [ContentItem::InputText { text }] if text.ends_with("\nx\n</turn_context_contribution>")
                     )
             )
         })
@@ -11610,10 +11788,8 @@ async fn build_initial_context_includes_turn_context_fragments_from_extensions()
     let developer_messages = developer_message_texts(&initial_context);
 
     assert!(
-        developer_messages
-            .iter()
-            .flatten()
-            .any(|text| *text == "turn context extension enabled"),
+        developer_messages.iter().flatten().any(|text| *text
+            == crate::stable_context::turn_contribution_text(0, "turn context extension enabled")),
         "expected turn context extension developer text, got {developer_messages:?}"
     );
 }
@@ -11632,16 +11808,16 @@ async fn build_initial_context_polls_context_contributors_concurrently_and_appli
     .expect("context contributors should be polled concurrently");
     let contributed_texts = developer_input_texts(&initial_context)
         .into_iter()
-        .filter(|text| text.starts_with("concurrent "))
+        .filter(|text| text.contains("concurrent "))
         .collect::<Vec<_>>();
 
     assert_eq!(
         contributed_texts,
         vec![
-            "concurrent thread first",
-            "concurrent thread second",
-            "concurrent turn first",
-            "concurrent turn second",
+            "concurrent thread first".to_string(),
+            "concurrent thread second".to_string(),
+            crate::stable_context::turn_contribution_text(0, "concurrent turn first"),
+            crate::stable_context::turn_contribution_text(1, "concurrent turn second"),
         ]
     );
 }
@@ -12013,6 +12189,8 @@ async fn staged_compaction_baseline_prevents_duplicate_full_context_before_sampl
         });
     }
 
+    let session = Arc::new(session);
+
     session
         .record_context_updates_and_set_reference_context_item(&step_context)
         .await;
@@ -12055,6 +12233,8 @@ async fn record_context_updates_includes_turn_context_fragments_on_steady_state_
     }
 
     let step_context = StepContext::for_test(Arc::clone(&turn_context));
+
+    let session = Arc::new(session);
     session
         .record_context_updates_and_set_reference_context_item(&step_context)
         .await;
@@ -12062,10 +12242,8 @@ async fn record_context_updates_includes_turn_context_fragments_on_steady_state_
     let history = session.clone_history().await;
     let developer_messages = developer_message_texts(history.raw_items());
     assert!(
-        developer_messages
-            .iter()
-            .flatten()
-            .any(|text| *text == "turn context extension enabled"),
+        developer_messages.iter().flatten().any(|text| *text
+            == crate::stable_context::turn_contribution_text(0, "turn context extension enabled")),
         "expected steady-state turn context extension developer text, got {developer_messages:?}"
     );
 }
@@ -12436,6 +12614,8 @@ async fn record_context_updates_and_set_reference_context_item_injects_full_cont
     let (session, turn_context) = make_session_and_context().await;
     let turn_context = Arc::new(turn_context);
     let step_context = StepContext::for_test(Arc::clone(&turn_context));
+
+    let session = Arc::new(session);
     session
         .record_context_updates_and_set_reference_context_item(&step_context)
         .await;
@@ -12471,6 +12651,8 @@ async fn record_context_updates_and_set_reference_context_item_reinjects_full_co
     session
         .record_conversation_items(&turn_context, std::slice::from_ref(&compacted_summary))
         .await;
+
+    let session = Arc::new(session);
     session
         .record_context_updates_and_set_reference_context_item(&step_context)
         .await;
@@ -12534,6 +12716,8 @@ async fn record_context_updates_and_set_reference_context_item_persists_baseline
 
     let turn_context = Arc::new(turn_context);
     let step_context = StepContext::for_test(Arc::clone(&turn_context));
+
+    let session = Arc::new(session);
     session
         .record_context_updates_and_set_reference_context_item(&step_context)
         .await;
@@ -12572,6 +12756,8 @@ async fn record_context_updates_reinjects_full_context_when_model_visible_fragme
     turn_context.developer_instructions = Some("old model-visible instructions".to_string());
     let previous_context = Arc::new(turn_context);
     let previous_step = StepContext::for_test(Arc::clone(&previous_context));
+
+    let session = Arc::new(session);
     session
         .record_context_updates_and_set_reference_context_item(&previous_step)
         .await;
@@ -12712,6 +12898,8 @@ async fn record_context_updates_and_set_reference_context_item_persists_split_fi
 
     let turn_context = Arc::new(turn_context);
     let step_context = StepContext::for_test(Arc::clone(&turn_context));
+
+    let session = Arc::new(session);
     session
         .record_context_updates_and_set_reference_context_item(&step_context)
         .await;
@@ -12821,6 +13009,8 @@ async fn record_context_updates_and_set_reference_context_item_persists_full_rei
         .await;
     let turn_context = Arc::new(turn_context);
     let step_context = StepContext::for_test(Arc::clone(&turn_context));
+
+    let session = Arc::new(session);
     session
         .record_context_updates_and_set_reference_context_item(&step_context)
         .await;
@@ -13826,8 +14016,11 @@ async fn turn_complete_is_an_interaction_ready_boundary_for_rollback() {
     ];
     // CompletingTask supplies only completion; record the normal persisted turn
     // boundaries so rollback has two distinct user turns to reconstruct.
-    sess.send_event(first_turn.as_ref(), session_trace_turn_started(first_turn.as_ref()))
-        .await;
+    sess.send_event(
+        first_turn.as_ref(),
+        session_trace_turn_started(first_turn.as_ref()),
+    )
+    .await;
     sess.send_event(
         first_turn.as_ref(),
         EventMsg::UserMessage(UserMessageEvent {
@@ -13860,8 +14053,11 @@ async fn turn_complete_is_an_interaction_ready_boundary_for_rollback() {
     ];
     // CompletingTask supplies only completion; record the normal persisted turn
     // boundaries so rollback has two distinct user turns to reconstruct.
-    sess.send_event(rollback_turn.as_ref(), session_trace_turn_started(rollback_turn.as_ref()))
-        .await;
+    sess.send_event(
+        rollback_turn.as_ref(),
+        session_trace_turn_started(rollback_turn.as_ref()),
+    )
+    .await;
     sess.send_event(
         rollback_turn.as_ref(),
         EventMsg::UserMessage(UserMessageEvent {
@@ -13970,7 +14166,8 @@ async fn turn_aborted_persists_missing_call_output_before_terminal_event() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn ephemeral_durable_history_is_visible_once_without_creating_rollout() -> anyhow::Result<()> {
+async fn ephemeral_durable_history_is_visible_once_without_creating_rollout() -> anyhow::Result<()>
+{
     let server = start_mock_server().await;
     let request = mount_sse_once(
         &server,
@@ -14058,6 +14255,274 @@ async fn ephemeral_durable_history_is_visible_once_without_creating_rollout() ->
         "ephemeral turn and durability calls must not create persisted sessions"
     );
     Ok(())
+}
+
+#[tokio::test]
+async fn durable_conversation_commit_retry_keeps_post_tool_context_exactly_once() {
+    let (mut session, turn, _rx) = make_session_and_context_with_rx().await;
+    let store =
+        attach_in_memory_thread_store(Arc::get_mut(&mut session).expect("unique session")).await;
+    let hook: ResponseItem = crate::context_manager::updates::build_developer_update_item(vec![
+        "accepted hook context".to_string(),
+    ])
+    .expect("hook message");
+    turn.queue_post_tool_contexts("hooked-tool", vec![hook])
+        .await;
+    let output = ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: "hooked-tool".to_string(),
+        output: FunctionCallOutputPayload::from_text("accepted tool output".to_string()),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    session
+        .record_tool_completion_ordered(&turn, "hooked-tool", std::slice::from_ref(&output))
+        .await
+        .expect("first append");
+    assert!(turn.take_post_tool_contexts("hooked-tool").await.is_empty());
+    let first_appends = store.calls().await.append_items;
+    session
+        .record_tool_completion_ordered(&turn, "hooked-tool", &[output])
+        .await
+        .expect("idempotent retry");
+    assert_eq!(store.calls().await.append_items, first_appends);
+    let history = session.clone_history().await;
+    assert_eq!(history.raw_items().len(), 2);
+    assert!(
+        matches!(&history.raw_items()[0], ResponseItem::FunctionCallOutput { output, .. } if output.text_content() == Some("accepted tool output"))
+    );
+    assert_eq!(
+        developer_input_texts(history.raw_items()),
+        vec!["accepted hook context"]
+    );
+    let stored = session
+        .live_thread()
+        .expect("attached store")
+        .load_history(false)
+        .await
+        .expect("stored history");
+    let stored_items = stored
+        .items
+        .into_iter()
+        .filter_map(|item| match item {
+            RolloutItem::ResponseItem(item) => Some(item),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(stored_items, history.raw_items());
+}
+
+#[tokio::test]
+async fn durable_conversation_commit_append_failure_never_publishes_history_or_consumes_hooks() {
+    let (mut session, turn, _rx) = make_session_and_context_with_rx().await;
+    attach_thread_persistence(Arc::get_mut(&mut session).expect("unique session")).await;
+    session
+        .live_thread()
+        .expect("attached persistence")
+        .shutdown()
+        .await
+        .expect("close writer");
+    let output = ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: "failed-append".to_string(),
+        output: FunctionCallOutputPayload::from_text("must not publish".to_string()),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let hook: ResponseItem = crate::context_manager::updates::build_developer_update_item(vec![
+        "pending hook".to_string(),
+    ])
+    .expect("hook message");
+    turn.queue_post_tool_contexts("failed-append", vec![hook.clone()])
+        .await;
+    session
+        .record_conversation_items(&turn, std::slice::from_ref(&output))
+        .await;
+    assert!(session.clone_history().await.raw_items().is_empty());
+    assert!(
+        session
+            .record_tool_completion_ordered(&turn, "failed-append", &[output])
+            .await
+            .is_err()
+    );
+    assert!(session.clone_history().await.raw_items().is_empty());
+    assert_eq!(
+        turn.take_post_tool_contexts("failed-append").await,
+        vec![hook]
+    );
+    let step = StepContext::for_test(Arc::clone(&turn));
+    let prepared = session.prepare_context_update(&step).await;
+    assert!(
+        session
+            .compare_and_record_context_updates(prepared, session.services.planning_generation())
+            .await
+            .is_none()
+    );
+    assert!(session.clone_history().await.raw_items().is_empty());
+    assert!(
+        session
+            .state
+            .lock()
+            .await
+            .pending_context_baseline()
+            .is_none()
+    );
+    session
+        .record_inter_agent_communication(
+            &turn,
+            InterAgentCommunication::new(
+                AgentPath::root().join("worker").expect("worker"),
+                AgentPath::root(),
+                Vec::new(),
+                "must not publish child output".to_string(),
+                false,
+            ),
+        )
+        .await;
+    assert!(session.clone_history().await.raw_items().is_empty());
+}
+
+#[tokio::test]
+async fn durable_conversation_commit_flush_failure_retries_without_duplicate_append() {
+    let (mut session, turn, _rx) = make_session_and_context_with_rx().await;
+    let rollout_path = attach_thread_persistence_with_materialization(
+        Arc::get_mut(&mut session).expect("unique session"),
+        false,
+    )
+    .await;
+    tokio::fs::create_dir_all(&rollout_path)
+        .await
+        .expect("block deferred rollout materialization");
+    let output = ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: "accepted-before-flush-failure".to_string(),
+        output: FunctionCallOutputPayload::from_text("accepted output".to_string()),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    session
+        .record_conversation_items_durable(&turn, std::slice::from_ref(&output))
+        .await
+        .expect_err("the real writer cannot flush into a directory");
+    let accepted_history = session.clone_history().await.into_raw_items();
+    assert_eq!(
+        accepted_history.len(),
+        1,
+        "accepted append is published once"
+    );
+    assert!(
+        matches!(&accepted_history[0], ResponseItem::FunctionCallOutput { output, .. }
+        if output.text_content() == Some("accepted output"))
+    );
+    tokio::fs::remove_dir(&rollout_path)
+        .await
+        .expect("remove empty obstruction at the exact rollout file path");
+    session
+        .record_conversation_items_durable(&turn, &[output])
+        .await
+        .expect("retry flushes the already accepted append");
+    assert_eq!(session.clone_history().await.raw_items(), accepted_history);
+    let stored = session
+        .live_thread()
+        .expect("writer")
+        .load_history(false)
+        .await
+        .expect("durable history");
+    let stored_items = stored
+        .items
+        .into_iter()
+        .filter_map(|item| match item {
+            RolloutItem::ResponseItem(item) => Some(item),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        stored_items, accepted_history,
+        "retry must not append a duplicate to storage"
+    );
+}
+
+#[tokio::test]
+async fn durable_conversation_commit_context_and_inter_agent_writes_survive_cancellation_in_order()
+{
+    let (mut session, turn, _rx) = make_session_and_context_with_rx().await;
+    let store =
+        attach_in_memory_thread_store(Arc::get_mut(&mut session).expect("unique session")).await;
+    let prepared = session
+        .prepare_context_update(&StepContext::for_test(Arc::clone(&turn)))
+        .await;
+    let expected_context_count = prepared.context_items.len();
+    assert!(expected_context_count > 0, "exercise a real context append");
+    let initial_appends = store.calls().await.append_items;
+    let gate = session
+        .durable_history_commit_gate
+        .acquire()
+        .await
+        .expect("commit gate");
+    let mut context = Box::pin(
+        session
+            .compare_and_record_context_updates(prepared, session.services.planning_generation()),
+    );
+    assert!(futures::poll!(context.as_mut()).is_pending());
+    drop(context);
+    let mut communication = Box::pin(session.record_inter_agent_communication(
+        &turn,
+        InterAgentCommunication::new(
+            AgentPath::root().join("worker").expect("worker"),
+            AgentPath::root(),
+            Vec::new(),
+            "retained child result".to_string(),
+            false,
+        ),
+    ));
+    assert!(futures::poll!(communication.as_mut()).is_pending());
+    drop(communication);
+    // Give both shielded tasks a chance to attempt the held gate.
+    tokio::task::yield_now().await;
+    assert_eq!(store.calls().await.append_items, initial_appends);
+    assert!(session.clone_history().await.raw_items().is_empty());
+    drop(gate);
+    timeout(
+        Duration::from_secs(5),
+        session.flush_rollout_after_ordered_commits(&turn),
+    )
+    .await
+    .expect("canceled callers cannot strand commits")
+    .expect("flush accepted writes");
+    let history = session.clone_history().await.into_raw_items();
+    assert_eq!(history.len(), expected_context_count + 1);
+    assert_eq!(
+        history
+            .iter()
+            .filter(|item| serde_json::to_string(item)
+                .unwrap()
+                .contains("retained child result"))
+            .count(),
+        1
+    );
+    assert!(
+        session
+            .state
+            .lock()
+            .await
+            .pending_context_baseline()
+            .is_some()
+    );
+    let stored = session
+        .live_thread()
+        .expect("writer")
+        .load_history(false)
+        .await
+        .expect("stored history");
+    let stored_items = stored
+        .items
+        .into_iter()
+        .filter_map(|item| match item {
+            RolloutItem::ResponseItem(item) => Some(item),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        stored_items, history,
+        "both writers must publish in the same order as storage"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -17853,6 +18318,8 @@ fn turn_context_projection_uses_one_worker_and_preserves_gitdir_permissions() {
         );
         let step = StepContext::for_test(Arc::clone(&turn));
         assert!(session.reference_context_item().await.is_none());
+
+        let session = Arc::new(session);
         session
             .record_context_updates_and_set_reference_context_item(&step)
             .await;
@@ -18565,7 +19032,6 @@ async fn shutdown_waits_for_owned_trace_and_finishes_bundle_before_acknowledgmen
     Ok(())
 }
 
-
 #[cfg(test)]
 mod abandoned_interactive_registry_tests {
     use super::*;
@@ -18662,6 +19128,29 @@ mod abandoned_interactive_registry_tests {
                 assert_eq!(request.server_name, "registry-server")
             }
             (_, event) => panic!("unexpected registry event: {event:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_approval_requests_cannot_register_in_a_replacement_turn() {
+        for kind in 0..2 {
+            let (session, turn, events) = make_session_and_context_with_rx().await;
+            let active = ActiveTurn {
+                terminal: Some(crate::state::TurnTerminalCoordinator::new(
+                    "replacement-turn".to_string(),
+                )),
+                ..Default::default()
+            };
+            let state = Arc::clone(&active.turn_state);
+            *session.active_turn.lock().await = Some(active);
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                request(&session, &turn, kind, false),
+            )
+            .await
+            .expect("stale request returns Abort without waiting for a user");
+            assert!(!pending(&state, kind).await);
+            assert!(events.try_recv().is_err());
         }
     }
 

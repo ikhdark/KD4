@@ -177,7 +177,7 @@ pub(crate) struct ConcurrencySlice {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct FindingTotals {
     pub confirmed: u32,
-    pub rejected: u32,
+    pub rejected: Option<u32>,
     pub unresolved: u32,
 }
 
@@ -227,9 +227,9 @@ pub(crate) struct TaskMetricInput {
     pub concurrency: Vec<ConcurrencySlice>,
     pub first_pass_validation_succeeded: bool,
     pub acceptance_total: u32,
-    pub acceptance_first_pass_closed: u32,
+    pub acceptance_first_pass_closed: Option<u32>,
     pub acceptance_final_closed: u32,
-    pub duplicate_work: u32,
+    pub duplicate_work: Option<u32>,
     pub conflicts: u32,
     pub drift: u32,
     pub reviewer_findings: FindingTotals,
@@ -250,11 +250,11 @@ pub(crate) struct TaskMetrics {
     pub concurrency_utilization_basis_points: u16,
     pub first_pass_validation_succeeded: bool,
     pub acceptance_total: u32,
-    pub acceptance_first_pass_closed: u32,
+    pub acceptance_first_pass_closed: Option<u32>,
     pub acceptance_final_closed: u32,
-    pub first_pass_acceptance_basis_points: u16,
+    pub first_pass_acceptance_basis_points: Option<u16>,
     pub final_acceptance_basis_points: u16,
-    pub duplicate_work: u32,
+    pub duplicate_work: Option<u32>,
     pub conflicts: u32,
     pub drift: u32,
     pub reviewer_findings: FindingTotals,
@@ -268,9 +268,9 @@ pub(crate) struct TaskMetrics {
 pub(crate) struct TaskMetricTerminalInput {
     pub first_pass_validation_succeeded: bool,
     pub acceptance_total: u32,
-    pub acceptance_first_pass_closed: u32,
+    pub acceptance_first_pass_closed: Option<u32>,
     pub acceptance_final_closed: u32,
-    pub duplicate_work: u32,
+    pub duplicate_work: Option<u32>,
     pub conflicts: u32,
     pub drift: u32,
     pub reviewer_findings: FindingTotals,
@@ -283,7 +283,6 @@ pub(crate) struct TaskMetricTerminalInput {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MetricsError {
     TooManyRows,
-    TooManyEvents,
     RecorderFinished,
     InvalidEventTime,
     InvalidCriticalPathIdleTime,
@@ -323,7 +322,9 @@ impl TaskMetrics {
         if input.critical_path_idle_time > input.duration {
             return Err(MetricsError::InvalidCriticalPathIdleTime);
         }
-        if input.acceptance_first_pass_closed > input.acceptance_final_closed
+        if input
+            .acceptance_first_pass_closed
+            .is_some_and(|closed| closed > input.acceptance_final_closed)
             || input.acceptance_final_closed > input.acceptance_total
         {
             return Err(MetricsError::InvalidAcceptanceClosure);
@@ -360,10 +361,9 @@ impl TaskMetrics {
             acceptance_total: input.acceptance_total,
             acceptance_first_pass_closed: input.acceptance_first_pass_closed,
             acceptance_final_closed: input.acceptance_final_closed,
-            first_pass_acceptance_basis_points: ratio(
-                u128::from(input.acceptance_first_pass_closed),
-                u128::from(input.acceptance_total),
-            ),
+            first_pass_acceptance_basis_points: input
+                .acceptance_first_pass_closed
+                .map(|closed| ratio(u128::from(closed), u128::from(input.acceptance_total))),
             final_acceptance_basis_points: ratio(
                 u128::from(input.acceptance_final_closed),
                 u128::from(input.acceptance_total),
@@ -426,28 +426,31 @@ impl TaskMetrics {
                 bool_tag(self.first_pass_validation_succeeded),
             )],
         );
-        session_telemetry.histogram(
-            TASK_ACCEPTANCE_CLOSURE_METRIC,
-            i64::from(self.first_pass_acceptance_basis_points),
-            &[(PHASE_TAG, "first_pass")],
-        );
+        if let Some(closure) = self.first_pass_acceptance_basis_points {
+            session_telemetry.histogram(
+                TASK_ACCEPTANCE_CLOSURE_METRIC,
+                i64::from(closure),
+                &[(PHASE_TAG, "first_pass")],
+            );
+        }
         session_telemetry.histogram(
             TASK_ACCEPTANCE_CLOSURE_METRIC,
             i64::from(self.final_acceptance_basis_points),
             &[(PHASE_TAG, "final")],
         );
-        session_telemetry.histogram(
-            TASK_DUPLICATE_WORK_METRIC,
-            i64::from(self.duplicate_work),
-            &[],
-        );
+        if let Some(duplicate_work) = self.duplicate_work {
+            session_telemetry.histogram(TASK_DUPLICATE_WORK_METRIC, i64::from(duplicate_work), &[]);
+        }
         session_telemetry.histogram(TASK_CONFLICT_METRIC, i64::from(self.conflicts), &[]);
         session_telemetry.histogram(TASK_DRIFT_METRIC, i64::from(self.drift), &[]);
         for (disposition, count) in [
-            ("confirmed", self.reviewer_findings.confirmed),
+            ("confirmed", Some(self.reviewer_findings.confirmed)),
             ("rejected", self.reviewer_findings.rejected),
-            ("unresolved", self.reviewer_findings.unresolved),
+            ("unresolved", Some(self.reviewer_findings.unresolved)),
         ] {
+            let Some(count) = count else {
+                continue;
+            };
             session_telemetry.histogram(
                 TASK_REVIEWER_FINDING_METRIC,
                 i64::from(count),
@@ -522,7 +525,10 @@ impl TaskMetricRecorder {
         }
         let mut next = self.usage_by_role.get(&key).copied().unwrap_or_default();
         add_usage(&mut next, tokens, calls)?;
-        self.reserve_non_terminal_event()?;
+        self.recorded_events = self
+            .recorded_events
+            .saturating_add(1)
+            .min(MAX_RECORDED_EVENTS);
         self.usage_by_role.insert(key, next);
         Ok(())
     }
@@ -547,7 +553,10 @@ impl TaskMetricRecorder {
         validate_concurrency_state(active_turns, capacity)?;
         let (weighted_active_time, weighted_capacity_time, critical_path_idle_time) =
             self.integrated_until(elapsed)?;
-        self.reserve_non_terminal_event()?;
+        self.recorded_events = self
+            .recorded_events
+            .saturating_add(1)
+            .min(MAX_RECORDED_EVENTS);
         self.last_elapsed = elapsed;
         self.active_turns = active_turns;
         self.capacity = capacity;
@@ -602,7 +611,10 @@ impl TaskMetricRecorder {
             weighted_active_time,
             weighted_capacity_time,
         )?;
-        self.reserve_terminal_event()?;
+        self.recorded_events = self
+            .recorded_events
+            .saturating_add(1)
+            .min(MAX_RECORDED_EVENTS);
         self.last_elapsed = elapsed;
         self.weighted_active_time = weighted_active_time;
         self.weighted_capacity_time = weighted_capacity_time;
@@ -611,17 +623,7 @@ impl TaskMetricRecorder {
         Ok(Some(metrics))
     }
 
-    pub(crate) fn finish_and_emit(
-        &mut self,
-        elapsed: Duration,
-        terminal: TaskMetricTerminalInput,
-        session_telemetry: &SessionTelemetry,
-    ) -> Result<Option<TaskMetrics>, MetricsError> {
-        self.finish_with(elapsed, terminal, |metrics| {
-            metrics.emit(session_telemetry);
-        })
-    }
-
+    #[cfg(test)]
     fn finish_with(
         &mut self,
         elapsed: Duration,
@@ -641,23 +643,6 @@ impl TaskMetricRecorder {
         } else {
             Ok(())
         }
-    }
-
-    fn reserve_non_terminal_event(&mut self) -> Result<(), MetricsError> {
-        self.reserve_event(MAX_RECORDED_EVENTS.saturating_sub(1))
-    }
-
-    fn reserve_terminal_event(&mut self) -> Result<(), MetricsError> {
-        self.reserve_event(MAX_RECORDED_EVENTS)
-    }
-
-    fn reserve_event(&mut self, limit: usize) -> Result<(), MetricsError> {
-        self.ensure_recordable()?;
-        if self.recorded_events >= limit {
-            return Err(MetricsError::TooManyEvents);
-        }
-        self.recorded_events += 1;
-        Ok(())
     }
 
     fn integrated_until(
@@ -730,30 +715,35 @@ impl TaskMetricRuntime {
             .record_store_role_usage(self.role, self.capability, tokens, calls)
     }
 
-    pub(crate) fn finish_and_emit(
+    pub(super) fn finish(
         &mut self,
         task: &AgentTask,
-        session_telemetry: &SessionTelemetry,
-    ) -> Result<bool, MetricsError> {
-        let emitted = self
-            .recorder
-            .finish_and_emit(
-                self.started_at.elapsed(),
-                terminal_input(task),
-                session_telemetry,
-            )
-            .map(|metrics| metrics.is_some())?;
-        if emitted {
-            session_telemetry.counter(
-                TASK_TERMINAL_STATE_METRIC,
-                1,
-                &[(
-                    "state",
-                    attempt_state_metric_label(task.current_attempt.state),
-                )],
-            );
-        }
-        Ok(emitted)
+    ) -> Result<Option<TerminalTaskMetrics>, MetricsError> {
+        self.recorder
+            .finish(self.started_at.elapsed(), terminal_input(task))
+            .map(|metrics| {
+                metrics.map(|metrics| TerminalTaskMetrics {
+                    metrics,
+                    state: task.current_attempt.state,
+                })
+            })
+    }
+}
+
+/// Constructed only by successful recorder finalization and consumed once outside the index lock.
+pub(super) struct TerminalTaskMetrics {
+    metrics: TaskMetrics,
+    state: AttemptState,
+}
+
+impl TerminalTaskMetrics {
+    pub(super) fn emit(self, session_telemetry: &SessionTelemetry) {
+        self.metrics.emit(session_telemetry);
+        session_telemetry.counter(
+            TASK_TERMINAL_STATE_METRIC,
+            1,
+            &[("state", attempt_state_metric_label(self.state))],
+        );
     }
 }
 
@@ -795,11 +785,9 @@ fn terminal_input(task: &AgentTask) -> TaskMetricTerminalInput {
             )
         })
         .unwrap_or(0);
-    let acceptance_first_pass_closed = if task.current_attempt.ordinal == 0 {
-        acceptance_final_closed
-    } else {
-        0
-    };
+    // Earlier attempt criterion results are not present in this snapshot.
+    let acceptance_first_pass_closed =
+        (task.current_attempt.ordinal == 0).then_some(acceptance_final_closed);
     let first_pass_validation_succeeded = task.current_attempt.ordinal == 0
         && receipt.is_some_and(|receipt| {
             receipt.status == AgentStatusClaim::Completed
@@ -884,7 +872,7 @@ fn terminal_input(task: &AgentTask) -> TaskMetricTerminalInput {
         acceptance_total,
         acceptance_first_pass_closed,
         acceptance_final_closed,
-        duplicate_work: 0,
+        duplicate_work: None,
         conflicts,
         drift,
         reviewer_findings,

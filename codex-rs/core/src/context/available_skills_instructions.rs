@@ -90,6 +90,7 @@ mod tests {
             .strip_prefix("<skills_usage_instructions>\n## How to use skills\n")
             .and_then(|text| text.strip_suffix("\n</skills_usage_instructions>"))
             .expect("complete skills-usage markers and heading");
+        assert_eq!(body, SKILLS_HOW_TO_USE);
         assert!(body.contains("read each selected `SKILL.md` completely"));
         assert!(body.contains("Do not delegate that reading or interpretation"));
         assert!(body.contains("Read task-required linked instructions"));

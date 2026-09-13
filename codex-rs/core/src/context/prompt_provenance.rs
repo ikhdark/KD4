@@ -212,6 +212,9 @@ impl PromptProvenanceSidecar {
         let mut contributions_by_item = BTreeMap::new();
         let mut aligned_items = Vec::with_capacity(items.len());
         let mut current_input_fingerprint = None;
+        let current_turn_id = current_input_index
+            .and_then(|index| items.get(index))
+            .and_then(ResponseItem::turn_id);
         for (index, item) in items.iter().enumerate() {
             let ResponseItem::Message { content, .. } = item else {
                 aligned_items.push(PromptItemProvenance::default());
@@ -227,8 +230,12 @@ impl PromptProvenanceSidecar {
                     _ => None,
                 })
                 .collect::<Vec<_>>();
-            let current_input = current_input_index == Some(index);
-            let fingerprint = if prompt_item_requires_fingerprint(&categories, current_input) {
+            let current_input = current_input_index == Some(index)
+                || current_turn_id.is_some_and(|turn_id| item.turn_id() == Some(turn_id));
+            let fingerprint = if prompt_item_requires_fingerprint(
+                &categories,
+                current_input_index == Some(index),
+            ) {
                 response_item_fingerprint(item).ok()
             } else {
                 None
@@ -238,7 +245,7 @@ impl PromptProvenanceSidecar {
             {
                 contributions_by_item.insert(fingerprint, categories.clone().into());
             }
-            if current_input {
+            if current_input_index == Some(index) {
                 current_input_fingerprint = fingerprint;
             }
             aligned_items.push(PromptItemProvenance::new(categories, current_input));
@@ -247,10 +254,7 @@ impl PromptProvenanceSidecar {
         Self {
             contributions_by_item: Arc::new(contributions_by_item),
             aligned_items: aligned_items.into(),
-            current_turn_id: current_input_index
-                .and_then(|index| items.get(index))
-                .and_then(ResponseItem::turn_id)
-                .map(str::to_string),
+            current_turn_id: current_turn_id.map(str::to_string),
             current_input_fingerprint,
         }
     }
@@ -269,6 +273,8 @@ impl PromptProvenanceSidecar {
     }
 
     /// Adds provenance for multiple built-in fragments in one history pass.
+    /// Message positions and contents must still match the assembled sequence;
+    /// tool-output compaction may change non-message items in place.
     /// If assembly supplied the same text more than once, the last category
     /// wins, matching repeated `with_exact_fragment` calls.
     pub(crate) fn with_exact_fragments<'a>(
@@ -280,23 +286,17 @@ impl PromptProvenanceSidecar {
         if fragments.is_empty() {
             return self.clone();
         }
-        let mut contributions_by_item = self.contributions_by_item.as_ref().clone();
+        let mut contributions_by_item = Arc::clone(&self.contributions_by_item);
         let mut aligned_items = Vec::with_capacity(items.len());
         for (index, item) in items.iter().enumerate() {
             let ResponseItem::Message { content, .. } = item else {
                 aligned_items.push(PromptItemProvenance::default());
                 continue;
             };
-            let Ok(fingerprint) = response_item_fingerprint(item) else {
-                aligned_items.push(PromptItemProvenance::new(
-                    vec![None; content.len()],
-                    self.is_current_input(item),
-                ));
-                continue;
-            };
-            let mut categories = contributions_by_item
-                .get(&fingerprint)
-                .map(|categories| categories.to_vec())
+            let aligned = self.aligned_item(index);
+            let mut categories = aligned
+                .map(|item| item.categories.to_vec())
+                .or_else(|| self.contributions(item).map(<[_]>::to_vec))
                 .unwrap_or_else(|| vec![None; content.len()]);
             let mut changed = false;
             for (index, content_item) in content.iter().enumerate() {
@@ -312,16 +312,45 @@ impl PromptProvenanceSidecar {
                     changed = true;
                 }
             }
-            if changed {
-                contributions_by_item.insert(fingerprint, categories.clone().into());
+            if changed && let Ok(fingerprint) = response_item_fingerprint(item) {
+                Arc::make_mut(&mut contributions_by_item)
+                    .insert(fingerprint, categories.clone().into());
             }
             aligned_items.push(PromptItemProvenance::new(
                 categories,
-                self.aligned_items
-                    .get(index)
-                    .is_some_and(|item| item.current_input)
-                    || self.is_current_input(item),
+                aligned.map_or_else(|| self.is_current_input(item), |item| item.current_input),
             ));
+        }
+        Self {
+            contributions_by_item,
+            aligned_items: aligned_items.into(),
+            current_turn_id: self.current_turn_id.clone(),
+            current_input_fingerprint: self.current_input_fingerprint,
+        }
+    }
+
+    /// Assigns one already-rendered response item to a category without
+    /// matching equal text in any other item. The assembled sequence must be
+    /// an unchanged suffix of `items`, optionally preceded by transport context.
+    pub(crate) fn with_response_item_category(
+        &self,
+        items: &[ResponseItem],
+        index: usize,
+        category: PromptContextCategory,
+    ) -> Self {
+        let Some(item @ ResponseItem::Message { content, .. }) = items.get(index) else {
+            return self.clone();
+        };
+        let offset = items.len().saturating_sub(self.aligned_items.len());
+        let mut aligned_items = vec![PromptItemProvenance::default(); offset];
+        aligned_items.extend(self.aligned_items.iter().cloned());
+        let Some(aligned) = aligned_items.get_mut(index) else {
+            return self.clone();
+        };
+        aligned.categories = vec![Some(category); content.len()].into();
+        let mut contributions_by_item = self.contributions_by_item.as_ref().clone();
+        if let Ok(fingerprint) = response_item_fingerprint(item) {
+            contributions_by_item.insert(fingerprint, vec![Some(category); content.len()].into());
         }
         Self {
             contributions_by_item: Arc::new(contributions_by_item),
@@ -331,32 +360,53 @@ impl PromptProvenanceSidecar {
         }
     }
 
-    /// Assigns one already-rendered response item to a category without
-    /// matching equal text in any other item.
-    pub(crate) fn with_response_item_category(
-        &self,
-        item: &ResponseItem,
-        category: PromptContextCategory,
-    ) -> Self {
-        let mut contributions_by_item = self.contributions_by_item.as_ref().clone();
-        if let ResponseItem::Message { content, .. } = item
-            && let Ok(fingerprint) = response_item_fingerprint(item)
-        {
-            contributions_by_item.insert(fingerprint, vec![Some(category); content.len()].into());
-        }
-        Self {
-            contributions_by_item: Arc::new(contributions_by_item),
-            aligned_items: Arc::clone(&self.aligned_items),
-            current_turn_id: self.current_turn_id.clone(),
-            current_input_fingerprint: self.current_input_fingerprint,
-        }
-    }
-
     fn aligned_item(&self, index: usize) -> Option<&PromptItemProvenance> {
         self.aligned_items.get(index)
     }
 
+    /// Rebuild alignment only when transport fallback replay changes the
+    /// assembled sequence. Canonical fingerprints are recovery hints here;
+    /// ordinary requests retain occurrence-specific aligned attribution.
+    pub(crate) fn for_reprojected_items(&self, items: &[ResponseItem]) -> Self {
+        let aligned_items = items
+            .iter()
+            .map(|item| {
+                let ResponseItem::Message { content, .. } = item else {
+                    return PromptItemProvenance::default();
+                };
+                let fingerprint = if !self.contributions_by_item.is_empty()
+                    || (self.current_turn_id.is_none() && self.current_input_fingerprint.is_some())
+                {
+                    response_item_fingerprint(item).ok()
+                } else {
+                    None
+                };
+                let current_input = if let Some(turn_id) = self.current_turn_id.as_deref() {
+                    item.turn_id() == Some(turn_id)
+                } else {
+                    self.current_input_fingerprint
+                        .zip(fingerprint)
+                        .is_some_and(|(expected, actual)| expected == actual)
+                };
+                PromptItemProvenance::new(
+                    fingerprint
+                        .and_then(|fingerprint| self.contributions_by_item.get(&fingerprint))
+                        .map(|categories| categories.to_vec())
+                        .unwrap_or_else(|| vec![None; content.len()]),
+                    current_input,
+                )
+            })
+            .collect::<Vec<_>>();
+        Self {
+            aligned_items: aligned_items.into(),
+            ..self.clone()
+        }
+    }
+
     fn contributions(&self, item: &ResponseItem) -> Option<&[Option<PromptContextCategory>]> {
+        if self.contributions_by_item.is_empty() {
+            return None;
+        }
         let fingerprint = response_item_fingerprint(item).ok()?;
         self.contributions_by_item
             .get(&fingerprint)
@@ -367,9 +417,10 @@ impl PromptProvenanceSidecar {
         if let Some(current_turn_id) = self.current_turn_id.as_deref() {
             return item.turn_id() == Some(current_turn_id);
         }
-        self.current_input_fingerprint
-            .zip(response_item_fingerprint(item).ok())
-            .is_some_and(|(expected, actual)| expected == actual)
+        let Some(expected) = self.current_input_fingerprint else {
+            return false;
+        };
+        response_item_fingerprint(item).is_ok_and(|actual| expected == actual)
     }
 }
 
@@ -415,9 +466,13 @@ impl PromptContextBreakdown {
         sidecar: &PromptProvenanceSidecar,
     ) -> serde_json::Result<Self> {
         let mut breakdown = Self::default();
-        for item in items {
+        let aligned_offset = items.len().saturating_sub(sidecar.aligned_items.len());
+        for (index, item) in items.iter().enumerate() {
             let serialized_item = serde_json::to_vec(item)?;
-            breakdown.record_response_item(item, &serialized_item, sidecar)?;
+            let aligned = index
+                .checked_sub(aligned_offset)
+                .and_then(|index| sidecar.aligned_item(index));
+            breakdown.record_response_item(item, &serialized_item, sidecar, aligned)?;
         }
         breakdown.record_overhead(
             PromptContextCategory::OtherInjected,
@@ -536,6 +591,7 @@ impl PromptContextBreakdown {
         item: &ResponseItem,
         serialized_item: &[u8],
         sidecar: &PromptProvenanceSidecar,
+        provenance: Option<&PromptItemProvenance>,
     ) -> serde_json::Result<()> {
         if matches!(item, ResponseItem::AdditionalTools { .. }) {
             self.record_serialized(PromptContextCategory::ToolSchemas, serialized_item);
@@ -545,15 +601,18 @@ impl PromptContextBreakdown {
             self.record_serialized(PromptContextCategory::History, serialized_item);
             return Ok(());
         };
-        let fallback = if role == "user" && sidecar.is_current_input(item) {
+        let fallback = if role == "user"
+            && provenance.map_or_else(|| sidecar.is_current_input(item), |item| item.current_input)
+        {
             PromptContextCategory::TaskInput
         } else if role == "developer" {
             PromptContextCategory::OtherInjected
         } else {
             PromptContextCategory::History
         };
-        let categories = sidecar
-            .contributions(item)
+        let categories = provenance
+            .map(|item| item.categories.as_ref())
+            .or_else(|| sidecar.contributions(item))
             .map(|categories| {
                 categories
                     .iter()
@@ -692,6 +751,8 @@ fn sequence_envelope_bytes(item_count: usize) -> u64 {
 }
 
 fn response_item_fingerprint(item: &ResponseItem) -> serde_json::Result<[u8; 32]> {
+    #[cfg(test)]
+    tests::FINGERPRINT_CALLS.with(|calls| calls.set(calls.get() + 1));
     let mut normalized = item.clone();
     normalized.clear_internal_chat_message_metadata_passthrough();
     let serialized = serde_json::to_vec(&normalized)?;
@@ -733,6 +794,7 @@ fn category_for_stable_kind(kind: StableContextKind) -> PromptContextCategory {
         | StableContextKind::MultiAgentUsageHint => PromptContextCategory::AgentRole,
         StableContextKind::RequestUserInput
         | StableContextKind::Wait
+        | StableContextKind::TurnContribution
         | StableContextKind::DynamicHistory
         | StableContextKind::TaskModelGuidance
         | StableContextKind::ModelSwitch
@@ -750,6 +812,32 @@ mod tests {
     use super::*;
     use codex_extension_api::PromptSlot;
     use codex_protocol::models::InternalChatMessageMetadataPassthrough;
+
+    // Synchronous tests count real fingerprint work without timing thresholds
+    // or interference from tests running on other threads.
+    thread_local! {
+        pub(super) static FINGERPRINT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    fn measure_both(
+        items: &[ResponseItem],
+        sidecar: &PromptProvenanceSidecar,
+    ) -> [PromptContextBreakdown; 2] {
+        let encoded = serde_json::to_string(items).unwrap();
+        let raw_items: Vec<&RawValue> = serde_json::from_str(&encoded).unwrap();
+        let logical = PromptContextBreakdown::from_response_items(items, sidecar).unwrap();
+        let wire = PromptContextBreakdown::from_serialized_response_items(
+            items, &raw_items, sidecar, None,
+        )
+        .unwrap();
+        assert_eq!(logical.measurements(), wire.measurements());
+        assert_eq!(logical.total_bytes(), encoded.len() as u64);
+        [logical, wire]
+    }
+
+    fn item_bytes(item: &ResponseItem) -> u64 {
+        serde_json::to_vec(item).unwrap().len() as u64
+    }
 
     fn message(role: &str, text: &str, turn_id: Option<&str>) -> ResponseItem {
         ResponseItem::Message {
@@ -786,12 +874,177 @@ mod tests {
 
     #[test]
     fn ordinary_history_does_not_require_a_provenance_fingerprint() {
-        assert!(!prompt_item_requires_fingerprint(&[None, None], false));
-        assert!(prompt_item_requires_fingerprint(&[None], true));
-        assert!(prompt_item_requires_fingerprint(
-            &[Some(PromptContextCategory::Memory)],
-            false
-        ));
+        for history_len in [1, 64] {
+            let mut items = (0..history_len)
+                .map(|index| message("user", &format!("prior {index}"), Some("old-turn")))
+                .collect::<Vec<_>>();
+            items.push(message("developer", "memory", Some("current-turn")));
+            items.push(message("user", "first contribution", Some("current-turn")));
+            items.push(message("user", "second contribution", Some("current-turn")));
+
+            FINGERPRINT_CALLS.set(0);
+            let sidecar = PromptProvenanceSidecar::from_assembled_items(
+                &items,
+                &StableContextManifest::default(),
+            );
+            assert_eq!(
+                FINGERPRINT_CALLS.replace(0),
+                1,
+                "only the last input needs identity recovery"
+            );
+            let augmented =
+                sidecar.with_exact_fragment(&items, "memory", PromptContextCategory::Memory);
+            assert_eq!(
+                FINGERPRINT_CALLS.replace(0),
+                1,
+                "only the matching fragment needs a fingerprint"
+            );
+            let unmatched =
+                augmented.with_exact_fragment(&items, "absent", PromptContextCategory::Skills);
+            assert_eq!(FINGERPRINT_CALLS.replace(0), 0);
+            assert!(unmatched.shares_contributions_with(&augmented));
+
+            for measured in measure_both(&items, &unmatched) {
+                assert_eq!(
+                    measured.bytes(PromptContextCategory::Memory),
+                    item_bytes(&items[history_len])
+                );
+                assert_eq!(
+                    measured.bytes(PromptContextCategory::History),
+                    items[..history_len].iter().map(item_bytes).sum::<u64>()
+                );
+                assert_eq!(
+                    measured.bytes(PromptContextCategory::TaskInput),
+                    items[history_len + 1..].iter().map(item_bytes).sum::<u64>()
+                );
+                assert_eq!(measured.bytes(PromptContextCategory::Skills), 0);
+            }
+            assert_eq!(
+                FINGERPRINT_CALLS.get(),
+                0,
+                "aligned measurement must not fingerprint history again"
+            );
+        }
+    }
+
+    #[test]
+    fn absent_provenance_does_not_fingerprint_messages_for_lookup_or_replay() {
+        let items = vec![
+            message("user", "history", None),
+            message("developer", "context", None),
+        ];
+        let sidecar = PromptProvenanceSidecar::default();
+        FINGERPRINT_CALLS.set(0);
+        let logical = PromptContextBreakdown::from_response_items(&items, &sidecar).unwrap();
+        assert_eq!(
+            logical.bytes(PromptContextCategory::History),
+            item_bytes(&items[0])
+        );
+        assert_eq!(logical.bytes(PromptContextCategory::TaskInput), 0);
+        assert_eq!(
+            FINGERPRINT_CALLS.replace(0),
+            0,
+            "no identity or category hints exist to look up"
+        );
+
+        let recovered = sidecar.for_reprojected_items(&items);
+        for measured in measure_both(&items, &recovered) {
+            assert_eq!(measured.measurements(), logical.measurements());
+        }
+        assert_eq!(
+            FINGERPRINT_CALLS.get(),
+            0,
+            "empty provenance needs no recovery fingerprints"
+        );
+    }
+
+    #[test]
+    fn category_override_updates_every_content_block_of_only_the_selected_occurrence() {
+        let mut repeated = message("user", "first block", None);
+        if let ResponseItem::Message { content, .. } = &mut repeated {
+            content.push(ContentItem::InputText {
+                text: "second block".to_string(),
+            });
+        }
+        let original = vec![repeated.clone(), repeated];
+        let sidecar = PromptProvenanceSidecar::from_assembled_items(
+            &original,
+            &StableContextManifest::default(),
+        );
+        let mut prefixed = vec![message("developer", "transport base", None)];
+        prefixed.extend(original.iter().cloned());
+        let overridden = sidecar
+            .with_response_item_category(&prefixed, 0, PromptContextCategory::BaseSystem)
+            .with_response_item_category(&prefixed, 1, PromptContextCategory::Memory);
+        for measured in measure_both(&prefixed, &overridden) {
+            assert_eq!(
+                measured.bytes(PromptContextCategory::BaseSystem),
+                item_bytes(&prefixed[0])
+            );
+            assert_eq!(
+                measured.bytes(PromptContextCategory::Memory),
+                item_bytes(&prefixed[1])
+            );
+            assert_eq!(
+                measured.bytes(PromptContextCategory::TaskInput),
+                item_bytes(&prefixed[2])
+            );
+            assert_eq!(measured.bytes(PromptContextCategory::History), 0);
+        }
+        for measured in measure_both(&original, &sidecar) {
+            assert_eq!(measured.bytes(PromptContextCategory::Memory), 0);
+            assert_eq!(
+                measured.bytes(PromptContextCategory::History),
+                item_bytes(&original[0])
+            );
+            assert_eq!(
+                measured.bytes(PromptContextCategory::TaskInput),
+                item_bytes(&original[1])
+            );
+        }
+    }
+
+    #[test]
+    fn replay_recovers_categories_and_current_input_after_reordering_and_removal() {
+        for turn_id in [Some("current-turn"), None] {
+            let original = vec![
+                message("user", "discarded history", Some("old-turn")),
+                message("developer", "memory", turn_id),
+                message("user", "current", turn_id),
+            ];
+            let sidecar = PromptProvenanceSidecar::from_assembled_items(
+                &original,
+                &StableContextManifest::default(),
+            )
+            .with_exact_fragment(&original, "memory", PromptContextCategory::Memory);
+            let replay = vec![
+                original[2].clone(),
+                message("user", "restored history", Some("old-turn")),
+                original[1].clone(),
+            ];
+            FINGERPRINT_CALLS.set(0);
+            let recovered = sidecar.for_reprojected_items(&replay);
+            assert_eq!(
+                FINGERPRINT_CALLS.replace(0),
+                3,
+                "recover each message identity once"
+            );
+            for measured in measure_both(&replay, &recovered) {
+                assert_eq!(
+                    measured.bytes(PromptContextCategory::TaskInput),
+                    item_bytes(&replay[0])
+                );
+                assert_eq!(
+                    measured.bytes(PromptContextCategory::History),
+                    item_bytes(&replay[1])
+                );
+                assert_eq!(
+                    measured.bytes(PromptContextCategory::Memory),
+                    item_bytes(&replay[2])
+                );
+            }
+            assert_eq!(FINGERPRINT_CALLS.get(), 0);
+        }
     }
 
     #[test]
@@ -875,5 +1128,32 @@ mod tests {
         assert!(breakdown.bytes(PromptContextCategory::EnvironmentPermissions) > 0);
         assert!(breakdown.bytes(PromptContextCategory::AgentRole) > 0);
         assert_eq!(breakdown.bytes(PromptContextCategory::History), 0);
+    }
+
+    #[test]
+    fn unrelated_fragments_preserve_occurrence_categories_and_shared_fingerprints() {
+        let items = vec![
+            message("developer", "same content", None),
+            message("developer", "same content", None),
+            message("user", "current", None),
+        ];
+        let sidecar = PromptProvenanceSidecar::from_assembled_items(
+            &items,
+            &StableContextManifest::default(),
+        )
+        .with_response_item_category(&items, 1, PromptContextCategory::Memory);
+        let augmented =
+            sidecar.with_exact_fragment(&items, "absent", PromptContextCategory::Skills);
+        assert!(augmented.shares_contributions_with(&sidecar));
+        let measured = PromptContextBreakdown::from_response_items(&items, &augmented).unwrap();
+        assert_eq!(
+            measured.bytes(PromptContextCategory::Memory),
+            serde_json::to_vec(&items[1]).unwrap().len() as u64
+        );
+        assert_eq!(measured.bytes(PromptContextCategory::Skills), 0);
+        assert_eq!(
+            measured.bytes(PromptContextCategory::TaskInput),
+            serde_json::to_vec(&items[2]).unwrap().len() as u64
+        );
     }
 }

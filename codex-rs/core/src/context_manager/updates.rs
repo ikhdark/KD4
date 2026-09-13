@@ -303,4 +303,46 @@ mod tests {
             None
         );
     }
+
+    #[tokio::test]
+    async fn blank_collaboration_instructions_emit_reset_and_preserve_nonblank_formatting() {
+        let (_session, mut next) = make_session_and_context().await;
+        next.collaboration_mode.settings.developer_instructions =
+            Some("active instructions".to_string());
+        let previous = next.to_turn_context_item();
+        for instructions in [None, Some(""), Some("\n\t \u{2003}")] {
+            next.collaboration_mode.settings.developer_instructions =
+                instructions.map(str::to_string);
+            let updates = super::build_settings_update_items(
+                Some(&previous),
+                None,
+                &next,
+                &codex_execpolicy::Policy::empty(),
+                false,
+            );
+            let [codex_protocol::models::ResponseItem::Message { role, content, .. }] =
+                updates.as_slice()
+            else {
+                panic!("expected one developer update: {updates:?}");
+            };
+            assert_eq!(role, "developer");
+            assert_eq!(content, &vec![codex_protocol::models::ContentItem::InputText {
+                text: "<collaboration_mode>No collaboration-mode-specific instructions are currently active. Any previously provided collaboration-mode instructions no longer apply.</collaboration_mode>".to_string(),
+            }]);
+        }
+
+        let blank_previous = next.to_turn_context_item();
+        next.collaboration_mode.settings.developer_instructions = None;
+        assert_eq!(
+            build_collaboration_mode_update_item(Some(&blank_previous), &next),
+            None
+        );
+
+        next.collaboration_mode.settings.developer_instructions =
+            Some("\n  keep formatting\n".to_string());
+        assert_eq!(
+            build_collaboration_mode_update_item(Some(&blank_previous), &next),
+            Some("<collaboration_mode>\n  keep formatting\n</collaboration_mode>".to_string()),
+        );
+    }
 }

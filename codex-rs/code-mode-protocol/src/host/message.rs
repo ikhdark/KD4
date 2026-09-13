@@ -230,7 +230,7 @@ pub enum DelegateResponse {
     #[serde(rename = "tool/result")]
     ToolResult { result: JsonValue },
     #[serde(rename = "notification/delivered")]
-    NotificationDelivered,
+    NotificationDelivered {},
 }
 
 #[derive(Debug, Deserialize, PartialEq, Serialize)]

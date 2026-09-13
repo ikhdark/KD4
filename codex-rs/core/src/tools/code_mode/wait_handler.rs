@@ -179,6 +179,20 @@ impl CodeModeWaitHandler {
                 .map_err(FunctionCallError::RespondToModel)?;
                 let authoritative_wait_signal =
                     terminal_wait_owner_signal(&wait_response, &cell_id);
+                let keep_dispatch_open = matches!(
+                    &wait_response,
+                    codex_code_mode::WaitOutcome::LiveCell(
+                        codex_code_mode::RuntimeResponse::Yielded { .. }
+                            | codex_code_mode::RuntimeResponse::ExplicitYield { .. }
+                    )
+                );
+                // Observation errors do not prove that the cell stopped. Only
+                // retire a confirmed terminal response, after packet formatting.
+                let dispatch_lease =
+                    CellDispatchLease::new(Arc::clone(&exec.session), cell_id.clone());
+                if keep_dispatch_open {
+                    dispatch_lease.keep_open();
+                }
                 let mut terminal_parent_call_id = None;
                 if let codex_code_mode::WaitOutcome::LiveCell(response) = &wait_response
                     && !matches!(
@@ -201,8 +215,6 @@ impl CodeModeWaitHandler {
                         .services
                         .code_mode_service
                         .cell_parent_call_id(runtime_cell_id);
-                    let dispatch_lease =
-                        CellDispatchLease::new(Arc::clone(&exec.session), runtime_cell_id.clone());
                     if exec.session.services.rollout_thread_trace.is_enabled() {
                         let trace = exec
                             .session
@@ -217,7 +229,6 @@ impl CodeModeWaitHandler {
                             .record_trace(move || trace.record_ended(&response))
                             .await;
                     }
-                    drop(dispatch_lease);
                 }
                 exec.session.services.elicitations.wait_until_clear().await;
                 if let codex_code_mode::WaitOutcome::LiveCell(response) = &wait_response {
@@ -236,7 +247,7 @@ impl CodeModeWaitHandler {
                 output =
                     attach_drained_wait_evidence(&exec, output, &cell_id, drained_observations);
                 if let Some(signal) = authoritative_wait_signal {
-                    output = output.with_sampling_request_signal(signal);
+                    output = super::merge_code_mode_signal(output, signal);
                 }
                 Ok(boxed_tool_output(output))
             }
@@ -520,6 +531,97 @@ mod tests {
             cell_id: cell_id.clone(),
             content_items: Vec::new(),
         })
+    }
+
+    #[tokio::test]
+    async fn terminal_wait_preserves_required_outcome_and_semantic_evidence() {
+        use crate::tools::context::RequiredToolTerminalCause;
+        for (cause, expected_outcome) in [
+            (RequiredToolTerminalCause::Failure, "failure"),
+            (RequiredToolTerminalCause::Blocked, "blocked"),
+        ] {
+            let (mut session, turn) = crate::session::tests::make_session_and_context().await;
+            session.services.code_mode_service = super::super::CodeModeService::new(Arc::new(
+                codex_code_mode::InProcessCodeModeSessionProvider,
+            ));
+            let session = Arc::new(session);
+            let turn = Arc::new(turn);
+            let service = &session.services.code_mode_service;
+            let started = service
+                .execute(codex_code_mode::ExecuteRequest {
+                    tool_call_id: "outer-exec".to_string(),
+                    enabled_tools: Vec::new(),
+                    source: "await yield_control();".to_string(),
+                    yield_time_ms: None,
+                    max_output_tokens: None,
+                })
+                .await
+                .unwrap();
+            let cell = started.cell_id.clone();
+            service.record_cell_parent_call_id(&cell, "outer-exec");
+            service.mark_cell_ready_for_dispatch(&cell);
+            assert!(matches!(
+                started.initial_response().await.unwrap(),
+                codex_code_mode::RuntimeResponse::ExplicitYield { .. }
+            ));
+            let ordinal = service.begin_packet_call(&cell).unwrap();
+            service.complete_packet_call(
+                &cell,
+                ordinal,
+                false,
+                0,
+                Vec::new(),
+                None,
+                Some((cause, "REQUIRED_DIAGNOSTIC".to_string())),
+            );
+            let output = CodeModeWaitHandler
+                .handle_call(ToolInvocation {
+                    session: Arc::clone(&session),
+                    step_context: crate::session::step_context::StepContext::for_test(turn),
+                    cancellation_token: tokio_util::sync::CancellationToken::new(),
+                    tracker: Arc::new(tokio::sync::Mutex::new(
+                        crate::turn_diff_tracker::TurnDiffTracker::new(),
+                    )),
+                    call_id: "wait-call".to_string(),
+                    tool_name: ToolName::plain(WAIT_TOOL_NAME),
+                    source: crate::tools::router::ToolCallSource::Direct,
+                    payload: ToolPayload::Function {
+                        arguments: serde_json::json!({ "cell_id": cell.as_str() }).to_string(),
+                    },
+                })
+                .await
+                .unwrap();
+            let signal = output.sampling_request_signal().unwrap();
+            assert_eq!(signal["outcome"], expected_outcome);
+            assert_eq!(
+                signal["authoritative_wait_owner_v1"]["state_revision"],
+                "completed"
+            );
+            assert_eq!(
+                signal["authoritative_wait_owner_v1"]["owner"],
+                cell.as_str()
+            );
+            assert!(
+                signal["semantic_evidence"]
+                    .to_string()
+                    .contains("REQUIRED_DIAGNOSTIC")
+            );
+            assert!(
+                signal["failure_signature"]
+                    .as_str()
+                    .is_some_and(|value| !value.is_empty())
+            );
+            assert!(output.log_preview().contains("REQUIRED_DIAGNOSTIC"));
+            assert!(
+                !service
+                    .packet_admission
+                    .lock()
+                    .unwrap()
+                    .cells
+                    .contains_key(cell.as_str())
+            );
+            service.shutdown().await.unwrap();
+        }
     }
 
     #[test]

@@ -53,7 +53,7 @@ impl CellDispatchLease {
         }
     }
 
-    fn keep_open(&self) {
+    pub(super) fn keep_open(&self) {
         self.state
             .keep_open
             .store(true, std::sync::atomic::Ordering::Release);
@@ -383,6 +383,17 @@ mod tests {
         service.record_cell_parent_call_id(&cell_id, "outer-call");
         service.mark_cell_ready_for_dispatch(&cell_id);
         assert!(service.dispatch_broker.has_waitable_cells());
+        let pending = service.begin_packet_call(&cell_id).unwrap();
+        service.record_packet_call(
+            &cell_id,
+            false,
+            42,
+            vec![
+                codex_protocol::models::FunctionCallOutputContentItem::InputText {
+                    text: "abandoned feedback".to_string(),
+                },
+            ],
+        );
 
         drop(CellDispatchLease::new(
             Arc::clone(&session),
@@ -391,6 +402,27 @@ mod tests {
 
         assert_eq!(service.cell_parent_call_id(&cell_id), None);
         assert!(!service.dispatch_broker.has_waitable_cells());
+        service.complete_packet_call(
+            &cell_id,
+            pending,
+            false,
+            10,
+            Vec::new(),
+            None,
+            Some((
+                crate::tools::context::RequiredToolTerminalCause::Failure,
+                "late failure".to_string(),
+            )),
+        );
+        assert_eq!(service.begin_packet_call(&cell_id), None);
+        assert!(
+            !service
+                .packet_admission
+                .lock()
+                .unwrap()
+                .cells
+                .contains_key(cell_id.as_str())
+        );
     }
 
     #[tokio::test]

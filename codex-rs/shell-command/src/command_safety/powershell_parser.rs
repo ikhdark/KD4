@@ -26,6 +26,7 @@ use std::time::Duration;
 
 const POWERSHELL_PARSER_SCRIPT: &str = include_str!("powershell_parser.ps1");
 const POWERSHELL_PARSER_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_CACHED_SYNTAX_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum PowershellFlavor {
@@ -34,6 +35,8 @@ enum PowershellFlavor {
 }
 
 type CachedParser = Arc<Mutex<Option<PowershellParserProcess>>>;
+
+static TEMPORARY_PARSER_SLOT: Mutex<()> = Mutex::new(());
 
 static PARSER_PROCESSES: LazyLock<Mutex<HashMap<PowershellFlavor, CachedParser>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -129,30 +132,41 @@ fn parse_with_powershell_ast_request(
             .or_insert_with(|| Arc::new(Mutex::new(None)))
             .clone()
     };
-    match acquire_cached_parser(&parser) {
+    match acquire_cached_parser(&parser, &TEMPORARY_PARSER_SLOT) {
         CachedParserAccess::Shared(mut parser) => {
             parse_with_cached_process(&mut parser, executable, script, resolution)
         }
-        CachedParserAccess::Temporary => {
+        CachedParserAccess::Temporary(_slot) => {
             // The shared child has one stdin/stdout protocol stream, but independent parser
             // requests do not depend on one another. Use a short-lived host instead of queuing
             // every classification behind a slow or stalled request.
             let mut parser = None;
             parse_with_cached_process(&mut parser, executable, script, resolution)
         }
+        CachedParserAccess::Saturated => PowershellParseOutcome::Failed,
     }
 }
 
 enum CachedParserAccess<'a> {
     Shared(MutexGuard<'a, Option<PowershellParserProcess>>),
-    Temporary,
+    Temporary(MutexGuard<'a, ()>),
+    Saturated,
 }
 
-fn acquire_cached_parser(parser: &CachedParser) -> CachedParserAccess<'_> {
+fn acquire_cached_parser<'a>(
+    parser: &'a CachedParser,
+    temporary_slot: &'a Mutex<()>,
+) -> CachedParserAccess<'a> {
     match parser.try_lock() {
         Ok(parser) => CachedParserAccess::Shared(parser),
         Err(TryLockError::Poisoned(poisoned)) => CachedParserAccess::Shared(poisoned.into_inner()),
-        Err(TryLockError::WouldBlock) => CachedParserAccess::Temporary,
+        Err(TryLockError::WouldBlock) => match temporary_slot.try_lock() {
+            Ok(slot) => CachedParserAccess::Temporary(slot),
+            Err(TryLockError::Poisoned(poisoned)) => {
+                CachedParserAccess::Temporary(poisoned.into_inner())
+            }
+            Err(TryLockError::WouldBlock) => CachedParserAccess::Saturated,
+        },
     }
 }
 
@@ -173,7 +187,7 @@ pub struct PowershellDirectArgvCandidate {
     pub powershell_version: String,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PowershellParseAnalysis {
     pub commands: Vec<Vec<String>>,
     pub direct_argv: Option<PowershellDirectArgvCandidate>,
@@ -211,7 +225,7 @@ pub(crate) fn is_trusted_powershell_host(executable: &str) -> bool {
     requested_executable_matches_trusted(executable, &trusted_executable)
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum PowershellParseOutcome {
     Analysis(PowershellParseAnalysis),
     Unsupported,
@@ -288,6 +302,9 @@ fn encoded_parser_bootstrap() -> &'static str {
 struct PowershellParserProcess {
     child: Option<Child>,
     requests: mpsc::Sender<ParserIoRequest>,
+    // Syntax is deterministic within this host. Keep just the latest bounded result so
+    // consecutive safety consumers do not repeat the same AST parse and IPC round trip.
+    last_syntax: Option<(String, PowershellParseOutcome)>,
     // Request ids are monotonic within one child process so the caller can detect protocol
     // desynchronization if stdout is contaminated or the child is unexpectedly replaced.
     next_request_id: u64,
@@ -370,6 +387,7 @@ impl PowershellParserProcess {
         Ok(Self {
             child,
             requests,
+            last_syntax: None,
             next_request_id: 0,
         })
     }
@@ -384,6 +402,19 @@ impl PowershellParserProcess {
         script: &str,
         resolution: Option<&PowershellResolutionState>,
     ) -> std::io::Result<PowershellParseOutcome> {
+        if resolution.is_none()
+            && let Some((cached_script, outcome)) = &self.last_syntax
+            && cached_script == script
+        {
+            return Ok(outcome.clone());
+        }
+        // Resolution depends on the current filesystem, cwd, PATH and PATHEXT. It must
+        // always reach the host, and no result from that request can enter this cache.
+        // The resolution script restores cwd/PATH/PATHEXT and does not change
+        // syntax or native argument mode. Keep syntax proof across those requests.
+        if resolution.is_none() {
+            self.last_syntax = None;
+        }
         let request = PowershellParserRequest {
             id: self.next_request_id,
             payload: encode_powershell_base64(script),
@@ -432,7 +463,14 @@ impl PowershellParserProcess {
             ));
         }
 
-        Ok(response.into_outcome())
+        let outcome = response.into_outcome();
+        if resolution.is_none()
+            && !matches!(outcome, PowershellParseOutcome::Failed)
+            && script.len().saturating_add(response_line.len()) <= MAX_CACHED_SYNTAX_BYTES
+        {
+            self.last_syntax = Some((script.to_string(), outcome.clone()));
+        }
+        Ok(outcome)
     }
 }
 
@@ -743,17 +781,26 @@ mod tests {
     }
 
     #[test]
-    fn cached_parser_contention_uses_a_temporary_host_slot() {
+    fn cached_parser_contention_bounds_temporary_hosts() {
         let parser: CachedParser = Arc::new(Mutex::new(None));
+        let temporary_slot = Mutex::new(());
         let held = parser.lock().unwrap_or_else(PoisonError::into_inner);
-        assert!(
-            matches!(
-                acquire_cached_parser(&parser),
-                CachedParserAccess::Temporary
-            ),
-            "contended parser access should avoid waiting on the shared host"
-        );
+        let temporary = acquire_cached_parser(&parser, &temporary_slot);
+        assert!(matches!(temporary, CachedParserAccess::Temporary(_)));
+        assert!(matches!(
+            acquire_cached_parser(&parser, &temporary_slot),
+            CachedParserAccess::Saturated
+        ));
+        drop(temporary);
+        assert!(matches!(
+            acquire_cached_parser(&parser, &temporary_slot),
+            CachedParserAccess::Temporary(_)
+        ));
         drop(held);
+        assert!(matches!(
+            acquire_cached_parser(&parser, &temporary_slot),
+            CachedParserAccess::Shared(_)
+        ));
     }
 
     #[test]
@@ -787,13 +834,20 @@ mod tests {
         let powershell = powershell.as_path().to_str().unwrap();
         let mut parser = PowershellParserProcess::spawn(powershell).unwrap();
 
-        let first = parser.parse("Get-Content 'foo bar'").unwrap();
-        let PowershellParseOutcome::Analysis(first) = first else {
-            panic!("expected parser analysis");
-        };
+        for _ in 0..10 {
+            let first = parser.parse("Get-Content 'foo bar'").unwrap();
+            let PowershellParseOutcome::Analysis(first) = first else {
+                panic!("expected parser analysis");
+            };
+            assert_eq!(
+                first.commands,
+                vec![vec!["Get-Content".to_string(), "foo bar".to_string()]],
+            );
+            assert_eq!(first.resolved_application, None);
+        }
         assert_eq!(
-            first.commands,
-            vec![vec!["Get-Content".to_string(), "foo bar".to_string(),]],
+            parser.next_request_id, 1,
+            "reuse identical syntax without IPC"
         );
 
         let second = parser.parse("Write-Output foo | Measure-Object").unwrap();
@@ -806,6 +860,147 @@ mod tests {
                 vec!["Write-Output".to_string(), "foo".to_string()],
                 vec!["Measure-Object".to_string()],
             ],
+        );
+        assert_eq!(parser.next_request_id, 2, "changed syntax must be parsed");
+
+        let third = parser.parse("Get-Content 'foo bar'").unwrap();
+        let PowershellParseOutcome::Analysis(third) = third else {
+            panic!("expected parser analysis");
+        };
+        assert_eq!(
+            third.commands,
+            vec![vec!["Get-Content".to_string(), "foo bar".to_string()]],
+        );
+        assert_eq!(parser.next_request_id, 3, "retain only the latest syntax");
+    }
+
+    #[test]
+    fn parser_process_reuses_rejections_but_retries_parse_failures() {
+        let Some(powershell) = try_find_powershell_executable_blocking() else {
+            return;
+        };
+        let mut parser = PowershellParserProcess::spawn(powershell.as_path().to_str().unwrap())
+            .expect("start parser");
+        for _ in 0..2 {
+            assert_eq!(
+                parser.parse("if ($true) { Write-Output hidden }").unwrap(),
+                PowershellParseOutcome::Unsupported,
+            );
+        }
+        assert_eq!(parser.next_request_id, 1);
+        for _ in 0..2 {
+            assert_eq!(
+                parser.parse("Get-Content '").unwrap(),
+                PowershellParseOutcome::Failed
+            );
+        }
+        assert_eq!(
+            parser.next_request_id, 3,
+            "parse failures must not be cached"
+        );
+    }
+
+    #[test]
+    fn parser_process_does_not_retain_oversized_syntax() {
+        let Some(powershell) = try_find_powershell_executable_blocking() else {
+            return;
+        };
+        let mut parser = PowershellParserProcess::spawn(powershell.as_path().to_str().unwrap())
+            .expect("start parser");
+        let argument = "x".repeat(65_536);
+        let script = format!("Get-Content '{argument}'");
+        for _ in 0..2 {
+            let PowershellParseOutcome::Analysis(analysis) = parser.parse(&script).unwrap() else {
+                panic!("expected parser analysis");
+            };
+            assert_eq!(
+                analysis.commands,
+                vec![vec!["Get-Content".to_string(), argument.clone()]]
+            );
+        }
+        assert_eq!(parser.next_request_id, 2);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn parser_process_resolves_each_request_against_the_current_path() {
+        let Some(powershell) = crate::powershell::try_find_pwsh_executable_blocking() else {
+            return;
+        };
+        let executable = fs::canonicalize(powershell.as_path()).expect("canonical pwsh");
+        let mut parser =
+            PowershellParserProcess::spawn(executable.to_str().unwrap()).expect("start parser");
+        let mut resolution = PowershellResolutionState {
+            cwd: std::env::current_dir().unwrap().display().to_string(),
+            path: executable.parent().unwrap().display().to_string(),
+            pathext: ".EXE".to_string(),
+        };
+        for expected_path in [Some(executable.as_path()), None] {
+            let PowershellParseOutcome::Analysis(syntax) = parser.parse("pwsh --version").unwrap()
+            else {
+                panic!("expected syntax analysis");
+            };
+            assert_eq!(
+                syntax.commands,
+                vec![vec!["pwsh".to_string(), "--version".to_string()]]
+            );
+            assert_eq!(syntax.resolved_application, None);
+
+            let PowershellParseOutcome::Analysis(resolved) = parser
+                .parse_request("pwsh --version", Some(&resolution))
+                .unwrap()
+            else {
+                panic!("expected resolved analysis");
+            };
+            assert_eq!(
+                resolved
+                    .resolved_application
+                    .as_deref()
+                    .map(Path::new)
+                    .map(fs::canonicalize)
+                    .transpose()
+                    .unwrap()
+                    .as_deref(),
+                expected_path,
+            );
+            resolution.path.clear();
+        }
+        assert_eq!(
+            parser.next_request_id, 3,
+            "resolution must always reach the host"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn saturated_parser_returns_failure_without_spawning_another_host() {
+        let powershell = try_find_powershell_executable_blocking()
+            .expect("Windows PowerShell is required for parser integration tests");
+        let executable = powershell.as_path().to_str().unwrap();
+        let flavor = PowershellFlavor::from_requested_executable(executable).unwrap();
+        let parser = PARSER_PROCESSES
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(flavor)
+            .or_insert_with(|| Arc::new(Mutex::new(None)))
+            .clone();
+        let primary = parser.lock().unwrap_or_else(PoisonError::into_inner);
+        let temporary = TEMPORARY_PARSER_SLOT
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        assert_eq!(
+            parse_with_powershell_ast(executable, "Get-Content Cargo.toml"),
+            PowershellParseOutcome::Failed,
+        );
+        drop(temporary);
+        let parsed = parse_with_powershell_ast(executable, "Get-Content Cargo.toml");
+        drop(primary);
+        let PowershellParseOutcome::Analysis(parsed) = parsed else {
+            panic!("releasing temporary capacity must restore classification");
+        };
+        assert_eq!(
+            parsed.commands,
+            vec![vec!["Get-Content".to_string(), "Cargo.toml".to_string()]]
         );
     }
 

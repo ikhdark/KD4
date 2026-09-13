@@ -19,16 +19,7 @@ fn user_shell_command_fragment(
     output: String,
     _truncation_policy: TruncationPolicy,
 ) -> UserShellCommand {
-    let command = escape_xml_text(command);
-    let output = escape_xml_text(&output);
     UserShellCommand::new(command, exit_code, duration, output)
-}
-
-fn escape_xml_text(input: &str) -> String {
-    input
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
 }
 
 #[cfg(test)]

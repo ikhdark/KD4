@@ -51,6 +51,14 @@ const MULTI_AGENT_USAGE_HINT_REMOVED_MARKER: &str = "<multi_agent_usage_hint sta
 const TRUSTED_STABLE_CONTEXT_ITEM_ID_BASE: &str = "msg_sctx";
 const TRUSTED_STABLE_CONTEXT_ITEM_ID_PREFIX: &str = "msg_sctx_";
 
+pub(crate) fn turn_contribution_text(index: usize, text: &str) -> String {
+    format!("<turn_context_contribution index=\"{index}\">\n{text}\n</turn_context_contribution>")
+}
+
+pub(crate) fn turn_contribution_removal(index: usize) -> String {
+    format!("<turn_context_contribution index=\"{index}\" state=\"removed\" />")
+}
+
 /// Marks a message as stable context emitted by a trusted core producer.
 ///
 /// The marker uses the existing durable response-item ID field so it survives
@@ -101,6 +109,7 @@ pub(crate) enum StableContextKind {
     ToolSchemas,
     RequestUserInput,
     Wait,
+    TurnContribution,
     DynamicHistory,
 }
 
@@ -130,6 +139,7 @@ impl StableContextKind {
             Self::ToolSchemas => "tool_schemas",
             Self::RequestUserInput => "request_user_input",
             Self::Wait => "wait",
+            Self::TurnContribution => "turn_contribution",
             Self::DynamicHistory => "dynamic_history",
         }
     }
@@ -382,6 +392,7 @@ pub(crate) struct StableContextProjection {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum StableContextSlot {
+    TurnContribution(usize),
     Repository,
     Collaboration,
     SkillUsage,
@@ -408,6 +419,7 @@ enum StableContextSlot {
 impl StableContextSlot {
     fn kind(self) -> StableContextKind {
         match self {
+            Self::TurnContribution(_) => StableContextKind::TurnContribution,
             Self::Repository => StableContextKind::Repository,
             Self::Collaboration => StableContextKind::Collaboration,
             Self::SkillUsage => StableContextKind::SkillUsage,
@@ -432,8 +444,12 @@ impl StableContextSlot {
         }
     }
 
-    fn semantic_key(self) -> &'static str {
-        match self {
+    fn semantic_key(self) -> std::borrow::Cow<'static, str> {
+        if let Self::TurnContribution(index) = self {
+            return format!("turn_contribution:{index}").into();
+        }
+        let key = match self {
+            Self::TurnContribution(_) => unreachable!(),
             Self::Repository => "repository",
             Self::Collaboration => "collaboration",
             Self::SkillUsage => "skill_usage",
@@ -455,7 +471,8 @@ impl StableContextSlot {
             Self::MultiAgent => "multi_agent",
             Self::MultiAgentUsageHint => "multi_agent_usage_hint",
             Self::RootCoordinator => "root_coordinator",
-        }
+        };
+        key.into()
     }
 
     /// Canonical ordering for the reusable model-visible prefix. Keep this
@@ -463,6 +480,7 @@ impl StableContextSlot {
     /// and reconstructed histories yield the same prompt layout.
     fn canonical_order(self) -> u8 {
         match self {
+            Self::TurnContribution(_) => 22,
             Self::Repository => 0,
             Self::DeveloperInstructions => 1,
             Self::Collaboration => 2,
@@ -494,7 +512,8 @@ impl StableContextSlot {
     fn is_volatile(self) -> bool {
         matches!(
             self,
-            Self::SelectedSkill
+            Self::TurnContribution(_)
+                | Self::SelectedSkill
                 | Self::AppContext
                 | Self::ModelSwitch
                 | Self::Environment
@@ -786,6 +805,7 @@ fn project_items(
     for (slot, occurrence_index) in &latest_by_slot {
         let occurrence = &occurrences[*occurrence_index];
         let should_keep = match slot {
+            StableContextSlot::TurnContribution(_) => !occurrence.explicitly_removed,
             StableContextSlot::Repository => !repository_removed,
             StableContextSlot::Collaboration => !collaboration_removed,
             StableContextSlot::DeveloperInstructions => !developer_instructions_removed,
@@ -903,7 +923,9 @@ fn project_items(
         let occurrence = &occurrences[latest_index];
         let (prior_count, replaced) =
             prior_occurrence_summary(items, occurrences, latest_index, slot);
-        let removed = (slot == StableContextSlot::Repository && repository_removed)
+        let removed = (matches!(slot, StableContextSlot::TurnContribution(_))
+            && occurrence.explicitly_removed)
+            || (slot == StableContextSlot::Repository && repository_removed)
             || (slot == StableContextSlot::Collaboration && collaboration_removed)
             || (slot == StableContextSlot::DeveloperInstructions && developer_instructions_removed)
             || (slot == StableContextSlot::MultiAgentUsageHint && multi_agent_usage_hint_removed);
@@ -915,7 +937,7 @@ fn project_items(
             .unwrap_or_else(|| occurrence.text(items));
         let mut component = component_from_text(
             slot.kind(),
-            slot.semantic_key(),
+            &slot.semantic_key(),
             text,
             !removed && !gated,
             if removed {
@@ -1062,7 +1084,7 @@ fn analyze_unprojected(
         .map(|occurrence| {
             component_from_text(
                 occurrence.slot.kind(),
-                occurrence.slot.semantic_key(),
+                &occurrence.slot.semantic_key(),
                 occurrence.text(items),
                 true,
                 if retained_fallback {
@@ -1101,6 +1123,23 @@ fn classify_stable_text(role: &str, text: &str) -> Option<StableTextClassificati
     #[cfg(test)]
     CLASSIFY_STABLE_TEXT_CALLS.with(|calls| calls.set(calls.get() + 1));
 
+    if matches!(role, "developer" | "user")
+        && let Some(rest) = text.strip_prefix("<turn_context_contribution index=\"")
+        && let Some((index, suffix)) = rest.split_once('"')
+        && let Ok(index) = index.parse::<usize>()
+    {
+        let payload = if suffix == " state=\"removed\" />" {
+            StablePayload::Removed
+        } else if suffix.starts_with(">\n") && suffix.ends_with("\n</turn_context_contribution>") {
+            StablePayload::Inline
+        } else {
+            return None;
+        };
+        return Some(StableTextClassification {
+            slot: StableContextSlot::TurnContribution(index),
+            payload,
+        });
+    }
     if role == "user" && marked(text, REPOSITORY_OPEN_TAG, REPOSITORY_CLOSE_TAG) {
         return Some(StableTextClassification::inline(
             StableContextSlot::Repository,

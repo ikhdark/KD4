@@ -118,3 +118,41 @@ fn parse_mcp_tool_preserves_output_schema_without_inferred_type() {
         }
     );
 }
+
+#[test]
+fn mcp_registration_preserves_payload_reference_root_in_code_mode() {
+    let mut tool = mcp_tool(
+        "answer",
+        "Get answer",
+        serde_json::json!({"type": "object"}),
+    );
+    tool.output_schema = Some(std::sync::Arc::new(rmcp::model::object(
+        serde_json::json!({
+            "$defs": {"Payload": {
+                "type": "object", "properties": {"answer": {"type": "string"}}, "required": ["answer"]
+            }},
+            "$ref": "#/$defs/Payload"
+        }),
+    )));
+    let parsed = parse_mcp_tool(&tool).unwrap();
+    assert_eq!(
+        parsed.output_schema.as_ref().unwrap()["x-codex-mcp-result"],
+        true
+    );
+    let specs = [crate::ToolSpec::Function(crate::ResponsesApiTool {
+        name: parsed.name,
+        description: parsed.description,
+        strict: false,
+        defer_loading: None,
+        parameters: parsed.input_schema,
+        output_schema: parsed.output_schema,
+    })];
+    let definitions = crate::collect_code_mode_tool_definitions(&specs);
+    assert_eq!(definitions.len(), 1);
+    assert!(
+        definitions[0]
+            .description
+            .contains("Promise<CallToolResult<{ answer: string; }>>")
+    );
+    assert!(!definitions[0].description.contains("unresolved $ref"));
+}

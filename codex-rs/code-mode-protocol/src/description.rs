@@ -31,7 +31,6 @@ mod tests {
     use super::augment_tool_definition;
     use super::build_exec_tool_description;
     use super::build_wait_tool_description;
-    use super::exec_prompt::EXEC_DESCRIPTION_TEMPLATE;
     use super::normalize_code_mode_identifier;
     use super::parse_exec_source;
     use super::pragma::ParsedExecSource;
@@ -214,12 +213,13 @@ mod tests {
             &[],
         );
         assert!(description.contains("Nested tool schemas are discovered lazily at runtime"));
-        assert!(description.contains("When the exact tool name is known"));
-        assert!(
-            description.contains("inspect compact `ALL_TOOL_NAMES` only when the name is unknown")
-        );
-        assert!(description.contains("`resolve_tool(name)`"));
-        assert!(description.contains("Never scan `ALL_TOOLS`"));
+        assert!(description.contains("`resolve_tool(name)` when the name is known"));
+        assert!(description.contains("or inspect `ALL_TOOL_NAMES`"));
+        assert!(description.contains("Never scan/filter/stringify/print `ALL_TOOLS`"));
+        assert_eq!(description.matches("`resolve_tool(name)`").count(), 1);
+        assert!(description.contains(
+            "When `tool_search` is advertised, use it to activate tools that are not yet listed."
+        ));
         assert!(
             description.len() < 4_000,
             "compact exec prompt unexpectedly expanded to {} bytes",
@@ -232,6 +232,9 @@ mod tests {
         let description = build_exec_tool_description(false, false, &[]);
         assert!(description.contains("`setTimeout(callback: () => void, delayMs?: number)`"));
         assert!(description.contains("`clearTimeout(timeoutId?: number)`"));
+        assert!(description.contains("returns an ID"));
+        assert!(description.contains("Await a promise resolved by the callback to wait."));
+        assert!(!description.contains("manage timers; await them"));
     }
 
     #[test]
@@ -258,49 +261,61 @@ mod tests {
         assert!(description.contains("Prefer a purpose-built tool over shell"));
         assert!(description.contains("consolidate related read-only probes"));
         assert!(description.contains("merely to re-filter a result already returned"));
-        assert!(description.contains("first safe useful read or action in the initial exec"));
-        assert!(description.contains("skip status-only sampling"));
-        assert!(description.contains(
-            "Batch the instructions, target source, tests, and status you already know you need into one exec"
-        ));
-        assert!(description.contains("project instructions already in context"));
-        assert!(description.contains("loaded `AGENTS.md` contract"));
+        assert!(description.contains("Start useful work in the initial exec"));
         assert!(
-            description.contains("Reuse exact schemas, CLI usage, and results already in context")
+            description.contains("Batch independent known reads/probes with `Promise.allSettled`")
         );
-        assert!(description.contains("do not rediscover or guess arguments/subcommands"));
-        assert!(description.contains("If absent or stale"));
-        assert!(description.contains("inspect the exact schema or `--help` once before calling"));
+        assert!(description.contains("Reuse current applicable `AGENTS.md`"));
+        assert!(description.contains("retrieve missing scopes or invalidated content"));
+        assert!(description.contains("Reuse current schemas, CLI usage, and results"));
+        assert!(description.contains("Resolve missing/stale tool schemas before calling"));
+        assert!(
+            description.contains("consult CLI `--help` only for uncertain arguments/subcommands")
+        );
         assert!(description.contains("Nested tools: use a present schema"));
         assert!(description.contains("`resolve_tool(name)` when the name is known"));
         assert!(description.contains("or inspect `ALL_TOOL_NAMES`"));
         assert!(description.contains("Never scan/filter/stringify/print `ALL_TOOLS`"));
-        assert!(description.contains("Read or list known paths directly"));
-        assert!(description.contains("do not substitute a search or second shell"));
+        assert!(description.contains("Do not rediscover known paths"));
+        assert!(description.contains("Read/list known locations directly"));
+        assert!(description.contains("otherwise search narrowly within that path"));
+        assert!(!description.contains("do not substitute a search or second shell"));
         assert!(description.contains("hard 60s default deadline"));
         assert!(description.contains("Resume only a returned session/cell ID"));
         assert!(description.contains("never duplicate a timed-out operation"));
         assert!(description.contains("Honor tool contracts"));
         assert!(description.contains("with `Promise.allSettled`"));
-        assert!(description.contains("never bare `Promise.all`"));
-        assert!(description.contains("sequence true dependencies"));
+        assert!(description.contains("inspect every result"));
+        assert!(description.contains("Find unknown paths first; sequence dependent calls"));
+        assert!(description.contains("Keep status and file outputs distinct"));
+        assert!(description.contains("independent calls may share one exec"));
         assert!(description.contains("initial 10s budget"));
         assert!(description.contains("same awaited evaluation"));
         assert!(description.contains("only for a new model decision"));
-        assert!(description.contains("Run the required test as its own final command"));
-        assert!(description.contains("never mask it with `|| true`"));
-        assert!(description.contains("at most one combined diff/status check, then finish"));
-        assert!(description.contains("unchanged evidence"));
-        assert!(description.contains("synthesize, or stop"));
-        assert!(description.contains("never repeat the same call/poll"));
-        assert!(description.contains("change route/state"));
+        assert!(description.contains("Run required validation after the final relevant edit"));
+        assert!(description.contains(
+            "Parallelize only tool-permitted commands with independent build locks, output paths, and services"
+        ));
+        assert!(
+            description.contains("Propagate sequential failures with `&&` or exit-code checks")
+        );
+        assert!(description.contains("never mask them with `|| true`"));
+        assert!(
+            description.contains("Complete requested work and checks, or report failures/blockers")
+        );
+        assert!(description.contains("Follow plans while they match the current request"));
+        assert!(description.contains("Do not repeat unchanged deterministic failures"));
+        assert!(description.contains("resume live operations through documented wait interfaces"));
+        assert!(!description.contains("never repeat the same call/poll"));
+        assert!(description.contains("Change route/state"));
         assert!(description.contains("Keep evidence bounded"));
-        assert!(description.contains("relevant tables/line ranges"));
-        assert!(description.contains("never whole files"));
-        assert!(description.contains("concise synthesis, not raw payloads"));
+        assert!(description.contains("relevant ranges for large files"));
+        assert!(description.contains("whole files when small or required"));
+        assert!(!description.contains("never whole files"));
         assert!(description.contains("retained-artifact selectors after truncation"));
         assert!(description.contains("Output defaults to the 10000-token hard cap"));
         assert!(description.contains("smallest useful budget"));
+        assert!(description.contains(r#"first-line `// @exec: {"max_output_tokens": 2000}`"#));
         assert!(
             description.contains("queues an extra model-visible message without yielding the cell")
         );
@@ -315,9 +330,9 @@ mod tests {
         assert!(!description.contains("Model projections are capped"));
         const COMPACT_EXEC_DESCRIPTION_BYTE_BUDGET: usize = 3_300;
         assert!(
-            EXEC_DESCRIPTION_TEMPLATE.len() <= COMPACT_EXEC_DESCRIPTION_BYTE_BUDGET,
+            description.len() <= COMPACT_EXEC_DESCRIPTION_BYTE_BUDGET,
             "the exec contract must stay within {COMPACT_EXEC_DESCRIPTION_BYTE_BUDGET} bytes; got {}",
-            EXEC_DESCRIPTION_TEMPLATE.len()
+            description.len()
         );
     }
 
@@ -358,11 +373,11 @@ mod tests {
         let description = build_exec_tool_description(false, true, &[]);
 
         assert!(description.contains("Some deferred nested tools may be omitted"));
-        assert!(
-            description.contains("inspect compact `ALL_TOOL_NAMES` only when the name is unknown")
-        );
-        assert!(description.contains("`resolve_tool(\"tool_name\")`"));
-        assert!(description.contains("Never scan `ALL_TOOLS`"));
+        assert!(description.contains("`resolve_tool(name)` when the name is known"));
+        assert!(description.contains("or inspect `ALL_TOOL_NAMES`"));
+        assert!(description.contains("Never scan/filter/stringify/print `ALL_TOOLS`"));
+        assert_eq!(description.matches("`resolve_tool(name)`").count(), 1);
+        assert!(!description.contains("Nested tool schemas are discovered lazily at runtime"));
     }
 
     #[test]
@@ -378,6 +393,39 @@ mod tests {
     }
 
     #[test]
+    fn assembled_exec_descriptions_bound_boilerplate_without_limiting_tool_names() {
+        let inventories = [
+            Vec::new(),
+            vec!["request_user_input".to_string()],
+            (0..128)
+                .map(|index| format!("direct_tool_{index}"))
+                .collect(),
+        ];
+        for names in inventories {
+            // Names, their backticks, and separators grow with the inventory.
+            // The 4,000-byte budget covers all remaining assembled instructions.
+            let list_bytes = names.iter().map(|name| name.len() + 2).sum::<usize>()
+                + names.len().saturating_sub(1) * 2;
+            for code_mode_only in [false, true] {
+                for has_deferred_tools in [false, true] {
+                    let description =
+                        build_exec_tool_description(code_mode_only, has_deferred_tools, &names);
+                    assert!(
+                        description.len() < 4_000 + list_bytes,
+                        "assembled exec prompt exceeded its boilerplate budget: {} bytes, \
+                         {list_bytes} bytes of names, code_mode_only={code_mode_only}, \
+                         has_deferred_tools={has_deferred_tools}",
+                        description.len()
+                    );
+                    for name in &names {
+                        assert!(description.contains(&format!("`{name}`")));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn yield_time_control_is_not_advertised_to_the_model() {
         let exec = build_exec_tool_description(false, false, &[]);
         let wait = build_wait_tool_description();
@@ -385,5 +433,218 @@ mod tests {
         assert!(!exec.contains("yield_time_ms"));
         assert!(exec.contains("documented `{ timeout_ms }` option"));
         assert!(!wait.contains("yield_time_ms"));
+    }
+
+    fn assert_input_declaration(schema: serde_json::Value, expected: &str) {
+        let definition = ToolDefinition {
+            name: "sample".to_string(),
+            tool_name: ToolName::plain("sample"),
+            description: "Sample tool.".to_string(),
+            kind: CodeModeToolKind::Function,
+            input_schema: Some(schema),
+            output_schema: None,
+        };
+        assert_eq!(
+            augment_tool_definition(definition).description,
+            format!(
+                "Sample tool.\n\nexec tool declaration:\n```ts\ndeclare const tools: {{ sample(args: {expected}, options?: {{ timeout_ms?: number }}): Promise<unknown>; }};\n```"
+            )
+        );
+    }
+
+    #[test]
+    fn declarations_preserve_composition_siblings() {
+        for keyword in ["allOf", "anyOf", "oneOf"] {
+            assert_input_declaration(
+                json!({
+                    "type": "object", "properties": {"cmd": {"type": "string"}},
+                    "required": ["cmd"],
+                    (keyword): [{"properties": {"timeout": {"type": "number"}}}]
+                }),
+                "({ cmd: string; }) & ({ timeout?: number; })",
+            );
+        }
+        assert_input_declaration(
+            json!({
+                "const": {"cmd": "run"}, "type": "object", "required": ["path"]
+            }),
+            r#"({ path: unknown; [key: string]: unknown; }) & ({"cmd":"run"})"#,
+        );
+        assert_input_declaration(
+            json!({
+                "enum": [{"cmd": "run"}], "type": "object", "required": ["path"]
+            }),
+            r#"({ path: unknown; [key: string]: unknown; }) & ({"cmd":"run"})"#,
+        );
+    }
+
+    #[test]
+    fn declarations_respect_explicit_reference_dialects() {
+        let mut schema = json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$defs": {"base": {"type": "object", "properties": {"cmd": {"type": "string"}}, "required": ["cmd"]}},
+            "$ref": "#/$defs/base",
+            "properties": {"path": {"type": "string"}}, "required": ["path"]
+        });
+        assert_input_declaration(schema.clone(), "({ path: string; }) & ({ cmd: string; })");
+        schema["$schema"] = json!("http://json-schema.org/draft-07/schema#");
+        assert_input_declaration(schema, "{ cmd: string; }");
+    }
+
+    #[test]
+    fn declarations_preserve_tuple_prefix_tail_and_length() {
+        assert_input_declaration(
+            json!({
+                "type": "array", "prefixItems": [{"type": "string"}, {"type": "integer"}],
+                "items": false, "minItems": 2
+            }),
+            "[string, number /* integer */] /* minItems: 2 */",
+        );
+        assert_input_declaration(
+            json!({
+                "type": "array", "prefixItems": [{"type": "string"}, {"type": "integer"}]
+            }),
+            "[(string)?, (number /* integer */)?, ...Array<unknown>]",
+        );
+        assert_input_declaration(
+            json!({
+                "type": "array", "prefixItems": [{"type": "string"}],
+                "items": {"type": "boolean"}, "minItems": 2, "maxItems": 4
+            }),
+            "[string, ...Array<boolean>] /* minItems: 2; maxItems: 4 */",
+        );
+        assert_input_declaration(
+            json!({
+                "type": "array", "prefixItems": [{"type": "string"}], "items": false, "minItems": 2
+            }),
+            "never",
+        );
+        assert_input_declaration(
+            json!({
+                "type": "array", "items": [{"type": "string"}], "additionalItems": false, "minItems": 1
+            }),
+            "[string] /* minItems: 1 */",
+        );
+        assert_input_declaration(
+            json!({
+                "type": "array", "prefixItems": [{"type": "string"}, {"type": "number"}], "maxItems": 1
+            }),
+            "[(string)?] /* maxItems: 1 */",
+        );
+    }
+
+    #[test]
+    fn declarations_preserve_required_only_keys_and_extra_key_rules() {
+        assert_input_declaration(
+            json!({"type": "object", "required": ["path"]}),
+            "{ path: unknown; [key: string]: unknown; }",
+        );
+        assert_input_declaration(
+            json!({"type": "object", "required": ["path"], "additionalProperties": false}),
+            "never",
+        );
+        assert_input_declaration(
+            json!({"type": "object", "required": ["path"], "additionalProperties": {"type": "string"}}),
+            "{ path: string; [key: string]: unknown; /* additional keys: string */ }",
+        );
+        assert_input_declaration(
+            json!({
+                "type": "object", "properties": {"name": {"type": "string"}},
+                "required": ["name"], "additionalProperties": {"type": "number"}
+            }),
+            "{ name: string; [key: string]: unknown; /* additional keys: number */ }",
+        );
+        assert_input_declaration(
+            json!({
+                "type": "object", "required": ["path"], "additionalProperties": false,
+                "patternProperties": {"^path$": {"type": "string"}}
+            }),
+            "{ path: unknown; [key: string]: unknown; /* patternProperties not projected; consult JSON Schema */ }",
+        );
+    }
+
+    #[test]
+    fn output_envelopes_preserve_root_refs_and_ordinary_fields() {
+        let definition = ToolDefinition {
+            name: "receipt".to_string(),
+            tool_name: ToolName::plain("receipt"),
+            description: "Receipt.".to_string(),
+            kind: CodeModeToolKind::Function,
+            input_schema: None,
+            output_schema: Some(json!({
+                "$defs": {"Payload": {"type": "object", "properties": {"answer": {"type": "string"}}, "required": ["answer"]}},
+                "type": "object",
+                "properties": {
+                    "content": {"type": "array", "items": {"type": "object"}},
+                    "isError": {"type": "boolean"}, "_meta": {"type": "object"},
+                    "structuredContent": {"$ref": "#/$defs/Payload"},
+                    "receipt_id": {"type": "string"}
+                }, "required": ["receipt_id", "structuredContent"]
+            })),
+        };
+        let description = augment_tool_definition(definition).description;
+        assert!(description.contains("receipt_id: string;"));
+        assert!(description.contains("structuredContent: { answer: string; };"));
+        assert!(!description.contains("CallToolResult"));
+        assert!(!description.contains("unresolved $ref"));
+    }
+
+    #[test]
+    fn pragma_data_errors_do_not_blame_an_unrelated_field() {
+        let error = parse_exec_source("// @exec: {\"yield_time_ms\": -1}\ntext('hi')").unwrap_err();
+        assert!(error.contains("invalid field value"));
+        assert!(error.contains("-1"));
+        assert!(!error.contains("max_output_tokens"));
+        let error = parse_exec_source(
+            "// @exec: {\"max_output_tokens\": 1, \"max_output_tokens\": 2}\ntext('hi')",
+        )
+        .unwrap_err();
+        assert!(error.contains("duplicate field"));
+        assert!(!error.contains("must be a non-negative safe integer"));
+    }
+
+    #[test]
+    fn direct_only_patch_routing_and_output_pragma_are_usable() {
+        let description = build_exec_tool_description(false, false, &["apply_patch".to_string()]);
+        assert!(description.contains("nested when registered, otherwise direct"));
+        assert!(description.contains("Direct-only tools omitted from `ALL_TOOLS`: `apply_patch`"));
+        let directive = description
+            .split("first-line `")
+            .nth(1)
+            .unwrap()
+            .split('`')
+            .next()
+            .unwrap();
+        assert_eq!(
+            parse_exec_source(&format!("{directive}\ntext('hi')"))
+                .unwrap()
+                .max_output_tokens,
+            Some(2000)
+        );
+    }
+
+    #[test]
+    fn declarations_bound_acyclic_reference_expansion_and_large_literals() {
+        let mut defs = serde_json::Map::new();
+        defs.insert("L0".to_string(), json!({"type": "string"}));
+        for level in 1..=20 {
+            let reference = format!("#/$defs/L{}", level - 1);
+            defs.insert(
+                format!("L{level}"),
+                json!({"type": "object", "properties": {
+                    "left": {"$ref": reference}, "right": {"$ref": reference}
+                }}),
+            );
+        }
+        let incomplete = "unknown /* schema projection incomplete: rendering limit reached; consult the tool's JSON Schema */";
+        assert_input_declaration(json!({"$defs": defs, "$ref": "#/$defs/L20"}), incomplete);
+        assert_input_declaration(json!({"const": "x".repeat(200_000)}), incomplete);
+        let mut deep = json!({"type": "string"});
+        for _ in 0..70 {
+            deep = json!({"type": "array", "items": deep});
+        }
+        assert_input_declaration(deep, incomplete);
+        // Exhaustion must not poison subsequent independent renders.
+        assert_input_declaration(json!({"type": "string"}), "string");
     }
 }

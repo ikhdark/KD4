@@ -48,6 +48,12 @@ impl fmt::Display for CellId {
     }
 }
 
+/// A session-owned cell and its one-shot initial response receiver.
+///
+/// Dropping this handle or its response future only drops the receiver; it does
+/// not request termination. Retain `cell_id` before consuming the handle when
+/// recovery may require `wait` or `terminate`. The session remains responsible
+/// for the cell until completion, termination, or session shutdown.
 pub struct StartedCell {
     pub cell_id: CellId,
     initial_response: CodeModeSessionResultFuture<'static, RuntimeResponse>,
@@ -79,6 +85,8 @@ impl StartedCell {
         }
     }
 
+    /// An error reports response-delivery or runtime failure, not proof that the
+    /// cell never ran. Do not replay side-effecting work based on this error alone.
     pub async fn initial_response(self) -> Result<RuntimeResponse, String> {
         self.initial_response.await
     }
@@ -101,6 +109,10 @@ pub trait CodeModeSessionDelegate: Send + Sync {
     ) -> NotificationFuture<'a>;
 
     /// Releases delegate state associated with a cell after it reaches a terminal state.
+    ///
+    /// This is not a join of all delegate futures: remote callbacks may still be
+    /// unwinding after their cancellation tokens and response delivery are revoked.
+    /// Cleanup must tolerate those late callbacks without recreating live cell state.
     fn cell_closed(&self, cell_id: &CellId);
 }
 
@@ -109,16 +121,30 @@ pub trait CodeModeSessionDelegate: Send + Sync {
 /// Cells executed in the same session share stored values. Separate sessions
 /// must keep those values isolated. Implementations may execute cells
 /// in-process or remotely.
+///
+/// The session owns admitted work independently of the futures observing it.
+/// Dropping an operation future or receiving an error does not establish that
+/// execution had no effects. Callers retain returned cell IDs for recovery and
+/// use `shutdown` when abandoning the session, including after a start whose
+/// outcome is unknown.
 pub trait CodeModeSession: Send + Sync {
+    /// Starts a cell and returns its identity before the initial response.
+    /// Cancellation before this returns can race with admission; it is not a
+    /// portable guarantee that the cell never started.
     fn execute<'a>(
         &'a self,
         request: ExecuteRequest,
     ) -> CodeModeSessionResultFuture<'a, StartedCell>;
 
+    /// Observes an existing cell. Dropping the observation does not terminate it
+    /// or guarantee that output already consumed by that observation is replayed.
     fn wait<'a>(&'a self, request: WaitRequest) -> CodeModeSessionResultFuture<'a, WaitOutcome>;
 
+    /// Requests termination; dropping this future is not confirmation of cleanup.
     fn terminate<'a>(&'a self, cell_id: CellId) -> CodeModeSessionResultFuture<'a, WaitOutcome>;
 
+    /// Shuts down session-owned work. Await this when relinquishing ownership;
+    /// dropping the future alone does not establish that cleanup has finished.
     fn shutdown<'a>(&'a self) -> CodeModeSessionResultFuture<'a, ()>;
 }
 

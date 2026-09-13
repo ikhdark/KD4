@@ -12,10 +12,13 @@ use codex_extension_api::WorldStateSectionContribution;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use indexmap::IndexMap;
+use serde::Deserialize;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Map;
 use serde_json::Value;
+use sha2::Digest;
+use sha2::Sha256;
 use std::collections::BTreeMap;
 use std::fmt;
 
@@ -87,22 +90,20 @@ impl<S: WorldStateSection> ErasedWorldStateSection for S {
     ) -> Option<Box<dyn ContextualUserFragment>> {
         let typed_snapshot;
         let previous = match previous {
-            PreviousSectionState::Known(previous) => {
-                match serde_json::from_value::<S::Snapshot>(previous.clone()) {
-                    Ok(previous) => {
-                        typed_snapshot = previous;
-                        PreviousSectionState::Known(&typed_snapshot)
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            section_id = S::ID,
-                            %err,
-                            "failed to restore world-state section snapshot"
-                        );
-                        PreviousSectionState::Unknown
-                    }
+            PreviousSectionState::Known(previous) => match S::Snapshot::deserialize(previous) {
+                Ok(previous) => {
+                    typed_snapshot = previous;
+                    PreviousSectionState::Known(&typed_snapshot)
                 }
-            }
+                Err(err) => {
+                    tracing::warn!(
+                        section_id = S::ID,
+                        %err,
+                        "failed to restore world-state section snapshot"
+                    );
+                    PreviousSectionState::Unknown
+                }
+            },
             PreviousSectionState::Absent => PreviousSectionState::Absent,
             PreviousSectionState::Unknown => PreviousSectionState::Unknown,
         };
@@ -268,6 +269,19 @@ pub(crate) struct WorldStateSnapshot {
     sections: BTreeMap<String, Value>,
 }
 
+/// A bounded delivery is not a typed, fully accepted section snapshot. Keep its
+/// source identity separate from the text actually sent, including across resume.
+#[derive(Serialize, serde::Deserialize)]
+struct PartialDelivery<'a> {
+    source_digest: &'a str,
+    role: &'a str,
+    rendered: &'a str,
+}
+
+fn partial_delivery(snapshot: &Value) -> Option<PartialDelivery<'_>> {
+    PartialDelivery::deserialize(snapshot.get("partial_delivery")?).ok()
+}
+
 impl WorldStateSnapshot {
     pub(crate) fn section(&self, id: &str) -> Option<&Value> {
         self.sections.get(id)
@@ -279,6 +293,9 @@ impl WorldStateSnapshot {
 
     /// Returns the RFC 7386 merge patch that advances `previous` to `self`.
     pub(crate) fn merge_patch_from(&self, previous: &Self) -> Option<Value> {
+        if self == previous {
+            return None;
+        }
         let previous = Value::Object(previous.sections.clone().into_iter().collect());
         let current = Value::Object(self.sections.clone().into_iter().collect());
         create_merge_patch(&previous, &current)
@@ -392,7 +409,16 @@ impl WorldState {
     ) -> (Vec<Box<dyn ContextualUserFragment>>, WorldStateSnapshot) {
         self.render_with(|id, section| {
             if let Some(previous) = previous.and_then(|previous| previous.sections.get(id)) {
-                if section.has_retained_fragment_matcher() && !has_retained_fragment(items, section)
+                if let Some(partial) = partial_delivery(previous)
+                    && section.truncate_when_oversized()
+                {
+                    if has_delivered_text(items, partial.role, partial.rendered) {
+                        PreviousSectionState::Known(previous)
+                    } else {
+                        PreviousSectionState::Unknown
+                    }
+                } else if section.has_retained_fragment_matcher()
+                    && !has_retained_fragment(items, section)
                 {
                     PreviousSectionState::Absent
                 } else {
@@ -416,10 +442,17 @@ impl WorldState {
         for (id, section) in &self.sections {
             let previous = previous(id, section.as_ref());
             let rejected_snapshot = match &previous {
-                PreviousSectionState::Known(previous) => Some((*previous).clone()),
+                PreviousSectionState::Known(previous) => Some(*previous),
                 PreviousSectionState::Absent | PreviousSectionState::Unknown => None,
             };
-            let fragment = section.render_diff(previous);
+            let partial = rejected_snapshot
+                .filter(|_| section.truncate_when_oversized())
+                .and_then(partial_delivery);
+            let fragment = section.render_diff(if partial.is_some() {
+                PreviousSectionState::Unknown
+            } else {
+                previous
+            });
             let snapshot_advanced = match fragment {
                 Some(fragment) if !matches!(fragment.role(), "developer" | "user") => {
                     tracing::warn!(
@@ -432,20 +465,55 @@ impl WorldState {
                 Some(fragment) => {
                     let rendered = fragment.render();
                     if !budget.try_take(&rendered) {
-                        if section.truncate_when_oversized()
-                            && let Some(rendered) = budget.take(&rendered)
-                        {
-                            tracing::warn!(
-                                section_id = *id,
-                                "mandatory world-state section exceeded its context budget; admitted a bounded rendering"
-                            );
-                            let role = fragment.role();
-                            fragments.push(Box::new(RenderedContextFragment::new(role, rendered))
-                                as Box<dyn ContextualUserFragment>);
-                            false
-                        } else {
-                            false
+                        if section.truncate_when_oversized() {
+                            // Always bound an authoritative replacement, so the same source
+                            // produces the same bounded text on initial and subsequent passes.
+                            if let Some(replacement) =
+                                section.render_diff(PreviousSectionState::Unknown)
+                                && matches!(replacement.role(), "developer" | "user")
+                                && let Some(source) = section.snapshot()
+                            {
+                                let source_digest =
+                                    format!("{:x}", Sha256::digest(source.to_string().as_bytes()));
+                                let mut candidate_budget = budget.clone();
+                                let replacement_text = replacement.render();
+                                if let Some(rendered) = candidate_budget.take(&replacement_text) {
+                                    let role = replacement.role();
+                                    if partial.as_ref().is_some_and(|previous| {
+                                        previous.source_digest == source_digest
+                                            && previous.role == role
+                                            && previous.rendered.len() >= rendered.len()
+                                    }) {
+                                        sections.insert(
+                                            (*id).to_string(),
+                                            rejected_snapshot.expect("partial snapshot").clone(),
+                                        );
+                                        continue;
+                                    }
+                                    let snapshot = if rendered == replacement_text {
+                                        source
+                                    } else {
+                                        tracing::warn!(
+                                            section_id = *id,
+                                            "mandatory world-state section exceeded its context budget; admitted a bounded rendering"
+                                        );
+                                        serde_json::json!({"partial_delivery": PartialDelivery {
+                                            source_digest: &source_digest,
+                                            role,
+                                            rendered: &rendered,
+                                        }})
+                                    };
+                                    budget = candidate_budget;
+                                    fragments.push(Box::new(RenderedContextFragment::new(
+                                        role, rendered,
+                                    ))
+                                        as Box<dyn ContextualUserFragment>);
+                                    sections.insert((*id).to_string(), snapshot);
+                                    continue;
+                                }
+                            }
                         }
+                        false
                     } else {
                         let role = fragment.role();
                         fragments.push(Box::new(RenderedContextFragment::new(role, rendered))
@@ -459,7 +527,7 @@ impl WorldState {
             let snapshot = if snapshot_advanced {
                 section.snapshot()
             } else {
-                rejected_snapshot
+                rejected_snapshot.cloned()
             };
             if let Some(snapshot) = snapshot {
                 sections.insert((*id).to_string(), snapshot);
@@ -468,6 +536,15 @@ impl WorldState {
 
         (fragments, WorldStateSnapshot { sections })
     }
+}
+
+fn has_delivered_text(items: &[ResponseItem], delivered_role: &str, rendered: &str) -> bool {
+    items.iter().any(|item| {
+        matches!(item, ResponseItem::Message { role, content, .. }
+        if role == delivered_role && content.iter().any(|content| {
+            matches!(content, ContentItem::InputText { text } if text.contains(rendered))
+        }))
+    })
 }
 
 fn has_retained_fragment(items: &[ResponseItem], section: &dyn ErasedWorldStateSection) -> bool {

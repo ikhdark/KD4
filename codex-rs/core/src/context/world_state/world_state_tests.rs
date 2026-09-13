@@ -188,6 +188,37 @@ fn rendered_sections_share_one_hard_budget() {
 }
 
 #[test]
+fn rejected_update_preserves_the_previously_delivered_value() {
+    let state = |value: String| {
+        let mut state = WorldState::default();
+        state.add_extension_section(WorldStateSectionContribution::new(
+            "updated",
+            json!({"value": value}),
+            move |_| {
+                Some(RenderedWorldStateFragment::new(
+                    "developer",
+                    ("", ""),
+                    value.clone(),
+                ))
+            },
+        ));
+        state
+    };
+    let (first, accepted) = state("A".to_string()).render_full_with_snapshot();
+    assert_eq!(
+        first
+            .iter()
+            .map(|fragment| fragment.render())
+            .collect::<Vec<_>>(),
+        vec!["A"]
+    );
+    let (rejected, next) = state("B".repeat(50_000)).render_diff_with_snapshot(&accepted);
+    assert!(rejected.is_empty());
+    assert_eq!(next, accepted);
+    assert_eq!(next.into_value(), json!({"updated": {"value": "A"}}));
+}
+
+#[test]
 fn missing_retained_fragment_is_rendered_again() {
     let mut world_state = WorldState::default();
     world_state.add_extension_section(

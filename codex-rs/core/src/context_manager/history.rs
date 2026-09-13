@@ -109,7 +109,12 @@ impl PreparedPromptItems {
         Self(Arc::new(PreparedPromptItemsInner {
             len: self.0.len.saturating_add(suffix.len()),
             source: PreparedPromptItemsSource::Appended {
-                prefix: self.clone(),
+                // A materialized prefix already owns every item we need. Do not
+                // retain its ancestors and all their earlier flattened copies.
+                prefix: self.0.flattened.get().map_or_else(
+                    || self.clone(),
+                    |items| Self::from_shared(Arc::clone(items)),
+                ),
                 suffix,
             },
             flattened: OnceLock::new(),
@@ -813,16 +818,23 @@ impl ContextManager {
         debug_assert_eq!(target, StableContextTarget::Sampling);
         let tool_history = Arc::clone(&self.tool_history);
         let prepared = self.prepare_for_prompt_target(input_modalities, target);
+        let items = prepared.shared_items();
+        let fallback_items = prepared.shared_fallback_items();
+        let shares_input = Arc::ptr_eq(&items, &fallback_items);
         let projection = tool_history.project_workspace_freshness_with_cache(
-            prepared.shared_items(),
+            items,
             workspace_identity,
             git_workspace,
         );
-        let fallback_projection = tool_history.project_workspace_freshness_with_cache(
-            prepared.shared_fallback_items(),
-            workspace_identity,
-            git_workspace,
-        );
+        let fallback_projection = if shares_input {
+            projection.clone()
+        } else {
+            tool_history.project_workspace_freshness_with_cache(
+                fallback_items,
+                workspace_identity,
+                git_workspace,
+            )
+        };
         apply_tool_history_projection(prepared, projection, fallback_projection)
     }
 
@@ -858,14 +870,23 @@ impl ContextManager {
             }
             None => tool_history.project_with_workspace_identity(items, workspace_identity),
         };
-        let projection = project(prepared.shared_items());
-        let fallback_projection = project(prepared.shared_fallback_items());
+        let items = prepared.shared_items();
+        let fallback_items = prepared.shared_fallback_items();
+        let shares_input = Arc::ptr_eq(&items, &fallback_items);
+        let projection = project(items);
+        // Most prompts have identical sampling and fallback input. Reuse this
+        // request's projection, including freshness checks and substitutions;
+        // a distinct fallback must still be projected independently.
+        let fallback_projection = if shares_input {
+            projection.clone()
+        } else {
+            project(fallback_items)
+        };
         apply_tool_history_projection(prepared, projection, fallback_projection)
     }
 
     pub(crate) fn set_tool_history_state(&mut self, state: ToolHistoryState) {
         self.tool_history = Arc::new(state);
-        self.invalidate_prepared_history();
     }
 
     pub(crate) fn tool_history_state(&self) -> ToolHistoryState {
@@ -882,18 +903,16 @@ impl ContextManager {
     #[cfg(test)]
     pub(crate) fn register_non_workspace_code_mode_call(&mut self, call_id: String) {
         Arc::make_mut(&mut self.tool_history).register_non_workspace_code_mode_call(call_id);
-        self.invalidate_prepared_history();
     }
 
     pub(crate) fn apply_tool_history_mutation(
         &mut self,
         mutation: &crate::tool_history::ToolHistoryMutation,
     ) -> bool {
-        let changed = mutation.apply(Arc::make_mut(&mut self.tool_history));
-        if changed {
-            self.invalidate_prepared_history();
-        }
-        changed
+        // Every tool-history mutation affects the projection applied after
+        // canonical preparation. Re-run that projection against current state
+        // while preserving the normalized history and its token estimates.
+        mutation.apply(Arc::make_mut(&mut self.tool_history))
     }
 
     #[cfg(test)]

@@ -755,6 +755,52 @@ async fn dropped_wait_observer_leaves_the_cell_available() {
 }
 
 #[tokio::test]
+async fn dropped_initial_response_leaves_the_running_cell_owned_by_the_session() {
+    let (delegate, mut events_rx) = BlockingDelegate::new();
+    let service = InProcessCodeModeSession::with_delegate(delegate.clone());
+    let cell = service
+        .execute(ExecuteRequest {
+            enabled_tools: vec![blocking_tool()],
+            yield_time_ms: Some(60_000),
+            ..execute_request("await tools.block({});")
+        })
+        .await
+        .expect("start cell");
+    let cell_id = cell.cell_id.clone();
+    let mut initial_response = Box::pin(cell.initial_response());
+    assert!(matches!(
+        futures::poll!(&mut initial_response),
+        std::task::Poll::Pending
+    ));
+    assert_eq!(next_event(&mut events_rx).await, DelegateEvent::ToolStarted);
+    drop(initial_response);
+
+    // Termination must still find and clean up this admitted cell after its
+    // response receiver has gone away.
+    assert!(!delegate.tool_finished.load(Ordering::Acquire));
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), service.terminate(cell_id.clone()))
+            .await
+            .expect("cell termination timeout")
+            .expect("terminate owned cell"),
+        WaitOutcome::LiveCell(RuntimeResponse::Terminated {
+            cell_id: cell_id.clone(),
+            content_items: Vec::new(),
+        })
+    );
+    assert!(delegate.tool_finished.load(Ordering::Acquire));
+    assert_eq!(
+        next_event(&mut events_rx).await,
+        DelegateEvent::ToolCancelled
+    );
+    assert_eq!(
+        next_event(&mut events_rx).await,
+        DelegateEvent::CellClosed(cell_id)
+    );
+    service.shutdown().await.expect("shutdown session");
+}
+
+#[tokio::test]
 async fn natural_completion_cleans_up_callbacks_before_responding() {
     let (delegate, mut events_rx) = BlockingDelegate::new();
     let service = InProcessCodeModeSession::with_delegate(delegate.clone());

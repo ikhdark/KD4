@@ -3,28 +3,289 @@ use serde_json::json;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 
+use super::EncodedFrame;
 use super::FramedReader;
 use super::FramedWriter;
 use super::MAX_FRAME_BYTES;
 
 #[tokio::test]
-async fn frame_wire_format_is_little_endian_length_prefixed_json() {
-    let (writer, mut reader) = tokio::io::duplex(/*max_buf_size*/ 128);
-    let write = tokio::spawn(async move {
-        FramedWriter::new(writer)
-            .write(&json!({"value": 1}))
+async fn nested_tool_input_presence_survives_the_host_transport() {
+    use super::DelegateRequest;
+    use super::DelegateRequestId;
+    use super::HostToClient;
+    use super::SessionId;
+    use crate::CellId;
+    use crate::CodeModeNestedToolCall;
+    use crate::CodeModeToolKind;
+    use codex_protocol::ToolName;
+
+    for input in [
+        None,
+        Some(json!(null)),
+        Some(json!({ "value": null })),
+        Some(json!("text")),
+    ] {
+        let expected = CodeModeNestedToolCall {
+            cell_id: CellId::new("cell-input".to_string()),
+            parent_tool_call_id: Some("parent-call".to_string()),
+            runtime_tool_call_id: "nested-call".to_string(),
+            tool_name: ToolName::plain("example"),
+            tool_kind: CodeModeToolKind::Function,
+            input,
+        };
+        let runtime_json = serde_json::to_value(&expected).expect("encode runtime invocation");
+        assert_eq!(runtime_json.get("input"), expected.input.as_ref());
+        assert_eq!(
+            serde_json::from_value::<CodeModeNestedToolCall>(runtime_json)
+                .expect("decode runtime invocation"),
+            expected
+        );
+
+        let message = HostToClient::DelegateRequest {
+            id: DelegateRequestId::new(1),
+            session_id: SessionId::new("session-input").expect("valid session ID"),
+            request: DelegateRequest::InvokeTool {
+                invocation: expected.clone().into(),
+            },
+        };
+        let wire_json = serde_json::to_value(&message).expect("encode wire invocation");
+        assert_eq!(
+            wire_json["request"]["invocation"].get("input"),
+            expected.input.as_ref()
+        );
+
+        let (writer, reader) = tokio::io::duplex(128);
+        let write = tokio::spawn(async move {
+            FramedWriter::new(writer)
+                .write(&message)
+                .await
+                .expect("write invocation frame");
+        });
+        let received = FramedReader::new(reader)
+            .read::<HostToClient>()
             .await
-            .expect("write frame");
-    });
+            .expect("read invocation frame")
+            .expect("invocation frame present");
+        write.await.expect("writer task");
+        let HostToClient::DelegateRequest {
+            request: DelegateRequest::InvokeTool { invocation },
+            ..
+        } = received
+        else {
+            panic!("expected nested tool invocation");
+        };
+        assert_eq!(CodeModeNestedToolCall::from(invocation), expected);
+    }
+}
+
+#[tokio::test]
+async fn frame_write_flushes_exact_wire_bytes_before_the_writer_is_dropped() {
+    let (writer, mut reader) = tokio::io::duplex(/*max_buf_size*/ 128);
+    let mut writer = FramedWriter::new(tokio::io::BufWriter::new(writer));
+    writer
+        .write(&json!({"value": 1}))
+        .await
+        .expect("write frame");
+    let mut bytes = [0; 15];
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        reader.read_exact(&mut bytes),
+    )
+    .await
+    .expect("frame must be delivered while the buffered writer is alive")
+    .expect("read bytes");
+    assert_eq!(&bytes, b"\x0b\0\0\0{\"value\":1}");
+    drop(writer);
+}
+
+#[tokio::test]
+async fn encoded_frame_serializes_once_and_reuses_the_encoded_bytes() {
+    use std::cell::Cell;
+
+    use serde::Serialize;
+
+    struct CountingMessage(Cell<u8>);
+
+    impl Serialize for CountingMessage {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            let calls = self.0.get() + 1;
+            self.0.set(calls);
+            serializer.serialize_u8(calls)
+        }
+    }
+
+    let message = CountingMessage(Cell::new(0));
+    let frame = EncodedFrame::encode(&message).expect("encode once");
+    assert_eq!(message.0.get(), 1);
+    let mut bytes = Vec::new();
+    let mut writer = FramedWriter::new(&mut bytes);
+    writer.write_frame(&frame).await.expect("first delivery");
+    writer.write_frame(&frame).await.expect("second delivery");
+    assert_eq!(message.0.get(), 1);
+    assert_eq!(bytes, b"\x01\0\0\x001\x01\0\0\x001");
+}
+
+#[tokio::test]
+async fn serializer_failure_after_partial_json_writes_no_transport_bytes() {
+    use serde::Serialize;
+    use serde::ser::Error;
+    use serde::ser::SerializeSeq;
+
+    struct FailingMessage;
+
+    impl Serialize for FailingMessage {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            let mut sequence = serializer.serialize_seq(Some(2))?;
+            sequence.serialize_element("partial JSON")?;
+            Err(S::Error::custom("deliberate serialization failure"))
+        }
+    }
 
     let mut bytes = Vec::new();
-    reader.read_to_end(&mut bytes).await.expect("read bytes");
-    write.await.expect("writer task");
+    let mut writer = FramedWriter::new(&mut bytes);
+    let err = writer
+        .write(&FailingMessage)
+        .await
+        .expect_err("serializer failure");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    assert!(err.to_string().contains("deliberate serialization failure"));
+    writer
+        .write(&7)
+        .await
+        .expect("reuse after encoding failure");
+    assert_eq!(bytes, b"\x01\0\0\x007");
+}
 
-    let payload = br#"{"value":1}"#;
-    let mut expected = (payload.len() as u32).to_le_bytes().to_vec();
-    expected.extend_from_slice(payload);
-    assert_eq!(bytes, expected);
+#[tokio::test]
+async fn cancelled_wait_can_resume_the_same_partial_frame_read() {
+    use std::future::Future;
+    use std::task::Context;
+    use std::task::Waker;
+
+    use tokio_util::sync::CancellationToken;
+
+    let bytes = b"\x0b\0\0\0{\"value\":1}";
+    for split in [1, 3, 4, 7] {
+        let (mut writer, reader) = tokio::io::duplex(32);
+        let mut reader = FramedReader::new(reader);
+        writer
+            .write_all(&bytes[..split])
+            .await
+            .expect("partial frame");
+        let mut read = Box::pin(reader.read::<serde_json::Value>());
+        assert!(
+            read.as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        tokio::select! {
+            biased;
+            () = cancelled.cancelled() => {}
+            result = &mut read => panic!("partial read completed early: {result:?}"),
+        }
+        writer
+            .write_all(&bytes[split..])
+            .await
+            .expect("remaining frame");
+        assert_eq!(
+            read.await.expect("resume original read"),
+            Some(json!({"value": 1}))
+        );
+        drop(writer);
+        assert_eq!(
+            reader
+                .read::<serde_json::Value>()
+                .await
+                .expect("boundary EOF"),
+            None
+        );
+    }
+}
+
+#[tokio::test]
+async fn cancelled_wait_can_resume_the_same_partial_frame_write() {
+    use std::future::Future;
+    use std::task::Context;
+    use std::task::Waker;
+
+    use tokio_util::sync::CancellationToken;
+
+    let frame = EncodedFrame::encode(&json!({"value": 1})).expect("encode frame");
+    for split in [1, 3, 4, 7] {
+        let (writer, mut reader) = tokio::io::duplex(split);
+        let mut writer = FramedWriter::new(writer);
+        let mut write = Box::pin(writer.write_frame(&frame));
+        assert!(
+            write
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        tokio::select! {
+            biased;
+            () = cancelled.cancelled() => {}
+            result = &mut write => panic!("partial write completed early: {result:?}"),
+        }
+        let mut bytes = [0; 15];
+        reader
+            .read_exact(&mut bytes[..split])
+            .await
+            .expect("already written prefix");
+        let (written, read) = tokio::join!(write, reader.read_exact(&mut bytes[split..]));
+        written.expect("resume original write");
+        read.expect("remaining frame");
+        assert_eq!(&bytes, b"\x0b\0\0\0{\"value\":1}");
+    }
+}
+
+#[tokio::test]
+async fn frame_reader_accepts_only_the_tag_only_notification_acknowledgment() {
+    use super::ClientToHost;
+    use super::DelegateRequestId;
+    use super::DelegateResponse;
+    use super::WireResult;
+
+    let valid = br#"{"type":"delegate/response","id":7,"result":{"status":"ok","value":{"type":"notification/delivered"}}}"#;
+    let invalid = br#"{"type":"delegate/response","id":7,"result":{"status":"ok","value":{"type":"notification/delivered","unexpected":true}}}"#;
+    let mut bytes = Vec::new();
+    for payload in [invalid.as_slice(), valid.as_slice()] {
+        bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(payload);
+    }
+    let mut reader = FramedReader::new(bytes.as_slice());
+    let err = reader
+        .read::<ClientToHost>()
+        .await
+        .expect_err("extra acknowledgment field");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    assert_eq!(
+        reader
+            .read::<ClientToHost>()
+            .await
+            .expect("next valid frame"),
+        Some(ClientToHost::DelegateResponse {
+            id: DelegateRequestId::new(7),
+            result: WireResult::Ok {
+                value: DelegateResponse::NotificationDelivered {}
+            },
+        })
+    );
+    assert_eq!(
+        reader.read::<ClientToHost>().await.expect("boundary EOF"),
+        None
+    );
 }
 
 #[tokio::test]
@@ -34,11 +295,10 @@ async fn fragmented_frame_round_trips() {
     let mut bytes = (payload.len() as u32).to_le_bytes().to_vec();
     bytes.extend(payload);
 
-    let (mut writer, reader) = tokio::io::duplex(/*max_buf_size*/ 128);
+    let (mut writer, reader) = tokio::io::duplex(/*max_buf_size*/ 1);
     let write = tokio::spawn(async move {
         for byte in bytes {
             writer.write_all(&[byte]).await.expect("write byte");
-            tokio::task::yield_now().await;
         }
     });
 
@@ -75,6 +335,121 @@ async fn eof_is_clean_only_at_a_frame_boundary() {
         .await
         .expect_err("truncated header");
     assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+
+    let (mut writer, reader) = tokio::io::duplex(/*max_buf_size*/ 16);
+    writer
+        .write_all(&4_u32.to_le_bytes())
+        .await
+        .expect("header");
+    writer.write_all(b"{}").await.expect("partial payload");
+    drop(writer);
+    let err = FramedReader::new(reader)
+        .read::<serde_json::Value>()
+        .await
+        .expect_err("truncated payload");
+    assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+}
+
+#[tokio::test]
+async fn consecutive_frames_end_at_a_clean_boundary() {
+    let (writer, reader) = tokio::io::duplex(/*max_buf_size*/ 16);
+    let write = tokio::spawn(async move {
+        let mut writer = FramedWriter::new(writer);
+        writer
+            .write(&json!({"first": 1}))
+            .await
+            .expect("first frame");
+        writer
+            .write(&json!(["second", 2]))
+            .await
+            .expect("second frame");
+    });
+    let mut reader = FramedReader::new(reader);
+    assert_eq!(
+        reader
+            .read::<serde_json::Value>()
+            .await
+            .expect("first frame"),
+        Some(json!({"first": 1}))
+    );
+    assert_eq!(
+        reader
+            .read::<serde_json::Value>()
+            .await
+            .expect("second frame"),
+        Some(json!(["second", 2]))
+    );
+    assert_eq!(
+        reader
+            .read::<serde_json::Value>()
+            .await
+            .expect("boundary EOF"),
+        None
+    );
+    write.await.expect("writer task");
+}
+
+#[tokio::test]
+async fn oversized_encoding_stops_early_and_leaves_the_stream_usable() {
+    use std::cell::Cell;
+
+    use serde::Serialize;
+    use serde::ser::SerializeSeq;
+
+    struct OversizedMessage {
+        serialized_chunks: Cell<usize>,
+    }
+
+    impl Serialize for OversizedMessage {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            let chunk = "x".repeat(1024);
+            let mut sequence = serializer.serialize_seq(None)?;
+            for _ in 0..=MAX_FRAME_BYTES / 1024 {
+                self.serialized_chunks.set(self.serialized_chunks.get() + 1);
+                sequence.serialize_element(&chunk)?;
+            }
+            sequence.end()
+        }
+    }
+
+    let message = OversizedMessage {
+        serialized_chunks: Cell::new(0),
+    };
+    let mut bytes = Vec::new();
+    let err = FramedWriter::new(&mut bytes)
+        .write(&message)
+        .await
+        .expect_err("oversized encoding");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    assert!(message.serialized_chunks.get() > 0);
+    assert!(message.serialized_chunks.get() < MAX_FRAME_BYTES / 1024 + 1);
+    assert!(
+        bytes.is_empty(),
+        "encoding failure must not write a frame prefix"
+    );
+
+    FramedWriter::new(&mut bytes)
+        .write(&json!({"after": "rejection"}))
+        .await
+        .expect("write after encoding failure");
+    let mut reader = FramedReader::new(bytes.as_slice());
+    assert_eq!(
+        reader
+            .read::<serde_json::Value>()
+            .await
+            .expect("valid frame"),
+        Some(json!({"after": "rejection"}))
+    );
+    assert_eq!(
+        reader
+            .read::<serde_json::Value>()
+            .await
+            .expect("boundary EOF"),
+        None
+    );
 }
 
 #[tokio::test]

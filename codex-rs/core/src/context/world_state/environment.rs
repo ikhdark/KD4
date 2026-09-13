@@ -57,10 +57,11 @@ impl EnvironmentsState {
                 })
                 .collect(),
             legacy_single: is_legacy_single(&self.environments),
+            replace_all: false,
             current_date: self.current_date.clone(),
             timezone: self.timezone.clone(),
-            network: self.network.clone(),
-            filesystem: self.filesystem.clone(),
+            network: self.network.as_ref().map(NetworkContext::render),
+            filesystem: self.filesystem.as_ref().map(FileSystemContext::render),
             subagents: self.subagents.clone(),
         }
     }
@@ -69,6 +70,10 @@ impl EnvironmentsState {
 impl WorldStateSection for EnvironmentsState {
     const ID: &'static str = "environments";
     type Snapshot = EnvironmentsSnapshot;
+
+    fn matches_legacy_fragment(role: &str, text: &str) -> bool {
+        role == "user" && Self::matches_text(text)
+    }
 
     fn snapshot(&self) -> Self::Snapshot {
         EnvironmentsSnapshot {
@@ -100,6 +105,7 @@ impl WorldStateSection for EnvironmentsState {
     ) -> Option<Box<dyn ContextualUserFragment>> {
         let current = self.snapshot();
         let empty = EnvironmentsSnapshot::default();
+        let replace_all = matches!(previous, PreviousSectionState::Unknown);
         let previous = match previous {
             PreviousSectionState::Known(previous) => previous,
             PreviousSectionState::Absent | PreviousSectionState::Unknown => &empty,
@@ -119,7 +125,18 @@ impl WorldStateSection for EnvironmentsState {
                     .get(*id)
                     .is_none_or(|previous| !environment.has_same_diff_value(previous))
             })
-            .map(|(id, environment)| (id.clone(), EnvironmentUpdate::Current(environment.clone())))
+            .map(|(id, environment)| {
+                let mut environment = environment.clone();
+                if environment.shell.is_none()
+                    && previous
+                        .environments
+                        .get(id)
+                        .is_some_and(|previous| previous.shell.is_some())
+                {
+                    environment.shell = Some("unknown".to_string());
+                }
+                (id.clone(), EnvironmentUpdate::Current(environment))
+            })
             .collect::<BTreeMap<_, _>>();
         updates.extend(
             previous
@@ -132,17 +149,31 @@ impl WorldStateSection for EnvironmentsState {
             && updates
                 .values()
                 .all(|update| matches!(update, EnvironmentUpdate::Current(_)));
-        (!updates.is_empty() || turn_context_values_changed || subagents_changed).then(|| {
-            Box::new(RenderedEnvironments {
-                updates,
-                legacy_single,
-                current_date: self.current_date.clone(),
-                timezone: self.timezone.clone(),
-                network: self.network.clone(),
-                filesystem: self.filesystem.clone(),
-                subagents: self.subagents.clone(),
-            }) as Box<dyn ContextualUserFragment>
-        })
+        (replace_all || !updates.is_empty() || turn_context_values_changed || subagents_changed)
+            .then(|| {
+                Box::new(RenderedEnvironments {
+                    updates,
+                    legacy_single,
+                    replace_all,
+                    current_date: changed_value(
+                        &current.current_date,
+                        &previous.current_date,
+                        "unknown",
+                    ),
+                    timezone: changed_value(&current.timezone, &previous.timezone, "unknown"),
+                    network: changed_value(
+                        &current.network,
+                        &previous.network,
+                        "<network status=\"unspecified\" />",
+                    ),
+                    filesystem: changed_value(
+                        &current.filesystem,
+                        &previous.filesystem,
+                        "<filesystem status=\"unspecified\" />",
+                    ),
+                    subagents: changed_value(&current.subagents, &previous.subagents, "none"),
+                }) as Box<dyn ContextualUserFragment>
+            })
     }
 }
 
@@ -167,10 +198,11 @@ impl ContextualUserFragment for EnvironmentsState {
 struct RenderedEnvironments {
     updates: BTreeMap<String, EnvironmentUpdate>,
     legacy_single: bool,
+    replace_all: bool,
     current_date: Option<String>,
     timezone: Option<String>,
-    network: Option<NetworkContext>,
-    filesystem: Option<FileSystemContext>,
+    network: Option<String>,
+    filesystem: Option<String>,
     subagents: Option<String>,
 }
 
@@ -194,6 +226,9 @@ impl ContextualUserFragment for RenderedEnvironments {
 
     fn body(&self) -> String {
         let mut rendered = "\n".to_string();
+        if self.replace_all {
+            rendered.push_str("  This environment context replaces all previously provided environment context. Unlisted environments are unavailable; omitted fields are unspecified; omitted subagents means none.\n");
+        }
         if self.legacy_single {
             if let Some(EnvironmentUpdate::Current(environment)) = self.updates.values().next() {
                 push_environment_values(&mut rendered, environment, "  ");
@@ -223,12 +258,12 @@ impl ContextualUserFragment for RenderedEnvironments {
         push_optional_element(&mut rendered, "timezone", self.timezone.as_deref());
         if let Some(network) = &self.network {
             rendered.push_str("  ");
-            rendered.push_str(&network.render());
+            rendered.push_str(network);
             rendered.push('\n');
         }
         if let Some(filesystem) = &self.filesystem {
             rendered.push_str("  ");
-            rendered.push_str(&filesystem.render());
+            rendered.push_str(filesystem);
             rendered.push('\n');
         }
         if let Some(subagents) = &self.subagents {
@@ -242,6 +277,14 @@ impl ContextualUserFragment for RenderedEnvironments {
         }
         rendered
     }
+}
+
+fn changed_value(
+    current: &Option<String>,
+    previous: &Option<String>,
+    cleared: &str,
+) -> Option<String> {
+    (current != previous).then(|| current.clone().unwrap_or_else(|| cleared.to_string()))
 }
 
 fn push_environment_values(rendered: &mut String, environment: &EnvironmentState, indent: &str) {
@@ -300,13 +343,7 @@ struct EnvironmentSnapshot {
 
 impl EnvironmentSnapshot {
     fn has_same_diff_value(&self, other: &Self) -> bool {
-        self.cwd == other.cwd
-            && self.status == other.status
-            && self
-                .shell
-                .as_ref()
-                .zip(other.shell.as_ref())
-                .is_none_or(|(current, previous)| current == previous)
+        self.cwd == other.cwd && self.status == other.status && self.shell == other.shell
     }
 }
 

@@ -6,6 +6,7 @@ mod wait_handler;
 pub(crate) mod wait_spec;
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
@@ -56,7 +57,7 @@ use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_output_truncation::formatted_truncate_text_content_items_with_policy;
 use codex_utils_output_truncation::resolve_output_limits;
 use codex_utils_output_truncation::truncate_function_output_items_with_policy;
-use codex_utils_output_truncation::truncate_text;
+use codex_utils_output_truncation::truncate_text_to_token_ceiling;
 use codex_utils_string::approx_token_count;
 
 use delegate::CodeModeDispatchBroker;
@@ -93,7 +94,7 @@ pub(crate) struct CodeModeService {
 #[derive(Default)]
 struct CodeModePacketAdmission {
     cells: HashMap<String, CodeModePacketMetrics>,
-    consecutive_tiny_packets_by_turn: HashMap<String, u8>,
+    advised_turns: HashSet<String>,
 }
 
 #[derive(Default)]
@@ -137,11 +138,6 @@ struct CodeModePacketReceipt {
     advisory: Option<&'static str>,
 }
 
-#[derive(Default)]
-struct JsonByteCounter {
-    bytes: usize,
-}
-
 struct BoundedJsonWriter {
     bytes: Vec<u8>,
     total_bytes: usize,
@@ -157,7 +153,7 @@ impl BoundedJsonWriter {
         }
     }
 
-    fn finish(self) -> (String, bool) {
+    fn finish(self) -> (String, bool, usize) {
         let mut bytes = self.bytes;
         let mut truncated = self.total_bytes > bytes.len();
         if let Err(error) = std::str::from_utf8(&bytes) {
@@ -167,6 +163,7 @@ impl BoundedJsonWriter {
         (
             String::from_utf8(bytes).expect("validated UTF-8 prefix"),
             truncated,
+            self.total_bytes,
         )
     }
 }
@@ -185,26 +182,14 @@ impl std::io::Write for BoundedJsonWriter {
     }
 }
 
-impl std::io::Write for JsonByteCounter {
-    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
-        self.bytes = self.bytes.saturating_add(buffer.len());
-        Ok(buffer.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-fn serialized_json_len(value: &JsonValue) -> usize {
-    let mut counter = JsonByteCounter::default();
-    serde_json::to_writer(&mut counter, value).map_or(0, |()| counter.bytes)
-}
-
-fn bounded_serialized_json(value: &JsonValue) -> (String, bool) {
+fn bounded_serialized_json(value: &JsonValue) -> (String, bool, usize) {
     let mut writer = BoundedJsonWriter::new(MAX_RETAINED_NESTED_RESULT_BYTES);
     if serde_json::to_writer(&mut writer, value).is_err() {
-        return ("<nested result could not be serialized>".to_string(), false);
+        return (
+            "<nested result could not be serialized>".to_string(),
+            false,
+            0,
+        );
     }
     writer.finish()
 }
@@ -215,7 +200,7 @@ const MAX_RETAINED_NESTED_RESULT_BYTES: usize = 4_096;
 const MAX_FAILED_CELL_ERROR_BYTES: usize = 4_096;
 const FAILED_CELL_ERROR_TRUNCATION_MARKER: &str = "\n… [truncated]";
 const APPLY_PATCH_ENVELOPE_MARKER: &str = "*** Begin Patch";
-const TINY_PACKET_ADVISORY: &str = "Low-density packet: on the next decision, batch every known independent read in one exec with Promise.allSettled and print the evidence you need with text(...). If evidence is sufficient or unchanged, synthesize and stop instead of sampling or polling again.";
+const TINY_PACKET_ADVISORY: &str = "Low-density packet: when more evidence is needed, batch only necessary independent reads with known inputs in one exec using Promise.allSettled; print needed evidence with text(...). Reuse unchanged evidence. Stop when the task is answered.";
 
 impl CodeModeService {
     pub(crate) fn new(session_provider: Arc<dyn CodeModeSessionProvider>) -> Self {
@@ -299,6 +284,12 @@ impl CodeModeService {
     }
 
     pub(crate) fn record_cell_parent_call_id(&self, cell_id: &CellId, call_id: &str) {
+        self.packet_admission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .cells
+            .entry(cell_id.to_string())
+            .or_default();
         self.cell_parent_call_ids
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -315,22 +306,29 @@ impl CodeModeService {
 
     pub(crate) fn finish_cell_dispatch(&self, cell_id: &CellId) {
         self.dispatch_broker.close_cell(cell_id);
+        // Only registration creates packet state. Accepted child operations
+        // keep their own cleanup owner, but cannot recreate a closed packet.
+        self.packet_admission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .cells
+            .remove(cell_id.as_str());
         self.cell_parent_call_ids
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(cell_id.as_str());
     }
 
-    fn begin_packet_call(&self, cell_id: &CellId) -> usize {
+    fn begin_packet_call(&self, cell_id: &CellId) -> Option<usize> {
         let mut admission = self
             .packet_admission
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let metrics = admission.cells.entry(cell_id.to_string()).or_default();
+        let metrics = admission.cells.get_mut(cell_id.as_str())?;
         let ordinal = metrics.next_nested_ordinal;
         metrics.next_nested_ordinal = metrics.next_nested_ordinal.saturating_add(1);
         metrics.nested_call_count = metrics.nested_call_count.saturating_add(1);
-        ordinal
+        Some(ordinal)
     }
 
     fn complete_packet_call(
@@ -347,7 +345,9 @@ impl CodeModeService {
             .packet_admission
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let metrics = admission.cells.entry(cell_id.to_string()).or_default();
+        let Some(metrics) = admission.cells.get_mut(cell_id.as_str()) else {
+            return;
+        };
         metrics.batchable_observation_count = metrics
             .batchable_observation_count
             .saturating_add(usize::from(batchable_observation));
@@ -392,7 +392,8 @@ impl CodeModeService {
         result_bytes: usize,
         post_tool_use_feedback: Vec<FunctionCallOutputContentItem>,
     ) {
-        let ordinal = self.begin_packet_call(cell_id);
+        self.record_cell_parent_call_id(cell_id, "test-exec");
+        let ordinal = self.begin_packet_call(cell_id).expect("registered cell");
         self.complete_packet_call(
             cell_id,
             ordinal,
@@ -409,23 +410,29 @@ impl CodeModeService {
             .packet_admission
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut metrics = admission.cells.remove(cell_id).unwrap_or_default();
+        let mut metrics = admission
+            .cells
+            .get_mut(cell_id)
+            .map(|metrics| {
+                let next_nested_ordinal = metrics.next_nested_ordinal;
+                let packet = std::mem::take(metrics);
+                // Live output and steering can cross outstanding child calls.
+                // Drain response data, but keep registration order for the cell.
+                metrics.next_nested_ordinal = next_nested_ordinal;
+                packet
+            })
+            .unwrap_or_default();
         metrics
             .nested_results
             .sort_unstable_by_key(|result| result.ordinal);
         let tiny_read_only_packet = metrics.nested_call_count == 1
             && metrics.batchable_observation_count == 1
             && metrics.result_bytes <= TINY_PACKET_RESULT_BYTES;
-        let consecutive = admission
-            .consecutive_tiny_packets_by_turn
-            .entry(turn_id.to_string())
-            .or_default();
-        if tiny_read_only_packet {
-            *consecutive = consecutive.saturating_add(1);
-        } else {
-            *consecutive = 0;
-        }
-        let advisory = (*consecutive == 1).then_some(TINY_PACKET_ADVISORY);
+        // The guidance is unchanged across packets. Keep it once in the turn's
+        // history even when a larger packet separates two small reads.
+        let advisory = (tiny_read_only_packet
+            && admission.advised_turns.insert(turn_id.to_string()))
+        .then_some(TINY_PACKET_ADVISORY);
         CodeModePacketReceipt {
             nested_call_count: metrics.nested_call_count,
             batchable_observation_count: metrics.batchable_observation_count,
@@ -441,7 +448,7 @@ impl CodeModeService {
         self.packet_admission
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .consecutive_tiny_packets_by_turn
+            .advised_turns
             .remove(turn_id);
     }
 
@@ -561,10 +568,8 @@ pub(super) fn handle_runtime_response(
         started_at,
         packet.post_tool_use_feedback,
         nested_results,
+        packet.first_required_terminal,
     );
-    if let Some(required_terminal) = packet.first_required_terminal {
-        output = fold_nested_required_terminal(output, required_terminal);
-    }
     if let Some(advisory) = packet.advisory {
         output.body.push(FunctionCallOutputContentItem::InputText {
             text: advisory.to_string(),
@@ -639,39 +644,48 @@ pub(super) async fn emit_failed_code_mode_cell_item(
         .await;
 }
 
+fn merge_code_mode_signal(mut output: FunctionToolOutput, signal: JsonValue) -> FunctionToolOutput {
+    if let (Some(existing), Some(additional)) = (
+        output
+            .sampling_request_signal
+            .as_mut()
+            .and_then(JsonValue::as_object_mut),
+        signal.as_object(),
+    ) {
+        existing.extend(additional.clone());
+    } else {
+        output.sampling_request_signal = Some(signal);
+    }
+    output
+}
+
 fn fold_nested_required_terminal(
-    mut output: FunctionToolOutput,
+    output: FunctionToolOutput,
     terminal: CodeModeNestedTerminal,
 ) -> FunctionToolOutput {
-    output.body.push(FunctionCallOutputContentItem::InputText {
-        text: format!("Required nested tool outcome: {}", terminal.message),
-    });
-    match terminal.cause {
-        RequiredToolTerminalCause::Blocked => output
-            .with_skip_disposition(ToolOutputSkipDisposition::BlockingRequiredOperation)
-            .with_sampling_request_signal(serde_json::json!({
-                "outcome": "blocked",
-                "nested_ordinal": terminal.ordinal,
-            })),
-        RequiredToolTerminalCause::Failure => output
-            .with_outcome(ToolOutputOutcome::Failure)
-            .with_sampling_request_signal(serde_json::json!({
-                "outcome": "failure",
-                "nested_ordinal": terminal.ordinal,
-            })),
-        RequiredToolTerminalCause::TimedOut => output
-            .with_outcome(ToolOutputOutcome::TimedOut)
-            .with_sampling_request_signal(serde_json::json!({
-                "outcome": "timeout",
-                "nested_ordinal": terminal.ordinal,
-            })),
-        RequiredToolTerminalCause::RecoverableCancellation => output
-            .with_outcome(ToolOutputOutcome::Failure)
-            .with_sampling_request_signal(serde_json::json!({
-                "outcome": "recoverable_cancellation",
-                "nested_ordinal": terminal.ordinal,
-            })),
-    }
+    let (output, outcome) = match terminal.cause {
+        RequiredToolTerminalCause::Blocked => (
+            output.with_skip_disposition(ToolOutputSkipDisposition::BlockingRequiredOperation),
+            "blocked",
+        ),
+        RequiredToolTerminalCause::Failure => {
+            (output.with_outcome(ToolOutputOutcome::Failure), "failure")
+        }
+        RequiredToolTerminalCause::TimedOut => {
+            (output.with_outcome(ToolOutputOutcome::TimedOut), "timeout")
+        }
+        RequiredToolTerminalCause::RecoverableCancellation => (
+            output.with_outcome(ToolOutputOutcome::Failure),
+            "recoverable_cancellation",
+        ),
+    };
+    merge_code_mode_signal(
+        output,
+        serde_json::json!({
+            "outcome": outcome,
+            "nested_ordinal": terminal.ordinal,
+        }),
+    )
 }
 
 fn required_nested_tool_terminal_cause(
@@ -728,6 +742,7 @@ fn format_runtime_response(
     started_at: std::time::Instant,
     post_tool_use_feedback: Vec<FunctionCallOutputContentItem>,
     nested_results: Vec<CodeModeNestedResultEvidence>,
+    required_terminal: Option<CodeModeNestedTerminal>,
 ) -> FunctionToolOutput {
     let continuation_owner_key = match &response {
         RuntimeResponse::Yielded { cell_id, .. }
@@ -740,7 +755,7 @@ fn format_runtime_response(
         &response,
         RuntimeResponse::Yielded { .. } | RuntimeResponse::ExplicitYield { .. }
     );
-    let (mut content_items, outcome, success, script_error) = match response {
+    let (mut content_items, mut outcome, mut success, script_error) = match response {
         RuntimeResponse::Yielded { content_items, .. }
         | RuntimeResponse::ExplicitYield { content_items, .. } => {
             let content_items = into_function_call_output_content_items(content_items);
@@ -768,15 +783,40 @@ fn format_runtime_response(
 
     content_items.extend(nested_result_content_items(nested_results));
     content_items.extend(post_tool_use_feedback);
+    let mut diagnostic = required_terminal.as_ref().map(|terminal| {
+        success = false;
+        outcome = match terminal.cause {
+            RequiredToolTerminalCause::Blocked => OutputOutcome::Skipped,
+            RequiredToolTerminalCause::TimedOut => OutputOutcome::TimedOut,
+            RequiredToolTerminalCause::Failure
+            | RequiredToolTerminalCause::RecoverableCancellation => OutputOutcome::Failure,
+        };
+        format!("Required nested tool outcome: {}", terminal.message)
+    });
     if let Some(error_text) = script_error {
-        content_items.push(FunctionCallOutputContentItem::InputText {
-            text: format!("Script error:\n{error_text}"),
-        });
+        let script_error = format!("Script error:\n{error_text}");
+        match &mut diagnostic {
+            Some(diagnostic) => {
+                diagnostic.push('\n');
+                diagnostic.push_str(&script_error);
+            }
+            None => diagnostic = Some(script_error),
+        }
     }
+    let diagnostic_index = diagnostic.map(|text| {
+        let index = content_items.len();
+        content_items.push(FunctionCallOutputContentItem::InputText { text });
+        index
+    });
     sanitize_image_detail_items(original_image_detail_supported, &mut content_items);
     let mut canonical_content_items = content_items.clone();
-    let mut content_items =
-        truncate_code_mode_result(content_items, max_output_tokens, outcome, hard_limit);
+    let mut content_items = truncate_code_mode_result(
+        content_items,
+        max_output_tokens,
+        outcome,
+        hard_limit,
+        diagnostic_index,
+    );
     let semantic_evidence = serde_json::json!({
         "status": &script_status,
         "content_items": &content_items,
@@ -796,11 +836,15 @@ fn format_runtime_response(
     } else {
         crate::tools::context::semantic_failure_sampling_signal(semantic_evidence)
     };
-    FunctionToolOutput::from_content(content_items, Some(success))
+    let output = FunctionToolOutput::from_content(content_items, Some(success))
         .with_canonical_body(canonical_content_items)
         .with_outcome(typed_outcome)
         .with_sampling_request_signal(sampling_request_signal)
-        .with_deterministic_continuation_owner_key(continuation_owner_key)
+        .with_deterministic_continuation_owner_key(continuation_owner_key);
+    match required_terminal {
+        Some(terminal) => fold_nested_required_terminal(output, terminal),
+        None => output,
+    }
 }
 
 fn format_script_status(response: &RuntimeResponse) -> String {
@@ -843,6 +887,7 @@ fn truncate_code_mode_result(
     max_output_tokens: Option<usize>,
     outcome: OutputOutcome,
     hard_limit: usize,
+    diagnostic_index: Option<usize>,
 ) -> Vec<FunctionCallOutputContentItem> {
     let diagnostic_text = code_mode_text_content(&items);
     let requested_limit =
@@ -855,6 +900,9 @@ fn truncate_code_mode_result(
         hard_limit,
     );
     let policy = TruncationPolicy::Tokens(limits.applied_limit);
+    if let Some(error_index) = diagnostic_index {
+        return truncate_code_mode_failure(items, error_index, limits.applied_limit);
+    }
     if items
         .iter()
         .all(|item| matches!(item, FunctionCallOutputContentItem::InputText { .. }))
@@ -864,22 +912,10 @@ fn truncate_code_mode_result(
         return truncated_items;
     }
 
-    if outcome == OutputOutcome::Failure
-        && let Some(error_index) = items.iter().position(|item| {
-            matches!(
-                item,
-                FunctionCallOutputContentItem::InputText { text }
-                    if text.starts_with("Script error:\n")
-            )
-        })
-    {
-        return truncate_mixed_code_mode_failure(items, error_index, limits.applied_limit);
-    }
-
     truncate_function_output_items_with_policy(&items, policy)
 }
 
-fn truncate_mixed_code_mode_failure(
+fn truncate_code_mode_failure(
     mut items: Vec<FunctionCallOutputContentItem>,
     error_index: usize,
     token_limit: usize,
@@ -891,11 +927,18 @@ fn truncate_mixed_code_mode_failure(
     let error_tokens = approx_token_count(&error_text);
     let reserved_error_tokens = error_tokens.min(token_limit);
     let other_policy = TruncationPolicy::Tokens(token_limit.saturating_sub(reserved_error_tokens));
-    let mut projected = truncate_function_output_items_with_policy(&items, other_policy);
+    let mut projected = if items
+        .iter()
+        .all(|item| matches!(item, FunctionCallOutputContentItem::InputText { .. }))
+    {
+        formatted_truncate_text_content_items_with_policy(&items, other_policy).0
+    } else {
+        truncate_function_output_items_with_policy(&items, other_policy)
+    };
     let error_text = if error_tokens <= reserved_error_tokens {
         error_text
     } else {
-        truncate_text(&error_text, TruncationPolicy::Tokens(reserved_error_tokens))
+        truncate_text_to_token_ceiling(&error_text, reserved_error_tokens)
     };
     if !error_text.is_empty() {
         projected.push(FunctionCallOutputContentItem::InputText { text: error_text });
@@ -933,7 +976,8 @@ async fn call_nested_tool(
         .session
         .services
         .code_mode_service
-        .begin_packet_call(&cell_id);
+        .begin_packet_call(&cell_id)
+        .ok_or_else(|| FunctionCallError::RespondToModel("code mode cell is closed".to_string()))?;
     if is_exec_tool_name(&tool_name) {
         let message = format!("{PUBLIC_TOOL_NAME} cannot invoke itself");
         exec.session
@@ -1064,7 +1108,16 @@ async fn call_nested_tool(
     }
     let post_tool_use_feedback = result.take_code_mode_feedback();
     let result_value = result.code_mode_result();
-    let (retained_output, output_truncated) = bounded_serialized_json(&result_value);
+    let (retained_output, output_truncated, result_bytes) = bounded_serialized_json(&result_value);
+    if !output_truncated && let Some(parent_call_id) = parent_tool_call_id.as_ref() {
+        exec.session
+            .register_code_mode_nested_evidence(
+                parent_call_id.clone(),
+                nested_call_id.clone(),
+                retained_output.clone(),
+            )
+            .await;
+    }
     let nested_result = CodeModeNestedResultEvidence {
         ordinal: packet_ordinal,
         call_id: nested_call_id,
@@ -1096,7 +1149,7 @@ async fn call_nested_tool(
             packet_ordinal,
             is_batchable_observation(&tool_name, &payload)
                 && !result_has_live_exec_session(&result_value),
-            serialized_json_len(&result_value),
+            result_bytes,
             post_tool_use_feedback,
             Some(nested_result),
             required_terminal,
@@ -1177,6 +1230,7 @@ fn wrapped_patch_rejection(
         .iter()
         .any(|part| part.contains(APPLY_PATCH_ENVELOPE_MARKER))
         || is_native_apply_patch_invocation(&command)
+        || !is_wrapped_apply_patch_invocation(&command)
     {
         return None;
     }
@@ -1184,6 +1238,43 @@ fn wrapped_patch_rejection(
         "Patch envelopes must go through the apply_patch tool, not a shell wrapper: call `await tools.apply_patch(patch)` with the same `{APPLY_PATCH_ENVELOPE_MARKER}` body. The wrapped `{}` command was not run.",
         tool_name.name
     ))
+}
+
+fn is_wrapped_apply_patch_invocation(command: &[String]) -> bool {
+    let script = match command {
+        [script] => script.as_str(),
+        _ => match codex_shell_command::parse_command::extract_shell_command(command) {
+            Some((_, script)) => script,
+            None => return false,
+        },
+    };
+    // Recognize the complete PowerShell literal-pipeline shape. Marker-bearing
+    // searches, printed examples, and ambiguous scripts use ordinary dispatch.
+    let script = script.trim();
+    for (opening, closing) in [("@'", "'@"), ("@\"", "\"@")] {
+        if let Some(body) = script.strip_prefix(opening).and_then(|body| {
+            body.strip_prefix("\r\n")
+                .or_else(|| body.strip_prefix('\n'))
+        }) && let Some((_, tail)) = body.split_once(&format!("\n{closing}"))
+        {
+            return matches!(
+                tail.trim().strip_prefix('|').map(str::trim),
+                Some("apply_patch" | "applypatch")
+            );
+        }
+    }
+    codex_shell_command::bash::try_parse_shell(script)
+        .and_then(|tree| {
+            codex_shell_command::bash::try_parse_word_only_commands_sequence(&tree, script)
+        })
+        .is_some_and(|commands| {
+            commands.iter().any(|argv| {
+                matches!(
+                    argv.first().map(String::as_str),
+                    Some("apply_patch" | "applypatch")
+                )
+            })
+        })
 }
 
 /// Plain `apply_patch` heredoc forms are intercepted natively without a
@@ -1305,17 +1396,7 @@ fn nested_failure_fingerprint(tool_name: &ToolName, error: &str) -> String {
     {
         return fingerprint.to_string();
     }
-    let normalized = error
-        .split_whitespace()
-        .map(|part| {
-            if part.chars().all(|character| character.is_ascii_digit()) {
-                "#"
-            } else {
-                part
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ");
+    let normalized = error.split_whitespace().collect::<Vec<_>>().join(" ");
     format!(
         "code_mode.nested_tool.{:x}",
         Sha256::digest(format!("{tool_name}\0{normalized}").as_bytes())
@@ -1400,7 +1481,6 @@ mod tests {
     use super::nested_failure_fingerprint;
     use super::required_nested_tool_terminal_cause;
     use super::result_has_live_exec_session;
-    use super::serialized_json_len;
     use super::truncate_code_mode_result;
     use super::wrapped_patch_rejection;
     use crate::tools::context::FunctionToolOutput;
@@ -1425,17 +1505,19 @@ mod tests {
     }
 
     #[test]
-    fn packet_result_byte_count_matches_compact_json_without_allocating_a_buffer() {
+    fn retained_nested_result_counts_full_json_bytes_including_utf8() {
         let value = json!({
             "text": "multi-byte: é",
             "nested": [true, null, {"count": 17}],
         });
 
+        let (retained, truncated, bytes) = bounded_serialized_json(&value);
+        let expected = r#"{"text":"multi-byte: é","nested":[true,null,{"count":17}]}"#;
+        assert_eq!(bytes, expected.len());
+        assert!(!truncated);
         assert_eq!(
-            serialized_json_len(&value),
-            serde_json::to_vec(&value)
-                .expect("serialize expected packet result")
-                .len()
+            serde_json::from_str::<serde_json::Value>(&retained).unwrap(),
+            value
         );
     }
 
@@ -1447,11 +1529,15 @@ mod tests {
             "tail": "MUST_NOT_BE_RETAINED",
         });
 
-        let (retained, truncated) = bounded_serialized_json(&value);
+        let (retained, truncated, bytes) = bounded_serialized_json(&value);
+        let expected = format!(
+            r#"{{"a_prefix":"kept","body":"{}","tail":"MUST_NOT_BE_RETAINED"}}"#,
+            "x".repeat(MAX_RETAINED_NESTED_RESULT_BYTES * 2)
+        );
 
         assert!(truncated);
-        assert!(retained.len() <= MAX_RETAINED_NESTED_RESULT_BYTES);
-        assert!(retained.contains("kept"));
+        assert_eq!(retained, expected[..MAX_RETAINED_NESTED_RESULT_BYTES]);
+        assert_eq!(bytes, expected.len());
         assert!(!retained.contains("MUST_NOT_BE_RETAINED"));
     }
 
@@ -1461,11 +1547,11 @@ mod tests {
             "body": "🙂".repeat(MAX_RETAINED_NESTED_RESULT_BYTES),
         });
 
-        let (retained, truncated) = bounded_serialized_json(&value);
+        let (retained, truncated, bytes) = bounded_serialized_json(&value);
 
         assert!(truncated);
-        assert!(retained.len() <= MAX_RETAINED_NESTED_RESULT_BYTES);
-        assert!(std::str::from_utf8(retained.as_bytes()).is_ok());
+        assert_eq!(retained, format!("{{\"body\":\"{}", "🙂".repeat(1_021)));
+        assert_eq!(bytes, 16_395);
     }
 
     #[test]
@@ -1536,6 +1622,26 @@ mod tests {
             wrapped_patch_rejection(&ToolName::plain("read_tool_output"), &wrapped, true),
             None
         );
+        for cmd in [
+            r#"rg --fixed-strings "*** Begin Patch" src"#,
+            r#"printf '%s' '*** Begin Patch | apply_patch'"#,
+            r#"Write-Output '*** Begin Patch | apply_patch'"#,
+            "@'\n*** Begin Patch\n'@ | Write-Output",
+        ] {
+            let payload = ToolPayload::Function {
+                arguments: json!({ "cmd": cmd }).to_string(),
+            };
+            assert_eq!(
+                wrapped_patch_rejection(&exec_command, &payload, true),
+                None,
+                "{cmd}"
+            );
+        }
+        let piped = ToolPayload::Function {
+            arguments: json!({ "cmd": format!("printf '%s' '{envelope}' | apply_patch") })
+                .to_string(),
+        };
+        assert!(wrapped_patch_rejection(&exec_command, &piped, true).is_some());
     }
 
     /// Builds a real session, step context, and tool runtime with the given
@@ -1586,6 +1692,10 @@ mod tests {
         );
         let (session, turn, runtime) = nested_call_fixture(vec![apply_patch]).await;
         let cell_id = CellId::new("cell-patch".to_string());
+        session
+            .services
+            .code_mode_service
+            .record_cell_parent_call_id(&cell_id, "outer-exec");
         let exec = super::ExecContext {
             session: Arc::clone(&session),
             turn: Arc::clone(&turn),
@@ -1617,9 +1727,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn harmless_patch_marker_reaches_the_registered_shell_handler() {
+        let apply_patch: Arc<dyn crate::tools::registry::CoreToolRuntime> =
+            Arc::new(crate::tools::handlers::ApplyPatchHandler::new(false));
+        let shell: Arc<dyn crate::tools::registry::CoreToolRuntime> =
+            Arc::new(crate::tools::handlers::ShellCommandHandler::new(
+                crate::tools::handlers::ShellCommandHandlerOptions {
+                    allow_login_shell: false,
+                    allow_escalated_sandbox_permissions: false,
+                    exec_permission_approvals_enabled: false,
+                },
+            ));
+        let (session, turn, runtime) = nested_call_fixture(vec![apply_patch, shell]).await;
+        let cell_id = CellId::new("harmless-patch-marker".to_string());
+        let service = &session.services.code_mode_service;
+        service.record_cell_parent_call_id(&cell_id, "outer-exec");
+        let result = super::call_nested_tool(
+            super::ExecContext {
+                session: Arc::clone(&session),
+                turn: Arc::clone(&turn),
+            },
+            runtime,
+            codex_code_mode::CodeModeNestedToolCall {
+                cell_id: cell_id.clone(),
+                parent_tool_call_id: Some("outer-exec".to_string()),
+                runtime_tool_call_id: "print-marker".to_string(),
+                tool_name: ToolName::plain("shell_command"),
+                tool_kind: CodeModeToolKind::Function,
+                input: Some(json!({ "command": "echo '*** Begin Patch'", "login": false })),
+            },
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .expect("printing patch-shaped data must reach ordinary shell dispatch");
+        assert!(result.to_string().contains("*** Begin Patch"));
+        let packet = service.finish_packet(cell_id.as_str(), turn.sub_id.as_str());
+        assert_eq!(packet.nested_call_count, 1);
+        assert!(packet.first_required_terminal.is_none());
+        service.finish_cell_dispatch(&cell_id);
+    }
+
+    #[tokio::test]
     async fn wrapped_patch_is_not_rejected_when_no_apply_patch_tool_is_registered() {
         let (session, turn, runtime) = nested_call_fixture(Vec::new()).await;
         let cell_id = CellId::new("cell-no-patch-tool".to_string());
+        session
+            .services
+            .code_mode_service
+            .record_cell_parent_call_id(&cell_id, "outer-exec");
         let exec = super::ExecContext {
             session: Arc::clone(&session),
             turn: Arc::clone(&turn),
@@ -1654,16 +1809,18 @@ mod tests {
             .finish_packet("cell", "turn")
             .advisory
             .expect("first tiny packet should include an advisory");
-        assert!(advisory.contains("batch every known independent read in one exec"));
+        assert!(
+            advisory
+                .contains("batch only necessary independent reads with known inputs in one exec")
+        );
         assert!(
             !advisory.contains("notify"),
             "the advisory must not steer the model into notify-driven yields"
         );
         assert!(advisory.contains("Promise.allSettled"));
-        assert!(advisory.contains("print the evidence you need with text(...)"));
-        assert!(advisory.contains("evidence is sufficient or unchanged"));
-        assert!(advisory.contains("synthesize and stop"));
-        assert!(advisory.contains("instead of sampling or polling again"));
+        assert!(advisory.contains("print needed evidence with text(...)"));
+        assert!(advisory.contains("Reuse unchanged evidence"));
+        assert!(advisory.contains("Stop when the task is answered"));
         service.record_packet_call(&cell, true, 128, Vec::new());
         assert!(service.finish_packet("cell", "turn").advisory.is_none());
         service.record_packet_call(&cell, true, 128, Vec::new());
@@ -1675,6 +1832,13 @@ mod tests {
         let batched = service.finish_packet("cell", "turn");
         assert_eq!(batched.nested_call_count, 6);
         assert!(batched.advisory.is_none());
+        service.record_packet_call(&cell, true, 128, Vec::new());
+        assert!(service.finish_packet("cell", "turn").advisory.is_none());
+        service.record_packet_call(&cell, true, 128, Vec::new());
+        assert_eq!(
+            service.finish_packet("cell", "next-turn").advisory,
+            Some(advisory)
+        );
     }
 
     #[test]
@@ -1688,8 +1852,8 @@ mod tests {
                 .packet_admission
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .consecutive_tiny_packets_by_turn
-                .contains_key("finished-turn")
+                .advised_turns
+                .contains("finished-turn")
         );
 
         service.finish_turn("finished-turn");
@@ -1699,8 +1863,15 @@ mod tests {
                 .packet_admission
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .consecutive_tiny_packets_by_turn
-                .contains_key("finished-turn")
+                .advised_turns
+                .contains("finished-turn")
+        );
+        service.record_packet_call(&cell, true, 128, Vec::new());
+        assert!(
+            service
+                .finish_packet("cell", "finished-turn")
+                .advisory
+                .is_some()
         );
     }
 
@@ -1731,8 +1902,9 @@ mod tests {
     fn nested_terminal_fold_uses_registration_order_and_preserves_blocked_status() {
         let service = test_service();
         let cell = CellId::new("terminal-cell".to_string());
-        let first = service.begin_packet_call(&cell);
-        let second = service.begin_packet_call(&cell);
+        service.record_cell_parent_call_id(&cell, "outer-exec");
+        let first = service.begin_packet_call(&cell).unwrap();
+        let second = service.begin_packet_call(&cell).unwrap();
 
         service.complete_packet_call(
             &cell,
@@ -1775,7 +1947,10 @@ mod tests {
             output.skip_disposition,
             Some(ToolOutputSkipDisposition::BlockingRequiredOperation)
         );
-        assert!(output.into_text().contains("first nested block"));
+        assert_eq!(
+            output.sampling_request_signal().unwrap()["outcome"],
+            "blocked"
+        );
     }
 
     #[test]
@@ -1906,6 +2081,58 @@ mod tests {
     }
 
     #[test]
+    fn transported_nested_tool_input_preserves_dispatch_validation() {
+        use codex_code_mode::CodeModeNestedToolCall;
+        use codex_code_mode::host::WireNestedToolCall;
+
+        for (input, expected) in [
+            (
+                None,
+                Ok(ToolPayload::Function {
+                    arguments: "{}".to_string(),
+                }),
+            ),
+            (
+                Some(json!(null)),
+                Err("tool `example` expects a JSON object for arguments".to_string()),
+            ),
+            (
+                Some(json!({ "value": null })),
+                Ok(ToolPayload::Function {
+                    arguments: r#"{"value":null}"#.to_string(),
+                }),
+            ),
+        ] {
+            let invocation = CodeModeNestedToolCall {
+                cell_id: codex_code_mode::CellId::new("cell-input".to_string()),
+                parent_tool_call_id: None,
+                runtime_tool_call_id: "nested-call".to_string(),
+                tool_name: ToolName::plain("example"),
+                tool_kind: CodeModeToolKind::Function,
+                input,
+            };
+            let runtime_json = serde_json::to_vec(&invocation).expect("encode runtime input");
+            let runtime: CodeModeNestedToolCall =
+                serde_json::from_slice(&runtime_json).expect("decode runtime input");
+            let wire = WireNestedToolCall::from(invocation.clone());
+            let wire_json = serde_json::to_vec(&wire).expect("encode host input");
+            let wire: WireNestedToolCall =
+                serde_json::from_slice(&wire_json).expect("decode host input");
+
+            for received in [invocation, runtime, wire.into()] {
+                assert_eq!(
+                    build_nested_tool_payload(
+                        received.tool_kind,
+                        &received.tool_name,
+                        received.input
+                    ),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
     fn build_nested_tool_payload_uses_tool_search_kind() {
         let payload = build_nested_tool_payload(
             CodeModeToolKind::Function,
@@ -1943,8 +2170,16 @@ mod tests {
     }
 
     #[test]
-    fn nested_failure_fingerprint_normalizes_numeric_noise() {
+    fn nested_failure_fingerprint_preserves_diagnostic_numbers() {
         let tool_name = ToolName::plain("example");
+        assert_ne!(
+            nested_failure_fingerprint(&tool_name, "request failed with status 403"),
+            nested_failure_fingerprint(&tool_name, "request failed with status 404"),
+        );
+        assert_eq!(
+            nested_failure_fingerprint(&tool_name, "request 17 failed"),
+            nested_failure_fingerprint(&tool_name, "request  17\nfailed"),
+        );
         assert_eq!(
             nested_failure_fingerprint(
                 &tool_name,
@@ -1952,7 +2187,7 @@ mod tests {
             ),
             "owner.stable.failure"
         );
-        assert_eq!(
+        assert_ne!(
             nested_failure_fingerprint(&tool_name, "request 17 failed after 2 attempts"),
             nested_failure_fingerprint(&tool_name, "request 91 failed after 8 attempts")
         );
@@ -1969,7 +2204,7 @@ mod tests {
         }];
 
         let truncated_items =
-            truncate_code_mode_result(items, Some(5), OutputOutcome::Success, usize::MAX);
+            truncate_code_mode_result(items, Some(5), OutputOutcome::Success, usize::MAX, None);
         assert_eq!(
             truncated_items,
             vec![FunctionCallOutputContentItem::InputText {
@@ -2070,6 +2305,7 @@ mod tests {
                 std::time::Instant::now(),
                 Vec::new(),
                 Vec::new(),
+                None,
             );
             let projected =
                 codex_protocol::models::function_call_output_content_items_to_text(&outer.body)
@@ -2103,6 +2339,7 @@ mod tests {
             std::time::Instant::now(),
             Vec::new(),
             Vec::new(),
+            None,
         );
 
         let projected =
@@ -2134,7 +2371,7 @@ mod tests {
             text: "x".repeat(400),
         }];
 
-        let truncated = truncate_code_mode_result(items, Some(20), OutputOutcome::Success, 5);
+        let truncated = truncate_code_mode_result(items, Some(20), OutputOutcome::Success, 5, None);
         let [FunctionCallOutputContentItem::InputText { text }] = truncated.as_slice() else {
             panic!("expected one truncated text item");
         };
@@ -2147,7 +2384,10 @@ mod tests {
     fn over_truncation_mixed_code_mode_failure_preserves_the_script_error() {
         let items = vec![
             FunctionCallOutputContentItem::InputText {
-                text: "ordinary output ".repeat(1_000),
+                text: format!(
+                    "Script error:\nOLD_LOG {}",
+                    "ordinary output ".repeat(1_000)
+                ),
             },
             FunctionCallOutputContentItem::EncryptedContent {
                 encrypted_content: "opaque".to_string(),
@@ -2158,7 +2398,7 @@ mod tests {
         ];
 
         let projected =
-            truncate_code_mode_result(items, Some(40), OutputOutcome::Failure, usize::MAX);
+            truncate_code_mode_result(items, Some(40), OutputOutcome::Failure, usize::MAX, Some(2));
 
         assert!(projected.iter().any(|item| matches!(
             item,
@@ -2175,7 +2415,8 @@ mod tests {
         assert!(original_tokens < codex_code_mode::MAX_OUTPUT_TOKENS_PER_EXEC_CALL);
         let items = vec![FunctionCallOutputContentItem::InputText { text: text.clone() }];
 
-        let projected = truncate_code_mode_result(items, None, OutputOutcome::Success, usize::MAX);
+        let projected =
+            truncate_code_mode_result(items, None, OutputOutcome::Success, usize::MAX, None);
 
         let [
             FunctionCallOutputContentItem::InputText {
@@ -2190,7 +2431,8 @@ mod tests {
         let oversized = vec![FunctionCallOutputContentItem::InputText {
             text: "x".repeat(48_000),
         }];
-        let capped = truncate_code_mode_result(oversized, None, OutputOutcome::Success, usize::MAX);
+        let capped =
+            truncate_code_mode_result(oversized, None, OutputOutcome::Success, usize::MAX, None);
         let [FunctionCallOutputContentItem::InputText { text: capped_text }] = capped.as_slice()
         else {
             panic!("expected one capped text item");

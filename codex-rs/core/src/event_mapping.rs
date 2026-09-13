@@ -40,7 +40,8 @@ const CONTEXTUAL_DEVELOPER_PREFIXES: &[&str] = &[
 ];
 
 pub(crate) fn is_contextual_user_message_content(message: &[ContentItem]) -> bool {
-    message.iter().any(is_contextual_user_fragment)
+    // A contextual fragment must not hide ordinary text or images in the same message.
+    !message.is_empty() && message.iter().all(is_contextual_user_fragment)
 }
 
 /// Returns true when a developer message contains any rollback-trimmable contextual fragment.

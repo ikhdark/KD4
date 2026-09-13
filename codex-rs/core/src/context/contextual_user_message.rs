@@ -62,8 +62,12 @@ impl super::ContextualUserFragment for LegacyModelMismatchWarning {
     }
 
     fn matches_text(text: &str) -> bool {
-        text.trim().starts_with(
-            "Warning: Your account was flagged for potentially high-risk cyber activity",
+        // Preserve the short legacy form and the complete warning emitted before #22243.
+        // Prefix matching also swallowed user questions appended to either form.
+        matches!(
+            text.trim(),
+            "Warning: Your account was flagged for potentially high-risk cyber activity."
+                | "Warning: Your account was flagged for potentially high-risk cyber activity and this request was routed to gpt-5.2 as a fallback. To regain access to gpt-5.3-codex, apply for trusted access: https://chatgpt.com/cyber or learn more: https://developers.openai.com/codex/concepts/cyber-safety"
         )
     }
 
@@ -89,9 +93,25 @@ impl super::ContextualUserFragment for LegacyUnifiedExecProcessLimitWarning {
     }
 
     fn matches_text(text: &str) -> bool {
-        text.trim().starts_with(
-            "Warning: The maximum number of unified exec processes you can keep open is",
-        )
+        let Some(rest) = text.trim().strip_prefix(
+            "Warning: The maximum number of unified exec processes you can keep open is ",
+        ) else {
+            return false;
+        };
+        let is_count =
+            |value: &str| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit());
+        if let Some(limit) = rest.strip_suffix('.') {
+            return is_count(limit);
+        }
+        let Some(counts) = rest.strip_suffix(
+            " processes open. Reuse older processes or close them to prevent automatic pruning of old processes",
+        ) else {
+            return false;
+        };
+        let Some((limit, open)) = counts.split_once(" and you currently have ") else {
+            return false;
+        };
+        is_count(limit) && is_count(open)
     }
 
     fn body(&self) -> String {

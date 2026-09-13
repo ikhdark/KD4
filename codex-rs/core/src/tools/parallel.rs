@@ -259,6 +259,7 @@ pub(crate) struct ToolCallRuntime {
 
 struct PendingWorkspaceEvidenceResponse {
     ordinal: u64,
+    observed_effect_ordinal: u64,
     response: ResponseInputItem,
     workspace_cwd: std::path::PathBuf,
     source_dependencies: std::collections::BTreeSet<crate::tool_history::SourceDependencyV1>,
@@ -279,6 +280,8 @@ struct WorkspaceEvidenceGenerationBatchState {
     next_ordinal: u64,
     next_effect_ordinal: u64,
     call_ordinals: std::collections::HashMap<String, u64>,
+    observation_effect_ordinals: std::collections::HashMap<String, u64>,
+    code_mode_first_observation_revisions: std::collections::HashMap<String, u64>,
     responses: Vec<PendingWorkspaceEvidenceResponse>,
     mutations: Vec<PendingWorkspaceMutation>,
     owner: Option<WorkspaceEvidenceGenerationOwner>,
@@ -400,6 +403,39 @@ impl WorkspaceEvidenceGenerationBatch {
         !state.sealed && state.call_ordinals.contains_key(call_id)
     }
 
+    fn record_code_mode_workspace_observation(&self, parent_call_id: &str, mutation_revision: u64) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.sealed || !state.call_ordinals.contains_key(parent_call_id) {
+            return;
+        }
+        // A cell can retain an early read and print it after a later edit. Keep
+        // its first observation so that a subsequent read cannot hide that edit.
+        state
+            .code_mode_first_observation_revisions
+            .entry(parent_call_id.to_string())
+            .or_insert(mutation_revision);
+        let ordinal = state.next_effect_ordinal;
+        state
+            .observation_effect_ordinals
+            .entry(parent_call_id.to_string())
+            .or_insert(ordinal);
+    }
+
+    fn record_workspace_observation(&self, call_id: &str) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let ordinal = state.next_effect_ordinal;
+        state
+            .observation_effect_ordinals
+            .entry(call_id.to_string())
+            .or_insert(ordinal);
+    }
+
     pub(crate) fn record_mutation(
         &self,
         call_id: &str,
@@ -452,8 +488,14 @@ impl WorkspaceEvidenceGenerationBatch {
         if let Some(owner) = state.owner.as_mut() {
             owner.retain_accepted_effect();
         }
+        let observed_effect_ordinal = state
+            .observation_effect_ordinals
+            .get(call_id)
+            .copied()
+            .unwrap_or(state.next_effect_ordinal);
         state.responses.push(PendingWorkspaceEvidenceResponse {
             ordinal,
+            observed_effect_ordinal,
             response: response.clone(),
             workspace_cwd: classification.workspace_cwd.clone(),
             source_dependencies,
@@ -485,7 +527,7 @@ impl WorkspaceEvidenceGenerationBatch {
         turn: &TurnContext,
         tracker: &SharedTurnDiffTracker,
     ) -> CodexResult<WorkspaceEvidenceGenerationFlush> {
-        let (responses, mutations, _generation_owner) = {
+        let (responses, mutations, code_mode_observation_revisions, _generation_owner) = {
             let mut state = self
                 .state
                 .lock()
@@ -494,13 +536,15 @@ impl WorkspaceEvidenceGenerationBatch {
             (
                 std::mem::take(&mut state.responses),
                 std::mem::take(&mut state.mutations),
+                std::mem::take(&mut state.code_mode_first_observation_revisions),
                 state.owner.take(),
             )
         };
-        tracker
-            .lock()
-            .await
-            .clear_workspace_evidence_generation_batch(self);
+        let final_mutation_revision = {
+            let mut tracker = tracker.lock().await;
+            tracker.clear_workspace_evidence_generation_batch(self);
+            tracker.current_mutation_revision()
+        };
 
         struct Group {
             cwd: std::path::PathBuf,
@@ -512,11 +556,34 @@ impl WorkspaceEvidenceGenerationBatch {
             ordinal: u64,
             response: ResponseInputItem,
             revision: Option<crate::git_workspace::WorkspaceEvidenceIdentity>,
+            captured_current: bool,
             source_dependencies:
                 std::collections::BTreeSet<crate::tool_history::SourceDependencyV1>,
             source_path_observations: Vec<crate::git_workspace::SourcePathChangeObservation>,
         }
 
+        let stale_response_call_ids = responses
+            .iter()
+            .filter(|response| {
+                mutations.iter().any(|mutation| {
+                    mutation.ordinal >= response.observed_effect_ordinal
+                        && mutation.affected_paths.as_ref().is_none_or(|paths| {
+                            response.source_dependencies.is_empty()
+                                || paths.iter().any(|path| {
+                                    let changed =
+                                        crate::tool_history::SourceDependencyV1::new(path, false);
+                                    response.source_dependencies.iter().any(|dependency| {
+                                        crate::tool_history::source_dependency_overlaps(
+                                            dependency,
+                                            &changed.path,
+                                        )
+                                    })
+                                })
+                        })
+                })
+            })
+            .filter_map(|response| response_input_call_id(&response.response).map(str::to_string))
+            .collect::<std::collections::BTreeSet<_>>();
         let mut groups = std::collections::BTreeMap::<std::path::PathBuf, Group>::new();
         let mut canonical_keys =
             std::collections::HashMap::<std::path::PathBuf, std::path::PathBuf>::new();
@@ -551,14 +618,21 @@ impl WorkspaceEvidenceGenerationBatch {
                 .push(mutation);
         }
         // Relay persistence precedes this generation-boundary flush. Exclude
-        // only the queued responses that will be bound to the authoritative
-        // post-generation identity below; earlier history must still be
-        // invalidated by every mutation in the batch.
-        let current_generation_response_call_ids = groups
+        // queued responses that will be bound to the authoritative identity
+        // below, and cells whose observations all followed the final mutation.
+        // Earlier observations must still be invalidated by the batch's edits.
+        let mut current_generation_response_call_ids = groups
             .values()
             .flat_map(|group| group.responses.iter())
             .filter_map(|response| response_input_call_id(&response.response).map(str::to_string))
+            .filter(|call_id| !stale_response_call_ids.contains(call_id))
             .collect::<std::collections::BTreeSet<_>>();
+        current_generation_response_call_ids.extend(
+            code_mode_observation_revisions
+                .into_iter()
+                .filter(|(_, revision)| *revision == final_mutation_revision)
+                .map(|(call_id, _)| call_id),
+        );
 
         let primary_key =
             canonical_workspace_evidence_key_cached(turn.config.cwd.as_path(), &mut canonical_keys);
@@ -655,10 +729,13 @@ impl WorkspaceEvidenceGenerationBatch {
                 prefetched_workspace_identity = Some(capture.identity.clone());
             }
             for response in group.responses {
+                let captured_current = response_input_call_id(&response.response)
+                    .is_some_and(|call_id| !stale_response_call_ids.contains(call_id));
                 finalized_responses.push(FinalizedResponse {
                     ordinal: response.ordinal,
                     response: response.response,
                     revision: capture.identity.clone(),
+                    captured_current,
                     source_dependencies: response.source_dependencies,
                     source_path_observations: response.source_path_observations,
                 });
@@ -685,7 +762,7 @@ impl WorkspaceEvidenceGenerationBatch {
                 WorkspaceEvidenceObservation {
                     response: &response.response,
                     revision: response.revision,
-                    captured_current: true,
+                    captured_current: response.captured_current,
                     source_dependencies: response.source_dependencies,
                     source_path_observations: response.source_path_observations,
                     workspace_gate_guard: None,
@@ -1132,6 +1209,7 @@ impl ToolCallRuntime {
         self
     }
 
+    #[cfg(test)]
     async fn activate_workspace_evidence_generation(&self, call_id: &str) {
         let batch = &self.step_context.workspace_evidence_generation_batch;
         if !batch.register_call(call_id) {
@@ -1534,8 +1612,7 @@ impl ToolCallRuntime {
                     &call.payload,
                     self.step_context.turn.config.cwd.as_path(),
                 );
-            self.activate_workspace_evidence_generation(&call.call_id)
-                .await;
+            self.step_context.workspace_evidence_generation_batch.register_call(&call.call_id);
             if let Some(registration) = signal_registration.as_ref()
                 && let Some(guard) = registration.suppressed_failure.as_ref()
             {
@@ -1562,29 +1639,37 @@ impl ToolCallRuntime {
             }
             if let Some(registration) = signal_registration.as_ref()
                 && let Some(guard) = registration.replayed_success.as_ref()
-                && let Some(response) = guard.response_for_call(&call.call_id)
             {
-                timing.record_outcome("success");
-                timing.mark_output_collected();
-                if let Some(signal_collector) = signal_collector.as_ref() {
-                    signal_collector.record_response_result(
-                        registration.ordinal,
-                        ToolOutputOutcomeContext::new(ToolOutputOutcome::Success),
-                        None,
-                        &response,
-                        false,
-                    );
+                // Exclude every workspace writer, including scoped leases, between
+                // checking freshness and publishing the replay observation.
+                let replay_lease = acquire_exclusive_workspace_gate(
+                    Arc::clone(&self.parallel_execution),
+                    &self.step_context.turn.turn_timing_state,
+                ).await;
+                let revision = self.tracker.lock().await.current_mutation_revision();
+                if guard.is_fresh(revision)
+                    && let Some(response) = guard.response_for_call(&call.call_id)
+                {
+                    timing.record_outcome("success");
+                    timing.mark_output_collected();
+                    if let Some(signal_collector) = signal_collector.as_ref() {
+                        signal_collector.record_response_result(
+                            registration.ordinal,
+                            ToolOutputOutcomeContext::new(ToolOutputOutcome::Success),
+                            None, &response, false,
+                        );
+                    }
+                    Self::register_workspace_evidence_after_call(
+                        self.session.as_ref(), self.step_context.turn.as_ref(),
+                        WorkspaceEvidenceAfterCall {
+                            response: &response, baseline: None, mutation_advanced: false,
+                            source_dependencies_override: None,
+                            classification: &workspace_call_classification,
+                            workspace_gate_guard: Some(WorkspaceGateGuard::Exclusive { _guard: replay_lease }),
+                        }, None, None,
+                    ).await;
+                    return Ok(ToolCallCompletion::nonterminal(response));
                 }
-                self.register_workspace_evidence_for_response(
-                    &response,
-                    None,
-                    false,
-                    None,
-                    &workspace_call_classification,
-                    None,
-                )
-                .await;
-                return Ok(ToolCallCompletion::nonterminal(response));
             }
             if let Some(registration) = signal_registration.as_ref()
                 && let Some(guard) = registration.blocked_wait_guard.as_ref()
@@ -1672,12 +1757,10 @@ impl ToolCallRuntime {
                 && !crate::tools::code_mode::is_exec_tool_name(&owner_tool_name)
             {
                 let timing_snapshot = evidence_timing.snapshot(TokioInstant::now());
-                collector.record_child_runtime(
-                    timing_snapshot
-                        .first_poll_to_output_collected_ms
-                        .or(timing_snapshot.total_duration_ms)
-                        .unwrap_or_default(),
-                );
+                if let Some(runtime_ms) = timing_snapshot.first_poll_to_output_collected_ms
+                    .or(timing_snapshot.total_duration_ms) {
+                    collector.record_child_runtime(runtime_ms);
+                }
             }
             match result {
                 Ok(mut response) => {
@@ -1716,7 +1799,7 @@ impl ToolCallRuntime {
                         workspace_evidence_classification_for_executed_payload(
                             &workspace_call_classification,
                             owner_tool_name.name.as_str(),
-                            Some(&response.payload),
+                            Some(&response.payload).filter(|payload| *payload != &owner_payload),
                             self.step_context.turn.config.cwd.as_path(),
                         );
                     let code_mode_exec = crate::tools::code_mode::is_exec_tool_name(&owner_tool_name);
@@ -1940,8 +2023,9 @@ impl ToolCallRuntime {
             );
             timing.mark_first_poll();
             let _tool_call_timing_guard = tool_call_timing_guard;
-            self.activate_workspace_evidence_generation(&call.call_id)
-                .await;
+            self.step_context
+                .workspace_evidence_generation_batch
+                .register_call(&call.call_id);
             let result = self
                 .handle_tool_call_with_source_and_timing(
                     call,
@@ -1958,12 +2042,12 @@ impl ToolCallRuntime {
             timing.mark_output_collected();
             if nested_code_mode && let Some(collector) = signal_collector.as_ref() {
                 let timing_snapshot = timing.snapshot(TokioInstant::now());
-                collector.record_child_runtime(
-                    timing_snapshot
-                        .first_poll_to_output_collected_ms
-                        .or(timing_snapshot.total_duration_ms)
-                        .unwrap_or_default(),
-                );
+                if let Some(runtime_ms) = timing_snapshot
+                    .first_poll_to_output_collected_ms
+                    .or(timing_snapshot.total_duration_ms)
+                {
+                    collector.record_child_runtime(runtime_ms);
+                }
             }
             result
         }
@@ -2029,6 +2113,10 @@ impl ToolCallRuntime {
                 .map(|classification| classification.source_dependencies.clone())
         });
         let model_issued = matches!(&source, ToolCallSource::Direct);
+        let code_mode_parent_call_id = match &source {
+            ToolCallSource::CodeMode { parent_call_id, .. } => parent_call_id.clone(),
+            _ => None,
+        };
         let abort_turn = Arc::clone(&turn);
         let dispatch_state = Arc::new(ToolDispatchState::new());
         let admission_dispatch_state = Arc::clone(&dispatch_state);
@@ -2046,7 +2134,15 @@ impl ToolCallRuntime {
             supports_parallel,
             workspace_capable,
         );
+        let tracks_workspace =
+            workspace_capable || !supports_parallel || workspace_admission.bypass_outer_gate;
+        if tracks_workspace {
+            step_context
+                .workspace_evidence_generation_batch
+                .retain_generation_owner(&session, &turn, &tracker);
+        }
         let evidence_tracker = Arc::clone(&tracker);
+        let validation_signals = self.sampling_request_signals.clone();
 
         let dispatch_span = trace_span!(
             "dispatch_tool_call_with_terminal_outcome",
@@ -2078,6 +2174,14 @@ impl ToolCallRuntime {
 
         let mut dispatch_handle: AbortOnDropHandle<Result<AnyToolResult, FunctionCallError>> =
             AbortOnDropHandle::new(tokio::spawn(async move {
+                if tracks_workspace {
+                    tracker
+                        .lock()
+                        .await
+                        .activate_workspace_evidence_generation_batch(
+                            &step_context.workspace_evidence_generation_batch,
+                        );
+                }
                 let gate_guard = if workspace_admission.bypass_outer_gate {
                     None
                 } else {
@@ -2200,6 +2304,13 @@ impl ToolCallRuntime {
                 )
                 .await;
                 timing.mark_output_collected();
+                // Capture effect order while the execution lease still excludes
+                // later edits; outer response persistence may release that lease.
+                if tracks_workspace {
+                    step_context
+                        .workspace_evidence_generation_batch
+                        .record_workspace_observation(&evidence_call.call_id);
+                }
                 if post_dispatch_state.is_aborted() {
                     return result;
                 }
@@ -2215,7 +2326,11 @@ impl ToolCallRuntime {
                             workspace_evidence_classification_for_executed_payload(
                                 classification,
                                 dispatch_tool_name.as_str(),
-                                result.as_ref().ok().map(|result| &result.payload),
+                                result
+                                    .as_ref()
+                                    .ok()
+                                    .map(|result| &result.payload)
+                                    .filter(|payload| *payload != &evidence_call.payload),
                                 turn.config.cwd.as_path(),
                             )
                         });
@@ -2246,12 +2361,29 @@ impl ToolCallRuntime {
                         .filter(|classification| classification.observes_workspace),
                 ) {
                     let evidence_capture_started = Instant::now();
-                    let mutation_advanced = if let Some(before) = evidence_mutation_revision_before
-                    {
-                        evidence_tracker.lock().await.current_mutation_revision() > before
-                    } else {
-                        false
-                    };
+                    let mutation_revision =
+                        evidence_tracker.lock().await.current_mutation_revision();
+                    if successful && let Some(collector) = validation_signals.as_ref() {
+                        // Capture the actual workspace version while the lease
+                        // still excludes edits, for direct and nested tests.
+                        collector.record_validation_workspace_revision(
+                            &evidence_call.tool_name,
+                            &evidence_call.payload,
+                            mutation_revision,
+                        );
+                    }
+                    if let Some(parent_call_id) = code_mode_parent_call_id.as_deref() {
+                        // Record while the workspace lease is held. Registration
+                        // can release it before persisting the observation.
+                        step_context
+                            .workspace_evidence_generation_batch
+                            .record_code_mode_workspace_observation(
+                                parent_call_id,
+                                mutation_revision,
+                            );
+                    }
+                    let mutation_advanced = evidence_mutation_revision_before
+                        .is_some_and(|before| mutation_revision > before);
                     let workspace_evidence_deferred = Self::register_workspace_evidence_after_call(
                         session.as_ref(),
                         turn.as_ref(),
@@ -3768,12 +3900,96 @@ mod tests {
     impl CoreToolRuntime for ImmediateHandler {}
 
     #[tokio::test]
+    async fn sampled_replay_rechecks_workspace_revision_at_dispatch() {
+        use crate::session::reasoning_governor::{
+            SamplingReasoningGovernor, SamplingRequestSettledState,
+        };
+        for workspace_changed in [false, true] {
+            let (session, turn) = crate::session::tests::make_session_and_context().await;
+            let tool_name = codex_tools::ToolName::plain("exec_command");
+            let payload = ToolPayload::Function {
+                arguments: serde_json::json!({"cmd": "cat README.md"}).to_string(),
+            };
+            let mut governor = SamplingReasoningGovernor::new(None);
+            let baseline = governor.baselines(0);
+            let first = governor.collector(&baseline);
+            let registration =
+                first.register_deterministic_tool_call(&tool_name, &payload, "old-read");
+            first.record_response_result(
+                registration.ordinal,
+                codex_tools::ToolOutputOutcomeContext::new(codex_tools::ToolOutputOutcome::Success),
+                None,
+                &ResponseInputItem::FunctionCallOutput {
+                    call_id: "old-read".to_string(),
+                    output: codex_protocol::models::FunctionCallOutputPayload::from_text(
+                        "stale cached result".to_string(),
+                    ),
+                },
+                false,
+            );
+            governor.settle(
+                &baseline,
+                &first,
+                &SamplingRequestSettledState {
+                    mutation_revision: 0,
+                    tool_exposure_revision: 0,
+                },
+            );
+            let collector = governor.collector(&governor.baselines(0));
+            assert!(
+                collector
+                    .register_deterministic_tool_call(&tool_name, &payload, "probe")
+                    .replayed_success
+                    .is_some()
+            );
+            let handler = Arc::new(ImmediateHandler {
+                tool_name: tool_name.clone(),
+            }) as Arc<dyn CoreToolRuntime>;
+            let router = Arc::new(ToolRouter::from_parts(
+                ToolRegistry::from_tools([handler]),
+                Vec::new(),
+            ));
+            let step = StepContext::for_test(Arc::new(turn)).with_tool_router_for_test(router);
+            let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
+            // The request collector captured revision zero; another completed mutation
+            // happens before this call acquires the workspace lease.
+            if workspace_changed {
+                tracker.lock().await.record_unknown_mutation();
+            }
+            let runtime = ToolCallRuntime::new(Arc::new(session), step, tracker)
+                .with_sampling_request_signals(collector);
+            let response = tokio::time::timeout(
+                Duration::from_secs(5),
+                runtime.handle_tool_call(
+                    ToolCall {
+                        tool_name,
+                        call_id: "fresh-read".to_string(),
+                        payload,
+                    },
+                    CancellationToken::new(),
+                ),
+            )
+            .await
+            .expect("replay dispatch must release its workspace lease")
+            .expect("dispatch succeeds");
+            let expected = if workspace_changed {
+                "ok"
+            } else {
+                "stale cached result"
+            };
+            assert!(
+                matches!(response, ResponseInputItem::FunctionCallOutput { call_id, output } if call_id == "fresh-read" && output.text_content() == Some(expected))
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn non_workspace_sampled_call_reuses_precomputed_dependencies_without_mutation_tracker() {
         let (session, turn_context) = crate::session::tests::make_session_and_context().await;
         let session = Arc::new(session);
         let turn_context = Arc::new(turn_context);
         let tool_name = codex_tools::ToolName::plain("stateless_test_tool");
-        let handler = Arc::new(ImmediateHandler {
+        let handler = Arc::new(ParallelImmediateHandler {
             tool_name: tool_name.clone(),
         }) as Arc<dyn CoreToolRuntime>;
         let step_context = StepContext::for_test(Arc::clone(&turn_context));
@@ -3794,7 +4010,7 @@ mod tests {
             drop(held_tracker);
         });
 
-        tokio::time::timeout(
+        let result = tokio::time::timeout(
             Duration::from_secs(1),
             runtime.handle_tool_call(
                 ToolCall {
@@ -3807,9 +4023,16 @@ mod tests {
                 CancellationToken::new(),
             ),
         )
-        .await
-        .expect("non-workspace sampling must not read the mutation tracker")
-        .expect("stateless test tool should succeed");
+        .await;
+        let _ = release_tracker_tx.send(());
+        tracker_holder.join().expect("tracker holder joins");
+        let response = result
+            .expect("non-workspace sampling must not read the mutation tracker")
+            .expect("stateless test tool should succeed");
+        assert!(
+            matches!(response, ResponseInputItem::FunctionCallOutput { call_id, output }
+            if call_id == "stateless-sampled-call" && output.text_content() == Some("ok"))
+        );
 
         let counters = turn_context
             .turn_timing_state
@@ -3818,9 +4041,157 @@ mod tests {
             .counters;
         assert_eq!(counters.projection_source_dependencies_reuse_count, 1);
         assert_eq!(counters.projection_source_dependencies_fallback_count, 0);
+    }
 
-        let _ = release_tracker_tx.send(());
-        tracker_holder.join().expect("tracker holder joins");
+    #[tokio::test]
+    async fn runtime_read_then_patch_projects_stale_only_for_overlapping_sources() {
+        use crate::tools::handlers::{
+            ApplyPatchHandler, ShellCommandHandler, ShellCommandHandlerOptions,
+        };
+
+        for changed_file in ["source.txt", "unrelated.txt"] {
+            let home = tempfile::tempdir().unwrap();
+            let workspace = tempfile::tempdir().unwrap();
+            assert!(
+                std::process::Command::new("git")
+                    .args(["init", "--quiet"])
+                    .current_dir(workspace.path())
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            for name in ["source.txt", "unrelated.txt"] {
+                std::fs::write(workspace.path().join(name), "before\n").unwrap();
+            }
+            let cwd =
+                codex_utils_absolute_path::AbsolutePathBuf::try_from(workspace.path()).unwrap();
+            let (session, turn, _events) =
+                crate::session::tests::make_session_and_context_with_auth_config_home_and_rx(
+                    codex_login::CodexAuth::from_api_key("Test API Key"),
+                    Vec::new(),
+                    home.path(),
+                    |config| {
+                        config.cwd = cwd.clone();
+                        config.workspace_roots = vec![cwd.clone()];
+                        config.permissions.approval_policy = crate::config::Constrained::allow_any(
+                            codex_protocol::protocol::AskForApproval::Never,
+                        );
+                        config
+                            .permissions
+                            .set_permission_profile(
+                                codex_protocol::models::PermissionProfile::Disabled,
+                            )
+                            .unwrap();
+                    },
+                )
+                .await;
+            let handlers: Vec<Arc<dyn CoreToolRuntime>> = vec![
+                Arc::new(ShellCommandHandler::new(ShellCommandHandlerOptions {
+                    allow_login_shell: false,
+                    allow_escalated_sandbox_permissions: false,
+                    exec_permission_approvals_enabled: false,
+                })),
+                Arc::new(ApplyPatchHandler::default()),
+            ];
+            let router = Arc::new(ToolRouter::from_parts(
+                ToolRegistry::from_tools(handlers),
+                Vec::new(),
+            ));
+            let step = StepContext::for_test(Arc::clone(&turn)).with_tool_router_for_test(router);
+            let runtime = ToolCallRuntime::new(
+                Arc::clone(&session),
+                step,
+                Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+            );
+            let arguments = serde_json::json!({
+                "kind": "argv", "program": "rg", "args": ["--no-config", "before", "source.txt"],
+                "workdir": workspace.path(),
+            })
+            .to_string();
+            let call = ResponseItem::FunctionCall {
+                id: None,
+                name: "shell_command".to_string(),
+                namespace: None,
+                arguments: arguments.clone(),
+                call_id: "read-before-edit".to_string(),
+                internal_chat_message_metadata_passthrough: None,
+            };
+            let read = runtime
+                .clone()
+                .handle_tool_call(
+                    ToolCall {
+                        tool_name: codex_tools::ToolName::plain("shell_command"),
+                        call_id: "read-before-edit".to_string(),
+                        payload: ToolPayload::Function { arguments },
+                    },
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            let ResponseInputItem::FunctionCallOutput { output, .. } = &read else {
+                panic!("shell result");
+            };
+            assert_eq!(output.success, Some(true));
+            assert!(output.body.to_text().unwrap().contains("before"));
+            let canonical = vec![call, ResponseItem::from(read)];
+            session.record_conversation_items(&turn, &canonical).await;
+
+            let patch = format!(
+                "*** Begin Patch\n*** Update File: {changed_file}\n@@\n-before\n+after\n*** End Patch"
+            );
+            runtime
+                .clone()
+                .handle_tool_call(
+                    ToolCall {
+                        tool_name: codex_tools::ToolName::plain("apply_patch"),
+                        call_id: "edit-after-read".to_string(),
+                        payload: ToolPayload::Custom { input: patch },
+                    },
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                std::fs::read_to_string(workspace.path().join(changed_file)).unwrap(),
+                "after\n"
+            );
+            runtime.flush_workspace_evidence_generation().await.unwrap();
+
+            let identity = session
+                .services
+                .git_workspace
+                .workspace_evidence_identity(workspace.path())
+                .await;
+            let history = session.clone_history().await;
+            let projected = history
+                .tool_history_state()
+                .project_with_workspace_identity(
+                    Arc::from(history.raw_items().to_vec()),
+                    identity.as_ref(),
+                );
+            let ResponseItem::FunctionCallOutput { output, .. } = &projected.items[1] else {
+                panic!("projected read result");
+            };
+            if changed_file == "source.txt" {
+                let stale: serde_json::Value =
+                    serde_json::from_str(&output.body.to_text().unwrap()).unwrap();
+                assert_eq!(
+                    stale,
+                    serde_json::json!({
+                        "call_id": "read-before-edit",
+                        "rerun": { "force_fresh": true },
+                        "reason": "a source dependency changed after this tool result was captured; rerun the tool before relying on it",
+                        "stale_workspace_evidence": true,
+                    })
+                );
+            } else {
+                assert_eq!(
+                    projected.items.as_ref(),
+                    history.raw_items(),
+                    "disjoint edit keeps the actual read output"
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -6363,6 +6734,10 @@ mod tests {
             false
         );
         assert!(saved["workspace_evidence"].get("actual-mutation").is_some());
+        assert_eq!(
+            saved["workspace_evidence"]["actual-mutation"]["source_dependencies_current"],
+            !drop_before_flush
+        );
         if drop_before_flush {
             assert!(
                 live["workspace_evidence"]

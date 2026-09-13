@@ -1,5 +1,6 @@
 use super::has_non_contextual_dev_message_content;
 use super::is_contextual_dev_message_content;
+use super::is_contextual_user_message_content;
 use super::parse_turn_item;
 use crate::context::ContextualUserFragment;
 use crate::context::InternalContextSource;
@@ -20,6 +21,42 @@ use codex_protocol::models::WebSearchAction;
 use codex_protocol::protocol::SKILLS_INSTRUCTIONS_OPEN_TAG;
 use codex_protocol::user_input::UserInput;
 use pretty_assertions::assert_eq;
+
+#[test]
+fn contextual_user_content_requires_nonempty_exclusively_contextual_fragments() {
+    let environment = ContentItem::InputText {
+        text: "<environment_context>ctx</environment_context>".to_string(),
+    };
+    let warning = ContentItem::InputText {
+        text: "Warning: The maximum number of unified exec processes you can keep open is 64."
+            .to_string(),
+    };
+    assert!(!is_contextual_user_message_content(&[]));
+    assert!(is_contextual_user_message_content(&[environment.clone()]));
+    assert!(is_contextual_user_message_content(&[
+        environment.clone(),
+        warning
+    ]));
+    for ordinary in [
+        ContentItem::InputText {
+            text: "Explain this context.".to_string(),
+        },
+        ContentItem::InputImage {
+            image_url: "data:image/png;base64,abc".to_string(),
+            detail: None,
+        },
+    ] {
+        assert!(!is_contextual_user_message_content(&[ordinary.clone()]));
+        assert!(!is_contextual_user_message_content(&[
+            environment.clone(),
+            ordinary.clone()
+        ]));
+        assert!(!is_contextual_user_message_content(&[
+            ordinary,
+            environment.clone()
+        ]));
+    }
+}
 
 #[test]
 fn recognizes_skills_instructions_as_contextual_developer_content() {
@@ -86,6 +123,122 @@ fn parses_user_message_with_text_and_two_images() {
             assert_eq!(user.content, expected_content);
         }
         other => panic!("expected TurnItem::UserMessage, got {other:?}"),
+    }
+}
+
+#[test]
+fn preserves_user_content_mixed_with_context_or_hooks() {
+    let ResponseItem::Message {
+        content: hook_content,
+        ..
+    } = build_hook_prompt_message(&[HookPromptFragment::from_single_hook(
+        "hook instruction",
+        "hook-1",
+    )])
+    .expect("hook message")
+    else {
+        panic!("expected message");
+    };
+    for contextual in [
+        hook_content[0].clone(),
+        ContentItem::InputText {
+            text: "<environment_context>ctx</environment_context>".to_string(),
+        },
+        ContentItem::InputText {
+            text: "Warning: The maximum number of unified exec processes you can keep open is 64."
+                .to_string(),
+        },
+    ] {
+        let ContentItem::InputText { text: context_text } = &contextual else {
+            panic!("expected contextual text");
+        };
+        for (ordinary, expected_ordinary) in [
+            (
+                ContentItem::InputText {
+                    text: "keep my request".to_string(),
+                },
+                UserInput::Text {
+                    text: "keep my request".to_string(),
+                    text_elements: Vec::new(),
+                },
+            ),
+            (
+                ContentItem::InputImage {
+                    image_url: "data:image/png;base64,abc".to_string(),
+                    detail: None,
+                },
+                UserInput::Image {
+                    image_url: "data:image/png;base64,abc".to_string(),
+                    detail: None,
+                },
+            ),
+        ] {
+            for context_first in [true, false] {
+                let mut content = vec![contextual.clone(), ordinary.clone()];
+                let mut expected = vec![
+                    UserInput::Text {
+                        text: context_text.clone(),
+                        text_elements: Vec::new(),
+                    },
+                    expected_ordinary.clone(),
+                ];
+                if !context_first {
+                    content.reverse();
+                    expected.reverse();
+                }
+                let item = ResponseItem::Message {
+                    id: None,
+                    role: "user".to_string(),
+                    content,
+                    phase: None,
+                    internal_chat_message_metadata_passthrough: None,
+                };
+                let Some(TurnItem::UserMessage(user)) = parse_turn_item(&item) else {
+                    panic!("mixed message must stay visible: {item:?}");
+                };
+                assert_eq!(user.content, expected);
+            }
+        }
+    }
+}
+
+#[test]
+fn warning_prefixed_questions_stay_visible_with_or_without_hooks() {
+    for question in [
+        "Warning: Your account was flagged for potentially high-risk cyber activity. What does this mean?",
+        "Warning: The maximum number of unified exec processes you can keep open is 64. Can you explain this limit?",
+        "Warning: The maximum number of unified exec processes you can keep open is 60 and you currently have 61 processes open. Reuse older processes or close them to prevent automatic pruning of old processes\nCan you explain this limit?",
+    ] {
+        for with_hook in [false, true] {
+            let mut content = vec![ContentItem::InputText {
+                text: question.to_string(),
+            }];
+            let mut expected = vec![UserInput::Text {
+                text: question.to_string(),
+                text_elements: Vec::new(),
+            }];
+            if with_hook {
+                let hook = "<hook_prompt hook_run_id=\"hook-1\">hook instruction</hook_prompt>";
+                content.push(ContentItem::InputText {
+                    text: hook.to_string(),
+                });
+                expected.push(UserInput::Text {
+                    text: hook.to_string(),
+                    text_elements: Vec::new(),
+                });
+            }
+            let item = ResponseItem::Message {
+                id: None,
+                role: "user".to_string(),
+                content,
+                phase: None,
+                internal_chat_message_metadata_passthrough: None,
+            };
+            let Some(TurnItem::UserMessage(user)) = parse_turn_item(&item) else {
+                panic!("question must stay visible: {item:?}");
+            };
+            assert_eq!(user.content, expected);
+        }
     }
 }
 

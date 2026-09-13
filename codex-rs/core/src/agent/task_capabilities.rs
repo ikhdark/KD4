@@ -159,6 +159,7 @@ pub(crate) fn build_cold_review_context(
     input: ColdReviewContextInput,
 ) -> Result<ColdReviewContext, CapabilityPolicyError> {
     verify_assignment_authority(&input.assignment, repo_root)?;
+    let canonical_root = canonical_repository_root(repo_root)?;
     let mut seen_paths = BTreeSet::new();
     let mut observed_writes = Vec::with_capacity(input.observed_writes.len());
     for evidence in input.observed_writes {
@@ -174,7 +175,7 @@ pub(crate) fn build_cold_review_context(
                 actual: evidence.attempt_id,
             });
         }
-        let path = normalize_repo_relative_path(repo_root, &evidence.path)?;
+        let path = normalize_repo_relative_path(&canonical_root, &evidence.path)?;
         if !seen_paths.insert(normalized_comparison_path(&path)) {
             return Err(CapabilityPolicyError::DuplicateColdReviewWritePath(path));
         }
@@ -240,17 +241,27 @@ pub(crate) fn derive_risk_policy(
     input: RiskPolicyInput<'_>,
 ) -> Result<DerivedRiskPolicy, CapabilityPolicyError> {
     verify_assignment_authority(assignment, repo_root)?;
+    let canonical_root = canonical_repository_root(repo_root)?;
     let normalized_changed_paths = input
         .changed_paths
         .iter()
-        .map(|path| normalize_repo_relative_path(repo_root, path))
+        .map(|path| normalize_repo_relative_path(&canonical_root, path))
         .collect::<Result<Vec<_>, _>>()?;
-    let matched_high_risk_path = normalized_changed_paths.iter().try_fold(
-        false,
-        |matched, path| -> Result<bool, CapabilityPolicyError> {
-            Ok(matched || scopes_cover_path(repo_root, input.configured_high_risk_paths, path)?)
-        },
-    )?;
+    let normalized_scopes = input
+        .configured_high_risk_paths
+        .iter()
+        .map(|scope| {
+            Ok((
+                normalize_repo_relative_path(&canonical_root, &scope.path)?,
+                scope.recursive,
+            ))
+        })
+        .collect::<Result<Vec<_>, CapabilityPolicyError>>()?;
+    let matched_high_risk_path = normalized_changed_paths.iter().any(|path| {
+        normalized_scopes
+            .iter()
+            .any(|(scope, recursive)| scope_covers_path(scope, *recursive, path))
+    });
     let configured_contracts = input
         .configured_high_risk_contracts
         .iter()
@@ -281,33 +292,19 @@ pub(crate) fn derive_risk_policy(
     })
 }
 
-fn scopes_cover_path(
-    repo_root: &Path,
-    scopes: &[RepoScope],
-    normalized_path: &str,
-) -> Result<bool, CapabilityPolicyError> {
-    for scope in scopes {
-        let normalized_scope = normalize_repo_relative_path(repo_root, &scope.path)?;
-        if scope_covers_path(&normalized_scope, scope.recursive, normalized_path) {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
+// The caller canonicalizes the root once for this operation.
 fn normalize_repo_relative_path(
-    repo_root: &Path,
+    canonical_root: &Path,
     path: &str,
 ) -> Result<String, CapabilityPolicyError> {
     let normalized = normalize_repo_path_lexically(path)?;
-    let canonical_root = canonical_repository_root(repo_root)?;
-    ensure_canonical_containment(&canonical_root, &normalized, path)?;
+    ensure_canonical_containment(canonical_root, &canonical_root.join(&normalized), path)?;
     Ok(normalized)
 }
 
 /// Converts one absolute local path into the repository-relative identity used by typed-task
-/// scopes. Windows path prefixes and components are compared case-insensitively, while the
-/// returned spelling remains stable for evidence and receipt display.
+/// scopes. Resolve existing ancestors through the filesystem before comparing native path
+/// components, so case aliases and symlinks cannot redirect evidence to a different repository.
 pub(crate) fn normalize_absolute_repo_path(
     repo_root: &Path,
     path: &Path,
@@ -319,31 +316,21 @@ pub(crate) fn normalize_absolute_repo_path(
         ));
     }
 
-    let relative = {
-        let root_components = repo_root.components().collect::<Vec<_>>();
-        let path_components = path.components().collect::<Vec<_>>();
-        if path_components.len() < root_components.len()
-            || !path_components
-                .iter()
-                .zip(&root_components)
-                .all(|(candidate, root)| {
-                    candidate
-                        .as_os_str()
-                        .to_string_lossy()
-                        .eq_ignore_ascii_case(&root.as_os_str().to_string_lossy())
-                })
-        {
-            return Err(invalid_path(
-                &path.to_string_lossy(),
-                "absolute path is outside the assignment repository",
-            ));
-        }
-        path_components[root_components.len()..]
-            .iter()
-            .map(|component| component.as_os_str())
-            .collect::<PathBuf>()
-    };
-    normalize_repo_relative_path(repo_root, &relative.to_string_lossy())
+    let canonical_root = canonical_repository_root(repo_root)?;
+    let target = ensure_canonical_containment(&canonical_root, path, &path.to_string_lossy())?;
+    let relative = target.strip_prefix(&canonical_root).map_err(|_| {
+        invalid_path(
+            &path.to_string_lossy(),
+            "absolute path is outside the assignment repository",
+        )
+    })?;
+    let relative = relative.to_str().ok_or_else(|| {
+        invalid_path(
+            &path.to_string_lossy(),
+            "path cannot be represented losslessly as UTF-8",
+        )
+    })?;
+    normalize_repo_path_lexically(relative)
 }
 
 fn normalize_repo_path_lexically(path: &str) -> Result<String, CapabilityPolicyError> {
@@ -427,12 +414,10 @@ fn canonical_repository_root(repo_root: &Path) -> Result<PathBuf, CapabilityPoli
 
 fn ensure_canonical_containment(
     canonical_root: &Path,
-    normalized_relative: &str,
+    target: &Path,
     original_path: &str,
-) -> Result<(), CapabilityPolicyError> {
-    let target =
-        canonical_root.join(normalized_relative.replace('/', std::path::MAIN_SEPARATOR_STR));
-    let mut existing = target.as_path();
+) -> Result<PathBuf, CapabilityPolicyError> {
+    let mut existing = target;
     loop {
         match std::fs::symlink_metadata(existing) {
             Ok(_) => break,
@@ -455,25 +440,16 @@ fn ensure_canonical_containment(
             format!("existing ancestor cannot be canonicalized: {error}"),
         )
     })?;
-    if !path_starts_with(&canonical_existing, canonical_root) {
+    if !canonical_existing.starts_with(canonical_root) {
         return Err(invalid_path(
             original_path,
             "path resolves outside the repository through a symlink",
         ));
     }
-    Ok(())
-}
-
-fn path_starts_with(path: &Path, root: &Path) -> bool {
-    let path_components = path
-        .components()
-        .map(|component| component.as_os_str().to_string_lossy().to_lowercase())
-        .collect::<Vec<_>>();
-    let root_components = root
-        .components()
-        .map(|component| component.as_os_str().to_string_lossy().to_lowercase())
-        .collect::<Vec<_>>();
-    path_components.starts_with(&root_components)
+    let suffix = target
+        .strip_prefix(existing)
+        .map_err(|_| invalid_path(original_path, "invalid path ancestor"))?;
+    Ok(canonical_existing.join(suffix))
 }
 
 fn scope_covers_path(scope: &str, recursive: bool, path: &str) -> bool {
@@ -495,7 +471,11 @@ fn repo_paths_equal(left: &str, right: &str) -> bool {
 }
 
 fn normalized_comparison_path(path: &str) -> String {
-    path.to_lowercase()
+    if cfg!(windows) {
+        path.to_lowercase()
+    } else {
+        path.to_owned()
+    }
 }
 
 fn normalize_contract_id(contract: &str) -> Option<String> {

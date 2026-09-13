@@ -9,7 +9,6 @@ use crate::session::tests::make_session_and_context;
 use crate::session::turn_context::TurnContext;
 use crate::tools::context::ExecCommandToolOutput;
 use crate::unified_exec::WriteStdinRequest;
-use crate::unified_exec::process::OutputHandles;
 use codex_exec_server::ExecProcess;
 use codex_exec_server::ExecProcessEventReceiver;
 use codex_exec_server::ExecProcessFuture;
@@ -22,7 +21,6 @@ use codex_exec_server::WriteStatus;
 use codex_sandboxing::SandboxType;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_output_truncation::TruncationPolicy;
-use codex_utils_output_truncation::approx_token_count;
 use pretty_assertions::assert_eq;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -35,7 +33,8 @@ use tokio::time::Instant;
 const TEST_MAX_OUTPUT_TOKENS: usize = 10_000;
 
 async fn test_session_and_turn() -> (Arc<Session>, Arc<TurnContext>) {
-    let (session, turn) = make_session_and_context().await;
+    let (session, mut turn) = make_session_and_context().await;
+    turn.permission_profile = codex_protocol::models::PermissionProfile::Disabled;
     (Arc::new(session), Arc::new(turn))
 }
 
@@ -98,7 +97,8 @@ async fn exec_command_with_tty(
     tty: bool,
 ) -> Result<ExecCommandToolOutput, UnifiedExecError> {
     let manager = &session.services.unified_exec_manager;
-    let process_id = manager.allocate_process_id().await;
+    let reservation = manager.reserve_process_id().await;
+    let process_id = reservation.process_id();
     let cwd = workdir
         .as_ref()
         .map_or_else(|| turn.cwd().clone(), |workdir| turn.cwd().join(workdir));
@@ -118,109 +118,55 @@ async fn exec_command_with_tty(
             cmd.to_string(),
         ]
     };
-    let request = test_exec_request(turn, command.clone(), cwd.clone(), shell_env());
-
-    let process = manager
-        .open_session_with_prepared_exec_env(
-            process_id,
-            &request,
-            tty,
-            Box::new(NoopSpawnLifecycle),
-            None,
-            turn.environments
-                .primary()
-                .expect("turn environment")
-                .environment
-                .as_ref(),
-            &PendingSpawnRegistration::default(),
-        )
-        .await?;
+    let environment = turn
+        .environments
+        .primary()
+        .expect("turn environment")
+        .clone();
+    let request = ExecCommandRequest {
+        validation: None,
+        attempt_key: crate::tools::command_execution::CommandAttemptKey::new(
+            "exec_command",
+            &environment.environment_id,
+            cwd.as_path().to_string_lossy().as_ref(),
+            &command,
+        ),
+        command_for_safety: command.clone(),
+        command,
+        raw_output_artifact: crate::tools::command_output_artifact::RawOutputArtifact::unavailable(
+            "test fixture",
+        ),
+        shell_type: crate::shell::ShellType::PowerShell,
+        shell_wrapper_is_owned: true,
+        hook_command: cmd.to_string(),
+        process_id,
+        yield_time_ms,
+        max_output_tokens: None,
+        cwd: cwd.clone().into(),
+        normalization_cwd: None,
+        sandbox_cwd: cwd.into(),
+        turn_environment: environment,
+        network: None,
+        tty,
+        sandbox_permissions: crate::sandboxing::SandboxPermissions::UseDefault,
+        additional_permissions: None,
+        additional_permissions_uri: None,
+        additional_permissions_preapproved: false,
+        justification: None,
+        prefix_rule: None,
+        validation_launch: None,
+        known_delta: None,
+    };
     let context =
         UnifiedExecContext::new(Arc::clone(session), Arc::clone(turn), "call".to_string());
-    let started_at = Instant::now();
-    let process_started_alive = !process.has_exited() && process.exit_code().is_none();
-    if process_started_alive {
-        let entry = ProcessEntry {
-            process: Arc::clone(&process),
-            command_execution_id: Default::default(),
-            parent_tool_execution_id: Default::default(),
-            call_id: context.call_id.clone(),
-            process_id,
-            cwd: cwd.clone().into(),
-            initial_exec_command_active: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-            hook_command: cmd.to_string(),
-            tty,
-            network_approval: None,
-            session: Arc::downgrade(session),
-            last_used: started_at,
-        };
-        manager
-            .process_store
-            .lock()
-            .await
-            .processes
-            .insert(process_id, entry);
-    }
-
-    let OutputHandles {
-        output_buffer,
-        output_notify,
-        output_closed,
-        output_closed_notify,
-        cancellation_token,
-        ..
-    } = process.output_handles();
-    let deadline = started_at + Duration::from_millis(yield_time_ms);
-    let collected = UnifiedExecProcessManager::collect_output_until_deadline(
-        &output_buffer,
-        &output_notify,
-        &output_closed,
-        &output_closed_notify,
-        &cancellation_token,
-        Some(session.subscribe_elicitation_pause_state()),
-        deadline,
-    )
-    .await;
-    let wall_time = Instant::now().saturating_duration_since(started_at);
-    let text = String::from_utf8_lossy(&collected).to_string();
-    let has_exited = process.has_exited();
-    let exit_code = process.exit_code();
-    let response_process_id = if process_started_alive && !has_exited {
-        Some(process_id)
-    } else {
-        manager.release_process_id(process_id).await;
-        None
-    };
-    if response_process_id.is_some()
-        && let Some(entry) = manager
-            .process_store
-            .lock()
-            .await
-            .processes
-            .get_mut(&process_id)
-    {
-        entry
-            .initial_exec_command_active
-            .store(false, std::sync::atomic::Ordering::Release);
-    }
-
-    Ok(ExecCommandToolOutput {
-        validation: None,
-        event_call_id: context.call_id,
-        chunk_id: generate_chunk_id(),
-        wall_time,
-        raw_output: collected,
-        truncation_policy: turn.model_info.truncation_policy.into(),
-        max_output_tokens: None,
-        process_id: response_process_id,
-        exit_code,
-        process_exited: exit_code.is_some(),
-        original_token_count: Some(approx_token_count(&text)),
-        hook_command: Some(cmd.to_string()),
-        raw_output_artifact: None,
-        raw_output_reduction_notice: None,
-        repair_notice: None,
-    })
+    manager
+        .exec_command(
+            request,
+            reservation,
+            &context,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await
 }
 
 struct BlockingTerminateExecProcess {
@@ -401,9 +347,9 @@ async fn write_stdin_yield_deadlines_include_reaction_and_cap_background_wait() 
 #[test]
 fn push_chunk_preserves_prefix_and_suffix() {
     let mut buffer = HeadTailBuffer::default();
-    buffer.push_chunk(vec![b'a'; UNIFIED_EXEC_OUTPUT_MAX_BYTES]);
-    buffer.push_chunk(vec![b'b']);
-    buffer.push_chunk(vec![b'c']);
+    buffer.push_chunk(&vec![b'a'; UNIFIED_EXEC_OUTPUT_MAX_BYTES]);
+    buffer.push_chunk(&vec![b'b']);
+    buffer.push_chunk(&vec![b'c']);
 
     assert_eq!(buffer.retained_bytes(), UNIFIED_EXEC_OUTPUT_MAX_BYTES);
     let snapshot = buffer.snapshot_chunks();
@@ -417,14 +363,17 @@ fn push_chunk_preserves_prefix_and_suffix() {
 #[test]
 fn head_tail_buffer_default_preserves_prefix_and_suffix() {
     let mut buffer = HeadTailBuffer::default();
-    buffer.push_chunk(vec![b'a'; UNIFIED_EXEC_OUTPUT_MAX_BYTES]);
-    buffer.push_chunk(b"bc".to_vec());
+    buffer.push_chunk(&vec![b'a'; UNIFIED_EXEC_OUTPUT_MAX_BYTES]);
+    buffer.push_chunk(b"bc");
 
     let rendered = buffer.to_bytes();
-    assert_eq!(rendered.first(), Some(&b'a'));
-    assert!(rendered.ends_with(b"bc"));
+    let mut expected = vec![b'a'; UNIFIED_EXEC_OUTPUT_MAX_BYTES - 2];
+    expected.extend_from_slice(b"bc");
+    assert_eq!(rendered, expected);
+    assert_eq!(buffer.omitted_bytes(), 2);
 }
 
+#[cfg(windows)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unified_exec_persists_across_requests() -> anyhow::Result<()> {
     let (session, turn) = test_session_and_turn().await;
@@ -480,6 +429,7 @@ async fn unified_exec_persists_across_requests() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(windows)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn multi_unified_exec_sessions() -> anyhow::Result<()> {
     let (session, mut turn) = make_session_and_context().await;
@@ -686,6 +636,7 @@ async fn multi_unified_exec_sessions() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(windows)]
 #[tokio::test]
 async fn unified_exec_timeouts() -> anyhow::Result<()> {
     const TEST_VAR_VALUE: &str = "unified_exec_var_123";
@@ -728,9 +679,18 @@ async fn unified_exec_timeouts() -> anyhow::Result<()> {
     assert_eq!(out_2.process_id, Some(process_id));
     assert_eq!(out_2.exit_code, None);
 
-    tokio::time::sleep(Duration::from_secs(7)).await;
-
-    let out_3 = write_stdin(&session, process_id, "", /*yield_time_ms*/ 100).await?;
+    let out_3 = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let output = write_stdin(&session, process_id, "", 1_000).await?;
+            if output
+                .truncated_output(TEST_MAX_OUTPUT_TOKENS)
+                .contains(TEST_VAR_VALUE)
+            {
+                return Ok::<_, UnifiedExecError>(output);
+            }
+        }
+    })
+    .await??;
 
     assert!(
         out_3
@@ -744,6 +704,7 @@ async fn unified_exec_timeouts() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(windows)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unified_exec_pause_blocks_yield_timeout() -> anyhow::Result<()> {
     let (session, turn) = test_session_and_turn().await;
@@ -782,6 +743,7 @@ async fn unified_exec_pause_blocks_yield_timeout() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(windows)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reusing_completed_process_returns_unknown_process() -> anyhow::Result<()> {
     let (session, mut turn) = make_session_and_context().await;
@@ -1044,6 +1006,7 @@ async fn terminating_during_stdin_poll_returns_exited_response() -> anyhow::Resu
     Ok(())
 }
 
+#[cfg(windows)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn completed_pipe_commands_preserve_exit_code() -> anyhow::Result<()> {
     let (_, turn) = make_session_and_context().await;

@@ -154,41 +154,96 @@ fn render_code_mode_tool_declaration(
 
 fn mcp_structured_content_schema(output_schema: Option<&JsonValue>) -> Option<&JsonValue> {
     let output_schema = output_schema?;
-    let properties = output_schema
-        .get("properties")
-        .and_then(JsonValue::as_object)?;
-    let content_schema = properties.get("content").and_then(JsonValue::as_object)?;
-    if content_schema.get("type").and_then(JsonValue::as_str) != Some("array") {
+    // Registration, rather than coincidental property names, establishes this
+    // envelope and the independent reference root of its embedded payload schema.
+    // Ordinary output schemas use the general renderer with their enclosing root.
+    if output_schema.get(crate::MCP_RESULT_SCHEMA_MARKER) != Some(&JsonValue::Bool(true)) {
         return None;
     }
+    output_schema.get("properties")?.get("structuredContent")
+}
 
-    if content_schema
-        .get("items")
-        .and_then(JsonValue::as_object)
-        .is_none_or(|items| items.get("type").and_then(JsonValue::as_str) != Some("object"))
-    {
-        return None;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+    use serde_json::json;
+
+    #[test]
+    fn envelope_selection_requires_a_boolean_registration_marker_and_payload() {
+        let mut envelope = json!({
+            "type": "object", "properties": {
+                "content": {"type": "array", "items": {"type": "object"}},
+                "isError": {"type": "boolean"}, "_meta": {"type": "object"},
+                "structuredContent": {"type": "string"}
+            }
+        });
+        assert_eq!(mcp_structured_content_schema(None), None);
+        assert_eq!(mcp_structured_content_schema(Some(&envelope)), None);
+        for marker in [json!(false), json!("true"), json!(1), JsonValue::Null] {
+            envelope["x-codex-mcp-result"] = marker;
+            assert_eq!(mcp_structured_content_schema(Some(&envelope)), None);
+        }
+        envelope["x-codex-mcp-result"] = json!(true);
+        assert_eq!(
+            mcp_structured_content_schema(Some(&envelope)),
+            Some(&json!({"type": "string"}))
+        );
+        envelope["properties"]["structuredContent"] = json!(false);
+        assert_eq!(
+            mcp_structured_content_schema(Some(&envelope)),
+            Some(&json!(false))
+        );
+        envelope["properties"]
+            .as_object_mut()
+            .unwrap()
+            .remove("structuredContent");
+        assert_eq!(mcp_structured_content_schema(Some(&envelope)), None);
     }
 
-    if properties
-        .get("isError")
-        .and_then(JsonValue::as_object)
-        .is_none_or(|schema| schema.get("type").and_then(JsonValue::as_str) != Some("boolean"))
-    {
-        return None;
+    #[test]
+    fn metadata_reference_root_changes_only_for_a_registered_embedded_schema() {
+        for (marker, expected_output) in [
+            (false, "{ receipt: string; structuredContent: boolean; }"),
+            (true, "CallToolResult<string>"),
+        ] {
+            // The same definition name deliberately has incompatible types in
+            // the envelope and independent server schema, exposing wrong roots.
+            let schema = json!({
+                "x-codex-mcp-result": marker,
+                "$defs": {"Value": {"type": "boolean"}},
+                "type": "object", "required": ["receipt", "structuredContent"],
+                "properties": {
+                    "receipt": {"type": "string"},
+                    "structuredContent": {
+                        "$defs": {"Value": {"type": "string"}}, "$ref": "#/$defs/Value"
+                    }
+                }
+            });
+            let definition = ToolDefinition {
+                name: "answer".to_string(),
+                tool_name: ToolName::plain("answer"),
+                description: "Answer.".to_string(),
+                kind: CodeModeToolKind::Function,
+                input_schema: None,
+                output_schema: Some(schema.clone()),
+            };
+            // Exercise serialization and the metadata boundary used by discovery.
+            let decoded =
+                serde_json::from_value(serde_json::to_value(definition).unwrap()).unwrap();
+            let augmented = augment_tool_definition(decoded);
+            assert_eq!(augmented.output_schema, Some(schema));
+            assert_eq!(
+                enabled_tool_metadata(&augmented),
+                EnabledToolMetadata {
+                    tool_name: ToolName::plain("answer"),
+                    global_name: "answer".to_string(),
+                    kind: CodeModeToolKind::Function,
+                    description: format!(
+                        "Answer.\n\nexec tool declaration:\n```ts\ndeclare const tools: {{ answer(args: unknown, options?: {{ timeout_ms?: number }}): Promise<{expected_output}>; }};\n```"
+                    ),
+                }
+            );
+        }
     }
-
-    if properties
-        .get("_meta")
-        .and_then(JsonValue::as_object)
-        .is_none_or(|schema| schema.get("type").and_then(JsonValue::as_str) != Some("object"))
-    {
-        return None;
-    }
-
-    Some(
-        properties
-            .get("structuredContent")
-            .unwrap_or(&JsonValue::Bool(true)),
-    )
 }

@@ -24,7 +24,7 @@ pub(crate) enum UnifiedExecError {
     #[error("failed to write to stdin")]
     WriteToStdin,
     #[error(
-        "stdin is closed for this session; rerun exec_command with tty=true to keep stdin open"
+        "stdin is closed for this session. Commands requiring interactive input must be started with tty=true; rerunning this command may repeat its effects."
     )]
     StdinClosed,
     #[error("missing command line for unified exec request")]

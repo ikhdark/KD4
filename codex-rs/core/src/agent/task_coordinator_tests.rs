@@ -113,7 +113,7 @@ fn task_progress_duration_uses_source_timestamps_and_clamps_clock_skew() {
 }
 
 #[tokio::test]
-async fn workspace_coordination_lazy_state_initialization_is_singleflight() {
+async fn workspace_coordination_concurrent_initialization_shares_runtime_and_root() {
     let codex_home = TempDir::new().expect("codex home tempdir");
     let coordinator = AgentTaskCoordinator::default();
     let first = coordinator.initialize_for_workspace_coordination(
@@ -138,7 +138,7 @@ async fn workspace_coordination_lazy_state_initialization_is_singleflight() {
 }
 
 #[tokio::test]
-async fn terminal_emission_uses_the_reserved_event_at_the_recorder_boundary() {
+async fn terminal_emission_exports_once_after_diagnostic_event_saturation() {
     let codex_home = TempDir::new().expect("codex home tempdir");
     let repository = TempDir::new().expect("repository tempdir");
     let state_runtime =
@@ -164,10 +164,10 @@ async fn terminal_emission_uses_the_reserved_event_at_the_recorder_boundary() {
             .runtimes
             .get_mut(&assignment.assignment_id)
             .expect("metric runtime exists");
-        for _ in 0..MAX_RECORDED_EVENTS - 1 {
+        for _ in 0..MAX_RECORDED_EVENTS + 1 {
             runtime
-                .record_usage(/*tokens*/ 0, /*calls*/ 0)
-                .expect("nonterminal event fits within the reserved boundary");
+                .record_usage(/*tokens*/ 1, /*calls*/ 1)
+                .expect("aggregation continues beyond the diagnostic limit");
         }
     }
 
@@ -197,7 +197,15 @@ async fn terminal_emission_uses_the_reserved_event_at_the_recorder_boundary() {
         .expect("receipt seals the attempt");
     coordinator.mark_task_inactive(assignment.assignment_id);
 
-    let telemetry = test_session_telemetry();
+    let exporter = opentelemetry_sdk::metrics::InMemoryMetricExporter::default();
+    let telemetry = test_session_telemetry()
+        .with_metrics_config(codex_otel::MetricsConfig::in_memory(
+            "test",
+            "codex",
+            "test",
+            exporter.clone(),
+        ))
+        .expect("metrics client");
     coordinator
         .maybe_emit_terminal_metrics(assignment.assignment_id, &telemetry)
         .await;
@@ -210,4 +218,156 @@ async fn terminal_emission_uses_the_reserved_event_at_the_recorder_boundary() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     assert!(!metrics.runtimes.contains_key(&assignment.assignment_id));
+    drop(metrics);
+    telemetry.shutdown_metrics().expect("flush metrics");
+    let exports = exporter.get_finished_metrics().expect("exports");
+    let export = exports.last().expect("terminal export");
+    let emitted = export
+        .scope_metrics()
+        .flat_map(|scope| scope.metrics())
+        .collect::<Vec<_>>();
+    let terminal = emitted
+        .iter()
+        .find(|metric| metric.name() == "codex.multi_agent.task.terminal_state")
+        .expect("actual terminal metric");
+    use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
+    let AggregatedMetrics::U64(MetricData::Sum(sum)) = terminal.data() else {
+        panic!("terminal counter");
+    };
+    let points = sum.data_points().collect::<Vec<_>>();
+    assert_eq!(points.len(), 1);
+    assert_eq!(points[0].value(), 1);
+    assert!(
+        points[0]
+            .attributes()
+            .any(|attribute| attribute.key.as_str() == "state"
+                && attribute.value.as_str() == "needs_main")
+    );
+    assert!(
+        !emitted
+            .iter()
+            .any(|metric| metric.name() == "codex.multi_agent.task.duplicate_work")
+    );
+    let findings = emitted
+        .iter()
+        .find(|metric| metric.name() == "codex.multi_agent.task.reviewer_finding")
+        .expect("observed findings");
+    let AggregatedMetrics::F64(MetricData::Histogram(histogram)) = findings.data() else {
+        panic!("findings histogram");
+    };
+    assert!(!histogram.data_points().any(|point| {
+        point.attributes().any(|attribute| {
+            attribute.key.as_str() == "disposition" && attribute.value.as_str() == "rejected"
+        })
+    }));
+}
+
+#[tokio::test]
+async fn binding_refresh_reconciles_absence_and_old_child_cannot_seal_reused_path() {
+    let home = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    let state = StateRuntime::init(home.path().to_path_buf(), "test-provider".to_string())
+        .await
+        .unwrap();
+    let coordinator = AgentTaskCoordinator::default();
+    coordinator
+        .initialize(state.clone(), "root-session".to_string())
+        .await
+        .unwrap();
+    let (assignment, attempt) = coordinator
+        .create_assignment(repo.path(), assignment_draft())
+        .await
+        .unwrap();
+    let path = AgentPath::root().join("worker").unwrap();
+    let old_thread = ThreadId::new();
+    coordinator
+        .bind_agent_task(AgentTaskBindingDraft {
+            assignment_id: assignment.assignment_id,
+            attempt_id: attempt.attempt_id,
+            agent_path: path.to_string(),
+            task_name: "worker".to_string(),
+            thread_id: Some(old_thread.to_string()),
+        })
+        .await
+        .unwrap();
+    let hydrated = AgentTaskCoordinator::default();
+    let (first, second) = tokio::join!(
+        hydrated.initialize(state.clone(), "root-session".to_string()),
+        hydrated.initialize(state.clone(), "root-session".to_string())
+    );
+    first.unwrap();
+    second.unwrap();
+    assert_eq!(
+        hydrated.binding_for_agent_path(&path).unwrap().attempt_id,
+        attempt.attempt_id
+    );
+    coordinator
+        .seal_missing_receipt(&path, old_thread, "stopped".to_string())
+        .await
+        .unwrap()
+        .expect("old task sealed");
+    coordinator
+        .remove_agent_task_binding(assignment.assignment_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        hydrated
+            .refresh_binding(assignment.assignment_id)
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(hydrated.binding_for_agent_path(&path), None);
+    assert_eq!(
+        hydrated.binding_for_assignment(assignment.assignment_id),
+        None
+    );
+
+    let (next, next_attempt) = coordinator
+        .create_assignment(repo.path(), assignment_draft())
+        .await
+        .unwrap();
+    let new_thread = ThreadId::new();
+    coordinator
+        .bind_agent_task(AgentTaskBindingDraft {
+            assignment_id: next.assignment_id,
+            attempt_id: next_attempt.attempt_id,
+            agent_path: path.to_string(),
+            task_name: "worker".to_string(),
+            thread_id: Some(new_thread.to_string()),
+        })
+        .await
+        .unwrap();
+    // Reinitialization must not implicitly reload live bindings from another coordinator.
+    hydrated
+        .initialize(state.clone(), "root-session".to_string())
+        .await
+        .unwrap();
+    assert_eq!(hydrated.binding_for_agent_path(&path), None);
+    assert!(
+        hydrated
+            .initialize(state, "different-root".to_string())
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        coordinator
+            .seal_missing_receipt(&path, old_thread, "late completion".to_string())
+            .await
+            .unwrap(),
+        None
+    );
+    let task = coordinator
+        .get_agent_task(next.assignment_id, None)
+        .await
+        .unwrap();
+    assert_eq!(task.receipt, None);
+    assert_eq!(task.current_attempt.state, AttemptState::Active);
+    assert!(
+        coordinator
+            .seal_missing_receipt(&path, new_thread, "new child stopped".to_string())
+            .await
+            .unwrap()
+            .is_some()
+    );
 }

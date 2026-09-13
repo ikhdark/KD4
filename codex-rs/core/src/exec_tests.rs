@@ -775,7 +775,11 @@ async fn forced_direct_exec_termination_reaps_the_child() -> Result<()> {
     .await?;
     managed_root.attach_and_resume(child.id().expect("child process id"))?;
     let raw = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, child.id().expect("child id")) };
-    assert!(!raw.is_null(), "observe child: {}", io::Error::last_os_error());
+    assert!(
+        !raw.is_null(),
+        "observe child: {}",
+        io::Error::last_os_error()
+    );
     let observed = unsafe { OwnedHandle::from_raw_handle(raw) };
 
     terminate_and_reap_child_process_tree(child, managed_root).await?;

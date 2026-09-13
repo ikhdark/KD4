@@ -42,6 +42,8 @@ pub enum WaitOutcome {
 }
 
 impl From<WaitOutcome> for RuntimeResponse {
+    /// Discards cell existence information at the response presentation boundary.
+    /// Perform existence-sensitive bookkeeping or recovery before converting.
     fn from(outcome: WaitOutcome) -> Self {
         match outcome {
             WaitOutcome::LiveCell(response) | WaitOutcome::MissingCell(response) => response,
@@ -78,5 +80,50 @@ pub struct CodeModeNestedToolCall {
     pub runtime_tool_call_id: String,
     pub tool_name: ToolName,
     pub tool_kind: CodeModeToolKind,
+    /// Missing input is distinct from an explicitly supplied JSON null.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_input"
+    )]
     pub input: Option<JsonValue>,
+}
+
+pub(crate) fn deserialize_present_input<'de, D>(
+    deserializer: D,
+) -> Result<Option<JsonValue>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    JsonValue::deserialize(deserializer).map(Some)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CodeModeNestedToolCall;
+    use serde_json::json;
+
+    #[test]
+    fn nested_tool_input_decodes_field_presence_from_json() {
+        let absent = json!({
+            "cell_id": "cell-input",
+            "runtime_tool_call_id": "nested-call",
+            "tool_name": { "name": "example", "namespace": null },
+            "tool_kind": "function"
+        });
+        let mut explicit_null = absent.clone();
+        explicit_null["input"] = json!(null);
+        let mut object = absent.clone();
+        object["input"] = json!({ "value": null });
+
+        for (encoded, expected) in [
+            (absent, None),
+            (explicit_null, Some(json!(null))),
+            (object, Some(json!({ "value": null }))),
+        ] {
+            let invocation: CodeModeNestedToolCall =
+                serde_json::from_value(encoded).expect("decode invocation");
+            assert_eq!(invocation.input, expected);
+        }
+    }
 }

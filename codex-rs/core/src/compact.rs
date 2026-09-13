@@ -369,6 +369,23 @@ async fn run_compact_task_inner_impl(
     let mut history = sess.clone_history().await;
     let (mut unresolved_history, _retained_image_count, omitted_images, omitted_user_text) =
         build_bounded_unresolved_input_history(history.raw_items());
+    let text_recovery_sidecar = match persist_compaction_text_recovery(
+        sess.as_ref(),
+        history.raw_items(),
+        &unresolved_history,
+    )
+    .await
+    {
+        Ok(sidecar) => sidecar,
+        Err(error) => {
+            sess.track_turn_codex_error(turn_context.as_ref(), &error);
+            if emit_error_event {
+                sess.send_event(&turn_context, EventMsg::Error(error.to_error_event(None)))
+                    .await;
+            }
+            return Err(error);
+        }
+    };
     let previous_summary = latest_summary_message(history.raw_items()).map(str::to_string);
     let reuse_previous_summary = previous_summary.is_some()
         && can_reuse_previous_summary(history.raw_items(), omitted_user_text);
@@ -383,29 +400,6 @@ async fn run_compact_task_inner_impl(
     history.record_items(
         &[initial_input_for_turn.into()],
         turn_context.model_info.truncation_policy.into(),
-    );
-
-    let base_instructions = BaseInstructions {
-        text: COMPACTION_BASE_INSTRUCTIONS.trim().to_string(),
-    };
-    let max_retries = turn_context.provider.info().stream_max_retries();
-    // Reuse the turn's live session when compaction runs inside a turn so the warm transport,
-    // sticky routing, and websocket incremental-request state carry over instead of forcing a
-    // second handshake while the turn's own connection sits idle. A standalone compaction turn
-    // has no such session and opens its own, which then publishes normally on drop.
-    //
-    // The caller reaches this point only after its response stream has closed: `run_turn`
-    // compacts from the post-sampling branch, and pre-sampling compaction runs before any
-    // stream is opened. Retries inside this compact turn keep sharing the one session.
-    let mut client_session = reuse_or_create_compaction_client_session(client_session, || {
-        sess.services.model_client.new_session()
-    });
-    let client_session = client_session.as_mut();
-    let window_id = sess.current_window_id().await;
-    let responses_metadata = turn_context.turn_metadata_state.to_responses_metadata(
-        sess.installation_id.clone(),
-        window_id,
-        CodexResponsesRequestKind::Compaction(compaction_metadata),
     );
 
     let workspace_identity = workspace_identity_for_compaction(
@@ -424,14 +418,37 @@ async fn run_compact_task_inner_impl(
     let artifact_pin_payload = history
         .tool_history_state()
         .artifact_pin_payload_for_items(&turn_input);
-    let prompt = Prompt {
-        input: turn_input.into(),
-        base_instructions: base_instructions.clone(),
-        ..Default::default()
-    };
     let summary_text_result = if reuse_previous_summary {
         validated_compaction_summary(previous_summary.as_deref(), "", false)
     } else {
+        let base_instructions = BaseInstructions {
+            text: COMPACTION_BASE_INSTRUCTIONS.trim().to_string(),
+        };
+        let max_retries = turn_context.provider.info().stream_max_retries();
+        // Reuse the turn's live session when compaction runs inside a turn so the warm transport,
+        // sticky routing, and websocket incremental-request state carry over instead of forcing a
+        // second handshake while the turn's own connection sits idle. A standalone compaction turn
+        // has no such session and opens its own, which then publishes normally on drop.
+        //
+        // The caller reaches this point only after its response stream has closed: `run_turn`
+        // compacts from the post-sampling branch, and pre-sampling compaction runs before any
+        // stream is opened. Retries inside this compact turn keep sharing the one session.
+        let mut client_session = reuse_or_create_compaction_client_session(client_session, || {
+            sess.services.model_client.new_session()
+        });
+        let client_session = client_session.as_mut();
+        let window_id = sess.current_window_id().await;
+        let responses_metadata = turn_context.turn_metadata_state.to_responses_metadata(
+            sess.installation_id.clone(),
+            window_id,
+            CodexResponsesRequestKind::Compaction(compaction_metadata),
+        );
+
+        let prompt = Prompt {
+            input: turn_input.into(),
+            base_instructions: base_instructions.clone(),
+            ..Default::default()
+        };
         turn_context.turn_timing_state.begin_compaction_generation();
         let mut retry_state = ResponsesStreamRetryState::default();
         loop {
@@ -524,9 +541,6 @@ async fn run_compact_task_inner_impl(
             return Err(error);
         }
     };
-    let text_recovery_sidecar =
-        persist_compaction_text_recovery(sess.as_ref(), history.raw_items(), &unresolved_history)
-            .await;
     // The summary and durable world state own consumed continuation state. Preserve only the
     // exact input tail that no model-generated item has consumed yet, in its original order.
     let mut summary_for_history = summary_text.clone();
@@ -1098,7 +1112,8 @@ pub(crate) fn collect_user_messages(items: &[ResponseItem]) -> Vec<CompactedUser
             } if role == "user" => {
                 if is_compaction_summary_item(item)
                     || (item.turn_id().is_none()
-                        && content.iter().any(is_legacy_compaction_warning_fragment))
+                        && content.iter().any(is_legacy_compaction_warning_fragment)
+                        && crate::event_mapping::is_contextual_user_message_content(content))
                 {
                     return None;
                 }
@@ -1293,14 +1308,15 @@ fn build_bounded_unresolved_input_history(
     items: &[ResponseItem],
 ) -> (Vec<ResponseItem>, usize, bool, bool) {
     let unresolved = unresolved_compaction_items(items);
-    let messages = collect_user_messages(&unresolved);
-    let user_source_indices = unresolved
+    let (user_source_indices, messages): (Vec<_>, Vec<_>) = unresolved
         .iter()
         .enumerate()
-        .filter_map(|(index, item)| {
-            (!collect_user_messages(std::slice::from_ref(item)).is_empty()).then_some(index)
+        .flat_map(|(index, item)| {
+            collect_user_messages(std::slice::from_ref(item))
+                .into_iter()
+                .map(move |message| (index, message))
         })
-        .collect::<Vec<_>>();
+        .unzip();
     let (user_items, retained_image_count, omitted_images, selected_user_indices) =
         append_bounded_user_messages(
             Vec::new(),
@@ -1328,17 +1344,27 @@ fn build_bounded_unresolved_input_history(
         .chain(selected_agent_items.iter().cloned())
         .collect::<Vec<_>>();
 
+    let retained_tokens_by_index = indexed_items
+        .iter()
+        .map(|(index, item)| {
+            (
+                *index,
+                response_item_text_tokens(item).saturating_add(agent_message_text_tokens(item)),
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut omission_receipts = Vec::new();
     let mut omitted_user_text = false;
     for (user_index, message) in messages.iter().enumerate() {
         let source_index = user_source_indices[user_index];
         let original_tokens = compacted_user_message_text_tokens(message);
-        let retained_tokens = indexed_items
-            .iter()
-            .find(|(index, _)| *index == source_index)
-            .map_or(0, |(_, item)| response_item_text_tokens(item));
+        let retained_tokens = retained_tokens_by_index
+            .get(&source_index)
+            .copied()
+            .unwrap_or(0);
         if retained_tokens < original_tokens {
             omitted_user_text = true;
-            indexed_items.push((
+            omission_receipts.push((
                 source_index,
                 compaction_text_omission_receipt(
                     "user",
@@ -1365,12 +1391,12 @@ fn build_bounded_unresolved_input_history(
             continue;
         };
         let original_tokens = agent_message_text_tokens(item);
-        let retained_tokens = selected_agent_items
-            .iter()
-            .find(|(index, _)| *index == source_index)
-            .map_or(0, |(_, item)| agent_message_text_tokens(item));
+        let retained_tokens = retained_tokens_by_index
+            .get(&source_index)
+            .copied()
+            .unwrap_or(0);
         if retained_tokens < original_tokens {
-            indexed_items.push((
+            omission_receipts.push((
                 source_index,
                 compaction_text_omission_receipt(
                     "agent",
@@ -1386,14 +1412,51 @@ fn build_bounded_unresolved_input_history(
         }
     }
 
+    // Detailed provenance is useful, but its envelope must also fit a fixed
+    // budget. Exact text remains recoverable from the mandatory sidecar.
+    let mut receipt_tokens = 0usize;
+    let mut omitted_receipt_count = 0usize;
+    let mut first_omitted_index = None;
+    for (index, receipt) in omission_receipts {
+        let tokens = response_item_text_tokens(&receipt);
+        if receipt_tokens.saturating_add(tokens) <= 1024 {
+            receipt_tokens += tokens;
+            indexed_items.push((index, receipt));
+        } else {
+            omitted_receipt_count += 1;
+            first_omitted_index.get_or_insert(index);
+        }
+    }
+    if let Some(index) = first_omitted_index {
+        indexed_items.push((
+            index,
+            ResponseItem::Message {
+                id: None,
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: serde_json::json!({
+                        "kind": COMPACT_TEXT_OMISSION_MARKER,
+                        "unresolved": true,
+                        "additional_omitted_messages": omitted_receipt_count,
+                        "instruction": "Recover exact text from the compaction recovery artifact.",
+                    })
+                    .to_string(),
+                }],
+                phase: None,
+                internal_chat_message_metadata_passthrough: None,
+            },
+        ));
+    }
+    let pending_output_ids = unresolved
+        .iter()
+        .filter_map(compaction_output_call_id)
+        .collect::<std::collections::HashSet<_>>();
     for (source_index, item) in unresolved.iter().enumerate() {
         let Some(call_id) = compaction_call_id(item).or_else(|| compaction_output_call_id(item))
         else {
             continue;
         };
-        let has_pending_output = unresolved
-            .iter()
-            .any(|candidate| compaction_output_call_id(candidate) == Some(call_id));
+        let has_pending_output = pending_output_ids.contains(call_id);
         if has_pending_output {
             indexed_items.push((source_index, item.clone()));
         }
@@ -1487,8 +1550,10 @@ async fn persist_compaction_text_recovery(
     sess: &Session,
     source_items: &[ResponseItem],
     bounded_history: &[ResponseItem],
-) -> Option<String> {
-    let canonical = compaction_text_recovery_canonical(source_items, bounded_history)?;
+) -> CodexResult<Option<String>> {
+    let Some(canonical) = compaction_text_recovery_canonical(source_items, bounded_history) else {
+        return Ok(None);
+    };
     let codex_home = sess.codex_home().await;
     let artifact = create_canonical_output_artifact(
         codex_home.as_path(),
@@ -1496,7 +1561,20 @@ async fn persist_compaction_text_recovery(
         &canonical,
     )
     .await;
+    if !artifact.complete {
+        return Err(CodexErr::Fatal(
+            "Compaction could not preserve exact unresolved text; original history was retained."
+                .to_string(),
+        ));
+    }
     compaction_text_recovery_sidecar(&canonical, &artifact)
+        .map(Some)
+        .ok_or_else(|| {
+            CodexErr::Fatal(
+                "Compaction recovery artifact is unavailable; original history was retained."
+                    .to_string(),
+            )
+        })
 }
 
 fn compaction_text_recovery_canonical(

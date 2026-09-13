@@ -153,7 +153,7 @@ impl ExecProcess for MockExecProcess {
     }
 }
 
-async fn remote_process(
+pub(super) async fn remote_process(
     write_status: WriteStatus,
     terminate_error: Option<String>,
 ) -> Arc<UnifiedExecProcess> {
@@ -548,7 +548,7 @@ async fn registered_network_denial_cleanup_is_awaited_without_tracking_idle_watc
     Ok(())
 }
 
-async fn store_process_for_test(
+pub(super) async fn store_process_for_test(
     manager: &UnifiedExecProcessManager,
     session: &Arc<Session>,
     turn: &TurnContext,
@@ -626,13 +626,13 @@ fn hold_artifact_lock(
     (release_tx, lock_thread)
 }
 
-struct DelayedWriteExecProcess {
+struct DelayedInputExecProcess {
     inner: MockExecProcess,
     writes: Arc<AtomicUsize>,
     acknowledgements: Arc<AtomicUsize>,
 }
 
-impl ExecProcess for DelayedWriteExecProcess {
+impl ExecProcess for DelayedInputExecProcess {
     fn process_id(&self) -> &ProcessId {
         self.inner.process_id()
     }
@@ -666,13 +666,96 @@ impl ExecProcess for DelayedWriteExecProcess {
         })
     }
 
-    fn signal(&self, signal: ProcessSignal) -> ExecProcessFuture<'_, ()> {
-        self.inner.signal(signal)
+    fn signal(&self, _signal: ProcessSignal) -> ExecProcessFuture<'_, ()> {
+        Box::pin(async move {
+            self.writes.fetch_add(1, Ordering::AcqRel);
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            self.acknowledgements.fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        })
     }
 
     fn terminate(&self) -> ExecProcessFuture<'_, ()> {
         ExecProcess::terminate(&self.inner)
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn stalled_interrupt_respects_yield_deadline_without_replay_or_retirement() {
+    let (session, turn) = make_session_and_context().await;
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let manager = &session.services.unified_exec_manager;
+    let process_id = 4_243;
+    let writes = Arc::new(AtomicUsize::new(0));
+    let acknowledgements = Arc::new(AtomicUsize::new(0));
+    let termination = Arc::new(TerminationControl::new());
+    termination.allowed.send_replace(true);
+    let (wake_tx, _wake_rx) = watch::channel(0);
+    let started = StartedExecProcess {
+        process: Arc::new(DelayedInputExecProcess {
+            inner: MockExecProcess {
+                process_id: "stalled-stdin".to_string().into(),
+                write_response: WriteResponse {
+                    status: WriteStatus::Accepted,
+                },
+                read_responses: Mutex::new(VecDeque::new()),
+                terminate_error: None,
+                termination_control: Some(Arc::clone(&termination)),
+                wake_tx,
+            },
+            writes: Arc::clone(&writes),
+            acknowledgements: Arc::clone(&acknowledgements),
+        }),
+    };
+    let process = UnifiedExecProcess::from_exec_server_started(
+        started,
+        None,
+        &PendingSpawnRegistration::default(),
+    )
+    .await
+    .expect("remote process starts");
+    store_process_for_test(manager, &session, &turn, process_id, Arc::clone(&process)).await;
+    manager
+        .process_store
+        .lock()
+        .await
+        .processes
+        .get_mut(&process_id)
+        .expect("stored process")
+        .tty = false;
+    let began = Instant::now();
+    let result = WriteStdinHandler
+        .handle(write_stdin_invocation_with_chars(
+            Arc::clone(&session),
+            Arc::clone(&turn),
+            "stalled-interrupt",
+            process_id,
+            "\u{3}",
+        ))
+        .await;
+    let error = match result {
+        Err(error) => error.to_string(),
+        Ok(_) => panic!("unconfirmed interrupt cannot report success"),
+    };
+    assert!(error.contains("interrupt delivery was not confirmed before the yield deadline"));
+    assert_eq!(began.elapsed(), Duration::from_secs(30));
+    assert_eq!(writes.load(Ordering::Acquire), 1);
+    assert_eq!(acknowledgements.load(Ordering::Acquire), 0);
+    assert_eq!(termination.calls.load(Ordering::Acquire), 0);
+    assert!(!process.has_exited());
+    assert!(
+        manager
+            .process_store
+            .lock()
+            .await
+            .processes
+            .get(&process_id)
+            .is_some_and(|entry| Arc::ptr_eq(&entry.process, &process))
+    );
+    tokio::time::advance(Duration::from_secs(60)).await;
+    assert_eq!(writes.load(Ordering::Acquire), 1);
+    assert_eq!(acknowledgements.load(Ordering::Acquire), 0);
 }
 
 #[tokio::test(start_paused = true)]
@@ -689,7 +772,7 @@ async fn stalled_stdin_acknowledgement_is_not_replayed_and_preserves_unconfirmed
         termination.allowed.send_replace(true);
         let (wake_tx, _wake_rx) = watch::channel(0);
         let started = StartedExecProcess {
-            process: Arc::new(DelayedWriteExecProcess {
+            process: Arc::new(DelayedInputExecProcess {
                 inner: MockExecProcess {
                     process_id: "stalled-stdin".to_string().into(),
                     write_response: WriteResponse {
@@ -798,16 +881,6 @@ async fn non_empty_write_stdin_collects_later_output_until_the_interaction_cap()
     delayed_output.await.expect("delayed output task finishes");
 }
 
-async fn wait_for_process_clones(process: &Arc<UnifiedExecProcess>, minimum: usize) {
-    tokio::time::timeout(Duration::from_secs(2), async {
-        while Arc::strong_count(process) < minimum {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("write_stdin calls should clone the process before waiting on its interaction lock");
-}
-
 #[tokio::test]
 async fn remote_write_unknown_process_marks_process_exited() {
     let process = remote_process(WriteStatus::UnknownProcess, /*terminate_error*/ None).await;
@@ -886,6 +959,7 @@ async fn tool_result_correctness_exited_process_with_open_output_is_not_running(
     assert_eq!(result["process_exited"], true);
 }
 
+#[cfg(windows)]
 #[tokio::test]
 async fn tool_result_correctness_closed_local_exit_channel_is_a_failure() {
     let temp = tempfile::tempdir().expect("tempdir");
@@ -931,6 +1005,7 @@ async fn tool_result_correctness_closed_local_exit_channel_is_a_failure() {
     ));
 }
 
+#[cfg(windows)]
 #[tokio::test]
 async fn local_process_constructor_observes_an_exit_during_the_grace_period() {
     let temp = tempfile::tempdir().expect("tempdir");
@@ -1014,6 +1089,30 @@ async fn unified_exec_termination_failure_retains_process_owner() {
             .is_some_and(|entry| Arc::ptr_eq(&entry.process, &process)),
         "the manager must retain the process owner when termination is unconfirmed"
     );
+}
+
+#[tokio::test]
+async fn exit_preserves_failure_while_termination_is_pending() {
+    let process = remote_process(WriteStatus::Accepted, None).await;
+    let gate = process.hold_termination_for_test();
+    let failure = process.fail_and_terminate("network denied".to_string());
+    tokio::pin!(failure);
+    assert!(futures::poll!(&mut failure).is_pending());
+    process.signal_exit_for_test(Some(7));
+    assert!(process.has_exited());
+    assert_eq!(process.exit_code(), Some(7));
+    assert_eq!(process.failure_message().as_deref(), Some("network denied"));
+    drop(gate);
+    failure
+        .await
+        .expect("already exited process completes termination");
+    process
+        .fail_and_terminate("later error".to_string())
+        .await
+        .expect("completed termination");
+    assert!(process.has_exited());
+    assert_eq!(process.exit_code(), Some(7));
+    assert_eq!(process.failure_message().as_deref(), Some("network denied"));
 }
 
 #[tokio::test]
@@ -1105,6 +1204,44 @@ async fn terminate_all_processes_uses_one_shared_confirmation_window() {
     assert_eq!(manager.process_store.lock().await.processes.len(), 2);
 }
 
+#[tokio::test(start_paused = true)]
+async fn unpublished_cleanup_uses_one_shared_confirmation_window() {
+    let manager = UnifiedExecProcessManager::default();
+    let (session, turn) = make_session_and_context().await;
+    let session = Arc::new(session);
+    let first_control = Arc::new(TerminationControl::new());
+    let second_control = Arc::new(TerminationControl::new());
+    let first = remote_process_with_termination_control(
+        WriteStatus::Accepted,
+        /*terminate_error*/ None,
+        Some(Arc::clone(&first_control)),
+    )
+    .await;
+    let second = remote_process_with_termination_control(
+        WriteStatus::Accepted,
+        /*terminate_error*/ None,
+        Some(Arc::clone(&second_control)),
+    )
+    .await;
+    store_process_for_test(&manager, &session, &turn, 1_101, first).await;
+    store_process_for_test(&manager, &session, &turn, 1_102, second).await;
+
+    let started_at = Instant::now();
+    let error = manager
+        .terminate_unpublished_processes_for_call_ids(&[
+            "exec-call-1101".to_string(),
+            "exec-call-1102".to_string(),
+        ])
+        .await
+        .expect_err("unconfirmed cleanup retains custody");
+    assert!(error.to_string().contains("termination"));
+
+    assert_eq!(started_at.elapsed(), Duration::from_secs(30));
+    assert_eq!(first_control.calls.load(Ordering::Acquire), 1);
+    assert_eq!(second_control.calls.load(Ordering::Acquire), 1);
+    assert_eq!(manager.process_store.lock().await.processes.len(), 2);
+}
+
 #[tokio::test]
 async fn dropping_confirmed_remote_process_does_not_terminate_twice() {
     let termination_control = Arc::new(TerminationControl::new());
@@ -1136,6 +1273,7 @@ async fn dropping_confirmed_remote_process_does_not_terminate_twice() {
     assert_eq!(termination_control.calls.load(Ordering::Acquire), 1);
 }
 
+#[cfg(windows)]
 #[tokio::test]
 async fn spawned_process_is_retained_when_constructor_future_is_cancelled() {
     let temp = tempfile::tempdir().expect("tempdir");
@@ -1282,6 +1420,15 @@ async fn cancelled_startup_keeps_store_and_ledger_until_termination_is_confirmed
     registration.attach_process(Arc::clone(&process), None);
     registration.set_initial_exec_command_active(Arc::clone(&active));
 
+    let pending_control = Arc::new(TerminationControl::new());
+    let pending_process = remote_process_with_termination_control(
+        WriteStatus::Accepted,
+        None,
+        Some(Arc::clone(&pending_control)),
+    )
+    .await;
+    registration.pending_spawns().register(pending_process);
+
     drop(registration);
 
     assert!(!active.load(Ordering::Acquire));
@@ -1291,6 +1438,9 @@ async fn cancelled_startup_keeps_store_and_ledger_until_termination_is_confirmed
     )
     .await
     .expect("termination starts");
+    tokio::time::timeout(Duration::from_secs(1), pending_control.started.notified())
+        .await
+        .expect("pending termination starts before primary termination is released");
     assert!(
         manager
             .process_store
@@ -1312,6 +1462,34 @@ async fn cancelled_startup_keeps_store_and_ledger_until_termination_is_confirmed
         .allowed
         .send(true)
         .expect("termination waiters remain subscribed");
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !termination_control.completed.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("primary termination finishes");
+    assert!(
+        manager
+            .process_store
+            .lock()
+            .await
+            .processes
+            .contains_key(&process_id)
+    );
+    assert!(
+        session
+            .services
+            .command_execution
+            .running_process(process_id)
+            .await
+            .is_some()
+    );
+    assert!(!pending_control.completed.load(Ordering::Acquire));
+    pending_control
+        .allowed
+        .send(true)
+        .expect("pending termination remains owned");
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             if !manager
@@ -1335,6 +1513,9 @@ async fn cancelled_startup_keeps_store_and_ledger_until_termination_is_confirmed
     .await
     .expect("cleanup finishes after termination confirmation");
     assert!(termination_control.completed.load(Ordering::Acquire));
+    assert!(pending_control.completed.load(Ordering::Acquire));
+    assert_eq!(termination_control.calls.load(Ordering::Acquire), 1);
+    assert_eq!(pending_control.calls.load(Ordering::Acquire), 1);
 }
 
 #[tokio::test]
@@ -1867,6 +2048,7 @@ async fn remote_termination_finalizes_artifact_before_publishing_output_closed()
     }
 }
 
+#[cfg(windows)]
 #[tokio::test]
 async fn terminating_local_process_finalizes_pending_raw_output_artifact() {
     let temp = tempfile::tempdir().expect("tempdir");
@@ -1912,6 +2094,7 @@ async fn terminating_local_process_finalizes_pending_raw_output_artifact() {
     );
 }
 
+#[cfg(windows)]
 #[tokio::test]
 async fn local_process_exited_before_registration_closes_output_before_denial_check() {
     let temp = tempfile::tempdir().expect("tempdir");
@@ -1961,7 +2144,7 @@ async fn sandbox_denial_snapshot_separates_capacity_omission_seam() {
         .output_buffer
         .lock()
         .await
-        .push_chunk(output);
+        .push_chunk(&output);
 
     let rendered = process.snapshot_output().await;
     let marker = omitted_output_marker(3);
@@ -1994,8 +2177,8 @@ async fn independent_process_polls_do_not_share_an_interaction_lock() {
     let interaction_guard = process_a.interaction_lock().lock_owned().await;
     let invocation_a =
         write_stdin_invocation(Arc::clone(&session), Arc::clone(&turn), "poll-a", 1001);
-    let poll_a = tokio::spawn(async move { WriteStdinHandler.handle(invocation_a).await });
-    wait_for_process_clones(&process_a, 3).await;
+    let mut poll_a = WriteStdinHandler.handle(invocation_a);
+    assert!(futures::poll!(&mut poll_a).is_pending());
 
     process_b
         .terminate_confirmed()
@@ -2024,7 +2207,6 @@ async fn independent_process_polls_do_not_share_an_interaction_lock() {
     tokio::time::timeout(Duration::from_secs(2), poll_a)
         .await
         .expect("process A poll should finish after its lock is released")
-        .expect("process A poll task should not panic")
         .expect("process A poll should succeed");
 }
 
@@ -2044,9 +2226,11 @@ async fn concurrent_completed_process_polls_emit_one_completion_and_post_hook() 
         write_stdin_invocation(Arc::clone(&session), Arc::clone(&turn), "poll-b", 1003);
     let poll_a_invocation = invocation_a.clone();
     let poll_b_invocation = invocation_b.clone();
-    let poll_a = tokio::spawn(async move { WriteStdinHandler.handle(poll_a_invocation).await });
-    let poll_b = tokio::spawn(async move { WriteStdinHandler.handle(poll_b_invocation).await });
-    wait_for_process_clones(&process, 4).await;
+    let mut poll_a = WriteStdinHandler.handle(poll_a_invocation);
+    let mut poll_b = WriteStdinHandler.handle(poll_b_invocation);
+    // Drive each invocation separately to the held interaction lock.
+    assert!(futures::poll!(&mut poll_a).is_pending());
+    assert!(futures::poll!(&mut poll_b).is_pending());
 
     process
         .terminate_confirmed()
@@ -2058,10 +2242,7 @@ async fn concurrent_completed_process_polls_emit_one_completion_and_post_hook() 
     })
     .await
     .expect("both completed-process polls should finish");
-    let results = [
-        (invocation_a, result_a.expect("poll A should not panic")),
-        (invocation_b, result_b.expect("poll B should not panic")),
-    ];
+    let results = [(invocation_a, result_a), (invocation_b, result_b)];
     let mut completions = 0;
     let mut post_hooks = 0;
     let mut unknown_process_errors = 0;

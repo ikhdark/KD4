@@ -23,11 +23,12 @@ impl ContextualUserFragment for TaskModelGuidance {
 
     fn body(&self) -> String {
         concat!(
-            "Before acting, form and maintain a working task model from the current request and ",
-            "higher-priority instructions. Track the desired outcome; active requirements and ",
-            "constraints; non-requirement context; authoritative, generated, legacy, fallback, ",
-            "or unused evidence; repository owners and transitive runtime relationships; material ",
-            "unknowns; one to three plausible hypotheses; and the smallest proof route. Attach one ",
+            "Maintain the task state needed for the current request and higher-priority ",
+            "instructions: desired outcome, active requirements and constraints, material ",
+            "unknowns, and the next necessary action. Form competing hypotheses only when ",
+            "uncertainty between explanations affects the next action. Track repository ",
+            "ownership and runtime relationships only as needed to establish the requested ",
+            "behavior. Attach one ",
             "explicit provenance kind to each material claim: direct_file_read, search_hit, ",
             "generated_summary, cached_observation, inferred_relationship, or test_result. Preserve ",
             "that label through summaries and durable state; storage or repetition never upgrades ",
@@ -35,7 +36,8 @@ impl ContextualUserFragment for TaskModelGuidance {
             "read at that time, search hits as candidates rather than authority, generated summaries ",
             "as derived and potentially lossy, cached observations as potentially stale, inferred ",
             "relationships as hypotheses, and test results as proof only for the exact exercised ",
-            "contract. Reuse current exact values and enumerations already returned by tools ",
+            "contract. These are internal evidence labels, not a mandatory user-facing reporting ",
+            "format. Reuse current exact values and enumerations already returned by tools ",
             "instead of rediscovering them. Batch independent read-only checks in one tool ",
             "generation when their tool contracts allow it. For actionable coding tasks, begin ",
             "with the responsible owner, implementation, and direct test when available; expand ",
@@ -50,8 +52,9 @@ impl ContextualUserFragment for TaskModelGuidance {
             "the value unknown or refresh it; never substitute a remembered value while citing ",
             "the earlier read. Resolve contradictions using runtime ",
             "reachability, ownership, freshness, and generated-source contracts. Revise the model ",
-            "when new evidence disagrees with it, and stay at module-level abstraction until a ",
-            "specific uncertainty requires implementation detail. Never fill an unknown with an ",
+            "when new evidence disagrees with it. Inspect implementation detail when needed to ",
+            "establish the requested behavior; expand beyond the relevant runtime path only for ",
+            "a material reason. Never fill an unknown with an ",
             "unstated assumption."
         )
         .to_string()
@@ -70,7 +73,6 @@ mod tests {
     fn renders_execution_time_task_model_contract() {
         let rendered = TaskModelGuidance.render();
         assert!(rendered.starts_with(TASK_MODEL_GUIDANCE_OPEN_TAG));
-        assert!(rendered.contains("one to three plausible hypotheses"));
         for provenance in [
             "direct_file_read",
             "search_hit",
@@ -91,6 +93,45 @@ mod tests {
         assert!(rendered.contains("never substitute a remembered value"));
         assert!(rendered.contains("Never fill an unknown"));
         assert!(rendered.ends_with(TASK_MODEL_GUIDANCE_CLOSE_TAG));
+    }
+
+    #[test]
+    fn model_message_conditions_diagnostic_work_on_the_requested_behavior() {
+        use codex_protocol::models::ContentItem;
+        use codex_protocol::models::ResponseItem;
+
+        let ResponseItem::Message { role, content, .. } =
+            ContextualUserFragment::into(TaskModelGuidance)
+        else {
+            panic!("expected a model message");
+        };
+        assert_eq!(role, "user");
+        let [ContentItem::InputText { text }] = content.as_slice() else {
+            panic!("expected one guidance fragment");
+        };
+        assert!(text.starts_with("<task_model_guidance>"));
+        assert!(text.ends_with("</task_model_guidance>"));
+        for required in [
+            "Form competing hypotheses only when uncertainty between explanations affects the next action.",
+            "Track repository ownership and runtime relationships only as needed to establish the requested behavior.",
+            "These are internal evidence labels, not a mandatory user-facing reporting format.",
+            "Inspect implementation detail when needed to establish the requested behavior; expand beyond the relevant runtime path only for a material reason.",
+        ] {
+            assert!(
+                text.contains(required),
+                "missing conditional guidance: {required}"
+            );
+        }
+        for obsolete in [
+            "Before acting",
+            "one to three plausible hypotheses",
+            "stay at module-level abstraction",
+        ] {
+            assert!(
+                !text.contains(obsolete),
+                "unconditional diagnostic requirement returned: {obsolete}"
+            );
+        }
     }
 
     #[test]

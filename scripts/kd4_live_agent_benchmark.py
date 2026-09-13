@@ -36,6 +36,7 @@ import tempfile
 import threading
 import time
 from collections import Counter, deque
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1651,6 +1652,140 @@ def classify_command(command: str) -> str:
     return "other"
 
 
+TOKEN_USAGE_FIELDS = {
+    "inputTokens": "input_tokens",
+    "cachedInputTokens": "cached_input_tokens",
+    "cacheWriteInputTokens": "cache_write_input_tokens",
+    "outputTokens": "output_tokens",
+    "reasoningOutputTokens": "reasoning_output_tokens",
+}
+
+
+def turn_token_usage(event: dict[str, Any] | None) -> dict[str, Any] | None:
+    usage = event.get("usage") if isinstance(event, dict) else None
+    if not isinstance(usage, dict):
+        return None
+    counts = {
+        name: value if type(value) is int and value >= 0 else None
+        for name, wire_name in TOKEN_USAGE_FIELDS.items()
+        for value in [usage.get(wire_name)]
+    }
+    if counts["inputTokens"] is None or counts["outputTokens"] is None:
+        return None
+    # Cache and reasoning counts are subsets, not additional tokens.
+    return {
+        "source": "terminal.usage",
+        **counts,
+        "totalTokens": counts["inputTokens"] + counts["outputTokens"],
+    }
+
+
+def collect_inference_trace(
+    root: Path, terminal_usage: dict[str, Any] | None, *, readers_drained: bool
+) -> dict[str, Any]:
+    """Index native payloads without truncating or reconstructing their contents."""
+    issues: list[str] = []
+    requests: list[dict[str, Any]] = []
+    bundles = sorted((root / "runtime").rglob("trace.jsonl"))
+    if not bundles:
+        issues.append("no native trace bundle emitted")
+    if not readers_drained:
+        issues.append("CLI readers did not drain")
+
+    def payload_path(bundle: Path, ref: Any) -> Path | None:
+        if not isinstance(ref, dict) or not isinstance(ref.get("path"), str):
+            return None
+        path = (bundle / ref["path"]).resolve()
+        if not path.is_relative_to(bundle.resolve()) or not path.is_file():
+            issues.append(f"missing or invalid payload reference: {ref['path']}")
+            return None
+        return path
+
+    for log in bundles:
+        attempts: dict[str, dict[str, Any]] = {}
+        try:
+            events = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines() if line]
+            for sequence, event in enumerate(events, 1):
+                if event.get("seq") != sequence:
+                    issues.append(f"non-contiguous trace: {log.name}:{sequence}")
+                payload = event["payload"]
+                # Check every raw payload reference, including tools and terminal output.
+                for value in payload.values():
+                    if isinstance(value, dict) and "raw_payload_id" in value:
+                        payload_path(log.parent, value)
+                kind = payload.get("type")
+                call_id = payload.get("inference_call_id")
+                if kind == "inference_started":
+                    path = payload_path(log.parent, payload.get("request_payload"))
+                    if call_id in attempts:
+                        issues.append(f"duplicate request id: {call_id}")
+                    row = {
+                        "inferenceCallId": call_id, "status": "unfinished",
+                        "requestPath": str(path) if path else None,
+                        "responsePath": None, "tokenUsage": None,
+                    }
+                    if path is None:
+                        issues.append(f"missing request payload: {call_id}")
+                    else:
+                        json.loads(path.read_text(encoding="utf-8"))
+                    attempts[call_id] = row
+                    requests.append(row)
+                elif kind in {"inference_completed", "inference_failed", "inference_cancelled"}:
+                    row = attempts.get(call_id)
+                    if row is None:
+                        issues.append(f"response without request: {call_id}")
+                        continue
+                    if row["status"] != "unfinished":
+                        issues.append(f"duplicate response: {call_id}")
+                        continue
+                    row["status"] = kind.removeprefix("inference_")
+                    row["error"] = payload.get("error")
+                    path = payload_path(log.parent, payload.get("response_payload") or payload.get("partial_response_payload"))
+                    row["responsePath"] = str(path) if path else None
+                    if path:
+                        response = json.loads(path.read_text(encoding="utf-8"))
+                        usage = turn_token_usage({"usage": response.get("token_usage")})
+                        if usage:
+                            usage["source"] = "native_inference_response.token_usage"
+                        row["tokenUsage"] = usage
+                        row["responseId"] = response.get("response_id")
+                        row["outputItemTypes"] = dict(Counter(
+                            item.get("type", "unknown") for item in response.get("output_items", [])
+                        ))
+                    if row["status"] == "completed" and (path is None or row["tokenUsage"] is None):
+                        issues.append(f"completed response missing payload or usage: {call_id}")
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            issues.append(f"cannot read trace {log}: {error}")
+    if not requests:
+        issues.append("no inference requests captured")
+    if any(row["status"] == "unfinished" for row in requests):
+        issues.append("inference request has no terminal trace event")
+    usage_rows = [row["tokenUsage"] for row in requests if row["tokenUsage"]]
+    totals = {
+        field: sum(usage[field] for usage in usage_rows)
+        if usage_rows and all(type(usage.get(field)) is int for usage in usage_rows) else None
+        for field in (*TOKEN_USAGE_FIELDS, "totalTokens")
+    }
+    reconciled = bool(terminal_usage) and all(
+        totals[field] == terminal_usage[field]
+        for field in (*TOKEN_USAGE_FIELDS, "totalTokens")
+        if terminal_usage.get(field) is not None
+    )
+    if not reconciled:
+        issues.append("request usage does not reconcile with terminal usage")
+    files = [
+        {"path": str(path.resolve()), "bytes": path.stat().st_size, "sha256": sha256(path)}
+        for path in sorted(root.rglob("*")) if path.is_file()
+    ]
+    return {
+        "status": "complete" if not issues else "incomplete",
+        "root": str(root.resolve()), "requests": requests,
+        "requestTokenTotals": totals, "usageReconciled": reconciled,
+        "files": files, "issues": issues,
+        "scope": "Native model request payloads and complete response output items, including per-request usage; not raw HTTP headers or streaming deltas. WebSocket requests may use previous_response_id or logical warmup history. CLI logs and workspace.diff are retained separately without report-prefix truncation.",
+    }
+
+
 def turn_measurements(event: dict[str, Any]) -> tuple[float | None, int | None]:
     timing = event.get("timing")
     if not isinstance(timing, dict):
@@ -3167,6 +3302,7 @@ def _run_agent_impl(
     task: BenchmarkTask,
     _process_holder: list[subprocess.Popen[str]],
     config_overrides: tuple[str, ...] | list[str] = (),
+    artifact_dir: Path | None = None,
 ) -> dict[str, Any]:
     with tempfile.TemporaryDirectory(
         prefix=f"kd4-live-{task.task_id}-{label}-{repetition}-"
@@ -3190,6 +3326,11 @@ def _run_agent_impl(
         )
         env = os.environ.copy()
         env["CODEX_HOME"] = str(home)
+        if artifact_dir is not None:
+            artifact_dir.mkdir(parents=True, exist_ok=True)
+            env["CODEX_ROLLOUT_TRACE_ROOT"] = str(artifact_dir / "runtime")
+        else:
+            env.pop("CODEX_ROLLOUT_TRACE_ROOT", None)
         env["RUST_LOG"] = "error"
         env["NO_COLOR"] = "1"
         # One wall-clock reading paired with the monotonic origin. Every absolute
@@ -3220,28 +3361,32 @@ def _run_agent_impl(
         def read_stdout() -> None:
             nonlocal stdout_truncated_lines
             assert process.stdout
-            for line, truncated in bounded_text_lines(
-                process.stdout, MAX_STREAM_LINE_CHARS
-            ):
-                if truncated:
-                    stdout_truncated_lines += 1
-                stdout_queue.put((time.perf_counter_ns(), line))
+            capture = (artifact_dir / "cli.stdout.jsonl").open("w", encoding="utf-8") if artifact_dir else nullcontext(None)
+            with capture as sink:
+                for line in process.stdout:
+                    observed_ns = time.perf_counter_ns()
+                    if sink is not None:
+                        sink.write(line)
+                    if len(line.rstrip()) > MAX_STREAM_LINE_CHARS:
+                        stdout_truncated_lines += 1
+                    stdout_queue.put((observed_ns, line[:MAX_STREAM_LINE_CHARS].rstrip()))
             stdout_queue.put(None)
 
         def read_stderr() -> None:
             nonlocal stderr_line_overflow
             assert process.stderr
-            for line, truncated in bounded_text_lines(
-                process.stderr, MAX_COMMAND_TEXT_CHARS
-            ):
-                if truncated:
-                    stderr_line_overflow += 1
-                if len(stderr_lines) == MAX_STDERR_LINES:
-                    # Evict the oldest line: fatal errors print last, and the
-                    # serialized stderr tail must hold the true tail.
-                    del stderr_lines[0]
-                    stderr_line_overflow += 1
-                stderr_lines.append(line)
+            capture = (artifact_dir / "cli.stderr.log").open("w", encoding="utf-8") if artifact_dir else nullcontext(None)
+            with capture as sink:
+                for line in process.stderr:
+                    if sink is not None:
+                        sink.write(line)
+                    if len(line.rstrip()) > MAX_COMMAND_TEXT_CHARS:
+                        stderr_line_overflow += 1
+                    if len(stderr_lines) == MAX_STDERR_LINES:
+                        # Preserve the true tail in the bounded report view.
+                        del stderr_lines[0]
+                        stderr_line_overflow += 1
+                    stderr_lines.append(line[:MAX_COMMAND_TEXT_CHARS].rstrip())
 
         # Daemon threads: a leaked grandchild can hold the inherited pipe open,
         # and a reader blocked on that pipe must not keep the interpreter alive.
@@ -3509,6 +3654,8 @@ def _run_agent_impl(
         if readers_drained:
             process.stdout.close()
             process.stderr.close()
+        if artifact_dir is not None:
+            (artifact_dir / "workspace.diff").write_bytes(git_bytes(workspace, "diff", "HEAD", "--"))
         verifier_passed, verifier_failures = verify_fixture(workspace, task)
 
         reasons: list[str] = []
@@ -3659,6 +3806,10 @@ def _run_agent_impl(
             "wallClockMs": wall_clock_ms,
             "modelWaitMs": model_wait_ms,
             "continuationCount": continuation_count,
+            "tokenUsage": turn_token_usage(terminal_payload),
+            "inferenceTrace": collect_inference_trace(
+                artifact_dir, turn_token_usage(terminal_payload), readers_drained=readers_drained
+            ) if artifact_dir is not None else None,
             "actualCommandCount": actual_command_count,
             "duplicateCommandCount": duplicate_command_count,
             "ttfoMs": ttfo_ms,
@@ -3666,7 +3817,7 @@ def _run_agent_impl(
             "terminalEvent": terminal_event,
             "eventCounts": dict(sorted(event_counts.items())),
             "itemCounts": dict(sorted(item_counts.items())),
-            "finalMessage": None if final_message is None else final_message[:500],
+            "finalMessage": final_message,
             "verifierPassed": verifier_passed,
             "readersDrained": readers_drained,
             # Bounded per-round evidence. Overflow counters make omitted rows
@@ -3704,6 +3855,7 @@ def run_agent(
     timeout_seconds: int,
     task: BenchmarkTask = DEFAULT_BENCHMARK_TASK,
     config_overrides: tuple[str, ...] | list[str] = (),
+    artifact_dir: Path | None = None,
 ) -> dict[str, Any]:
     """Run one agent with unconditional process-tree cleanup."""
     processes: list[subprocess.Popen[str]] = []
@@ -3721,6 +3873,7 @@ def run_agent(
             task=task,
             _process_holder=processes,
             config_overrides=validate_config_overrides(config_overrides),
+            artifact_dir=artifact_dir,
         )
     finally:
         for process in processes:
@@ -4466,6 +4619,24 @@ def summarize(runs: list[dict[str, Any]]) -> dict[str, Any]:
         "duplicateCommandCount": count_distribution(duplicate_commands),
         "logicalGenerationCount": count_distribution(logical_generations),
         "totalTokens": count_distribution(total_tokens),
+        "tokenUsage": {
+            field: count_distribution([
+                usage[field]
+                for run in runs
+                if isinstance(usage := run.get("tokenUsage"), dict)
+                and type(usage.get(field)) is int
+            ])
+            for field in (*TOKEN_USAGE_FIELDS, "totalTokens")
+        },
+        "inferenceTrace": {
+            "completeRuns": sum((run.get("inferenceTrace") or {}).get("status") == "complete" for run in runs),
+            "incompleteRuns": sum((run.get("inferenceTrace") or {}).get("status") != "complete" for run in runs),
+            "requestCount": sum(len((run.get("inferenceTrace") or {}).get("requests", [])) for run in runs),
+            "requestsWithUsage": sum(
+                row.get("tokenUsage") is not None for run in runs
+                for row in (run.get("inferenceTrace") or {}).get("requests", [])
+            ),
+        },
         "testsRan": {
             "runs": tests_ran,
             "ratePercent": round(tests_ran / len(runs) * 100, 3),
@@ -4713,8 +4884,9 @@ PAIRED_METRICS = (
 )
 
 # Metrics that exist only once a turn reaches its terminal event. Completion is
-# measured by this harness at that event; the others come from its `timing`
-# block. Everything else in `PAIRED_METRICS` is measured from the JSONL stream
+# measured by this harness at that event; token counts come from `usage`
+# (or legacy reports' timing totals), and runtime metrics come from `timing`.
+# Everything else in `PAIRED_METRICS` is measured from the JSONL stream
 # as the run proceeds and remains valid when the process is killed at timeout.
 _TERMINAL_ONLY_METRICS = frozenset(
     {
@@ -4735,6 +4907,10 @@ _TERMINAL_ONLY_METRICS = frozenset(
 
 def _run_metric(run: dict[str, Any], metric: str) -> float | int | None:
     """Read one comparable scalar off a run record."""
+    if metric == "totalTokens" and isinstance(usage := run.get("tokenUsage"), dict):
+        value = usage.get("totalTokens")
+        if type(value) is int and value >= 0:
+            return value
     if metric in {
         "completionMs",
         "wallClockMs",
@@ -5365,6 +5541,8 @@ def make_report(args: argparse.Namespace) -> dict[str, Any]:
         ),
     }
 
+    artifact_root = args.output.resolve().with_suffix(".artifacts")
+    artifact_root.mkdir(parents=True, exist_ok=True)
     pairs: list[dict[str, Any]] = []
     for task in tasks:
         for repetition in range(1, args.repetitions + 1):
@@ -5401,6 +5579,9 @@ def make_report(args: argparse.Namespace) -> dict[str, Any]:
                     timeout_seconds=args.timeout_seconds,
                     task=task,
                     config_overrides=config_overrides[role],
+                    artifact_dir=Path(tempfile.mkdtemp(
+                        prefix=f"{task.task_id}-{role}-{repetition}-", dir=artifact_root
+                    )),
                 )
                 require_binary_sha256(binary, expected_binary_sha256, label)
                 runs[role] = run
@@ -5412,6 +5593,8 @@ def make_report(args: argparse.Namespace) -> dict[str, Any]:
                     f"modelWaitMs={run['modelWaitMs']} "
                     f"continuations={run['continuationCount']} "
                     f"commands={run['actualCommandCount']} "
+                    f"totalTokens={(run.get('tokenUsage') or {}).get('totalTokens')} "
+                    f"trace={(run.get('inferenceTrace') or {}).get('status')} "
                     f"failures={run['failureReasons']}",
                     flush=True,
                 )
@@ -5584,6 +5767,23 @@ def make_report(args: argparse.Namespace) -> dict[str, Any]:
             "home": "fresh CODEX_HOME per run with the same auth source and no user config",
             "completionMetric": "process launch through turn.completed JSONL event",
             "ttfoMetric": "process launch through first non-error item.started or item.completed JSONL event",
+            "tokenUsage": (
+                "Standard terminal-event usage is retained for both variants. "
+                "Total tokens = input + output; cached input and reasoning output "
+                "are subsets and are not added again. Missing fields remain null. "
+                "Legacy run records may fall back to instrumented request totals."
+            ),
+            "traceCapture": (
+                "Both variants enable CODEX_ROLLOUT_TRACE_ROOT. Each run retains native model "
+                "request payloads, completed response items, per-request usage, tool inputs/results, "
+                "terminal output, full CLI stdout/stderr, and a final workspace diff in a unique "
+                "directory beside the report. inferenceTrace indexes payload paths and file hashes, "
+                "and checks request usage against terminal usage. Report previews remain bounded; "
+                "artifact payloads are not prefix-truncated. Native capture records model-visible "
+                "payloads rather than raw HTTP headers or individual streaming deltas; WebSocket "
+                "requests may use previous_response_id or logical warmup history. File-writing "
+                "overhead is included in both variants' measured latency."
+            ),
             "timeoutSeconds": args.timeout_seconds,
             "timingInstrumentationAsymmetry": (
                 "modelWait and continuationCount come from a `timing` block that "

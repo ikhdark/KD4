@@ -266,7 +266,7 @@ async fn cancellation_before_cell_dispatch_releases_delegate_call() {
             text: "delivered".to_string(),
         }
     );
-    peer.complete(id, Ok(DelegateResponse::NotificationDelivered))
+    peer.complete(id, Ok(DelegateResponse::NotificationDelivered {}))
         .await;
     assert_eq!(live_call.await, Ok(()));
     assert_eq!(

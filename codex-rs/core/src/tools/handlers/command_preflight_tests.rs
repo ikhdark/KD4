@@ -678,18 +678,144 @@ fn rejects_known_flag_typos_case_insensitively() {
 }
 
 #[test]
-fn rejects_rg_glob_backslashes_for_direct_argv() {
-    let issue = preflight_command_issue(
-        &strings(&["rg", "--files", "--glob", r"core\**\*.rs"]),
-        /*shell_type*/ None,
-    )
-    .expect_err("rg glob patterns should use slash separators");
+fn preserves_rg_glob_escapes_for_direct_argv() {
+    for glob in [r"core\**\*.rs", r"literal\*.rs"] {
+        assert_eq!(
+            preflight_command(&strings(&["rg", "--files", "--glob", glob]), None),
+            Ok(())
+        );
+    }
+}
 
-    assert_eq!(issue.code, CommandPreflightIssueCode::RgGlobPathSeparator);
-    let rendered = issue.render_for_model();
-    assert!(rendered.contains("gitignore-style `/` separators"));
-    assert!(rendered.contains("kind: \"argv\""));
-    assert!(rendered.contains("\"core/**/*.rs\""));
+#[test]
+fn preserves_rg_option_values_that_resemble_typos() {
+    for option in ["-e", "--regexp", "-ne", "--glob", "--ignore-file"] {
+        assert_eq!(
+            preflight_command(&strings(&["rg", option, "--ignorecase", "src"]), None),
+            Ok(())
+        );
+    }
+    let issue = preflight_command_issue(
+        &strings(&["rg", "-e", "--ignorecase", "--ignorecase", "src"]),
+        None,
+    )
+    .unwrap_err();
+    assert_eq!(
+        issue.retry,
+        Some(CommandPreflightRetry::Argv {
+            program: "rg".to_string(),
+            args: strings(&["-e", "--ignorecase", "--ignore-case", "src"]),
+        })
+    );
+}
+
+#[tokio::test]
+async fn runtime_repair_preserves_search_values_and_executes_only_the_corrected_flag() {
+    let fixture = tempfile::tempdir().unwrap();
+    std::fs::write(
+        fixture.path().join("input.txt"),
+        "--ignorecase\n--IGNORECASE\n--ignore-case\n",
+    )
+    .unwrap();
+    std::fs::write(
+        fixture.path().join("[literal].txt"),
+        "literal glob target\n",
+    )
+    .unwrap();
+    for (args, repaired, expected) in [
+        (
+            strings(&["--no-config", "-e", "--ignorecase", "input.txt"]),
+            false,
+            "--ignorecase\n",
+        ),
+        (
+            strings(&["-e", "--ignorecase", "--ignorecase", "input.txt"]),
+            true,
+            "--ignorecase\n--IGNORECASE\n",
+        ),
+        (
+            strings(&["--files", "--glob", r"\[literal\].txt"]),
+            false,
+            "[literal].txt\n",
+        ),
+    ] {
+        let invocation = CommandInvocation::Argv {
+            program: "rg".to_string(),
+            args,
+        };
+        let outcome = preflight_invocation_for_runtime(
+            false,
+            &invocation,
+            &invocation.to_direct_argv().unwrap(),
+            None,
+        )
+        .await
+        .expect("runtime preflight accepts the literal search value");
+        assert_eq!(outcome.repaired(), repaired);
+        let executed = outcome.invocation.to_direct_argv().unwrap();
+        let output = std::process::Command::new(&executed[0])
+            .args(&executed[1..])
+            .env_remove("RIPGREP_CONFIG_PATH")
+            .current_dir(fixture.path())
+            .output()
+            .expect("execute ripgrep");
+        assert!(output.status.success(), "{:?}", output);
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn runtime_preflight_executes_quoted_posix_text_with_comment_quotes() {
+    let script = "printf '%s' '$env:PATH' # user's note";
+    let invocation = CommandInvocation::Script(script.to_string());
+    let command = strings(&["bash", "-c", script]);
+    let outcome =
+        preflight_invocation_for_runtime(false, &invocation, &command, Some(ShellType::Bash))
+            .await
+            .expect("quoted text and comment quotes are valid POSIX shell");
+    assert_eq!(outcome.invocation, invocation);
+    assert!(!outcome.repaired());
+    let output = std::process::Command::new(&command[0])
+        .args(&command[1..])
+        .output()
+        .expect("execute Bash");
+    assert!(output.status.success(), "{:?}", output);
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), "$env:PATH");
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn runtime_preflight_preserves_powershell_calculated_measurement() {
+    let script = "(1,2,3 | Measure-Object -Property { $_ * 2 } -Sum).Sum";
+    let invocation = CommandInvocation::Script(script.to_string());
+    let command = strings(&["pwsh", "-NoProfile", "-Command", script]);
+    let outcome =
+        preflight_invocation_for_runtime(false, &invocation, &command, Some(ShellType::PowerShell))
+            .await
+            .expect("calculated properties are valid PowerShell");
+    assert_eq!(outcome.invocation, invocation);
+    assert!(!outcome.repaired());
+    let output = std::process::Command::new(&command[0])
+        .args(&command[1..])
+        .output()
+        .expect("execute PowerShell");
+    assert!(output.status.success(), "{:?}", output);
+    assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), "12");
+}
+
+#[test]
+fn accepts_posix_quoted_shell_text_and_comment_quotes() {
+    for script in [
+        "printf '%s' '$env:PATH'",
+        "echo ok # user's note",
+        "# unmatched '\n echo ok",
+    ] {
+        assert_eq!(
+            preflight_command(&strings(&["bash", "-c", script]), Some(ShellType::Bash)),
+            Ok(())
+        );
+    }
 }
 
 #[test]
@@ -807,25 +933,19 @@ fn powershell_cmdlet_retry_uses_powershell_literal_quoting() {
 }
 
 #[test]
-fn rejects_powershell_measure_object_scriptblock_property() {
-    let issue = preflight_command_issue(
-        &strings(&[
-            "pwsh",
-            "-NoProfile",
-            "-Command",
-            "Get-ChildItem | Measure-Object -Property { $_.Length } -Sum",
-        ]),
-        Some(ShellType::PowerShell),
-    )
-    .expect_err("Measure-Object -Property script blocks should be rejected");
-
+fn accepts_powershell_measure_object_scriptblock_property() {
     assert_eq!(
-        issue.code,
-        CommandPreflightIssueCode::PowerShellMeasureObjectScriptBlockProperty
+        preflight_command(
+            &strings(&[
+                "pwsh",
+                "-NoProfile",
+                "-Command",
+                "Get-ChildItem | Measure-Object -Property { $_.Length } -Sum",
+            ]),
+            Some(ShellType::PowerShell)
+        ),
+        Ok(())
     );
-    let rendered = issue.render_for_model();
-    assert!(rendered.contains("expects property names"));
-    assert!(rendered.contains("ForEach-Object"));
 }
 
 #[test]

@@ -61,6 +61,14 @@ impl PreparedTypedSpawn {
                 "prepared typed spawn no longer matches the requested source".to_string(),
             ));
         }
+        if !matches!(requested_source,
+            SessionSource::SubAgent(SubAgentSource::ThreadSpawn { parent_thread_id: source_parent, .. })
+                if Some(*source_parent) == parent_thread_id)
+        {
+            return Err(CodexErr::InvalidRequest(
+                "prepared typed spawn parent does not match the requested parent".to_string(),
+            ));
+        }
         let current_version = state
             .effective_multi_agent_version_for_spawn(
                 &InitialHistory::New,
@@ -84,6 +92,23 @@ impl PreparedTypedSpawn {
             residency_slot: self.residency_slot,
         })
     }
+}
+
+fn validate_typed_binding_path(
+    options: &SpawnAgentOptions,
+    metadata: &AgentMetadata,
+) -> CodexResult<()> {
+    if let Some(binding) = options.typed_task_binding.as_ref() {
+        let path = metadata.agent_path.as_ref().map(ToString::to_string);
+        if path.as_deref() != Some(binding.agent_path.as_str()) {
+            return Err(CodexErr::InvalidRequest(format!(
+                "typed task binding path {} does not match spawned agent path {}",
+                binding.agent_path,
+                path.as_deref().unwrap_or("<missing>")
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn typed_spawn_sources_match(prepared: &SessionSource, requested: &SessionSource) -> bool {
@@ -136,9 +161,11 @@ struct PendingSpawnCleanupJob {
     control: AgentControl,
     child_thread: Arc<crate::CodexThread>,
     child_thread_id: ThreadId,
+    #[cfg(test)]
+    completion: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
-type PendingSpawnCleanupSender = std::sync::mpsc::Sender<PendingSpawnCleanupJob>;
+type PendingSpawnCleanupSender = tokio::sync::mpsc::UnboundedSender<PendingSpawnCleanupJob>;
 type PendingSpawnCleanupSenderState = std::sync::Mutex<Option<PendingSpawnCleanupSender>>;
 
 static PENDING_SPAWN_CLEANUP_SENDER: std::sync::OnceLock<PendingSpawnCleanupSenderState> =
@@ -149,7 +176,7 @@ fn pending_spawn_cleanup_sender_state() -> &'static PendingSpawnCleanupSenderSta
 }
 
 fn start_pending_spawn_cleanup_worker() -> Option<PendingSpawnCleanupSender> {
-    let (sender, receiver) = std::sync::mpsc::channel::<PendingSpawnCleanupJob>();
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<PendingSpawnCleanupJob>();
     let (ready_sender, ready_receiver) = std::sync::mpsc::sync_channel(1);
     let worker = std::thread::Builder::new()
         .name("codex-spawn-cleanup".to_string())
@@ -167,13 +194,28 @@ fn start_pending_spawn_cleanup_worker() -> Option<PendingSpawnCleanupSender> {
             if ready_sender.send(Ok(())).is_err() {
                 return;
             }
-            while let Ok(job) = receiver.recv() {
-                let _ = runtime.block_on(job.control.rollback_failed_initial_submission(
-                    job.child_thread.as_ref(),
-                    job.child_thread_id,
-                    CodexErr::TurnAborted,
-                ));
-            }
+            // Drive delayed cleanup and closing-guard tasks even while the queue is idle.
+            runtime.block_on(async move {
+                while let Some(job) = receiver.recv().await {
+                    let error = job
+                        .control
+                        .rollback_failed_initial_submission(
+                            job.child_thread.as_ref(),
+                            job.child_thread_id,
+                            CodexErr::TurnAborted,
+                        )
+                        .await;
+                    // Successful rollback returns the original cancellation error.
+                    if !matches!(error, CodexErr::TurnAborted) {
+                        warn!(child_thread_id = %job.child_thread_id, %error,
+                            "cancelled agent spawn cleanup was incomplete");
+                    }
+                    #[cfg(test)]
+                    if let Some(completion) = job.completion {
+                        let _ = completion.send(());
+                    }
+                }
+            });
         });
     match worker {
         Ok(_) => match ready_receiver.recv() {
@@ -195,8 +237,8 @@ fn start_pending_spawn_cleanup_worker() -> Option<PendingSpawnCleanupSender> {
 }
 
 fn send_with_restarting_worker<T>(
-    state: &std::sync::Mutex<Option<std::sync::mpsc::Sender<T>>>,
-    mut start_worker: impl FnMut() -> Option<std::sync::mpsc::Sender<T>>,
+    state: &std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<T>>>,
+    mut start_worker: impl FnMut() -> Option<tokio::sync::mpsc::UnboundedSender<T>>,
     mut job: T,
 ) -> Result<(), T> {
     let mut worker = state
@@ -271,6 +313,8 @@ impl Drop for PendingSpawnCleanup {
             control: self.control.clone(),
             child_thread: Arc::clone(&self.child_thread),
             child_thread_id: self.child_thread_id,
+            #[cfg(test)]
+            completion: None,
         })
         .is_err()
         {
@@ -293,6 +337,14 @@ impl V2AgentLoadOwner {
     fn finish(mut self, result: &CodexResult<()>) {
         let completion = match result {
             Ok(()) => V2AgentLoadCompletion::Succeeded,
+            Err(CodexErr::AgentLimitReached { max_threads }) => {
+                V2AgentLoadCompletion::CapacityExceeded {
+                    max_threads: *max_threads,
+                }
+            }
+            Err(CodexErr::ThreadNotFound(thread_id)) => {
+                V2AgentLoadCompletion::ThreadNotFound(*thread_id)
+            }
             Err(error) => V2AgentLoadCompletion::Failed(Arc::from(error.to_string())),
         };
         self.complete(completion);
@@ -672,10 +724,19 @@ impl AgentControl {
                     if self.state.agent_metadata_for_thread(thread_id).is_none() {
                         return Err(CodexErr::ThreadNotFound(thread_id));
                     }
-                    if let V2AgentLoadCompletion::Failed(error) = completion {
-                        return Err(CodexErr::Fatal(format!(
-                            "failed to load V2 agent {thread_id}: {error}"
-                        )));
+                    match completion {
+                        V2AgentLoadCompletion::CapacityExceeded { max_threads } => {
+                            return Err(CodexErr::AgentLimitReached { max_threads });
+                        }
+                        V2AgentLoadCompletion::ThreadNotFound(thread_id) => {
+                            return Err(CodexErr::ThreadNotFound(thread_id));
+                        }
+                        V2AgentLoadCompletion::Failed(error) => {
+                            return Err(CodexErr::Fatal(format!(
+                                "failed to load V2 agent {thread_id}: {error}"
+                            )));
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -880,6 +941,19 @@ impl AgentControl {
     }
 
     #[cfg(test)]
+    async fn pause_after_thread_created_for_test(&self) {
+        let barrier = self
+            .test_hooks
+            .after_thread_created
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(barrier) = barrier {
+            barrier.pause().await;
+        }
+    }
+
+    #[cfg(test)]
     async fn pause_before_v2_cold_load_for_test(&self) {
         let barrier = self
             .test_hooks
@@ -900,6 +974,33 @@ impl AgentControl {
         options: SpawnAgentOptions,
         consumed_typed_spawn: Option<ConsumedTypedSpawn>,
     ) -> CodexResult<LiveAgent> {
+        let mut options = options;
+        if let Some(consumed) = consumed_typed_spawn.as_ref()
+            && let SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id, ..
+            }) = &consumed.session_source
+        {
+            options.parent_thread_id = Some(*parent_thread_id);
+        }
+        let effective_source = consumed_typed_spawn
+            .as_ref()
+            .map(|token| &token.session_source)
+            .or(session_source.as_ref());
+        if options.fork_mode.is_some() {
+            if options.fork_parent_spawn_call_id.is_none() {
+                return Err(CodexErr::Fatal(
+                    "spawn_agent fork requires a parent spawn call id".to_string(),
+                ));
+            }
+            if !matches!(
+                effective_source,
+                Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn { .. }))
+            ) {
+                return Err(CodexErr::Fatal(
+                    "spawn_agent fork requires a thread-spawn session source".to_string(),
+                ));
+            }
+        }
         let state = self.upgrade()?;
         let (
             multi_agent_version,
@@ -909,6 +1010,7 @@ impl AgentControl {
             mut agent_metadata,
             residency_slot,
         ) = if let Some(consumed) = consumed_typed_spawn {
+            validate_typed_binding_path(&options, &consumed.agent_metadata)?;
             (
                 consumed.multi_agent_version,
                 consumed.execution_guard,
@@ -964,6 +1066,7 @@ impl AgentControl {
                 }
                 other => (other, AgentMetadata::default()),
             };
+            validate_typed_binding_path(&options, &agent_metadata)?;
             let residency_slot = if spawn_uses_v2_residency {
                 Some(
                     self.reserve_v2_residency_slot(
@@ -1042,16 +1145,6 @@ impl AgentControl {
         }
 
         if let Some(mut binding) = options.typed_task_binding.clone() {
-            let spawned_agent_path = agent_metadata.agent_path.as_ref().map(ToString::to_string);
-            if spawned_agent_path.as_deref() != Some(binding.agent_path.as_str()) {
-                return Err(pending_cleanup
-                    .rollback(CodexErr::Fatal(format!(
-                        "typed task binding path {} does not match spawned agent path {}",
-                        binding.agent_path,
-                        spawned_agent_path.as_deref().unwrap_or("<missing>")
-                    )))
-                    .await);
-            }
             binding.thread_id = Some(new_thread.thread_id.to_string());
             if let Err(error) = self.task_coordinator().bind_agent_task(binding).await {
                 return Err(pending_cleanup
@@ -1159,17 +1252,7 @@ impl AgentControl {
             .notify_thread_created(new_thread.thread_id, &new_thread.thread)
             .await;
         #[cfg(test)]
-        {
-            let barrier = self
-                .test_hooks
-                .after_thread_created
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone();
-            if let Some(barrier) = barrier {
-                barrier.pause().await;
-            }
-        }
+        self.pause_after_thread_created_for_test().await;
 
         if let Some(SessionSource::SubAgent(
             subagent_source @ SubAgentSource::ThreadSpawn {
@@ -1220,7 +1303,7 @@ impl AgentControl {
                 .as_ref()
                 .map(ToString::to_string)
                 .unwrap_or_else(|| new_thread.thread_id.to_string());
-            self.maybe_start_completion_watcher(
+            let _ = self.maybe_start_completion_watcher(
                 new_thread.thread_id,
                 notification_source,
                 child_reference,
@@ -1297,7 +1380,15 @@ impl AgentControl {
 
     pub(super) fn estimate_forked_rollout_tokens(items: &[RolloutItem]) -> i64 {
         let mut active_history = Vec::new();
-        for item in items {
+        let start = items
+            .iter()
+            .rposition(|item| {
+                matches!(item,
+                    RolloutItem::Compacted(compacted) if compacted.replacement_history.is_some()
+                )
+            })
+            .unwrap_or(0);
+        for item in &items[start..] {
             match item {
                 RolloutItem::ResponseItem(response_item) => {
                     active_history.push(response_item.clone());
@@ -1352,11 +1443,6 @@ impl AgentControl {
             environments: inherited_environments,
             exec_policy: inherited_exec_policy,
         } = inheritance;
-        if options.fork_parent_spawn_call_id.is_none() {
-            return Err(CodexErr::Fatal(
-                "spawn_agent fork requires a parent spawn call id".to_string(),
-            ));
-        }
         let Some(fork_mode) = options.fork_mode.as_ref() else {
             return Err(CodexErr::Fatal(
                 "spawn_agent fork requires a fork mode".to_string(),
@@ -1474,7 +1560,13 @@ impl AgentControl {
                 && let Some(replacement_history) = compacted.replacement_history.as_mut()
             {
                 replacement_history.retain(|response_item| {
-                    !is_multi_agent_v2_usage_hint_message(
+                    // Summaries may lack a final phase; opaque compaction state is replay data.
+                    matches!(
+                        response_item,
+                        ResponseItem::Message { .. }
+                            | ResponseItem::Compaction { .. }
+                            | ResponseItem::ContextCompaction { .. }
+                    ) && !is_multi_agent_v2_usage_hint_message(
                         response_item,
                         &multi_agent_v2_usage_hint_texts_to_filter,
                     )
@@ -1528,15 +1620,26 @@ impl AgentControl {
         thread_id: ThreadId,
         session_source: SessionSource,
     ) -> CodexResult<ThreadId> {
+        let control = self.clone();
+        // Resume owns runtime publication independently of the requesting tool call.
+        tokio::spawn(async move {
+            control
+                .resume_agent_from_rollout_owned(config, thread_id, session_source)
+                .await
+        })
+        .await
+        .map_err(|error| {
+            CodexErr::Fatal(format!("agent {thread_id} resume task failed: {error}"))
+        })?
+    }
+
+    async fn resume_agent_from_rollout_owned(
+        &self,
+        config: Config,
+        thread_id: ThreadId,
+        session_source: SessionSource,
+    ) -> CodexResult<ThreadId> {
         let state = self.upgrade()?;
-        for metadata in self.state.live_agents() {
-            let Some(registered_thread_id) = metadata.agent_id else {
-                continue;
-            };
-            if state.get_thread(registered_thread_id).await.is_err() {
-                self.state.release_spawned_thread(registered_thread_id);
-            }
-        }
         let root_depth = thread_spawn_depth(&session_source).unwrap_or(0);
         let (resumed_thread_id, resumed_multi_agent_version) = Box::pin(
             self.resume_single_agent_from_rollout(config.clone(), thread_id, session_source),
@@ -1661,7 +1764,38 @@ impl AgentControl {
                 &config,
             )
             .await;
-        let agent_max_threads = config.effective_agent_max_threads(multi_agent_version);
+        let session_source = if multi_agent_version == MultiAgentVersion::V2 {
+            initial_history
+                .get_resumed_session_sources()
+                .map(|(source, _)| source)
+                .unwrap_or(session_source)
+        } else {
+            session_source
+        };
+        let uses_v2_residency = multi_agent_version == MultiAgentVersion::V2
+            && is_v2_resident_session_source(&session_source);
+        if uses_v2_residency && self.state.agent_metadata_for_thread(thread_id).is_some() {
+            self.ensure_v2_agent_loaded(config, thread_id).await?;
+            return Ok((thread_id, multi_agent_version));
+        }
+        if multi_agent_version != MultiAgentVersion::V2 {
+            // V1 tracks live runtimes. V2 intentionally retains cold-agent identities.
+            for metadata in self.state.live_agents() {
+                if let Some(registered_thread_id) = metadata.agent_id
+                    && matches!(
+                        state.get_thread(registered_thread_id).await,
+                        Err(CodexErr::ThreadNotFound(_))
+                    )
+                {
+                    self.state.release_spawned_thread(registered_thread_id);
+                }
+            }
+        }
+        let agent_max_threads = if multi_agent_version == MultiAgentVersion::V2 {
+            None
+        } else {
+            config.effective_agent_max_threads(multi_agent_version)
+        };
         let mut reservation = self.state.reserve_spawn_slot(agent_max_threads)?;
         let (session_source, agent_metadata) = match session_source {
             SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
@@ -1680,6 +1814,14 @@ impl AgentControl {
                 resumed_agent_nickname,
             )?,
             other => (other, AgentMetadata::default()),
+        };
+        let residency_slot = if uses_v2_residency {
+            Some(
+                self.reserve_v2_residency_slot(&state, &config, Some(thread_id))
+                    .await?,
+            )
+        } else {
+            None
         };
         let notification_source = session_source.clone();
         let inherited_environments = self
@@ -1714,6 +1856,9 @@ impl AgentControl {
                 ))),
             };
         }
+        if let Some(residency_slot) = residency_slot {
+            residency_slot.commit(resumed_thread.thread_id);
+        }
         if let Some(agent_path) = agent_metadata.agent_path.clone()
             && self
                 .task_coordinator()
@@ -1727,13 +1872,15 @@ impl AgentControl {
         state
             .notify_thread_created(resumed_thread.thread_id, &resumed_thread.thread)
             .await;
+        #[cfg(test)]
+        self.pause_after_thread_created_for_test().await;
         if multi_agent_version != MultiAgentVersion::V2 {
             let child_reference = agent_metadata
                 .agent_path
                 .as_ref()
                 .map(ToString::to_string)
                 .unwrap_or_else(|| resumed_thread.thread_id.to_string());
-            self.maybe_start_completion_watcher(
+            let _ = self.maybe_start_completion_watcher(
                 resumed_thread.thread_id,
                 Some(notification_source.clone()),
                 child_reference,
@@ -1768,6 +1915,63 @@ impl AgentControl {
 mod pending_spawn_cleanup_worker_tests {
     use super::send_with_restarting_worker;
 
+    #[tokio::test]
+    async fn cleanup_worker_finishes_late_shutdown_without_another_job() {
+        let mut config = crate::config::test_config().await;
+        let home = tempfile::tempdir().expect("temporary home");
+        config.codex_home = home.path().to_path_buf().try_into().unwrap();
+        config.cwd = home.path().to_path_buf().try_into().unwrap();
+        let manager = crate::ThreadManager::with_models_provider_and_home_for_tests(
+            codex_login::CodexAuth::from_api_key("dummy"),
+            config.model_provider.clone(),
+            config.codex_home.to_path_buf(),
+            std::sync::Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        );
+        let child = manager
+            .start_thread(config)
+            .await
+            .expect("start cleanup target");
+        let release = crate::test_support::block_thread_terminal_tasks(child.thread.as_ref());
+        let sender = super::start_pending_spawn_cleanup_worker().expect("start isolated worker");
+        let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+        assert!(
+            sender
+                .send(super::PendingSpawnCleanupJob {
+                    control: manager.agent_control(),
+                    child_thread: std::sync::Arc::clone(&child.thread),
+                    child_thread_id: child.thread_id,
+                    completion: Some(completion_tx),
+                })
+                .is_ok()
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(20), completion_rx)
+            .await
+            .expect("foreground rollback returns at its deadline")
+            .expect("worker job completed");
+        assert!(
+            manager.get_thread(child.thread_id).await.is_ok(),
+            "late termination still owns runtime"
+        );
+        release
+            .send(())
+            .expect("release terminal work after worker becomes idle");
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match manager.get_thread(child.thread_id).await {
+                    Err(codex_protocol::error::CodexErr::ThreadNotFound(id)) => {
+                        assert_eq!(id, child.thread_id);
+                        break;
+                    }
+                    Ok(_) => tokio::task::yield_now().await,
+                    Err(error) => panic!("unexpected lookup: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("idle worker must drive delayed cleanup without a second job");
+        drop(sender);
+    }
+
     #[test]
     fn cleanup_worker_failure_does_not_disable_later_scheduling() {
         let state = std::sync::Mutex::new(None);
@@ -1777,17 +1981,22 @@ mod pending_spawn_cleanup_worker_tests {
             "a failed worker start should return the unscheduled job"
         );
 
-        let (first_sender, first_receiver) = std::sync::mpsc::channel();
+        let (first_sender, mut first_receiver) = tokio::sync::mpsc::unbounded_channel();
         let mut first_sender = Some(first_sender);
         send_with_restarting_worker(&state, || first_sender.take(), 2)
             .expect("a later worker start should be retried");
-        assert_eq!(first_receiver.recv().expect("first worker job"), 2);
+        assert_eq!(first_receiver.blocking_recv().expect("first worker job"), 2);
         drop(first_receiver);
 
-        let (replacement_sender, replacement_receiver) = std::sync::mpsc::channel();
+        let (replacement_sender, mut replacement_receiver) = tokio::sync::mpsc::unbounded_channel();
         let mut replacement_sender = Some(replacement_sender);
         send_with_restarting_worker(&state, || replacement_sender.take(), 3)
             .expect("a disconnected cached worker should be replaced");
-        assert_eq!(replacement_receiver.recv().expect("replacement job"), 3);
+        assert_eq!(
+            replacement_receiver
+                .blocking_recv()
+                .expect("replacement job"),
+            3
+        );
     }
 }

@@ -412,3 +412,74 @@ fn closing_parent_rejects_new_and_in_flight_spawn_commits() {
         .commit(agent_metadata(child_thread_id))
         .expect("commit retry");
 }
+
+#[test]
+fn commit_without_thread_id_releases_capacity() {
+    let registry = Arc::new(AgentRegistry::default());
+    let error = registry
+        .reserve_spawn_slot(Some(1))
+        .expect("slot")
+        .commit(AgentMetadata::default())
+        .expect_err("missing thread id must fail");
+    assert!(error.to_string().contains("without a thread id"));
+    let thread_id = ThreadId::new();
+    registry
+        .reserve_spawn_slot(Some(1))
+        .expect("failed commit releases slot")
+        .commit(agent_metadata(thread_id))
+        .expect("valid commit");
+    assert!(registry.reserve_spawn_slot(Some(1)).is_err());
+    registry.release_spawned_thread(thread_id);
+}
+
+#[test]
+fn task_metadata_bounds_previews_and_batch_lookup_selects_requested_threads() {
+    let registry = Arc::new(AgentRegistry::default());
+    let first = ThreadId::new();
+    let second = ThreadId::new();
+    let mut metadata = agent_metadata(first);
+    metadata.last_task_message = Some("é".repeat(MAX_TASK_MESSAGE_BYTES));
+    registry
+        .reserve_spawn_slot(Some(2))
+        .expect("first slot")
+        .commit(metadata)
+        .expect("first agent");
+    registry
+        .reserve_spawn_slot(Some(2))
+        .expect("second slot")
+        .commit(agent_metadata(second))
+        .expect("second agent");
+    let selected = registry.agent_metadata_for_threads(&HashSet::from([first, ThreadId::new()]));
+    assert_eq!(selected.len(), 1);
+    let preview = selected[&first]
+        .last_task_message
+        .as_deref()
+        .expect("preview");
+    let prefix_chars = (MAX_TASK_MESSAGE_BYTES - "\n[truncated]".len()) / "é".len();
+    assert_eq!(
+        preview,
+        format!("{}\n[truncated]", "é".repeat(prefix_chars))
+    );
+    registry.update_last_task_message(first, "🦀".repeat(MAX_TASK_MESSAGE_BYTES));
+    let preview = registry
+        .agent_metadata_for_thread(first)
+        .unwrap()
+        .last_task_message
+        .unwrap();
+    assert_eq!(
+        preview,
+        format!(
+            "{}\n[truncated]",
+            "🦀".repeat((MAX_TASK_MESSAGE_BYTES - "\n[truncated]".len()) / "🦀".len())
+        )
+    );
+    registry.update_last_task_message(first, "small message".to_string());
+    assert_eq!(
+        registry
+            .agent_metadata_for_thread(first)
+            .unwrap()
+            .last_task_message
+            .as_deref(),
+        Some("small message")
+    );
+}
