@@ -68,6 +68,43 @@ fn request_snapshots_reuse_history_without_deduping_new_identical_items() -> any
 }
 
 #[test]
+fn replay_preserves_unicode_json_payload_with_a_bounded_summary() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let writer = create_started_writer(&temp)?;
+    start_turn(&writer, "turn-1")?;
+
+    let request_body = json!({
+        "input": [{
+            "type": "function_call",
+            "name": "shell",
+            "arguments": serde_json::to_string(&json!({"text": "é".repeat(150)}))?,
+            "call_id": "call-1"
+        }]
+    });
+    let request = writer.write_json_payload(RawPayloadKind::InferenceRequest, &request_body)?;
+    append_inference_start(&writer, "inference-1", "turn-1", request.clone())?;
+
+    let rollout = replay_bundle(temp.path())?;
+    let item_ids = &rollout.inference_calls["inference-1"].request_item_ids;
+    assert_eq!(item_ids.len(), 1);
+    assert_eq!(
+        rollout.conversation_items[&item_ids[0]].body,
+        ConversationBody {
+            parts: vec![ConversationPart::Json {
+                summary: format!("{{\"text\":\"{}...", "é".repeat(115)),
+                raw_payload_id: request.raw_payload_id,
+            }],
+        }
+    );
+    let stored_payload: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(temp.path().join(request.path))?)?;
+    assert_eq!(stored_payload, request_body);
+    assert_eq!(rollout.threads["thread-root"].conversation_item_ids, *item_ids);
+
+    Ok(())
+}
+
+#[test]
 fn response_outputs_enter_thread_conversation_on_completion() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
     let writer = create_started_writer(&temp)?;

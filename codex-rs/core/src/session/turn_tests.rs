@@ -463,12 +463,12 @@ async fn request_scaffold_reuses_stable_preparation_and_invalidates_only_owner_c
         "the cross-turn test requires value-equivalent config owners"
     );
     let equivalent_step_context = session.capture_step_context(equivalent_turn_context).await;
-    let router = ToolRouter::from_parts(
+    let router = Arc::new(ToolRouter::from_parts(
         ToolRegistry::from_tools(std::iter::empty::<
             Arc<dyn crate::tools::registry::CoreToolRuntime>,
         >()),
         Vec::new(),
-    );
+    ));
     let base_instructions = session.get_base_instructions().await;
     let mut history = ContextManager::new();
     let first_user_message = ResponseItem::Message {
@@ -656,12 +656,12 @@ async fn request_scaffold_reuses_stable_preparation_and_invalidates_only_owner_c
 
     // Reconstructing an identical router does not change its model-visible
     // surface and must retain the same physical scaffold.
-    let replacement_router = ToolRouter::from_parts(
+    let mut replacement_router = Arc::new(ToolRouter::from_parts(
         ToolRegistry::from_tools(std::iter::empty::<
             Arc<dyn crate::tools::registry::CoreToolRuntime>,
         >()),
         Vec::new(),
-    );
+    ));
     let replaced_surface = cache.resolve(
         &second_prepared,
         session.as_ref(),
@@ -696,14 +696,33 @@ async fn request_scaffold_reuses_stable_preparation_and_invalidates_only_owner_c
             },
         )],
     );
+    // Exercise replacement at the same address whenever ownership permits it.
+    // A cache that retains only a raw address allows this in-place replacement
+    // and incorrectly returns the old schema. Retained weak ownership requires
+    // a fresh allocation instead, even after the previous router is released.
+    if let Some(router) = Arc::get_mut(&mut replacement_router) {
+        *router = changed_router;
+    } else {
+        replacement_router = Arc::new(changed_router);
+    }
     let changed_surface = cache.resolve(
         &second_prepared,
         session.as_ref(),
-        &changed_router,
+        &replacement_router,
         step_context.as_ref(),
         &base_instructions,
         /*terminal_completion_only*/ false,
     );
+    let changed_prompt = build_projected_prompt_from_scaffold(
+        session.as_ref(),
+        &second_prepared,
+        step_context.as_ref(),
+        &changed_surface,
+    );
+    assert!(matches!(
+        changed_prompt.tools.specs(),
+        [codex_tools::ToolSpec::Function(tool)] if tool.name == "changed_surface"
+    ));
     assert!(!Arc::ptr_eq(
         &replaced_surface.scaffold,
         &changed_surface.scaffold
@@ -716,7 +735,7 @@ async fn request_scaffold_reuses_stable_preparation_and_invalidates_only_owner_c
     let replaced_instructions = cache.resolve(
         &second_prepared,
         session.as_ref(),
-        &changed_router,
+        &replacement_router,
         step_context.as_ref(),
         &changed_instructions,
         /*terminal_completion_only*/ false,
@@ -736,7 +755,7 @@ async fn request_scaffold_separates_terminal_and_ordinary_tool_surfaces() {
     let step_context = session
         .capture_step_context(Arc::clone(&turn_context))
         .await;
-    let router = ToolRouter::from_parts(
+    let router = Arc::new(ToolRouter::from_parts(
         ToolRegistry::from_tools(std::iter::empty::<
             Arc<dyn crate::tools::registry::CoreToolRuntime>,
         >()),
@@ -750,7 +769,7 @@ async fn request_scaffold_separates_terminal_and_ordinary_tool_surfaces() {
                 output_schema: None,
             },
         )],
-    );
+    ));
     let mut history = ContextManager::new();
     let user_message = ResponseItem::Message {
         id: None,

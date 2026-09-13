@@ -987,13 +987,31 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn permission_policy_uses_the_compile_target_platform_boundary() {
-        assert_eq!(current_platform_is_windows(), cfg!(windows));
-        assert_eq!(
-            is_unsandboxed_windows(WindowsSandboxLevel::Disabled, current_platform_is_windows()),
-            cfg!(windows)
-        );
+    #[tokio::test]
+    async fn permission_policy_uses_the_compile_target_platform_boundary() {
+        let config = ConfigToml {
+            sandbox_mode: Some(SandboxMode::WorkspaceWrite),
+            ..ConfigToml::default()
+        };
+        for (sandbox_level, expected) in [
+            (
+                WindowsSandboxLevel::Disabled,
+                if cfg!(windows) {
+                    PermissionProfile::read_only()
+                } else {
+                    PermissionProfile::workspace_write()
+                },
+            ),
+            (
+                WindowsSandboxLevel::RestrictedToken,
+                PermissionProfile::workspace_write(),
+            ),
+        ] {
+            let actual = config
+                .derive_permission_profile(None, sandbox_level, None, None)
+                .await;
+            assert_eq!(actual, expected, "sandbox level: {sandbox_level:?}");
+        }
     }
 
     #[test]

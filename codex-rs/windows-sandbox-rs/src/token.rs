@@ -146,6 +146,8 @@ pub unsafe fn convert_string_sid_to_sid(s: &str) -> Option<*mut c_void> {
         fn ConvertStringSidToSidW(StringSid: *const u16, Sid: *mut *mut c_void) -> i32;
     }
     let mut psid: *mut c_void = std::ptr::null_mut();
+    // SAFETY: The temporary wide string remains alive through the FFI call and is NUL-terminated;
+    // psid is a writable output slot for the caller-owned allocation.
     let ok = unsafe { ConvertStringSidToSidW(to_wide(s).as_ptr(), &mut psid) };
     if ok != 0 { Some(psid) } else { None }
 }
@@ -157,6 +159,8 @@ pub struct LocalSid {
 
 impl LocalSid {
     pub fn from_string(sid: &str) -> Result<Self> {
+        // SAFETY: The conversion helper reads sid synchronously; this LocalSid immediately owns the
+        // successful allocation and its Drop releases it.
         let psid = unsafe { convert_string_sid_to_sid(sid) }
             .ok_or_else(|| anyhow!("invalid SID string: {sid}"))?;
         Ok(Self { psid })
@@ -170,6 +174,8 @@ impl LocalSid {
 impl Drop for LocalSid {
     fn drop(&mut self) {
         if !self.psid.is_null() {
+            // SAFETY: LocalSid owns this non-null allocation from ConvertStringSidToSidW and
+            // releases it once; as_ptr only lends the allocation to synchronous callers.
             unsafe {
                 LocalFree(self.psid as HLOCAL);
             }
@@ -195,6 +201,8 @@ pub unsafe fn get_current_token_for_restriction() -> Result<HANDLE> {
             TokenHandle: *mut HANDLE,
         ) -> i32;
     }
+    // SAFETY: GetCurrentProcess supplies the current process pseudo-handle and h is a writable
+    // output slot; the successful token is returned with its close obligation.
     let ok = unsafe { OpenProcessToken(GetCurrentProcess(), desired, &mut h) };
     if ok == 0 {
         return Err(anyhow!("OpenProcessToken failed: {}", GetLastError()));
@@ -223,6 +231,8 @@ pub unsafe fn get_logon_sid_bytes(h_token: HANDLE) -> Result<Vec<u8>> {
         let group_count = std::ptr::read_unaligned(buf.as_ptr() as *const u32) as usize;
         // TOKEN_GROUPS layout is: DWORD GroupCount; SID_AND_ATTRIBUTES Groups[];
         // On 64-bit, Groups is aligned to pointer alignment after 4-byte GroupCount.
+        // SAFETY: The successful token-information buffer was checked to contain at least a u32, so
+        // advancing by its size stays within the allocation or at its end.
         let after_count = unsafe { buf.as_ptr().add(std::mem::size_of::<u32>()) } as usize;
         let align = std::mem::align_of::<SID_AND_ATTRIBUTES>();
         let aligned = (after_count + (align - 1)) & !(align - 1);
@@ -505,6 +515,9 @@ pub(crate) fn probe_legacy_delete_child_restriction() -> Result<bool> {
     let caps = crate::cap::load_or_create_cap_sids(probe_home.path())?;
     let cap_sid = LocalSid::from_string(&caps.workspace)?;
 
+    // SAFETY: The native token handles are owned and closed on each explicit exit; user_sid_bytes
+    // and cap_sid retain the valid SIDs through token and ACL creation. The probe path is
+    // NUL-terminated and impersonation is reverted before returning.
     unsafe {
         let base_token = get_current_token_for_restriction()?;
         let mut user_sid_bytes = match get_user_sid_bytes(base_token) {

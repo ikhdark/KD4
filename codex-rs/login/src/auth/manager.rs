@@ -617,12 +617,15 @@ impl CodexAuth {
             .filter(|identity| identity.account_id == account_id)
     }
 
-    fn persist_managed_chatgpt_agent_identity_record(
+    async fn persist_managed_chatgpt_agent_identity_record(
         &self,
         record: AgentIdentityAuthRecord,
     ) -> std::io::Result<()> {
         if let Self::Chatgpt(chatgpt_auth) = self {
-            chatgpt_auth.persist_agent_identity_record(record)?;
+            let chatgpt_auth = chatgpt_auth.clone();
+            tokio::task::spawn_blocking(move || chatgpt_auth.persist_agent_identity_record(record))
+                .await
+                .map_err(std::io::Error::other)??;
         }
         Ok(())
     }
@@ -683,7 +686,8 @@ impl CodexAuth {
             .await
             .map_err(|err| classify_bootstrap_error("agent task registration", err))?;
             if should_persist {
-                self.persist_managed_chatgpt_agent_identity_record(auth.record().clone())?;
+                self.persist_managed_chatgpt_agent_identity_record(auth.record().clone())
+                    .await?;
             }
             return Ok(auth);
         }
@@ -695,7 +699,8 @@ impl CodexAuth {
             auth_route_config,
         )
         .await?;
-        self.persist_managed_chatgpt_agent_identity_record(auth.record().clone())?;
+        self.persist_managed_chatgpt_agent_identity_record(auth.record().clone())
+            .await?;
         Ok(auth)
     }
 
@@ -2865,13 +2870,17 @@ impl AuthManager {
     ) -> Result<(), RefreshTokenError> {
         let refresh_response = request_chatgpt_token_refresh(refresh_token, auth.client()).await?;
 
-        persist_tokens(
-            auth.storage(),
-            refresh_response.id_token,
-            refresh_response.access_token,
-            refresh_response.refresh_token,
-        )
-        .map_err(RefreshTokenError::from)?;
+        let storage = auth.storage().clone();
+        tokio::task::spawn_blocking(move || {
+            persist_tokens(
+                &storage,
+                refresh_response.id_token,
+                refresh_response.access_token,
+                refresh_response.refresh_token,
+            )
+        })
+        .await
+        .map_err(std::io::Error::other)??;
         self.reload().await;
 
         Ok(())

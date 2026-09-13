@@ -1,6 +1,5 @@
 use crate::agents_md::AgentsMdFreshness;
 use crate::agents_md::LoadedAgentsMd;
-use crate::agents_md::ProjectInstructionsSourceFingerprint;
 use crate::agents_md::RepositoryStableContextBundle;
 use crate::agents_md::discover_project_instructions_with_markers;
 use crate::agents_md::effective_project_root_markers;
@@ -33,7 +32,6 @@ struct ProjectRootMarkersCacheEntry {
 #[derive(Default)]
 struct AgentsMdCache {
     key: Option<AgentsMdCacheKey>,
-    source_fingerprint: Option<ProjectInstructionsSourceFingerprint>,
     loaded: Option<Arc<LoadedAgentsMd>>,
     stable_context: Option<RepositoryStableContextBundle>,
 }
@@ -213,7 +211,6 @@ impl AgentsMdManager {
             project_root_markers.as_ref(),
         )
         .await;
-        let source_fingerprint = discovery.source_fingerprint();
         // File metadata is discovery evidence, not a content identity. Editors, sync tools, and
         // remote filesystems can replace a file while preserving its size and modification time,
         // so every sampling-step refresh must read the discovered instruction files again.
@@ -232,7 +229,6 @@ impl AgentsMdManager {
         } else {
             AgentsMdFreshness::IncompleteRead
         };
-        let complete = load.complete;
         let loaded = load.loaded;
         let semantically_unchanged = cache.key.as_ref() == Some(&key)
             && match (cache.loaded.as_ref(), loaded.as_ref()) {
@@ -255,7 +251,6 @@ impl AgentsMdManager {
                 }
             }
             cache.key = Some(key);
-            cache.source_fingerprint = complete.then_some(source_fingerprint).flatten();
             cache.loaded = loaded;
             cache.stable_context = stable_context;
             return AgentsMdObservation {
@@ -263,9 +258,6 @@ impl AgentsMdManager {
                 stable_context: cache.stable_context.clone(),
                 freshness,
             };
-        }
-        if complete {
-            cache.source_fingerprint = source_fingerprint;
         }
         cache.cached_observation(freshness)
     }

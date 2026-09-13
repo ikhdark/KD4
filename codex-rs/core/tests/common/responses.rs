@@ -458,6 +458,57 @@ mod tests {
         })
     }
 
+    #[tokio::test]
+    async fn websocket_request_waiters_observe_requested_index_and_recorded_requests() {
+        let server = start_websocket_server(vec![vec![vec![], vec![]]]).await;
+        let (missed_tx, missed_rx) = oneshot::channel();
+        let (resume_tx, resume_rx) = oneshot::channel();
+        *server.request_log_miss.lock().unwrap() = Some((missed_tx, resume_rx));
+        let (mut socket, _) = tokio_tungstenite::connect_async(server.uri())
+            .await
+            .expect("connect websocket fixture");
+        let first = server.wait_for_request(0, 0);
+        let another_first = server.wait_for_request(0, 0);
+        let second = server.wait_for_request(0, 1);
+        tokio::pin!(first, another_first, second);
+        assert!(futures::poll!(&mut first).is_pending());
+        missed_rx.await.expect("first observer read an empty log");
+        assert!(futures::poll!(&mut another_first).is_pending());
+        assert!(futures::poll!(&mut second).is_pending());
+
+        let first_body = serde_json::json!({"type": "response.create", "input": "first"});
+        socket
+            .send(Message::Text(first_body.to_string().into()))
+            .await
+            .expect("send first request");
+        tokio::time::timeout(Duration::from_secs(5), server.wait_for_response_batch(0, 0))
+            .await
+            .expect("server logged and notified before observer resumes");
+        resume_tx
+            .send(())
+            .expect("resume first observer after notification");
+        let (observed, also_observed) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(&mut first, &mut another_first)
+        })
+        .await
+        .expect("both request observers wake");
+        assert_eq!(observed.body_json(), first_body);
+        assert_eq!(also_observed.body_json(), first_body);
+        assert!(futures::poll!(&mut second).is_pending());
+
+        let second_body = serde_json::json!({"type": "response.create", "input": "second"});
+        socket
+            .send(Message::Text(second_body.to_string().into()))
+            .await
+            .expect("send second request");
+        let observed = tokio::time::timeout(Duration::from_secs(5), &mut second)
+            .await
+            .expect("second request observer wakes");
+        assert_eq!(observed.body_json(), second_body);
+        assert_eq!(server.wait_for_request(0, 0).await.body_json(), first_body);
+        drop(socket);
+    }
+
     #[test]
     fn body_matches_typed_text_items() {
         let stale_or_untyped = request_with_input(serde_json::json!([
@@ -597,6 +648,8 @@ pub struct WebSocketTestServer {
     response_batches_sent: Arc<Mutex<Vec<usize>>>,
     handshakes: Arc<Mutex<Vec<WebSocketHandshake>>>,
     request_log_updated: Arc<Notify>,
+    #[cfg(test)]
+    request_log_miss: Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
     response_batch_sent: Arc<Notify>,
     shutdown: oneshot::Sender<()>,
     task: tokio::task::JoinHandle<()>,
@@ -625,6 +678,7 @@ impl WebSocketTestServer {
         request_index: usize,
     ) -> WebSocketRequest {
         loop {
+            let notified = self.request_log_updated.notified();
             if let Some(request) = self
                 .connections
                 .lock()
@@ -635,7 +689,16 @@ impl WebSocketTestServer {
             {
                 return request;
             }
-            self.request_log_updated.notified().await;
+            // A test may pause after the log miss while the real socket writer publishes.
+            #[cfg(test)]
+            {
+                let pause = self.request_log_miss.lock().unwrap().take();
+                if let Some((observed, resume)) = pause {
+                    observed.send(()).expect("observe missing request");
+                    resume.await.expect("resume request observer");
+                }
+            }
+            notified.await;
         }
     }
 
@@ -1568,6 +1631,8 @@ pub async fn start_websocket_server_with_headers(
     });
 
     WebSocketTestServer {
+        #[cfg(test)]
+        request_log_miss: Mutex::new(None),
         uri,
         connections: connections_log,
         response_batches_sent: response_batches_sent_log,

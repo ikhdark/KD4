@@ -552,10 +552,10 @@ async fn assert_interrupted_isolated_spawn(namespace: Option<&str>) -> Result<()
     );
     tokio::time::timeout(Duration::from_secs(20), async {
         loop {
-            let process = Command::new("powershell.exe").args(["-NoProfile", "-Command", &format!(
+            let process = tokio::process::Command::new("powershell.exe").kill_on_drop(true).args(["-NoProfile", "-Command", &format!(
                 "if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ exit 1 }} else {{ exit 0 }}"
-            )]).output()?;
-            let listing = Command::new("git").arg("-C").arg(test.cwd_path()).args(["worktree", "list", "--porcelain"]).output()?;
+            )]).output().await?;
+            let listing = tokio::process::Command::new("git").kill_on_drop(true).arg("-C").arg(test.cwd_path()).args(["worktree", "list", "--porcelain"]).output().await?;
             if process.status.success() && !worktree.exists()
                 && listing.status.success()
                 && String::from_utf8_lossy(&listing.stdout).lines().filter(|line| line.starts_with("worktree ")).count() == 1 { break; }

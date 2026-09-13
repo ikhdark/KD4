@@ -1651,23 +1651,47 @@ mod tests {
     }
 
     #[test]
-    fn refresh_expires_in_from_timestamp_restores_future_durations() {
+    fn load_oauth_tokens_restores_future_duration_from_persisted_timestamp() -> Result<()> {
+        let env = TempCodexHome::new();
         let mut tokens = sample_tokens();
-        let expires_at = tokens.expires_at.expect("expires_at should be set");
-
+        let started = std::time::Instant::now();
+        let expires_at = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() + 600_000;
+        tokens.expires_at = Some(u64::try_from(expires_at)?);
         tokens.token_response.0.set_expires_in(None);
-        super::refresh_expires_in_from_timestamp(&mut tokens);
+        super::save_oauth_tokens(
+            env.path(),
+            &tokens.server_name,
+            &tokens,
+            OAuthCredentialsStoreMode::File,
+            AuthKeyringBackendKind::Direct,
+        )?;
+        let loaded = super::load_oauth_tokens(
+            env.path(),
+            &tokens.server_name,
+            &tokens.url,
+            OAuthCredentialsStoreMode::File,
+            AuthKeyringBackendKind::Direct,
+        )?
+        .expect("persisted tokens should load");
 
-        let actual = tokens
+        let mut expected = tokens;
+        expected
+            .token_response
+            .0
+            .set_expires_in(Some(&Duration::from_secs(600)));
+        assert_tokens_match_without_expiry(&loaded, &expected);
+        let actual = loaded
             .token_response
             .0
             .expires_in()
             .expect("expires_in should be restored")
             .as_secs();
-        let expected = super::expires_in_from_timestamp(expires_at)
-            .expect("expires_at should still be in the future");
-        let diff = actual.abs_diff(expected);
-        assert!(diff <= 1, "expires_in drift too large: diff={diff}");
+        let minimum = 600_u64.saturating_sub(started.elapsed().as_secs() + 1);
+        assert!(
+            (minimum..=600).contains(&actual),
+            "expected remaining expiry between {minimum} and 600 seconds, got {actual}"
+        );
+        Ok(())
     }
 
     #[test]

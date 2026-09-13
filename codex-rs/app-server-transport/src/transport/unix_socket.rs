@@ -120,14 +120,14 @@ pub async fn prepare_control_socket_path(socket_path: &Path) -> IoResult<()> {
         Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
         Err(err) if err.kind() == ErrorKind::ConnectionRefused => {}
         Err(err) => {
-            if !socket_path.exists() {
+            if !tokio::fs::try_exists(socket_path).await.unwrap_or(false) {
                 return Ok(());
             }
             return Err(err);
         }
     }
 
-    if !socket_path.try_exists()? {
+    if !tokio::fs::try_exists(socket_path).await? {
         return Ok(());
     }
 

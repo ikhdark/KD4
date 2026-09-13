@@ -909,17 +909,20 @@ fn remote_ca_environment_waits_for_worker_and_preserves_peer_hash_contract() {
         tokio::task::spawn_blocking(|| {}).await.unwrap();
         assert!(captured_rx.try_recv().is_err(), "abandoned preparation must not launch after its worker finishes");
 
-        for valid in [true, false] {
+        // Rejected starts retain their ID until asynchronous peer cleanup settles.
+        // These independent CA cases must use distinct process identities.
+        for (process_id, valid) in [(901, true), (902, false)] {
             if !valid {
                 std::fs::write(&bundle, b"tampered bytes under the same generated filename").unwrap();
             }
             let result = manager.open_session_with_prepared_exec_env(
-                901, &request, false, Box::new(crate::unified_exec::NoopSpawnLifecycle),
+                process_id, &request, false, Box::new(crate::unified_exec::NoopSpawnLifecycle),
                 None, &environment, &pending_spawns,
             ).await;
             let error = result.err().expect("external peer declines after capturing exact request");
-            assert!(error.to_string().contains("peer captured launch"));
+            assert!(error.to_string().contains("peer captured launch"), "unexpected launch error: {error:?}");
             let params: codex_exec_server::ExecParams = serde_json::from_value(captured_rx.recv().await.unwrap()).unwrap();
+            assert_eq!(params.process_id.as_str(), process_id.to_string());
             assert_eq!(params.env.get("SSL_CERT_FILE"), valid.then_some(&bundle_text));
             assert_eq!(params.env.get("HTTP_PROXY"), request.env.get("HTTP_PROXY"));
             assert_eq!(params.env_policy, Some(request.exec_server_env_config.as_ref().unwrap().policy.clone()));

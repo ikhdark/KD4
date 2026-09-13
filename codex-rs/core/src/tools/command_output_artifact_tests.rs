@@ -4,26 +4,52 @@ use std::time::Duration;
 #[tokio::test(flavor = "current_thread")]
 #[serial_test::serial(command_output_artifact)]
 async fn confirmed_performance_artifact_filesystem_operations_use_blocking_pool() {
-    for attach in [false, true] {
+    for (operation_kind, semaphore_registry) in [
+        ("create", false),
+        ("create", true),
+        ("attach", false),
+        ("attach", true),
+        ("raw_create", false),
+        ("raw_create", true),
+        ("raw_append", false),
+        ("raw_append", true),
+        ("raw_replace", false),
+        ("raw_replace", true),
+        ("raw_stream", false),
+    ] {
         let temp = tempfile::tempdir().expect("tempdir");
         let canonical = CanonicalToolResult::text("retained canonical output\n");
-        let existing = if attach {
-            Some(create_raw_output_artifact(temp.path(), "thread", &canonical.bytes).await)
-        } else {
-            None
+        let initial_output = match operation_kind {
+            "attach" => Some(canonical.bytes.as_slice()),
+            "raw_append" | "raw_stream" => Some(b"retained ".as_slice()),
+            "raw_replace" => Some(b"obsolete output\n".as_slice()),
+            _ => None,
         };
-        let existing_id = existing.as_ref().and_then(RawOutputArtifact::artifact_id);
+        let existing = match initial_output {
+            Some(output) => Some(create_raw_output_artifact(temp.path(), "thread", output).await),
+            None => None,
+        };
         let (locked_tx, locked_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let thread_released = Arc::clone(&released);
         let blocker = std::thread::spawn(move || {
-            let _guard = lock_retention_registry();
-            locked_tx.send(()).expect("notify registry held");
-            // A watchdog also releases an implementation that blocks the sole
-            // runtime thread, so the regression fails instead of hanging.
-            let _ = release_rx.recv_timeout(Duration::from_secs(5));
-            thread_released.store(true, Ordering::Release);
+            let wait_for_release = || {
+                locked_tx.send(()).expect("notify registry held");
+                // A watchdog also releases an implementation that blocks the sole
+                // runtime thread, so the regression fails instead of hanging.
+                let _ = release_rx.recv_timeout(Duration::from_secs(5));
+                thread_released.store(true, Ordering::Release);
+            };
+            if semaphore_registry {
+                let _guard = RETENTION_SWEEP_SEMAPHORES
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                wait_for_release();
+            } else {
+                let _guard = lock_retention_registry();
+                wait_for_release();
+            }
         });
         locked_rx.recv().expect("registry held");
         let home = temp.path().to_path_buf();
@@ -31,27 +57,77 @@ async fn confirmed_performance_artifact_filesystem_operations_use_blocking_pool(
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let operation = tokio::spawn(async move {
             entered_tx.send(()).expect("notify operation entry");
-            match existing_id {
-                Some(id) => {
-                    attach_canonical_output_artifact(&home, "thread", &id.to_string(), &canonical)
+            if operation_kind == "create" || operation_kind == "attach" {
+                let artifact = match existing.as_ref().and_then(RawOutputArtifact::artifact_id) {
+                    Some(id) => {
+                        attach_canonical_output_artifact(
+                            &home,
+                            "thread",
+                            &id.to_string(),
+                            &canonical,
+                        )
                         .await
-                }
-                None => create_canonical_output_artifact(&home, "thread", &canonical).await,
+                    }
+                    None => create_canonical_output_artifact(&home, "thread", &canonical).await,
+                };
+                assert!(artifact.complete, "{artifact:?}");
+                return artifact.artifact_id().expect("canonical artifact ID");
             }
+            let artifact = match operation_kind {
+                "raw_create" => create_raw_output_artifact(&home, "thread", &canonical.bytes).await,
+                "raw_append" => {
+                    append_raw_output_artifact(
+                        existing.as_ref().expect("existing raw artifact"),
+                        b"canonical output\n",
+                    )
+                    .await
+                }
+                "raw_replace" => {
+                    replace_raw_output_artifact(
+                        existing.as_ref().expect("existing raw artifact"),
+                        &canonical.bytes,
+                    )
+                    .await
+                }
+                "raw_stream" => {
+                    let state = Arc::new(Mutex::new(existing.expect("existing raw artifact")));
+                    let mut writer = RawOutputArtifactWriter::open(Some(&state))
+                        .await
+                        .expect("streaming writer");
+                    writer
+                        .write_chunk(Some(&state), b"canonical output\n")
+                        .await;
+                    writer.finish(Some(&state)).await;
+                    state.lock().await.clone()
+                }
+                _ => unreachable!("unknown artifact operation"),
+            };
+            assert!(
+                matches!(&artifact, RawOutputArtifact::Stored { .. }),
+                "{artifact:?}"
+            );
+            artifact.artifact_id().expect("raw artifact ID").to_string()
         });
         entered_rx.await.expect("operation entered");
         tokio::time::sleep(Duration::from_millis(50)).await;
         let executor_advanced_while_locked = !released.load(Ordering::Acquire);
+        let operation_waited_for_lock = !operation.is_finished();
         let _ = release_tx.send(());
-        let artifact = operation.await.expect("artifact operation");
+        let artifact_id = operation.await.expect("artifact operation");
         blocker.join().expect("registry blocker");
 
-        assert!(executor_advanced_while_locked, "attach={attach}");
-        assert!(artifact.complete, "{artifact:?}");
+        assert!(
+            executor_advanced_while_locked,
+            "operation={operation_kind}, semaphore_registry={semaphore_registry}"
+        );
+        assert!(
+            operation_waited_for_lock,
+            "operation={operation_kind}, semaphore_registry={semaphore_registry}"
+        );
         let recovered = read_tool_output_selectors(
             temp.path(),
             "thread",
-            &artifact.artifact_id().expect("artifact ID"),
+            &artifact_id,
             vec![ToolOutputSelector::Bytes {
                 start: 0,
                 end: expected.len() as u64,
@@ -2841,6 +2917,86 @@ async fn cancelled_canonical_attachment_finishes_owned_family_and_releases_reten
     assert!(!logical_transaction_path(&path).exists());
     drop(permit);
 }
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial(command_output_artifact)]
+async fn cancelled_raw_stream_open_releases_lock_before_returning_writer() {
+    let temp = tempfile::tempdir().expect("artifact home");
+    let artifact =
+        create_raw_output_artifact(temp.path(), "thread", b"original retained bytes\n").await;
+    let RawOutputArtifact::Stored { id, path, .. } = &artifact else {
+        panic!("raw artifact creation failed");
+    };
+    let id = id.to_string();
+    let path = path.clone();
+    let state = Arc::new(Mutex::new(artifact));
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let operation = tokio::spawn({
+        let state = Arc::clone(&state);
+        let barrier = Arc::clone(&barrier);
+        async move {
+            let _writer = RAW_OUTPUT_LOCK_BARRIER_FOR_TEST
+                .scope(barrier, RawOutputArtifactWriter::open(Some(&state)))
+                .await;
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(5), barrier.wait())
+        .await
+        .expect("normal streaming open acquires its output lock");
+    let contender = File::options()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .expect("independent artifact handle");
+    assert!(matches!(
+        contender.try_lock(),
+        Err(std::fs::TryLockError::WouldBlock)
+    ));
+    operation.abort();
+    assert!(operation.await.expect_err("cancel caller").is_cancelled());
+    barrier.wait().await;
+
+    let unlocked = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match contender.try_lock() {
+                Ok(()) => break true,
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                Err(error) => panic!("artifact lock failed: {error}"),
+            }
+        }
+    })
+    .await;
+    // Release the original owner even on a failed assertion so a leaking
+    // implementation does not leave this scenario's fixture locked.
+    if unlocked.is_err() {
+        if let RawOutputArtifact::Stored { handle, .. } = &*state.lock().await {
+            let _ = handle.unlock();
+        }
+    }
+    assert!(
+        unlocked.is_ok(),
+        "cancelled lock handoff must release the shared lock"
+    );
+    contender.unlock().expect("release independent lock");
+    assert!(matches!(
+        &*state.lock().await,
+        RawOutputArtifact::Stored { bytes: 24, .. }
+    ));
+    let recovered = read_tool_output_selectors(
+        temp.path(),
+        "thread",
+        &id,
+        vec![ToolOutputSelector::Bytes { start: 0, end: 24 }],
+    )
+    .await
+    .expect("unchanged raw artifact remains recoverable");
+    assert_eq!(
+        recovered.results[0].text.as_deref(),
+        Some("original retained bytes\n")
+    );
+}
+
 #[test]
 #[serial_test::serial(command_output_artifact)]
 fn raw_retention_worker_keeps_ownership_after_caller_and_runtime_cancellation() {

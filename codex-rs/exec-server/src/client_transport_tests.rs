@@ -139,3 +139,68 @@ async fn stdio_command_uses_declared_environment_and_managed_process_tree() -> R
     assert_eq!(status.code(), Some(0));
     Ok(())
 }
+
+// Occupying Tokio's only blocking worker models slow CA file/root loading without
+// replacing the connection code or depending on a particular machine's CA store.
+fn assert_websocket_deadline_covers_tls_preparation(noise: bool) -> Result<()> {
+    use crate::NoiseRendezvousConnectArgs;
+    use crate::RemoteExecServerConnectArgs;
+    use std::time::Duration;
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()?;
+    runtime.block_on(async {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let websocket_url = format!("ws://{}", listener.local_addr()?);
+        let deadline = Duration::from_millis(20);
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let blocker = tokio::task::spawn_blocking(move || {
+            let _ = started.send(());
+            let _ = held.recv();
+        });
+        ready.await?;
+        let connection = async {
+            if noise {
+                ExecServerClient::connect_noise_rendezvous(NoiseRendezvousConnectArgs {
+                    bundle: test_bundle(websocket_url.clone())?,
+                    harness_identity: NoiseChannelIdentity::generate()?,
+                    client_name: "tls-deadline-test".to_string(),
+                    connect_timeout: deadline,
+                    initialize_timeout: Duration::from_secs(1),
+                    resume_session_id: None,
+                }).await.map_err(anyhow::Error::from)
+            } else {
+                let mut args = RemoteExecServerConnectArgs::new(websocket_url.clone(), "tls-deadline-test".to_string());
+                args.connect_timeout = deadline;
+                ExecServerClient::connect_websocket(args).await.map_err(anyhow::Error::from)
+            }
+        };
+        let result = tokio::time::timeout(Duration::from_secs(1), connection).await;
+        // Release even on a failing assertion so runtime shutdown cannot hang.
+        drop(release);
+        blocker.await?;
+        let error = match result {
+            Ok(Err(error)) => error,
+            Ok(Ok(_)) => anyhow::bail!("connection unexpectedly succeeded"),
+            Err(_) => anyhow::bail!("connection deadline did not include TLS preparation"),
+        };
+        assert!(matches!(error.downcast_ref::<ExecServerError>(),
+            Some(ExecServerError::WebSocketConnectTimeout { timeout, .. }) if *timeout == deadline));
+        assert!(tokio::time::timeout(Duration::from_millis(50), listener.accept()).await.is_err(),
+            "an expired TLS preparation must not start a network connection");
+        anyhow::Ok(())
+    })
+}
+
+#[test]
+fn websocket_deadline_covers_tls_preparation_without_network_side_effects() -> Result<()> {
+    assert_websocket_deadline_covers_tls_preparation(false)
+}
+
+#[test]
+fn noise_websocket_deadline_covers_tls_preparation_without_network_side_effects() -> Result<()> {
+    assert_websocket_deadline_covers_tls_preparation(true)
+}

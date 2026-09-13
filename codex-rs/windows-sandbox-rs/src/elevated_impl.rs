@@ -189,6 +189,8 @@ mod windows_impl {
         );
         let sid_for_null = LocalSid::from_string(&cap_sids[0])?;
 
+        // SAFETY: sid_for_null retains a valid converted SID for the complete synchronous NUL-
+        // device ACL update.
         unsafe {
             allow_null_device(sid_for_null.as_ptr());
         }

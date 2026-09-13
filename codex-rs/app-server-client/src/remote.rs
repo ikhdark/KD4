@@ -812,37 +812,39 @@ async fn connect_websocket_endpoint(
         request.headers_mut().insert(AUTHORIZATION, header_value);
     }
 
-    let connector = tokio::task::spawn_blocking(|| {
-        ensure_rustls_crypto_provider();
-        maybe_build_rustls_client_config_with_custom_ca()
-            .map_err(IoError::from)
-            .map(|config| config.map(Connector::Rustls))
-    })
-    .await
-    .map_err(|error| IoError::other(format!("remote TLS configuration task failed: {error}")))??;
-    let websocket_config = remote_websocket_config();
-    let stream = timeout(
-        CONNECT_TIMEOUT,
+    let stream = timeout(CONNECT_TIMEOUT, async {
+        let connector = tokio::task::spawn_blocking(|| {
+            ensure_rustls_crypto_provider();
+            maybe_build_rustls_client_config_with_custom_ca()
+                .map_err(IoError::from)
+                .map(|config| config.map(Connector::Rustls))
+        })
+        .await
+        .map_err(|error| {
+            IoError::other(format!("remote TLS configuration task failed: {error}"))
+        })??;
+        let websocket_config = remote_websocket_config();
         connect_async_tls_with_config(
             request,
             Some(websocket_config),
             /*disable_nagle*/ false,
             connector,
-        ),
-    )
+        )
+        .await
+        .map(|(stream, _response)| stream)
+        .map_err(|err| {
+            IoError::other(format!(
+                "failed to connect to remote app server at `{websocket_url}`: {err}"
+            ))
+        })
+    })
     .await
     .map_err(|_| {
         IoError::new(
             ErrorKind::TimedOut,
             format!("timed out connecting to remote app server at `{websocket_url}`"),
         )
-    })?
-    .map(|(stream, _response)| stream)
-    .map_err(|err| {
-        IoError::other(format!(
-            "failed to connect to remote app server at `{websocket_url}`: {err}"
-        ))
-    })?;
+    })??;
 
     Ok((websocket_url, stream))
 }
@@ -1146,8 +1148,7 @@ async fn deliver_event(
 }
 
 fn jsonrpc_request_from_client_request(request: ClientRequest) -> IoResult<JSONRPCRequest> {
-    JSONRPCRequest::try_from(request)
-        .map_err(|err| IoError::new(ErrorKind::InvalidInput, err))
+    JSONRPCRequest::try_from(request).map_err(|err| IoError::new(ErrorKind::InvalidInput, err))
 }
 
 fn jsonrpc_notification_from_client_notification(
@@ -1191,6 +1192,75 @@ fn websocket_close_error_is_already_closed(err: &TungsteniteError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_connect_deadline_covers_queued_ca_preparation() {
+        use futures::FutureExt;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind remote peer");
+        listener.set_nonblocking(true).expect("nonblocking peer");
+        let websocket_url = format!("ws://localhost:{}", listener.local_addr().unwrap().port());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .max_blocking_threads(1)
+            .build()
+            .expect("runtime with one CA worker");
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocker = runtime.spawn_blocking(move || {
+            started_tx.send(()).expect("worker started");
+            release_rx.recv().expect("release worker");
+        });
+        started_rx.recv().expect("blocking worker occupied");
+
+        let result = runtime.block_on(async {
+            let mut connecting =
+                Box::pin(RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+                    endpoint: RemoteAppServerEndpoint::WebSocket {
+                        websocket_url,
+                        auth_token: Some("test-token".to_owned()),
+                    },
+                    client_name: "deadline-test".to_owned(),
+                    client_version: "1".to_owned(),
+                    experimental_api: true,
+                    mcp_server_openai_form_elicitation: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 1,
+                }));
+            // The normal entry queues its actual CA preparation behind the
+            // occupied blocking worker. Its connection timer must still run.
+            assert!(connecting.as_mut().now_or_never().is_none());
+            tokio::time::advance(CONNECT_TIMEOUT).await;
+            connecting.as_mut().now_or_never()
+        });
+        // Release and drain blocking work before asserting, including when
+        // the old implementation has failed to produce a timeout result.
+        release_tx.send(()).expect("release blocking worker");
+        runtime.block_on(async {
+            blocker.await.expect("blocking worker finished");
+            tokio::task::spawn_blocking(|| {})
+                .await
+                .expect("CA preparation drained");
+        });
+        let error = result
+            .expect("connection deadline includes waiting for CA preparation")
+            .err()
+            .expect("queued CA preparation must time out");
+        assert_eq!(error.kind(), ErrorKind::TimedOut);
+        assert!(
+            error
+                .to_string()
+                .contains("timed out connecting to remote app server")
+        );
+        assert_eq!(
+            listener
+                .accept()
+                .expect_err("no connection after expiry")
+                .kind(),
+            ErrorKind::WouldBlock
+        );
+    }
 
     #[tokio::test]
     async fn remote_startup_deadline_covers_blocked_initialize_write() {
@@ -1342,14 +1412,15 @@ mod tests {
         let (response_tx, response_rx) = oneshot::channel();
         drop(response_rx);
         let command = RemoteClientCommand::Request {
-            request: Box::new(jsonrpc_request_from_client_request(
-                ClientRequest::GetAccount {
+            request: Box::new(
+                jsonrpc_request_from_client_request(ClientRequest::GetAccount {
                     request_id: RequestId::Integer(1),
                     params: codex_app_server_protocol::GetAccountParams {
                         refresh_token: false,
                     },
-                },
-            ).expect("account request encodes")),
+                })
+                .expect("account request encodes"),
+            ),
             response_tx,
         };
 
@@ -1363,7 +1434,8 @@ mod tests {
             params: codex_app_server_protocol::GetAccountParams {
                 refresh_token: true,
             },
-        }).expect("account request encodes");
+        })
+        .expect("account request encodes");
         assert_eq!(request.method, "account/read");
         assert_eq!(request.id, RequestId::Integer(7));
         assert_eq!(

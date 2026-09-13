@@ -721,6 +721,117 @@ async fn ingest_review_prerequisites(
     events.clear();
 }
 
+#[tokio::test]
+async fn pending_analytics_requests_are_bounded_and_resume_after_completion() {
+    let mut reducer = AnalyticsReducer::default();
+    let mut events = Vec::new();
+    ingest_review_prerequisites(&mut reducer, &mut events).await;
+    for request_id in 0..=4096 {
+        reducer
+            .ingest(
+                AnalyticsFact::ClientRequest {
+                    connection_id: 7,
+                    request_id: RequestId::Integer(request_id),
+                    request: Box::new(sample_turn_steer_request("thread-1", "turn-1", request_id)),
+                },
+                &mut events,
+            )
+            .await;
+    }
+    assert!(events.is_empty());
+    for request_id in 0..=4096 {
+        reducer
+            .ingest(
+                AnalyticsFact::ErrorResponse {
+                    connection_id: 7,
+                    request_id: RequestId::Integer(request_id),
+                    error_type: Some(no_active_turn_steer_error_type()),
+                },
+                &mut events,
+            )
+            .await;
+    }
+    assert_eq!(events.len(), 4096);
+    let payload = serde_json::to_value(&events[0]).expect("serialize retained steer event");
+    assert_eq!(payload["event_type"], "codex_turn_steer_event");
+    events.clear();
+    reducer
+        .ingest(
+            AnalyticsFact::ClientRequest {
+                connection_id: 7,
+                request_id: RequestId::Integer(4096),
+                request: Box::new(sample_turn_steer_request("thread-1", "turn-1", 4096)),
+            },
+            &mut events,
+        )
+        .await;
+    reducer
+        .ingest(
+            AnalyticsFact::ErrorResponse {
+                connection_id: 7,
+                request_id: RequestId::Integer(4096),
+                error_type: Some(no_active_turn_steer_error_type()),
+            },
+            &mut events,
+        )
+        .await;
+    assert_eq!(events.len(), 1);
+}
+
+#[tokio::test]
+async fn pending_analytics_reviews_are_bounded_and_resume_after_completion() {
+    let mut reducer = AnalyticsReducer::default();
+    let mut events = Vec::new();
+    ingest_review_prerequisites(&mut reducer, &mut events).await;
+    for request_id in 0..=4096 {
+        reducer
+            .ingest(
+                AnalyticsFact::ServerRequest {
+                    connection_id: 7,
+                    request: Box::new(sample_command_approval_request(request_id, None)),
+                },
+                &mut events,
+            )
+            .await;
+    }
+    assert!(events.is_empty());
+    for request_id in 0..=4096 {
+        reducer
+            .ingest(
+                AnalyticsFact::ServerRequestAborted {
+                    completed_at_ms: 2000,
+                    request_id: RequestId::Integer(request_id),
+                },
+                &mut events,
+            )
+            .await;
+    }
+    assert_eq!(events.len(), 4096);
+    let payload = serde_json::to_value(&events[0]).expect("serialize retained review event");
+    assert_eq!(payload["event_type"], "codex_review_event");
+    assert_eq!(payload["event_params"]["status"], "aborted");
+    events.clear();
+    reducer
+        .ingest(
+            AnalyticsFact::ServerRequest {
+                connection_id: 7,
+                request: Box::new(sample_command_approval_request(4096, None)),
+            },
+            &mut events,
+        )
+        .await;
+    reducer
+        .ingest(
+            AnalyticsFact::ServerRequestAborted {
+                completed_at_ms: 2000,
+                request_id: RequestId::Integer(4096),
+            },
+            &mut events,
+        )
+        .await;
+    assert_eq!(events.len(), 1);
+}
+
 async fn ingest_completed_command_execution_item(
     reducer: &mut AnalyticsReducer,
     events: &mut Vec<TrackEventRequest>,
@@ -791,7 +902,7 @@ async fn ingest_command_execution_item_lifecycle(
         .await;
 }
 
-fn sample_initialize_fact(connection_id: u64) -> AnalyticsFact {
+pub(crate) fn sample_initialize_fact(connection_id: u64) -> AnalyticsFact {
     AnalyticsFact::Initialize {
         connection_id,
         params: InitializeParams {
@@ -896,7 +1007,10 @@ fn sample_command_execution_item_with_actions(
     item
 }
 
-fn sample_command_approval_request(request_id: i64, approval_id: Option<&str>) -> ServerRequest {
+pub(crate) fn sample_command_approval_request(
+    request_id: i64,
+    approval_id: Option<&str>,
+) -> ServerRequest {
     ServerRequest::CommandExecutionRequestApproval {
         request_id: RequestId::Integer(request_id),
         params: CommandExecutionRequestApprovalParams {

@@ -6,13 +6,13 @@ use anyhow::Context;
 use anyhow::Result;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use codex_windows_sandbox::LocalSid;
 use codex_windows_sandbox::SETUP_VERSION;
 use codex_windows_sandbox::SetupErrorCode;
 use codex_windows_sandbox::SetupErrorReport;
 use codex_windows_sandbox::SetupFailure;
 use codex_windows_sandbox::add_deny_write_ace;
 use codex_windows_sandbox::canonicalize_path;
-use codex_windows_sandbox::convert_string_sid_to_sid;
 use codex_windows_sandbox::ensure_allow_mask_aces_with_inheritance;
 use codex_windows_sandbox::ensure_allow_write_aces;
 use codex_windows_sandbox::extract_setup_failure;
@@ -36,7 +36,6 @@ use codex_windows_sandbox::workspace_write_cap_sid_for_root;
 use codex_windows_sandbox::workspace_write_root_overlaps_path;
 use codex_windows_sandbox::write_setup_error_report;
 use std::collections::HashSet;
-use std::ffi::OsStr;
 use std::ffi::c_void;
 use std::io::Write;
 use std::os::windows::process::CommandExt;
@@ -45,11 +44,9 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::process::Stdio;
 use std::sync::mpsc;
-use windows_sys::Win32::Foundation::GetLastError;
 use windows_sys::Win32::Foundation::HLOCAL;
 use windows_sys::Win32::Foundation::LocalFree;
 use windows_sys::Win32::Security::ACL;
-use windows_sys::Win32::Security::Authorization::ConvertStringSidToSidW;
 use windows_sys::Win32::Security::Authorization::EXPLICIT_ACCESS_W;
 use windows_sys::Win32::Security::Authorization::GRANT_ACCESS;
 use windows_sys::Win32::Security::Authorization::SE_FILE_OBJECT;
@@ -78,7 +75,7 @@ use sandbox_users::commit_setup_marker;
 use sandbox_users::prepare_setup_marker;
 use sandbox_users::provision_sandbox_users;
 use sandbox_users::resolve_sandbox_users_group_sid;
-use sandbox_users::sid_bytes_to_psid;
+use sandbox_users::sid_bytes_to_local_sid;
 use setup_mutex::acquire_setup_mutex;
 
 fn log_line(log: &mut dyn Write, msg: &str) -> Result<()> {
@@ -128,16 +125,19 @@ fn workspace_write_cap_sids_for_path(
     Ok(sid_strs)
 }
 
-fn write_root_needs_refresh(root: &Path, psid: *mut c_void) -> Result<bool> {
-    if !path_mask_allows(
-        root,
-        &[psid],
-        WRITE_ROOT_ALLOW_MASK,
-        /*require_all_bits*/ true,
-    )? {
-        return Ok(true);
+fn write_root_needs_refresh(root: &Path, sid: &LocalSid) -> Result<bool> {
+    // SAFETY: sid owns a valid converted SID for both synchronous ACL queries.
+    unsafe {
+        if !path_mask_allows(
+            root,
+            &[sid.as_ptr()],
+            WRITE_ROOT_ALLOW_MASK,
+            /*require_all_bits*/ true,
+        )? {
+            return Ok(true);
+        }
+        path_mask_has_explicit_allow_ace(root, &[sid.as_ptr()], FILE_DELETE_CHILD)
     }
-    path_mask_has_explicit_allow_ace(root, &[psid], FILE_DELETE_CHILD)
 }
 
 fn spawn_read_acl_helper(payload: &Payload, _log: &mut dyn Write) -> Result<()> {
@@ -211,6 +211,9 @@ fn apply_read_acls(
                 root.display()
             ),
         )?;
+        // SAFETY: subjects borrows the converted sandbox-group SID retained by the setup caller;
+        // root is borrowed for this synchronous ACL update and the helper does not take SID
+        // ownership.
         let result = unsafe {
             ensure_allow_mask_aces_with_inheritance(
                 root,
@@ -245,7 +248,11 @@ fn read_mask_allows_or_log(
     refresh_errors: &mut Vec<String>,
     log: &mut dyn Write,
 ) -> Result<bool> {
-    match path_mask_allows(root, psids, read_mask, /*require_all_bits*/ true) {
+    // SAFETY: This private helper is called only by apply_read_acls, whose SID
+    // pointers borrow LocalSid owners retained by run_read_acl_only.
+    match unsafe {
+        path_mask_allows(root, psids, read_mask, /*require_all_bits*/ true)
+    } {
         Ok(has) => Ok(has),
         Err(e) => {
             let label_suffix = label
@@ -302,20 +309,16 @@ fn lock_sandbox_dir(
         ),
         (real_sid, real_user_mask, GRANT_ACCESS),
     ];
+    // SAFETY: The SID strings and converted SID allocations stay live while EXPLICIT_ACCESS_W
+    // borrows them. The entry count matches the array, new_dacl is a writable output slot,
+    // and the owned NUL-terminated path remains live through SetNamedSecurityInfoW.
     unsafe {
         let mut eas: Vec<EXPLICIT_ACCESS_W> = Vec::new();
-        let mut sids: Vec<*mut c_void> = Vec::new();
+        let mut sids: Vec<LocalSid> = Vec::new();
         for (sid_bytes, mask, access_mode) in entries.iter().map(|(s, m, a)| (s, *m, *a)) {
-            let sid_str = string_from_sid_bytes(sid_bytes).map_err(anyhow::Error::msg)?;
-            let sid_w = to_wide(OsStr::new(&sid_str));
-            let mut psid: *mut c_void = std::ptr::null_mut();
-            if ConvertStringSidToSidW(sid_w.as_ptr(), &mut psid) == 0 {
-                return Err(anyhow::anyhow!(
-                    "ConvertStringSidToSidW failed: {}",
-                    GetLastError()
-                ));
-            }
-            sids.push(psid);
+            let sid = sid_bytes_to_local_sid(sid_bytes)?;
+            let psid = sid.as_ptr();
+            sids.push(sid);
             eas.push(EXPLICIT_ACCESS_W {
                 grfAccessPermissions: mask,
                 grfAccessMode: access_mode,
@@ -351,18 +354,13 @@ fn lock_sandbox_dir(
             new_dacl,
             std::ptr::null_mut(),
         );
+        if !new_dacl.is_null() {
+            LocalFree(new_dacl as HLOCAL);
+        }
         if res != 0 {
             return Err(anyhow::anyhow!(
                 "SetNamedSecurityInfoW sandbox dir failed: {res}",
             ));
-        }
-        if !new_dacl.is_null() {
-            LocalFree(new_dacl as HLOCAL);
-        }
-        for sid in sids {
-            if !sid.is_null() {
-                LocalFree(sid as HLOCAL);
-            }
         }
     }
     Ok(())
@@ -506,16 +504,17 @@ fn run_read_acl_only(
     };
     log_line(log, "read-acl-only mode: applying read ACLs")?;
     let sandbox_group_sid = resolve_sandbox_users_group_sid()?;
-    let sandbox_group_psid = sid_bytes_to_psid(&sandbox_group_sid)?;
+    let sandbox_group = sid_bytes_to_local_sid(&sandbox_group_sid)?;
+    let sandbox_group_psid = sandbox_group.as_ptr();
     let mut refresh_errors: Vec<String> = Vec::new();
     if !payload.read_roots.is_empty() {
         let users_sid = resolve_sid("Users")?;
-        let users_psid = sid_bytes_to_psid(&users_sid)?;
+        let users = sid_bytes_to_local_sid(&users_sid)?;
         let auth_sid = resolve_sid("Authenticated Users")?;
-        let auth_psid = sid_bytes_to_psid(&auth_sid)?;
+        let auth = sid_bytes_to_local_sid(&auth_sid)?;
         let everyone_sid = resolve_sid("Everyone")?;
-        let everyone_psid = sid_bytes_to_psid(&everyone_sid)?;
-        let rx_psids = vec![users_psid, auth_psid, everyone_psid];
+        let everyone = sid_bytes_to_local_sid(&everyone_sid)?;
+        let rx_psids = vec![users.as_ptr(), auth.as_ptr(), everyone.as_ptr()];
         let subjects = ReadAclSubjects {
             sandbox_group_psid,
             rx_psids: &rx_psids,
@@ -529,22 +528,6 @@ fn run_read_acl_only(
             "read",
             OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE,
         )?;
-        unsafe {
-            if !users_psid.is_null() {
-                LocalFree(users_psid as HLOCAL);
-            }
-            if !auth_psid.is_null() {
-                LocalFree(auth_psid as HLOCAL);
-            }
-            if !everyone_psid.is_null() {
-                LocalFree(everyone_psid as HLOCAL);
-            }
-        }
-    }
-    unsafe {
-        if !sandbox_group_psid.is_null() {
-            LocalFree(sandbox_group_psid as HLOCAL);
-        }
     }
     if !refresh_errors.is_empty() {
         log_line(
@@ -759,12 +742,13 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
             format!("resolve sandbox users group SID failed: {err}"),
         ))
     })?;
-    let sandbox_group_psid = sid_bytes_to_psid(&sandbox_group_sid).map_err(|err| {
+    let sandbox_group = sid_bytes_to_local_sid(&sandbox_group_sid).map_err(|err| {
         anyhow::Error::new(SetupFailure::new(
             SetupErrorCode::HelperSidResolveFailed,
             format!("convert sandbox users group SID to PSID failed: {err}"),
         ))
     })?;
+    let sandbox_group_psid = sandbox_group.as_ptr();
     let sandbox_group_sid_str =
         string_from_sid_bytes(&sandbox_group_sid).map_err(anyhow::Error::msg)?;
 
@@ -776,6 +760,8 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
     // Deny-read ACEs must be present before the sandboxed command starts. Apply
     // them synchronously here instead of delegating them to the background
     // helper used for read grants.
+    // SAFETY: sandbox_group_psid is a valid converted SID retained by this setup invocation; the
+    // synchronous ACL synchronization borrows it without taking ownership.
     let applied_deny_read_paths = unsafe {
         sync_persistent_deny_read_acls(
             &payload.codex_home,
@@ -858,15 +844,13 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
         };
         let root_cap_sid_str =
             workspace_write_cap_sid_for_root(&payload.codex_home, &payload.command_cwd, root)?;
-        let root_cap_psid = unsafe {
-            convert_string_sid_to_sid(&root_cap_sid_str)
-                .ok_or_else(|| anyhow::anyhow!("convert write root capability SID failed"))?
-        };
-        for (label, psid) in [
-            ("sandbox_group", sandbox_group_psid),
-            (cap_label, root_cap_psid),
+        let root_cap_sid = LocalSid::from_string(&root_cap_sid_str)
+            .context("convert write root capability SID failed")?;
+        for (label, sid) in [
+            ("sandbox_group", &sandbox_group),
+            (cap_label, &root_cap_sid),
         ] {
-            let needs_refresh = match write_root_needs_refresh(root, psid) {
+            let needs_refresh = match write_root_needs_refresh(root, sid) {
                 Ok(needs_refresh) => needs_refresh,
                 Err(e) => {
                     refresh_errors.push(format!(
@@ -889,9 +873,6 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
                 need_grant = true;
             }
         }
-        unsafe {
-            LocalFree(root_cap_psid as HLOCAL);
-        }
         if need_grant {
             log_line(
                 log,
@@ -910,24 +891,16 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
             let sid_strings = vec![sandbox_group_sid_str.clone(), root_cap_sid_str];
             let tx = tx.clone();
             scope.spawn(move || {
-                // Convert SID strings to psids locally in this thread.
-                let mut psids: Vec<*mut c_void> = Vec::new();
-                for sid_str in &sid_strings {
-                    if let Some(psid) = unsafe { convert_string_sid_to_sid(sid_str) } {
-                        psids.push(psid);
-                    } else {
-                        let _ = tx.send((root.clone(), Err(anyhow::anyhow!("convert SID failed"))));
-                        return;
-                    }
-                }
-
-                let res = unsafe { ensure_allow_write_aces(&root, &psids) };
-
-                for psid in psids {
-                    unsafe {
-                        LocalFree(psid as HLOCAL);
-                    }
-                }
+                // Retain each converted SID even when a later conversion fails.
+                let sids = sid_strings
+                    .iter()
+                    .map(|sid| LocalSid::from_string(sid))
+                    .collect::<Result<Vec<_>>>();
+                let res = sids.and_then(|sids| {
+                    let psids = sids.iter().map(LocalSid::as_ptr).collect::<Vec<_>>();
+                    // SAFETY: sids owns every converted SID until the synchronous update returns.
+                    unsafe { ensure_allow_write_aces(&root, &psids) }
+                });
                 let _ = tx.send((root, res));
             });
         }
@@ -976,12 +949,11 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
             path,
         )?;
         for deny_sid_str in deny_sid_strs {
-            let deny_psid = unsafe {
-                convert_string_sid_to_sid(&deny_sid_str)
-                    .ok_or_else(|| anyhow::anyhow!("convert deny capability SID failed"))?
-            };
+            let deny_sid = LocalSid::from_string(&deny_sid_str)
+                .context("convert deny capability SID failed")?;
 
-            match unsafe { add_deny_write_ace(path, deny_psid) } {
+            // SAFETY: deny_sid retains its valid SID for this synchronous ACL update.
+            match unsafe { add_deny_write_ace(path, deny_sid.as_ptr()) } {
                 Ok(true) => {
                     log_line(
                         log,
@@ -996,9 +968,6 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
                         &format!("deny ACE failed on {}: {err}", path.display()),
                     )?;
                 }
-            }
-            unsafe {
-                LocalFree(deny_psid as HLOCAL);
             }
         }
     }
@@ -1019,11 +988,6 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
         lock_persistent_sandbox_dirs(payload, &sandbox_group_sid, log)?;
     }
 
-    unsafe {
-        if !sandbox_group_psid.is_null() {
-            LocalFree(sandbox_group_psid as HLOCAL);
-        }
-    }
     if !refresh_errors.is_empty() {
         log_line(
             log,
@@ -1037,10 +1001,10 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
 
 #[cfg(test)]
 mod tests {
+    use super::LocalSid;
     use super::Payload;
     use super::SETUP_VERSION;
     use super::WRITE_ROOT_ALLOW_MASK;
-    use super::convert_string_sid_to_sid;
     use super::workspace_write_cap_sids_for_path;
     use super::write_root_needs_refresh;
     use codex_otel::StatsigMetricsSettings;
@@ -1051,8 +1015,6 @@ mod tests {
     use pretty_assertions::assert_eq;
     use serde_json::json;
     use std::fs;
-    use windows_sys::Win32::Foundation::HLOCAL;
-    use windows_sys::Win32::Foundation::LocalFree;
     use windows_sys::Win32::Storage::FileSystem::FILE_DELETE_CHILD;
 
     fn payload_json() -> serde_json::Value {
@@ -1111,19 +1073,21 @@ mod tests {
 
         let sid = workspace_write_cap_sid_for_root(&codex_home, &workspace, &workspace)
             .expect("workspace sid");
-        let psid = unsafe { convert_string_sid_to_sid(&sid).expect("convert workspace sid") };
+        let sid = LocalSid::from_string(&sid).expect("convert workspace sid");
+        let psid = sid.as_ptr();
         let stale_write_mask = WRITE_ROOT_ALLOW_MASK | FILE_DELETE_CHILD;
+        // SAFETY: psid is the test's valid converted SID, retained throughout the synchronous ACL
+        // update; workspace is a live temporary-directory path.
         let seeded = unsafe { ensure_allow_mask_aces(&workspace, &[psid], stale_write_mask) }
             .expect("seed stale write ACE");
         let needs_refresh_before =
-            write_root_needs_refresh(&workspace, psid).expect("check stale write ACE");
+            write_root_needs_refresh(&workspace, &sid).expect("check stale write ACE");
+        // SAFETY: The converted psid remains allocated while this synchronous helper replaces the
+        // test directory's write ACE.
         let replaced = unsafe { ensure_allow_write_aces(&workspace, &[psid]) }
             .expect("replace stale write ACE");
         let needs_refresh_after =
-            write_root_needs_refresh(&workspace, psid).expect("check refreshed write ACE");
-        unsafe {
-            LocalFree(psid as HLOCAL);
-        }
+            write_root_needs_refresh(&workspace, &sid).expect("check refreshed write ACE");
 
         assert_eq!(
             (seeded, needs_refresh_before, replaced, needs_refresh_after),

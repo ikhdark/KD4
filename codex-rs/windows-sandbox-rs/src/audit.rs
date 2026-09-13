@@ -119,12 +119,15 @@ unsafe fn path_has_world_write_allow(path: &Path) -> Result<bool> {
     let mut world = world_sid()?;
     let psid_world = world.as_mut_ptr() as *mut c_void;
     let write_mask = FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES;
-    path_mask_allows(
-        path,
-        &[psid_world],
-        write_mask,
-        /*require_all_bits*/ false,
-    )
+    // SAFETY: world owns the successfully constructed SID throughout this check.
+    unsafe {
+        path_mask_allows(
+            path,
+            &[psid_world],
+            write_mask,
+            /*require_all_bits*/ false,
+        )
+    }
 }
 
 pub fn audit_everyone_writable(
@@ -137,6 +140,8 @@ pub fn audit_everyone_writable(
     let mut seen: HashSet<String> = HashSet::new();
     let mut checked = 0usize;
     let check_world_writable = |path: &Path| -> bool {
+        // SAFETY: path is borrowed for the synchronous audit; path_has_world_write_allow creates
+        // and retains its SID and security-descriptor storage internally.
         match unsafe { path_has_world_write_allow(path) } {
             Ok(has) => has,
             Err(err) => {
@@ -323,6 +328,8 @@ fn apply_capability_denies_for_world_writable_for_permissions(
             continue;
         }
         for active_sid in &active_sids {
+            // SAFETY: active_sid is a LocalSid retained by active_sids while the synchronous ACL
+            // helper borrows its valid pointer.
             let res = unsafe { add_deny_write_ace(path, active_sid.as_ptr()) };
             match res {
                 Ok(true) => log_note(

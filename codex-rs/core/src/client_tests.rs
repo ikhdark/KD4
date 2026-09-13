@@ -1477,32 +1477,103 @@ async fn tool_history_fail_open_request_uses_unreplaced_input() {
     assert_eq!(request.input.as_ref(), &[stable, bounded]);
 }
 
-#[test]
-fn request_schema_serialization_cache_is_keyed_by_model_visible_schema() {
+#[tokio::test]
+async fn request_schema_serialization_cache_is_keyed_by_model_visible_schema() {
     let client = test_model_client(SessionSource::Cli);
     let prompt = Prompt {
         output_schema: Some(json!({"type": "object", "properties": {"value": {"type": "string"}}})),
         ..Prompt::default()
     };
+    let mut model_info = test_model_info();
+    model_info.support_verbosity = true;
+    let responses_metadata = test_responses_metadata_for_client(
+        &client,
+        /* turn_id */ None,
+        format!("{}:0", client.state.thread_id),
+        /* parent_thread_id */ None,
+        TestCodexResponsesRequestKind::Turn,
+    );
+    let setup = client
+        .current_client_setup()
+        .await
+        .expect("client setup should resolve");
+    let request_text = |prompt: &Prompt, model_info: &ModelInfo| {
+        let request = client
+            .build_responses_request_with_input(
+                &setup.api_provider,
+                prompt,
+                model_info,
+                /* effort */ None,
+                codex_protocol::config_types::ReasoningSummary::None,
+                /* service_tier */ None,
+                &responses_metadata,
+                /* use_stable_context_fallback */ false,
+            )
+            .expect("request should build");
+        serde_json::to_value(request.text).expect("request text controls should serialize")
+    };
+    let expected_object = json!({
+        "format": {
+            "type": "json_schema",
+            "strict": true,
+            "schema": {"type": "object", "properties": {"value": {"type": "string"}}},
+            "name": "codex_output_schema"
+        }
+    });
+    assert_eq!(request_text(&prompt, &model_info), expected_object);
+    assert_eq!(request_text(&prompt, &model_info), expected_object);
 
-    client
-        .request_schema_components(&prompt, None, /*use_responses_lite*/ false)
-        .expect("first serialization should succeed");
-    client
-        .request_schema_components(&prompt, None, /*use_responses_lite*/ false)
-        .expect("cached serialization should succeed");
     let mut changed = prompt;
     changed.output_schema = Some(json!({"type": "array"}));
-    client
-        .request_schema_components(&changed, None, /*use_responses_lite*/ false)
-        .expect("changed schema should serialize independently");
+    assert_eq!(
+        request_text(&changed, &model_info),
+        json!({
+            "format": {
+                "type": "json_schema",
+                "strict": true,
+                "schema": {"type": "array"},
+                "name": "codex_output_schema"
+            }
+        })
+    );
+    for (verbosity, expected_verbosity) in [
+        (codex_protocol::config_types::Verbosity::Low, "low"),
+        (codex_protocol::config_types::Verbosity::High, "high"),
+    ] {
+        model_info.default_verbosity = Some(verbosity);
+        assert_eq!(
+            request_text(&changed, &model_info),
+            json!({
+                "verbosity": expected_verbosity,
+                "format": {
+                    "type": "json_schema",
+                    "strict": true,
+                    "schema": {"type": "array"},
+                    "name": "codex_output_schema"
+                }
+            })
+        );
+    }
+    changed.output_schema_strict = false;
+    assert_eq!(
+        request_text(&changed, &model_info),
+        json!({
+            "verbosity": "high",
+            "format": {
+                "type": "json_schema",
+                "strict": false,
+                "schema": {"type": "array"},
+                "name": "codex_output_schema"
+            }
+        })
+    );
 
     let cache = client
         .state
         .request_schema_cache
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    assert_eq!(cache.diagnostics(), (1, 2, 2));
+    assert_eq!(cache.diagnostics(), (1, 5, 5));
 }
 
 #[test]

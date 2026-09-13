@@ -443,8 +443,10 @@ pub(super) fn yield_control_callback(
     _args: v8::FunctionCallbackArguments,
     _retval: v8::ReturnValue<v8::Value>,
 ) {
-    if let Some(state) = scope.get_slot::<RuntimeState>() {
-        let _ = state.event_tx.send(RuntimeEvent::YieldRequested);
+    if let Some(state) = scope.get_slot::<RuntimeState>()
+        && let Some(event) = state.output_admission.admit_yield()
+    {
+        let _ = state.event_tx.send(event);
     }
 }
 

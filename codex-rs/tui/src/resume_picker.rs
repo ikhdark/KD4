@@ -439,7 +439,7 @@ async fn run_session_picker_with_loader(
     picker_loader: PickerLoader,
     bg_rx: mpsc::Receiver<BackgroundEvent>,
 ) -> Result<SessionSelection> {
-    let alt = AltScreenGuard::enter(tui);
+    let alt = AltScreenGuard::enter(tui)?;
     let mut state = PickerState::new(
         alt.tui.frame_requester(),
         picker_loader,
@@ -654,15 +654,17 @@ struct AltScreenGuard<'a> {
 }
 
 impl<'a> AltScreenGuard<'a> {
-    fn enter(tui: &'a mut Tui) -> Self {
-        let _ = tui.enter_alt_screen();
-        Self { tui }
+    fn enter(tui: &'a mut Tui) -> Result<Self> {
+        tui.enter_alt_screen()?;
+        Ok(Self { tui })
     }
 }
 
 impl Drop for AltScreenGuard<'_> {
     fn drop(&mut self) {
-        let _ = self.tui.leave_alt_screen();
+        if let Err(err) = self.tui.leave_alt_screen() {
+            tracing::warn!("failed to leave session picker alternate screen: {err}");
+        }
     }
 }
 

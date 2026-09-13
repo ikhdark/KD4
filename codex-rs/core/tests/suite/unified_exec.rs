@@ -588,11 +588,11 @@ async fn exec_command_retained_session_lifecycle_completes_without_stale_process
 }
 
 #[test]
-#[ignore]
+#[ignore = "subprocess fixture for exec_command_fast_success_and_failure_lifecycles_finish_inline"]
 fn fast_success_child_fixture() {}
 
 #[test]
-#[ignore]
+#[ignore = "subprocess fixture for exec_command_fast_success_and_failure_lifecycles_finish_inline"]
 fn fast_failure_child_fixture() {
     std::process::exit(7);
 }

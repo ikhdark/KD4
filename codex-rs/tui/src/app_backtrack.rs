@@ -146,7 +146,7 @@ impl App {
                     kind: KeyEventKind::Press,
                     ..
                 }) => {
-                    self.overlay_confirm_backtrack(tui);
+                    self.overlay_confirm_backtrack(tui)?;
                     Ok(true)
                 }
                 _ => {
@@ -161,7 +161,7 @@ impl App {
         }) = event
         {
             // First Esc in transcript overlay: begin backtrack preview at latest user message.
-            self.begin_overlay_backtrack_preview(tui);
+            self.begin_overlay_backtrack_preview(tui)?;
             Ok(true)
         } else {
             // Not in backtrack mode: forward events to the overlay widget.
@@ -272,18 +272,19 @@ impl App {
     }
 
     /// Open transcript overlay (enters alternate screen and shows full transcript).
-    pub(crate) fn open_transcript_overlay(&mut self, tui: &mut tui::Tui) {
-        let _ = tui.enter_alt_screen();
+    pub(crate) fn open_transcript_overlay(&mut self, tui: &mut tui::Tui) -> Result<()> {
+        tui.enter_alt_screen()?;
         self.overlay = Some(Overlay::new_transcript(
             self.transcript_cells.clone(),
             self.keymap.pager.clone(),
         ));
         tui.frame_requester().schedule_frame();
+        Ok(())
     }
 
     /// Close transcript overlay and restore normal UI.
-    pub(crate) fn close_transcript_overlay(&mut self, tui: &mut tui::Tui) {
-        let _ = tui.leave_alt_screen();
+    pub(crate) fn close_transcript_overlay(&mut self, tui: &mut tui::Tui) -> Result<()> {
+        tui.leave_alt_screen()?;
         let was_backtrack = self.backtrack.overlay_preview_active;
         if !self.deferred_history_lines.is_empty() {
             let lines = std::mem::take(&mut self.deferred_history_lines);
@@ -299,6 +300,7 @@ impl App {
             // Ensure backtrack state is fully reset when overlay closes (e.g. via 'q').
             self.reset_backtrack_state();
         }
+        Ok(())
     }
 
     /// Initialize backtrack state and show composer hint.
@@ -321,7 +323,11 @@ impl App {
             return;
         }
 
-        self.open_transcript_overlay(tui);
+        if let Err(err) = self.open_transcript_overlay(tui) {
+            self.chat_widget
+                .add_error_message(format!("Failed to open transcript: {err}"));
+            return;
+        }
         self.backtrack.overlay_preview_active = true;
         // Composer is hidden by overlay; clear its hint.
         self.chat_widget.clear_esc_backtrack_hint();
@@ -329,13 +335,13 @@ impl App {
     }
 
     /// When overlay is already open, begin preview mode and select latest user message.
-    fn begin_overlay_backtrack_preview(&mut self, tui: &mut tui::Tui) {
+    fn begin_overlay_backtrack_preview(&mut self, tui: &mut tui::Tui) -> Result<()> {
         if !has_backtrack_target(&self.transcript_cells) {
-            self.close_transcript_overlay(tui);
+            self.close_transcript_overlay(tui)?;
             self.chat_widget
                 .add_info_message(NO_PREVIOUS_MESSAGE_TO_EDIT.to_string(), /*hint*/ None);
             tui.frame_requester().schedule_frame();
-            return;
+            return Ok(());
         }
 
         self.backtrack.primed = true;
@@ -346,6 +352,7 @@ impl App {
             self.apply_backtrack_selection_internal(last);
         }
         tui.frame_requester().schedule_frame();
+        Ok(())
     }
 
     /// Step selection to the next older user message and update overlay.
@@ -442,7 +449,7 @@ impl App {
                     .schedule_frame_in(std::time::Duration::from_millis(50));
             }
             if close_overlay {
-                self.close_transcript_overlay(tui);
+                self.close_transcript_overlay(tui)?;
                 tui.frame_requester().schedule_frame();
             }
             return Ok(());
@@ -451,7 +458,7 @@ impl App {
         if let Some(overlay) = &mut self.overlay {
             overlay.handle_event(tui, event)?;
             if overlay.is_done() {
-                self.close_transcript_overlay(tui);
+                self.close_transcript_overlay(tui)?;
                 tui.frame_requester().schedule_frame();
             }
         }
@@ -459,14 +466,15 @@ impl App {
     }
 
     /// Handle Enter in overlay backtrack preview: confirm selection and reset state.
-    fn overlay_confirm_backtrack(&mut self, tui: &mut tui::Tui) {
+    fn overlay_confirm_backtrack(&mut self, tui: &mut tui::Tui) -> Result<()> {
         let nth_user_message = self.backtrack.nth_user_message;
         let selection = self.backtrack_selection(nth_user_message);
-        self.close_transcript_overlay(tui);
+        self.close_transcript_overlay(tui)?;
         if let Some(selection) = selection {
             self.apply_backtrack_rollback(selection);
             tui.frame_requester().schedule_frame();
         }
+        Ok(())
     }
 
     /// Handle Esc in overlay backtrack preview: step selection if armed, else forward.

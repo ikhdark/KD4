@@ -1,5 +1,3 @@
-#![allow(clippy::uninit_vec)]
-
 // This file is copied from https://github.com/wezterm/wezterm (MIT license).
 // Copyright (c) 2018-Present Wez Furlong
 // Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -40,6 +38,8 @@ pub struct ProcThreadAttributeList {
 impl ProcThreadAttributeList {
     pub fn with_capacity(num_attributes: DWORD) -> Result<Self, Error> {
         let mut bytes_required: usize = 0;
+        // SAFETY: A null attribute-list pointer requests the required size; bytes_required is
+        // writable usize storage for that output.
         unsafe {
             InitializeProcThreadAttributeList(
                 ptr::null_mut(),
@@ -48,10 +48,11 @@ impl ProcThreadAttributeList {
                 &mut bytes_required,
             )
         };
-        let mut data = Vec::with_capacity(bytes_required);
-        unsafe { data.set_len(bytes_required) };
+        let mut data = vec![0; bytes_required];
 
         let attr_ptr = data.as_mut_slice().as_mut_ptr() as *mut _;
+        // SAFETY: data contains initialized bytes covering the API-reported size and remains
+        // allocated while the list is initialized.
         let res = unsafe {
             InitializeProcThreadAttributeList(attr_ptr, num_attributes, 0, &mut bytes_required)
         };
@@ -100,6 +101,8 @@ impl ProcThreadAttributeList {
         value: *mut c_void,
         size: usize,
     ) -> Result<(), Error> {
+        // SAFETY: self owns the initialized attribute list; the caller supplies the attribute-
+        // specific value and size and retains any referenced storage.
         let res = unsafe {
             UpdateProcThreadAttribute(
                 self.as_mut_ptr(),
@@ -122,6 +125,8 @@ impl ProcThreadAttributeList {
 
 impl Drop for ProcThreadAttributeList {
     fn drop(&mut self) {
+        // SAFETY: Self is constructed only after successful initialization, and its backing
+        // storage and job-list values remain alive during deletion.
         unsafe { DeleteProcThreadAttributeList(self.as_mut_ptr()) };
     }
 }

@@ -20,18 +20,26 @@ pub struct ProcThreadAttributeList {
 impl ProcThreadAttributeList {
     pub fn new(attr_count: u32) -> io::Result<Self> {
         let mut size: usize = 0;
+        // SAFETY: A null list pointer requests the required allocation size; size is writable
+        // usize storage.
         unsafe {
             InitializeProcThreadAttributeList(std::ptr::null_mut(), attr_count, 0, &mut size);
         }
         if size == 0 {
+            // SAFETY: GetLastError reads this thread's error after the size query failed to
+            // produce a buffer size.
             return Err(io::Error::from_raw_os_error(unsafe {
                 GetLastError() as i32
             }));
         }
         let mut buffer = vec![0u8; size];
         let list = buffer.as_mut_ptr() as LPPROC_THREAD_ATTRIBUTE_LIST;
+        // SAFETY: buffer contains initialized bytes covering the reported size and remains
+        // allocated for the attribute-list lifetime.
         let ok = unsafe { InitializeProcThreadAttributeList(list, attr_count, 0, &mut size) };
         if ok == 0 {
+            // SAFETY: GetLastError reads this thread's error immediately after attribute-list
+            // initialization failed.
             return Err(io::Error::from_raw_os_error(unsafe {
                 GetLastError() as i32
             }));
@@ -86,6 +94,8 @@ impl ProcThreadAttributeList {
         value: *mut c_void,
         size: usize,
     ) -> io::Result<()> {
+        // SAFETY: self owns the initialized list; the caller supplies the attribute-specific
+        // value and size and keeps referenced buffers alive.
         let ok = unsafe {
             UpdateProcThreadAttribute(
                 self.as_mut_ptr(),
@@ -98,6 +108,8 @@ impl ProcThreadAttributeList {
             )
         };
         if ok == 0 {
+            // SAFETY: GetLastError reads this thread's error immediately after the attribute
+            // update failed.
             return Err(io::Error::from_raw_os_error(unsafe {
                 GetLastError() as i32
             }));
@@ -108,6 +120,8 @@ impl ProcThreadAttributeList {
 
 impl Drop for ProcThreadAttributeList {
     fn drop(&mut self) {
+        // SAFETY: The list was successfully initialized before Self was constructed; the
+        // backing and attribute-value buffers remain alive during deletion.
         unsafe {
             DeleteProcThreadAttributeList(self.as_mut_ptr());
         }

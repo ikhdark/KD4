@@ -777,7 +777,6 @@ async fn project_doc_truncation_trims_split_multibyte_code_points() {
             vec![ProjectDocCandidate {
                 path: source_uri.clone(),
                 size: contents.len() as u64,
-                modified_at_ms: 1,
             }],
             limit,
             /*prefetch_utf8_boundary_slack*/ false,
@@ -820,7 +819,6 @@ async fn project_doc_truncation_preserves_invalid_boundary_bytes_lossily() {
         vec![ProjectDocCandidate {
             path: source_uri.clone(),
             size: CONTENTS.len() as u64,
-            modified_at_ms: 1,
         }],
         LIMIT,
         /*prefetch_utf8_boundary_slack*/ false,
@@ -885,7 +883,6 @@ async fn rendered_project_doc_overhead_uses_a_bounded_aggregate_omission_notice(
         candidates.push(ProjectDocCandidate {
             path: PathUri::from_abs_path(&path.abs()),
             size: 1,
-            modified_at_ms: 1,
         });
     }
     let nearest_path = candidates.last().expect("nearest candidate").path.clone();
@@ -926,7 +923,6 @@ fn long_project_doc_provenance_retains_a_bounded_scope_manifest() {
             candidate: ProjectDocCandidate {
                 path: long_path,
                 size: 2,
-                modified_at_ms: 1,
             },
             read: ProjectDocRead {
                 retained_data: vec![b'x'],

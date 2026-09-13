@@ -148,7 +148,7 @@ fn run_live(prompt: &str) -> (assert_cmd::assert::Assert, TempDir) {
     (output.assert(), dir)
 }
 
-#[ignore]
+#[ignore = "requires OPENAI_API_KEY and sends paid requests to the live OpenAI API"]
 #[test]
 fn live_create_file_hello_txt() {
     let (assert, dir) = run_live(
@@ -165,7 +165,7 @@ fn live_create_file_hello_txt() {
     assert_eq!(contents.trim(), "hello");
 }
 
-#[ignore]
+#[ignore = "requires OPENAI_API_KEY and sends paid requests to the live OpenAI API"]
 #[test]
 fn live_print_working_directory() {
     let (assert, dir) = run_live("Print the current working directory using the shell function.");

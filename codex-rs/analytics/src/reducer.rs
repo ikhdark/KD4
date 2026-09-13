@@ -145,8 +145,21 @@ use codex_protocol::request_permissions::PermissionGrantScope as CorePermissionG
 use codex_protocol::request_permissions::RequestPermissionsResponse as CoreRequestPermissionsResponse;
 use sha1::Digest;
 use std::collections::HashMap;
+use std::hash::Hash;
 use std::path::Path;
 use std::path::PathBuf;
+
+// Terminal facts can be dropped by the bounded analytics queue. Keep pending
+// correlation state bounded even when those facts never reach the reducer.
+const MAX_PENDING_ANALYTICS_ITEMS: usize = 4096;
+
+fn insert_pending<K: Eq + Hash, V>(pending: &mut HashMap<K, V>, key: K, value: V) {
+    if pending.len() >= MAX_PENDING_ANALYTICS_ITEMS && !pending.contains_key(&key) {
+        tracing::warn!("dropping analytics correlation: pending item limit reached");
+        return;
+    }
+    pending.insert(key, value);
+}
 
 #[derive(Default)]
 pub(crate) struct AnalyticsReducer {
@@ -663,7 +676,8 @@ impl AnalyticsReducer {
     ) {
         match request {
             ClientRequest::TurnStart { params, .. } => {
-                self.requests.insert(
+                insert_pending(
+                    &mut self.requests,
                     (connection_id, request_id),
                     RequestState::TurnStart(PendingTurnStartState {
                         thread_id: params.thread_id,
@@ -672,7 +686,8 @@ impl AnalyticsReducer {
                 );
             }
             ClientRequest::TurnSteer { params, .. } => {
-                self.requests.insert(
+                insert_pending(
+                    &mut self.requests,
                     (connection_id, request_id),
                     RequestState::TurnSteer(PendingTurnSteerState {
                         thread_id: params.thread_id,
@@ -1012,7 +1027,8 @@ impl AnalyticsReducer {
                 let Some(started_at_ms) = option_i64_to_u64(Some(params.started_at_ms)) else {
                     return;
                 };
-                self.pending_reviews.insert(
+                insert_pending(
+                    &mut self.pending_reviews,
                     request_id.clone(),
                     PendingReviewState {
                         thread_id: params.thread_id,
@@ -1041,7 +1057,8 @@ impl AnalyticsReducer {
                 let Some(started_at_ms) = option_i64_to_u64(Some(params.started_at_ms)) else {
                     return;
                 };
-                self.pending_reviews.insert(
+                insert_pending(
+                    &mut self.pending_reviews,
                     request_id.clone(),
                     PendingReviewState {
                         thread_id: params.thread_id,
@@ -1080,7 +1097,8 @@ impl AnalyticsReducer {
                 let Some(started_at_ms) = option_i64_to_u64(Some(params.started_at_ms)) else {
                     return;
                 };
-                self.pending_reviews.insert(
+                insert_pending(
+                    &mut self.pending_reviews,
                     request_id.clone(),
                     PendingReviewState {
                         thread_id: params.thread_id,

@@ -181,6 +181,8 @@ fn try_take_completed_connect_result(
     thread_handle: HANDLE,
     pipe_label: &str,
 ) -> Result<Option<Result<()>>> {
+    // SAFETY: thread_handle is the duplicated connect-thread handle retained by
+    // connect_pipe_with_timeout until all wait/result checks return.
     let thread_wait = unsafe { WaitForSingleObject(thread_handle, 0) };
     if thread_wait != WAIT_OBJECT_0 {
         return Ok(None);
@@ -210,8 +212,13 @@ fn connect_pipe_with_timeout(
         thread::Builder::new()
             .name(format!("codex-runner-connect-{pipe_label}"))
             .spawn(move || {
+                // SAFETY: GetCurrentProcess returns the current process pseudo-handle and takes no
+                // pointers or ownership.
                 let current_process = unsafe { GetCurrentProcess() };
                 let mut thread_handle: HANDLE = ptr::null_mut();
+                // SAFETY: The current process/thread pseudo-handles refer to this running thread;
+                // thread_handle is a writable output slot and the successful duplicate is
+                // sent to the parent for eventual closure.
                 let duplicate_ok = unsafe {
                     DuplicateHandle(
                         current_process,
@@ -262,8 +269,12 @@ fn connect_pipe_with_timeout(
             )? {
                 result
             } else {
+                // SAFETY: thread_handle is the still-open duplicated handle for this specific
+                // connect thread; cancellation does not transfer handle ownership.
                 let cancel_ok = unsafe { CancelSynchronousIo(thread_handle) };
                 if cancel_ok == 0 {
+                    // SAFETY: Read the thread-local result immediately after CancelSynchronousIo
+                    // reports failure; this call takes no pointers.
                     let err = unsafe { GetLastError() };
                     if err != ERROR_NOT_FOUND {
                         Err(anyhow::anyhow!(
@@ -303,6 +314,8 @@ fn connect_pipe_with_timeout(
         }
     };
 
+    // SAFETY: The parent owns this duplicated thread handle and has finished wait/cancellation
+    // operations; closing it does not close the independently running thread.
     unsafe {
         CloseHandle(thread_handle);
     }
@@ -320,8 +333,12 @@ pub(crate) fn spawn_runner_transport(
     let (pipe_in_name, pipe_out_name) = pipe_pair();
     let h_pipe_in =
         create_named_pipe(&pipe_in_name, PIPE_ACCESS_OUTBOUND, &sandbox_creds.username)?;
+    // SAFETY: The successful pipe handle is uniquely owned here; File takes its close obligation.
+    let pipe_write = unsafe { File::from_raw_handle(h_pipe_in as _) };
     let h_pipe_out =
         create_named_pipe(&pipe_out_name, PIPE_ACCESS_INBOUND, &sandbox_creds.username)?;
+    // SAFETY: The successful pipe handle is uniquely owned here; File takes its close obligation.
+    let pipe_read = unsafe { File::from_raw_handle(h_pipe_out as _) };
 
     let runner_exe = find_runner_exe(codex_home, log_dir);
     let runner_cmdline = runner_exe
@@ -340,12 +357,21 @@ pub(crate) fn spawn_runner_transport(
     let user_w = to_wide(&sandbox_creds.username);
     let domain_w = to_wide(".");
     let password_w = to_wide(&sandbox_creds.password);
+    // SAFETY: STARTUPINFOW consists of integer fields and nullable pointers; zero is valid
+    // initialization before cb is assigned.
     let mut si: STARTUPINFOW = unsafe { std::mem::zeroed() };
     si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+    // SAFETY: PROCESS_INFORMATION is an output structure containing nullable handles and integer
+    // IDs, so zero is a valid initial representation.
     let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
     let env_block: Option<Vec<u16>> = None;
 
+    // SAFETY: SetErrorMode takes only flag bits and returns the previous process error mode for
+    // restoration below.
     let previous_error_mode = unsafe { SetErrorMode(RUNNER_ERROR_MODE_FLAGS) };
+    // SAFETY: All credential, executable and cwd strings are live NUL-terminated buffers;
+    // cmdline_vec is writable, si has its required size, and pi is a writable output
+    // structure. A null environment requests inheritance.
     let spawn_res = unsafe {
         CreateProcessWithLogonW(
             user_w.as_ptr(),
@@ -365,16 +391,14 @@ pub(crate) fn spawn_runner_transport(
             &mut pi,
         )
     };
+    // SAFETY: Read the process-create error before SetErrorMode can replace it.
+    let spawn_error = unsafe { GetLastError() };
+    // SAFETY: Restore the process error mode returned before process creation.
     unsafe {
         SetErrorMode(previous_error_mode);
     }
     if spawn_res == 0 {
-        let err = unsafe { GetLastError() };
-        unsafe {
-            CloseHandle(h_pipe_in);
-            CloseHandle(h_pipe_out);
-        }
-        return Err(RunnerLogonError { code: err }.into());
+        return Err(RunnerLogonError { code: spawn_error }.into());
     }
     let expected_runner_pid = pi.dwProcessId;
 
@@ -384,6 +408,8 @@ pub(crate) fn spawn_runner_transport(
         Ok(())
     })();
 
+    // SAFETY: pi.hThread is the owned thread handle returned by successful process creation; the
+    // handshake no longer needs it and no other owner closes it.
     unsafe {
         if !pi.hThread.is_null() {
             CloseHandle(pi.hThread);
@@ -391,6 +417,9 @@ pub(crate) fn spawn_runner_transport(
     }
 
     if let Err(err) = connect_result {
+        // SAFETY: The parent still owns the process and pipe handles on handshake failure; it
+        // requests runner termination before closing each handle, with no later File
+        // ownership transfer.
         unsafe {
             // Keep the process handle alive until the pipe handshake finishes. If the handshake
             // fails after the runner process has already launched, we still need a way to stop
@@ -399,17 +428,13 @@ pub(crate) fn spawn_runner_transport(
                 let _ = TerminateProcess(pi.hProcess, 1);
                 CloseHandle(pi.hProcess);
             }
-            CloseHandle(h_pipe_in);
-            CloseHandle(h_pipe_out);
         }
         return Err(err);
     }
 
     let mut transport = RunnerTransport {
-        // Once the pipe connect phase succeeds we can transfer the raw HANDLEs into `File`s.
-        // From here on, the `RunnerTransport` owns closing the pipes on every success/error path.
-        pipe_write: unsafe { File::from_raw_handle(h_pipe_in as _) },
-        pipe_read: unsafe { File::from_raw_handle(h_pipe_out as _) },
+        pipe_write,
+        pipe_read,
     };
     let startup_result = (|| -> Result<()> {
         // Keep the runner process HANDLE alive until the *entire* startup handshake finishes.
@@ -420,6 +445,8 @@ pub(crate) fn spawn_runner_transport(
         Ok(())
     })();
     if let Err(err) = startup_result {
+        // SAFETY: The parent retains the runner process handle through startup; failure requests
+        // termination and closes that handle once, while transport owns the pipe handles.
         unsafe {
             if !pi.hProcess.is_null() {
                 let _ = TerminateProcess(pi.hProcess, 1);
@@ -430,6 +457,8 @@ pub(crate) fn spawn_runner_transport(
         return Err(err);
     }
 
+    // SAFETY: Startup has completed and the parent still owns this process handle; the transport
+    // owns its separate pipes, so closing the process handle does not release them.
     unsafe {
         if !pi.hProcess.is_null() {
             // The runner has now connected both pipes *and* acknowledged the spawn request, so
@@ -450,6 +479,8 @@ fn wait_for_complete_frame(pipe_read: &File, timeout: Duration) -> Result<()> {
     loop {
         let mut bytes_read = 0u32;
         let mut total_available = 0u32;
+        // SAFETY: pipe_read retains its valid pipe handle; len_buf and both count slots are
+        // writable and the requested peek size is exactly len_buf.len().
         let ok = unsafe {
             PeekNamedPipe(
                 handle,
@@ -461,6 +492,8 @@ fn wait_for_complete_frame(pipe_read: &File, timeout: Duration) -> Result<()> {
             )
         };
         if ok == 0 {
+            // SAFETY: Read the thread-local error immediately after PeekNamedPipe reports failure;
+            // this call takes no pointers.
             let err = unsafe { GetLastError() } as i32;
             return Err(anyhow::anyhow!(
                 "PeekNamedPipe failed while waiting for spawn_ready: {err}"

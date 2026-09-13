@@ -1,4 +1,4 @@
-use codex_exec_server::ExecutorFileSystem;
+use codex_file_system::ExecutorFileSystem;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 use std::path::Path;

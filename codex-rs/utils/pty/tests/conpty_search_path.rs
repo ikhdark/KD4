@@ -53,6 +53,8 @@ fn conpty_ignores_dll_in_current_directory() -> anyhow::Result<()> {
             .encode_wide()
             .chain(std::iter::once(0))
             .collect::<Vec<_>>();
+        // SAFETY: conpty_dll is a live, NUL-terminated UTF-16 module name. GetModuleHandleW
+        // only borrows it and the returned handle is not closed here.
         let module = unsafe { GetModuleHandleW(conpty_dll.as_ptr()) };
         assert!(
             module.is_null(),

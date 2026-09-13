@@ -508,12 +508,17 @@ impl crate::FsmonitorProbeRunner for LocalFsmonitorProbeRunner<'_> {
     async fn run_probe(&mut self, args: &[&str]) -> Option<Vec<u8>> {
         // Both probes are fast, bounded metadata queries that do not inspect the
         // worktree or index, so do not reduce the requested command's timeout.
-        let mut command = Command::new(self.git);
-        command.args(args).current_dir(self.cwd).kill_on_drop(true);
-        match timeout(GIT_COMMAND_TIMEOUT, command.output()).await {
-            Ok(Ok(output)) if output.status.success() => Some(output.stdout),
-            _ => None,
-        }
+        // Keep the raw configuration query intact while containing any helper
+        // processes started by the selected Git executable or wrapper.
+        let args = args.iter().map(OsString::from).collect::<Vec<_>>();
+        let output = run_git_command_attempt(
+            self.git,
+            &args,
+            self.cwd,
+            crate::FsmonitorOverride::Disabled,
+        )
+        .await?;
+        output.status.success().then_some(output.stdout)
     }
 }
 
@@ -1537,6 +1542,89 @@ mod tests {
         assert!(
             observed.stdout.is_empty(),
             "timed out Git diff left filter processes alive: {}",
+            String::from_utf8_lossy(&observed.stdout)
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn fsmonitor_probe_timeout_terminates_wrapper_and_descendant() {
+        assert_fsmonitor_probe_cleans_wrapper_tree(false).await;
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn fsmonitor_probe_cancellation_terminates_wrapper_and_descendant() {
+        assert_fsmonitor_probe_cleans_wrapper_tree(true).await;
+    }
+
+    #[cfg(windows)]
+    async fn assert_fsmonitor_probe_cleans_wrapper_tree(cancel_after_spawn: bool) {
+        let temp = tempfile::tempdir().expect("temporary Git wrapper directory");
+        let helper = temp.path().join("git-wrapper.ps1");
+        let git = temp.path().join("git.cmd");
+        let pids = temp.path().join("wrapper-pids.txt");
+        let pids_literal = pids.display().to_string().replace('\'', "''");
+        std::fs::write(
+            &helper,
+            format!(
+                "$child = Start-Process powershell.exe -ArgumentList '-NoProfile', '-Command', 'Start-Sleep -Seconds 60' -WindowStyle Hidden -PassThru\n[IO.File]::WriteAllText('{pids_literal}', \"$PID $($child.Id)\")\nStart-Sleep -Seconds 60\n"
+            ),
+        )
+        .expect("write Git wrapper helper");
+        std::fs::write(
+            &git,
+            format!(
+                "@echo off\r\npowershell.exe -NoProfile -ExecutionPolicy Bypass -File \"{}\"\r\n",
+                helper.display()
+            ),
+        )
+        .expect("write Git wrapper");
+
+        // Enter the policy detection used by status and diff. Only the external
+        // executable is replaced; detection, spawning, and timeout remain real.
+        let result = if cancel_after_spawn {
+            let operation = detect_local_fsmonitor_override(&git, temp.path());
+            tokio::pin!(operation);
+            tokio::select! {
+                result = &mut operation => panic!("fsmonitor probe completed before cancellation: {result:?}"),
+                _ = async {
+                    while !std::fs::read_to_string(&pids).is_ok_and(|contents| {
+                        contents.split_whitespace().filter_map(|pid| pid.parse::<u32>().ok()).count() == 2
+                    }) {
+                        tokio::time::sleep(TokioDuration::from_millis(10)).await;
+                    }
+                } => {}
+            }
+            None
+        } else {
+            Some(detect_local_fsmonitor_override(&git, temp.path()).await)
+        };
+        let ids = std::fs::read_to_string(&pids)
+            .expect("fsmonitor probe must launch the wrapper")
+            .split_whitespace()
+            .map(|pid| pid.parse::<u32>().expect("recorded process id").to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(ids.len(), 2);
+        let ids = ids.join(",");
+        let observed = Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-Command",
+                &format!("$live = @(Get-Process -Id {ids} -ErrorAction SilentlyContinue); $live | ForEach-Object {{ $_.Id }}; $live | Stop-Process -Force -ErrorAction SilentlyContinue"),
+            ])
+            .output()
+            .await
+            .expect("observe and clean up wrapper processes");
+        assert_eq!(
+            result,
+            (!cancel_after_spawn).then_some(crate::FsmonitorOverride::Disabled),
+            "incomplete probes must not enable the filesystem monitor"
+        );
+        assert!(observed.status.success());
+        assert!(
+            observed.stdout.is_empty(),
+            "fsmonitor probe left wrapper processes alive: {}",
             String::from_utf8_lossy(&observed.stdout)
         );
     }

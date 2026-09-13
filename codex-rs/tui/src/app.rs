@@ -179,8 +179,6 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
-use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 use tokio::select;
@@ -510,7 +508,7 @@ pub(crate) struct App {
     pub(crate) keymap: RuntimeKeymap,
 
     /// Controls the animation thread that sends CommitTick events.
-    pub(crate) commit_anim_running: Arc<AtomicBool>,
+    pub(crate) commit_animation_task: Option<tokio_util::task::AbortOnDropHandle<()>>,
     // Shared across ChatWidget instances so invalid status-line config warnings only emit once.
     status_line_invalid_items_warned: Arc<AtomicBool>,
     // Shared across ChatWidget instances so invalid terminal-title config warnings only emit once.
@@ -1023,7 +1021,7 @@ See the Codex keymap documentation for supported actions and examples."
             has_emitted_history_lines: false,
             transcript_reflow: TranscriptReflowState::default(),
             initial_history_replay_buffer: None,
-            commit_anim_running: Arc::new(AtomicBool::new(false)),
+            commit_animation_task: None,
             status_line_invalid_items_warned: status_line_invalid_items_warned.clone(),
             terminal_title_invalid_items_warned: terminal_title_invalid_items_warned.clone(),
             skill_load_warnings: SkillLoadWarningState::default(),

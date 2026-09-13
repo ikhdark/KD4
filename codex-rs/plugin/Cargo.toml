@@ -14,7 +14,7 @@ workspace = true
 
 [dependencies]
 codex-config = { workspace = true }
-codex-exec-server = { workspace = true }
+codex-file-system = { workspace = true }
 codex-utils-absolute-path = { workspace = true }
 codex-utils-path-uri = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
@@ -22,6 +22,7 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+codex-exec-server = { workspace = true }
 pretty_assertions = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt"] }

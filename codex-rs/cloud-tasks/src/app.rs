@@ -58,7 +58,6 @@ pub struct App {
     pub apply_modal: Option<ApplyModalState>,
     pub best_of_modal: Option<BestOfModalState>,
     pub environments: Vec<EnvironmentRow>,
-    pub env_last_loaded: Option<std::time::Instant>,
     pub env_loading: bool,
     pub env_error: Option<String>,
     // New Task page
@@ -89,7 +88,6 @@ impl App {
             apply_modal: None,
             best_of_modal: None,
             environments: Vec::new(),
-            env_last_loaded: None,
             env_loading: false,
             env_error: None,
             new_task: None,
@@ -132,7 +130,6 @@ impl App {
             Ok(list) => {
                 self.environments = list;
                 self.env_error = None;
-                self.env_last_loaded = Some(std::time::Instant::now());
             }
             Err(error) => self.env_error = Some(error.to_string()),
         }
@@ -197,12 +194,9 @@ pub struct DiffOverlay {
     pub base_can_apply: bool,
     pub diff_lines: Vec<String>,
     pub text_lines: Vec<String>,
-    pub prompt: Option<String>,
     pub attempts: Vec<AttemptView>,
     pub selected_attempt: usize,
     pub current_view: DetailView,
-    pub base_turn_id: Option<String>,
-    pub sibling_turn_ids: Vec<String>,
     pub attempt_total_hint: Option<usize>,
 }
 
@@ -238,12 +232,9 @@ impl DiffOverlay {
             base_can_apply: false,
             diff_lines: Vec::new(),
             text_lines: Vec::new(),
-            prompt: None,
             attempts: vec![AttemptView::default()],
             selected_attempt: 0,
             current_view: DetailView::Prompt,
-            base_turn_id: None,
-            sibling_turn_ids: Vec::new(),
             attempt_total_hint,
         }
     }
@@ -308,23 +299,17 @@ impl DiffOverlay {
     }
 
     pub fn apply_selection_to_fields(&mut self) {
-        let (diff_lines, text_lines, prompt) = if let Some(attempt) = self.current_attempt() {
-            (
-                attempt.diff_lines.clone(),
-                attempt.text_lines.clone(),
-                attempt.prompt.clone(),
-            )
+        let (diff_lines, text_lines) = if let Some(attempt) = self.current_attempt() {
+            (attempt.diff_lines.clone(), attempt.text_lines.clone())
         } else {
             self.diff_lines.clear();
             self.text_lines.clear();
-            self.prompt = None;
             self.sd.set_content(vec!["<loading attempt>".to_string()]);
             return;
         };
 
         self.diff_lines = diff_lines.clone();
         self.text_lines = text_lines.clone();
-        self.prompt = prompt;
 
         match self.current_view {
             DetailView::Diff => {

@@ -1650,6 +1650,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "close_fds"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3bc416f33de9d59e79e57560f450d21ff8393adcf1cdfc3e6d8fb93d5f88a2ed"
+dependencies = [
+ "cfg-if",
+ "libc",
+]
+
+[[package]]
 name = "clru"
 version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1965,11 +1975,13 @@ dependencies = [
  "codex-protocol",
  "codex-utils-cargo-bin",
  "codex-utils-cli",
+ "futures",
  "pretty_assertions",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-tungstenite 0.28.0",
  "tracing",
  "tracing-subscriber",
  "tungstenite 0.27.0",
@@ -3467,6 +3479,7 @@ version = "0.0.0"
 dependencies = [
  "codex-config",
  "codex-exec-server",
+ "codex-file-system",
  "codex-utils-absolute-path",
  "codex-utils-path-uri",
  "pretty_assertions",
@@ -4074,6 +4087,7 @@ name = "codex-utils-pty"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "close_fds",
  "filedescriptor",
  "libc",
  "log",

@@ -648,9 +648,15 @@ async fn connect_websocket(
         .map_err(|err| ApiError::Stream(format!("failed to build websocket request: {err}")))?;
     request.headers_mut().extend(headers);
 
-    let connector = WebSocketConnector::new(http_client_factory)
-        .map_err(|err| ApiError::Stream(format!("failed to configure websocket TLS: {err}")))?
-        .with_tcp_nodelay();
+    let http_client_factory = http_client_factory.clone();
+    let connector =
+        tokio::task::spawn_blocking(move || WebSocketConnector::new(&http_client_factory))
+            .await
+            .map_err(|err| {
+                ApiError::Stream(format!("websocket TLS configuration task failed: {err}"))
+            })?
+            .map_err(|err| ApiError::Stream(format!("failed to configure websocket TLS: {err}")))?
+            .with_tcp_nodelay();
     let response = connector.connect(request, websocket_config()).await;
 
     let (stream, response) = match response {
@@ -910,6 +916,84 @@ mod tests {
     use serde_json::json;
     use std::collections::HashMap;
     use std::sync::Mutex as StdMutex;
+
+    #[test]
+    fn responses_connect_and_probe_cancel_tls_preparation_before_network() {
+        struct NoAuth;
+        impl crate::auth::AuthProvider for NoAuth {
+            fn add_auth_headers(&self, _: &mut HeaderMap) {}
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            for probe in [false, true] {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("listener");
+                let client = ResponsesWebsocketClient::new(
+                    Provider {
+                        name: "tls-cancellation-test".to_string(),
+                        base_url: format!("http://{}", listener.local_addr().expect("address")),
+                        query_params: None,
+                        headers: HeaderMap::new(),
+                        retry: crate::provider::RetryConfig {
+                            max_retries: 0,
+                            base_delay: Duration::ZERO,
+                            retry_429: false,
+                            retry_5xx: false,
+                            retry_transport: false,
+                        },
+                        stream_idle_timeout: Duration::from_secs(1),
+                    },
+                    Arc::new(NoAuth),
+                );
+                let factory =
+                    HttpClientFactory::new(codex_http_client::OutboundProxyPolicy::ReqwestDefault);
+                let (release, held) = std::sync::mpsc::channel::<()>();
+                let (started, ready) = tokio::sync::oneshot::channel();
+                let blocker = tokio::task::spawn_blocking(move || {
+                    let _ = started.send(());
+                    let _ = held.recv();
+                });
+                ready.await.expect("blocking worker started");
+                let operation = async {
+                    if probe {
+                        client
+                            .probe_handshake(
+                                &factory,
+                                HeaderMap::new(),
+                                HeaderMap::new(),
+                                Duration::from_secs(1),
+                            )
+                            .await
+                            .map(|_| ())
+                    } else {
+                        client
+                            .connect(&factory, HeaderMap::new(), HeaderMap::new(), None, None)
+                            .await
+                            .map(|_| ())
+                    }
+                };
+                let result = tokio::time::timeout(Duration::from_millis(20), operation).await;
+                drop(release);
+                blocker.await.expect("worker released");
+                assert!(
+                    result.is_err(),
+                    "TLS preparation must yield to cancellation"
+                );
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                        .await
+                        .is_err(),
+                    "canceled CA preparation must not dispatch a websocket request"
+                );
+            }
+        });
+    }
 
     #[test]
     fn reset_without_close_handshake_maps_to_incomplete_stream_error() {

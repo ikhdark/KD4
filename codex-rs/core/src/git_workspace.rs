@@ -2388,11 +2388,41 @@ async fn git_config_signature(executable: &Path, cwd: &Path) -> Option<[u8; 32]>
             "--list",
         ])
         .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
-    let output = timeout(GIT_DEPENDENCY_TIMEOUT, command.output())
-        .await
-        .ok()?
-        .ok()?;
+    let output = timeout(GIT_DEPENDENCY_TIMEOUT, async move {
+        // Own the entire process tree until output collection completes. A Git
+        // wrapper may launch helpers even for a read-only configuration probe.
+        #[cfg(windows)]
+        let (_managed, child) = {
+            command.creation_flags(codex_utils_pty::WINDOWS_CREATE_SUSPENDED);
+            let managed = codex_utils_pty::ManagedRootProcess::reserve_with_reclaim()
+                .await
+                .ok()?;
+            managed.require_descendant_containment().ok()?;
+            tokio::task::spawn_blocking(move || {
+                let mut child = command.spawn()?;
+                let pid = child
+                    .id()
+                    .ok_or_else(|| std::io::Error::other("missing Git process id"))?;
+                if let Err(error) = managed.attach_and_resume(pid) {
+                    let _ = child.start_kill();
+                    return Err(error);
+                }
+                Ok((managed, child))
+            })
+            .await
+            .ok()?
+            .ok()?
+        };
+        #[cfg(not(windows))]
+        let child = command.spawn().ok()?;
+        child.wait_with_output().await.ok()
+    })
+    .await
+    .ok()??;
     output
         .status
         .success()

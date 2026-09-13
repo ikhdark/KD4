@@ -218,7 +218,10 @@ mod tests {
         fn new(name: &'static str, value: Option<&str>) -> Self {
             let previous = env::var_os(name);
             match value {
+                // SAFETY: Environment mutation is thread-safe on Windows, the supported TUI platform.
+                // The serial test guard also prevents semantic interference between these fixtures.
                 Some(value) => unsafe { env::set_var(name, value) },
+                // SAFETY: Windows permits concurrent environment mutation; these fixtures are also serial.
                 None => unsafe { env::remove_var(name) },
             }
             Self { name, previous }
@@ -228,7 +231,9 @@ mod tests {
     impl Drop for EnvVarGuard {
         fn drop(&mut self) {
             match self.previous.take() {
+                // SAFETY: Windows permits concurrent environment mutation; restore the saved fixture value.
                 Some(value) => unsafe { env::set_var(self.name, value) },
+                // SAFETY: Windows permits concurrent environment mutation; restore the original absence.
                 None => unsafe { env::remove_var(self.name) },
             }
         }

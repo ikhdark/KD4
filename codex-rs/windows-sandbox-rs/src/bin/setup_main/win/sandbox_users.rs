@@ -108,6 +108,9 @@ pub fn ensure_sandbox_user(username: &str, password: &str, log: &mut dyn Write) 
 pub fn ensure_local_user(name: &str, password: &str, log: &mut dyn Write) -> Result<()> {
     let name_w = to_wide(OsStr::new(name));
     let pwd_w = to_wide(OsStr::new(password));
+    // SAFETY: The NUL-terminated name and password buffers remain live through the NetUser calls;
+    // each information structure has the layout selected by its API level. The group-add
+    // call borrows one level-3 member record while its strings remain live.
     unsafe {
         let info = USER_INFO_1 {
             usri1_name: name_w.as_ptr() as *mut u16,
@@ -176,6 +179,8 @@ pub fn ensure_local_group(name: &str, comment: &str, log: &mut dyn Write) -> Res
 
     let name_w = to_wide(OsStr::new(name));
     let comment_w = to_wide(OsStr::new(comment));
+    // SAFETY: The group name and comment are live NUL-terminated buffers, info has the level-1
+    // layout requested by NetLocalGroupAdd, and parm_err is writable.
     unsafe {
         let info = LOCALGROUP_INFO_1 {
             lgrpi1_name: name_w.as_ptr() as *mut u16,
@@ -205,6 +210,8 @@ pub fn ensure_local_group(name: &str, comment: &str, log: &mut dyn Write) -> Res
 pub fn ensure_local_group_member(group_name: &str, member_name: &str) -> Result<()> {
     let group_w = to_wide(OsStr::new(group_name));
     let member_w = to_wide(OsStr::new(member_name));
+    // SAFETY: group_w and member_w are live NUL-terminated buffers; the API receives one level-3
+    // member record and copies its contents synchronously.
     unsafe {
         let member = LOCALGROUP_MEMBERS_INFO_3 {
             lgrmi3_domainandname: member_w.as_ptr() as *mut u16,
@@ -224,6 +231,8 @@ pub fn ensure_local_group_member(group_name: &str, member_name: &str) -> Result<
 fn lookup_account_name_for_sid(sid_str: &str) -> Result<String> {
     let sid_w = to_wide(OsStr::new(sid_str));
     let mut psid: *mut c_void = std::ptr::null_mut();
+    // SAFETY: sid_w is NUL-terminated and live through conversion, and psid is a writable output
+    // slot whose successful allocation is released below.
     if unsafe { ConvertStringSidToSidW(sid_w.as_ptr(), &mut psid) } == 0 {
         return Err(anyhow::anyhow!(
             "ConvertStringSidToSidW failed for {sid_str}: {}",
@@ -233,6 +242,8 @@ fn lookup_account_name_for_sid(sid_str: &str) -> Result<String> {
     let mut name_len: u32 = 0;
     let mut domain_len: u32 = 0;
     let mut use_type: SID_NAME_USE = 0;
+    // SAFETY: The converted psid is still allocated. Null name/domain buffers with zero lengths
+    // request required sizes, and the length and SID-use outputs are writable.
     let ok = unsafe {
         LookupAccountSidW(
             std::ptr::null(),
@@ -245,8 +256,12 @@ fn lookup_account_name_for_sid(sid_str: &str) -> Result<String> {
         )
     };
     if ok == 0 {
+        // SAFETY: GetLastError reads this thread's status immediately after the failed lookup and
+        // takes no pointers.
         let err = unsafe { GetLastError() };
         if err != ERROR_INSUFFICIENT_BUFFER {
+            // SAFETY: The preflight failed before any SID ownership transfer; this function still
+            // owns the converted allocation and releases it before returning.
             unsafe {
                 LocalFree(psid as _);
             }
@@ -257,6 +272,8 @@ fn lookup_account_name_for_sid(sid_str: &str) -> Result<String> {
     }
     let mut name_buf: Vec<u16> = vec![0u16; name_len as usize];
     let mut domain_buf: Vec<u16> = vec![0u16; domain_len as usize];
+    // SAFETY: psid remains allocated; name_buf and domain_buf have the element counts supplied by
+    // the sizing call, with writable length and SID-use outputs.
     let ok = unsafe {
         LookupAccountSidW(
             std::ptr::null(),
@@ -268,30 +285,24 @@ fn lookup_account_name_for_sid(sid_str: &str) -> Result<String> {
             &mut use_type,
         )
     };
+    // SAFETY: Capture the lookup error before LocalFree can change this thread's status.
+    let lookup_error = unsafe { GetLastError() };
+    // SAFETY: LookupAccountSidW has returned and this function owns the converted SID.
     unsafe {
         LocalFree(psid as _);
     }
     if ok == 0 {
         return Err(anyhow::anyhow!(
-            "LookupAccountSidW failed for {sid_str}: {}",
-            unsafe { GetLastError() }
+            "LookupAccountSidW failed for {sid_str}: {lookup_error}"
         ));
     }
     let name = String::from_utf16_lossy(&name_buf);
     Ok(name.trim_end_matches('\0').to_string())
 }
 
-pub fn sid_bytes_to_psid(sid: &[u8]) -> Result<*mut c_void> {
+pub fn sid_bytes_to_local_sid(sid: &[u8]) -> Result<codex_windows_sandbox::LocalSid> {
     let sid_str = string_from_sid_bytes(sid).map_err(anyhow::Error::msg)?;
-    let sid_w = to_wide(OsStr::new(&sid_str));
-    let mut psid: *mut c_void = std::ptr::null_mut();
-    if unsafe { ConvertStringSidToSidW(sid_w.as_ptr(), &mut psid) } == 0 {
-        return Err(anyhow::anyhow!(
-            "ConvertStringSidToSidW failed: {}",
-            unsafe { GetLastError() }
-        ));
-    }
-    Ok(psid)
+    codex_windows_sandbox::LocalSid::from_string(&sid_str)
 }
 
 fn random_password() -> String {
@@ -411,6 +422,8 @@ pub(super) fn prepare_setup_marker(codex_home: &Path, real_user: &str) -> Result
         "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;{real_user_sid})"
     ));
     let mut security_descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    // SAFETY: sddl is a live NUL-terminated string, security_descriptor is writable, and the
+    // returned descriptor remains allocated through CreateFileW below.
     let converted = unsafe {
         ConvertStringSecurityDescriptorToSecurityDescriptorW(
             sddl.as_ptr(),
@@ -435,6 +448,9 @@ pub(super) fn prepare_setup_marker(codex_home: &Path, real_user: &str) -> Result
         bInheritHandle: 0,
     };
     let marker_path_wide = to_wide(marker_path.as_os_str());
+    // SAFETY: The path is NUL-terminated, security_attributes has its required size and points to
+    // the live converted security descriptor, and the returned file handle is checked
+    // before use.
     let marker_handle = unsafe {
         CreateFileW(
             marker_path_wide.as_ptr(),
@@ -446,7 +462,11 @@ pub(super) fn prepare_setup_marker(codex_home: &Path, real_user: &str) -> Result
             /*htemplatefile*/ std::ptr::null_mut(),
         )
     };
+    // SAFETY: Capture the thread-local CreateFileW result before cleanup can change it;
+    // GetLastError has no pointer preconditions.
     let create_error = unsafe { GetLastError() };
+    // SAFETY: CreateFileW has returned and no longer borrows this successfully converted security
+    // descriptor, which this function owns and releases once.
     unsafe {
         LocalFree(security_descriptor as _);
     }
@@ -460,6 +480,8 @@ pub(super) fn prepare_setup_marker(codex_home: &Path, real_user: &str) -> Result
             ),
         )));
     }
+    // SAFETY: marker_handle passed the invalid-handle check and is the sole owned handle returned
+    // by CreateFileW; no subsequent operation uses it.
     unsafe {
         CloseHandle(marker_handle);
     }

@@ -192,43 +192,59 @@ unsafe fn dacl_mask_allows_with_scope(
 }
 
 /// Path-based wrapper around the mask check (single DACL fetch).
-pub fn path_mask_allows(
+///
+/// # Safety
+/// Every pointer in `psids` must refer to a valid SID that remains readable for
+/// the duration of this call.
+pub unsafe fn path_mask_allows(
     path: &Path,
     psids: &[*mut c_void],
     desired_mask: u32,
     require_all_bits: bool,
 ) -> Result<bool> {
-    path_mask_allows_with_scope(
-        path,
-        psids,
-        desired_mask,
-        require_all_bits,
-        AceScope::Effective,
-    )
+    // SAFETY: The caller guarantees every SID remains valid for this synchronous check.
+    unsafe {
+        path_mask_allows_with_scope(
+            path,
+            psids,
+            desired_mask,
+            require_all_bits,
+            AceScope::Effective,
+        )
+    }
 }
 
 /// Returns whether an explicit allow ACE for one of the provided SIDs grants any bit in `desired_mask`.
-pub fn path_mask_has_explicit_allow_ace(
+///
+/// # Safety
+/// Every pointer in `psids` must refer to a valid SID that remains readable for
+/// the duration of this call.
+pub unsafe fn path_mask_has_explicit_allow_ace(
     path: &Path,
     psids: &[*mut c_void],
     desired_mask: u32,
 ) -> Result<bool> {
-    path_mask_allows_with_scope(
-        path,
-        psids,
-        desired_mask,
-        /*require_all_bits*/ false,
-        AceScope::Explicit,
-    )
+    // SAFETY: The caller guarantees every SID remains valid for this synchronous check.
+    unsafe {
+        path_mask_allows_with_scope(
+            path,
+            psids,
+            desired_mask,
+            /*require_all_bits*/ false,
+            AceScope::Explicit,
+        )
+    }
 }
 
-fn path_mask_allows_with_scope(
+unsafe fn path_mask_allows_with_scope(
     path: &Path,
     psids: &[*mut c_void],
     desired_mask: u32,
     require_all_bits: bool,
     scope: AceScope,
 ) -> Result<bool> {
+    // SAFETY: Both callers forward their valid-SID contract. The fetched descriptor
+    // keeps the DACL live through the mask check and is freed only afterward.
     unsafe {
         let (p_dacl, sd) = fetch_dacl_handle(path)?;
         let has = dacl_mask_allows_with_scope(p_dacl, psids, desired_mask, require_all_bits, scope);

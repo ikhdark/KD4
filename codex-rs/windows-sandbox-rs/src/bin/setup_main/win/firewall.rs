@@ -58,6 +58,8 @@ pub fn ensure_offline_proxy_allowlist(
     allow_local_binding: bool,
     log: &mut dyn Write,
 ) -> Result<()> {
+    // SAFETY: The reserved pointer is null and apartment initialization is performed on this
+    // calling thread; every successful initialization is balanced below on the same thread.
     let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
     if hr.is_err() {
         return Err(anyhow::Error::new(SetupFailure::new(
@@ -66,6 +68,9 @@ pub fn ensure_offline_proxy_allowlist(
         )));
     }
 
+    // SAFETY: COM initialization succeeded on this thread. The firewall interfaces are created,
+    // used and dropped inside this closure before CoUninitialize; borrowed BSTR/spec values
+    // live through each call.
     let result = unsafe {
         (|| -> Result<()> {
             let policy: INetFwPolicy2 = CoCreateInstance(&NetFwPolicy2, None, CLSCTX_INPROC_SERVER)
@@ -142,6 +147,8 @@ pub fn ensure_offline_proxy_allowlist(
         })()
     };
 
+    // SAFETY: This thread successfully initialized COM above, and the closure has already dropped
+    // all firewall interfaces before the matching uninitialization.
     unsafe {
         CoUninitialize();
     }
@@ -149,6 +156,8 @@ pub fn ensure_offline_proxy_allowlist(
 }
 
 pub fn ensure_offline_outbound_block(offline_sid: &str, log: &mut dyn Write) -> Result<()> {
+    // SAFETY: The reserved pointer is null and apartment initialization is performed on this
+    // calling thread; every successful initialization is balanced below on the same thread.
     let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
     if hr.is_err() {
         return Err(anyhow::Error::new(SetupFailure::new(
@@ -157,6 +166,8 @@ pub fn ensure_offline_outbound_block(offline_sid: &str, log: &mut dyn Write) -> 
         )));
     }
 
+    // SAFETY: COM initialization succeeded on this thread. The firewall interfaces remain on this
+    // thread and are dropped with the closure before the matching CoUninitialize.
     let result = unsafe {
         (|| -> Result<()> {
             let policy: INetFwPolicy2 = CoCreateInstance(&NetFwPolicy2, None, CLSCTX_INPROC_SERVER)
@@ -191,6 +202,8 @@ pub fn ensure_offline_outbound_block(offline_sid: &str, log: &mut dyn Write) -> 
         })()
     };
 
+    // SAFETY: This thread successfully initialized COM above, and the closure has already dropped
+    // all firewall interfaces before the matching uninitialization.
     unsafe {
         CoUninitialize();
     }
@@ -203,6 +216,8 @@ fn remove_rule_if_present(
     log: &mut dyn Write,
 ) -> Result<()> {
     let name = BSTR::from(internal_name);
+    // SAFETY: rules is a live interface in the caller's initialized COM apartment, and name is a
+    // BSTR retained for this synchronous lookup.
     match unsafe { rules.Item(&name) } {
         Ok(_) => {}
         Err(error)
@@ -217,6 +232,8 @@ fn remove_rule_if_present(
             )));
         }
     }
+    // SAFETY: rules remains a live interface in the initialized COM apartment; name remains a valid
+    // BSTR throughout the synchronous removal call.
     unsafe { rules.Remove(&name) }.map_err(|err| {
         anyhow::Error::new(SetupFailure::new(
             SetupErrorCode::HelperFirewallRuleCreateOrAddFailed,
@@ -229,6 +246,8 @@ fn remove_rule_if_present(
 
 fn ensure_local_policy_rules_take_effect(policy: &INetFwPolicy2) -> Result<()> {
     let mut modify_state = NET_FW_MODIFY_STATE::default();
+    // SAFETY: The vtable and raw this pointer come from the same live INetFwPolicy2 interface.
+    // modify_state is a writable output slot retained until this synchronous call returns.
     let result = unsafe {
         (Interface::vtable(policy).LocalPolicyModifyState)(
             Interface::as_raw(policy),
@@ -279,6 +298,8 @@ fn ensure_block_rule(
     log: &mut dyn Write,
 ) -> Result<()> {
     let name = BSTR::from(spec.internal_name);
+    // SAFETY: rules is retained by the caller in its initialized COM apartment; name remains a live
+    // BSTR through the lookup.
     let rule: INetFwRule3 = match unsafe { rules.Item(&name) } {
         Ok(existing) => existing.cast().map_err(|err| {
             anyhow::Error::new(SetupFailure::new(
@@ -288,6 +309,9 @@ fn ensure_block_rule(
         })?,
         Err(_) => {
             let new_rule: INetFwRule3 =
+                // SAFETY: The caller initialized COM on this thread; the fixed NetFwRule class is
+                // requested without aggregation, and the returned interface owns its COM
+                // reference.
                 unsafe { CoCreateInstance(&NetFwRule, None, CLSCTX_INPROC_SERVER) }.map_err(
                     |err| {
                         anyhow::Error::new(SetupFailure::new(
@@ -296,6 +320,8 @@ fn ensure_block_rule(
                         ))
                     },
                 )?;
+            // SAFETY: new_rule owns a live COM reference and name is a BSTR that remains valid for
+            // the synchronous property setter.
             unsafe { new_rule.SetName(&name) }.map_err(|err| {
                 anyhow::Error::new(SetupFailure::new(
                     SetupErrorCode::HelperFirewallRuleCreateOrAddFailed,
@@ -304,6 +330,8 @@ fn ensure_block_rule(
             })?;
             // Set all properties before adding the rule so we don't leave half-configured rules.
             configure_rule(&new_rule, spec)?;
+            // SAFETY: Both rules and new_rule are live interfaces in this apartment. Add takes its
+            // own COM reference; the Rust owners remain alive through the call.
             unsafe { rules.Add(&new_rule) }.map_err(|err| {
                 anyhow::Error::new(SetupFailure::new(
                     SetupErrorCode::HelperFirewallRuleCreateOrAddFailed,
@@ -331,6 +359,8 @@ fn ensure_block_rule(
 }
 
 fn configure_rule(rule: &INetFwRule3, spec: &BlockRuleSpec<'_>) -> Result<()> {
+    // SAFETY: The caller retains rule in the initialized COM apartment. Each property value is a
+    // scalar or live BSTR for its setter, and no borrowed string storage escapes the call.
     unsafe {
         rule.SetDescription(&BSTR::from(spec.friendly_desc))
             .map_err(|err| {
@@ -385,6 +415,8 @@ fn configure_rule(rule: &INetFwRule3, spec: &BlockRuleSpec<'_>) -> Result<()> {
     }
 
     // Read-back verification: ensure we actually wrote the expected SID scope.
+    // SAFETY: rule remains a live COM interface in this apartment; the generated getter returns an
+    // owned BSTR whose lifetime is managed by the binding.
     let actual_owner = unsafe { rule.LocalUserOwner() }.map_err(|err| {
         anyhow::Error::new(SetupFailure::new(
             SetupErrorCode::HelperFirewallRuleVerifyFailed,
@@ -402,6 +434,8 @@ fn configure_rule(rule: &INetFwRule3, spec: &BlockRuleSpec<'_>) -> Result<()> {
             ),
         )));
     }
+    // SAFETY: rule remains a live COM interface in this apartment; the generated getter returns an
+    // owned BSTR whose lifetime is managed by the binding.
     let authorized_users = unsafe { rule.LocalUserAuthorizedList() }.map_err(|err| {
         anyhow::Error::new(SetupFailure::new(
             SetupErrorCode::HelperFirewallRuleVerifyFailed,
@@ -421,6 +455,8 @@ fn configure_rule(rule: &INetFwRule3, spec: &BlockRuleSpec<'_>) -> Result<()> {
 }
 
 fn configure_rule_network_scope(rule: &INetFwRule3, spec: &BlockRuleSpec<'_>) -> Result<()> {
+    // SAFETY: rule is retained in the initialized COM apartment; protocol is scalar and each
+    // address/port BSTR remains alive through the synchronous setter.
     unsafe {
         rule.SetProtocol(spec.protocol).map_err(|err| {
             anyhow::Error::new(SetupFailure::new(
@@ -507,11 +543,18 @@ mod tests {
 
     #[test]
     fn remove_rule_propagates_native_lookup_errors_and_preserves_missing_idempotence() {
+        // SAFETY: The reserved pointer is null; this test initializes COM on its own thread and
+        // balances success with CoUninitialize below.
         let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
         assert!(hr.is_ok(), "CoInitializeEx failed: {hr:?}");
         let result = (|| -> Result<()> {
             let policy: INetFwPolicy2 =
+                // SAFETY: This test thread has initialized COM, the fixed firewall policy class is
+                // requested without aggregation, and the returned interface owns its
+                // reference.
                 unsafe { CoCreateInstance(&NetFwPolicy2, None, CLSCTX_INPROC_SERVER) }?;
+            // SAFETY: policy is a live interface on this initialized COM thread; the returned rules
+            // interface owns its reference.
             let rules = unsafe { policy.Rules() }?;
             let mut log = Vec::new();
             // Native Item rejects an empty BSTR with E_INVALIDARG. No policy is
@@ -538,6 +581,8 @@ mod tests {
             assert!(log.is_empty(), "absent rule is an idempotent no-op");
             Ok(())
         })();
+        // SAFETY: COM initialization succeeded on this thread and all interfaces were dropped when
+        // the result closure returned.
         unsafe {
             CoUninitialize();
         }
@@ -546,6 +591,8 @@ mod tests {
 
     #[test]
     fn configured_remote_address_literals_are_accepted_by_firewall_com() {
+        // SAFETY: The reserved pointer is null; this test initializes COM on its own thread and
+        // balances success with CoUninitialize below.
         let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
         assert!(hr.is_ok(), "CoInitializeEx failed: {hr:?}");
 
@@ -554,6 +601,8 @@ mod tests {
             NON_LOOPBACK_REMOTE_ADDRESSES,
             "*",
         ];
+        // SAFETY: COM is initialized on this test thread. Each temporary rule and BSTR lives
+        // through its property calls, and only owned strings leave the closure.
         let results = candidates.map(|remote_addresses| unsafe {
             let rule: windows::core::Result<INetFwRule3> =
                 CoCreateInstance(&NetFwRule, None, CLSCTX_INPROC_SERVER);
@@ -564,6 +613,8 @@ mod tests {
             .map(|stored| stored.to_string())
         });
 
+        // SAFETY: COM initialization succeeded on this thread, and every temporary rule has been
+        // dropped before uninitialization.
         unsafe {
             CoUninitialize();
         }
@@ -578,6 +629,8 @@ mod tests {
 
     #[test]
     fn production_firewall_rule_network_scopes_are_accepted_by_firewall_com() {
+        // SAFETY: The reserved pointer is null; this test initializes COM on its own thread and
+        // balances success with CoUninitialize below.
         let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
         assert!(hr.is_ok(), "CoInitializeEx failed: {hr:?}");
 
@@ -611,6 +664,8 @@ mod tests {
             },
         ];
 
+        // SAFETY: COM is initialized on this test thread. Each rule owns its interface while
+        // setters and getters run, and only owned strings/scalars leave the closure.
         let results = specs.each_ref().map(|spec| unsafe {
             let rule: INetFwRule3 = CoCreateInstance(&NetFwRule, None, CLSCTX_INPROC_SERVER)?;
             configure_rule(&rule, spec)?;
@@ -628,6 +683,8 @@ mod tests {
             ))
         });
 
+        // SAFETY: COM initialization succeeded on this thread, and every temporary rule has been
+        // dropped before uninitialization.
         unsafe {
             CoUninitialize();
         }

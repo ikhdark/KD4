@@ -31,7 +31,7 @@ pub async fn autodetect_environment_id(
     desired_label: Option<String>,
 ) -> anyhow::Result<AutodetectSelection> {
     // 1) Try repo-specific environments based on local git origins (GitHub only, like VSCode)
-    let origins = get_git_origins();
+    let origins = get_git_origins().await?;
     crate::append_error_log(format!("env: git origins: {origins:?}"));
     let mut by_repo_envs: Vec<CodeEnvironment> = Vec::new();
     for origin in &origins {
@@ -184,24 +184,70 @@ mod tests {
                 wiremock::ResponseTemplate::new(200)
                     .set_body_json(serde_json::json!([{"id": "env-1", "label": "Local"}])),
             )
-            .expect(1)
+            .expect(2)
             .mount(&server)
             .await;
         let http = crate::environment_http_clients(&codex_http_client::HttpClientFactory::new(
             codex_http_client::OutboundProxyPolicy::ReqwestDefault,
         ));
 
-        let environments = list_environments_with_origins(
-            &http,
-            &CloudBaseUrl::new(&format!("{}/backend-api", server.uri())),
-            &HeaderMap::new(),
-            &[],
-        )
-        .await
-        .expect("environment response should decode");
+        let base_url = CloudBaseUrl::new(&format!("{}/backend-api", server.uri()));
+        let environments = list_environments(&http, &base_url, &HeaderMap::new())
+            .await
+            .expect("environment response should decode");
 
         assert_eq!(environments.len(), 1);
         assert_eq!(environments[0].id, "env-1");
+        assert_eq!(environments[0].label.as_deref(), Some("Local"));
+
+        let selected = autodetect_environment_id(
+            &http,
+            &base_url,
+            &HeaderMap::new(),
+            Some("local".to_owned()),
+        )
+        .await
+        .expect("environment should be selected after Git discovery");
+        assert_eq!(selected.id, "env-1");
+        assert_eq!(selected.label.as_deref(), Some("Local"));
+    }
+
+    #[test]
+    fn git_origin_discovery_yields_to_the_async_scheduler() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .expect("runtime");
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocker = runtime.spawn_blocking(move || {
+            started_tx.send(()).expect("signal worker start");
+            release_rx
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .expect("scheduler must release worker");
+        });
+        started_rx.recv().expect("worker started");
+
+        runtime.block_on(async {
+            let finished = std::cell::Cell::new(false);
+            let discovery = async {
+                let origins = get_git_origins().await.expect("Git discovery");
+                finished.set(true);
+                origins
+            };
+            let observer = async {
+                let completed_before_yield = finished.get();
+                release_tx.send(()).expect("release Git worker");
+                assert!(
+                    !completed_before_yield,
+                    "Git discovery must yield before running synchronous commands"
+                );
+            };
+            let (origins, ()) = tokio::join!(biased; discovery, observer);
+            blocker.await.expect("blocking worker");
+            assert!(origins.windows(2).all(|pair| pair[0] < pair[1]));
+        });
     }
 
     #[test]
@@ -217,7 +263,11 @@ mod tests {
     }
 }
 
-fn get_git_origins() -> Vec<String> {
+async fn get_git_origins() -> anyhow::Result<Vec<String>> {
+    Ok(tokio::task::spawn_blocking(read_git_origins).await?)
+}
+
+fn read_git_origins() -> Vec<String> {
     // Prefer: git config --get-regexp remote\..*\.url
     let out = std::process::Command::new("git")
         .args(["config", "--get-regexp", "remote\\..*\\.url"])
@@ -307,7 +357,7 @@ pub async fn list_environments(
     base_url: &CloudBaseUrl,
     headers: &HeaderMap,
 ) -> anyhow::Result<Vec<crate::app::EnvironmentRow>> {
-    let origins = get_git_origins();
+    let origins = get_git_origins().await?;
     list_environments_with_origins(http, base_url, headers, &origins).await
 }
 

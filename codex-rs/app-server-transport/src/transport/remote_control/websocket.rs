@@ -64,6 +64,7 @@ use tokio_tungstenite::connect_async_tls_with_config;
 use tokio_tungstenite::tungstenite;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::AbortOnDropHandle;
 
 #[cfg(test)]
 use super::RemoteControlEnrollmentState;
@@ -1393,10 +1394,24 @@ pub(super) async fn connect_remote_control_websocket(
     WebSocketStream<MaybeTlsStream<TcpStream>>,
     tungstenite::http::Response<()>,
 )> {
-    ensure_rustls_crypto_provider();
-    let connector = maybe_build_rustls_client_config_with_custom_ca()
-        .map_err(io::Error::from)?
-        .map(Connector::Rustls);
+    // CA reads and native-root initialization may block. Keep them off the
+    // connection task, before enrollment can change state or contact the server.
+    let prepare_connector = AbortOnDropHandle::new(tokio::task::spawn_blocking(|| {
+        ensure_rustls_crypto_provider();
+        maybe_build_rustls_client_config_with_custom_ca()
+    }));
+    let connector =
+        tokio::time::timeout(REMOTE_CONTROL_WEBSOCKET_CONNECT_TIMEOUT, prepare_connector)
+            .await
+            .map_err(|_| {
+                io::Error::new(
+                    ErrorKind::TimedOut,
+                    "timed out preparing remote control websocket TLS configuration",
+                )
+            })?
+            .map_err(io::Error::other)?
+            .map_err(io::Error::from)?
+            .map(Connector::Rustls);
 
     let (auth, enrollment) = {
         let mut current_enrollment = current_enrollment.lock().await;
@@ -2552,6 +2567,158 @@ mod tests {
                 .expect("auth change watch should remain open"),
             "recovery's own auth reload should not wake the reconnect loop"
         );
+    }
+
+    #[test]
+    fn custom_ca_preparation_is_responsive_and_precedes_enrollment() -> io::Result<()> {
+        const CHILD: &str = "CODEX_TEST_REMOTE_CONTROL_CA_PREPARATION";
+        const TEST: &str = "transport::remote_control::websocket::tests::custom_ca_preparation_is_responsive_and_precedes_enrollment";
+        const PASSED: &str = "REMOTE_CONTROL_CA_PREPARATION_VERIFIED";
+        if std::env::var_os(CHILD).is_none() {
+            let home = TempDir::new()?;
+            std::fs::write(
+                home.path().join("missing-ca.pem"),
+                include_str!("../../../../http-client/tests/fixtures/test-ca.pem"),
+            )?;
+            let output = std::process::Command::new(std::env::current_exe()?)
+                .args(["--exact", TEST, "--nocapture"])
+                .env(CHILD, "1")
+                .env("CODEX_HOME", home.path())
+                .env("CODEX_CA_CERTIFICATE", home.path().join("missing-ca.pem"))
+                .env_remove("SSL_CERT_FILE")
+                .output()?;
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "{stdout}\n{stderr}");
+            assert!(
+                stdout.contains(PASSED),
+                "child assertions must run: {stdout}"
+            );
+            return Ok(());
+        }
+
+        // Build the auth fixture with a valid CA, then remove it so the normal
+        // connection boundary, rather than fixture construction, sees the failure.
+        let auth_manager = remote_control_auth_manager();
+        let http_clients = test_http_clients();
+        std::fs::remove_file(
+            std::env::var_os("CODEX_CA_CERTIFICATE").expect("child CA path is configured"),
+        )?;
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()?
+            .block_on(async {
+                for case in ["invalid-ca", "deadline", "cancel"] {
+                    let listener = TcpListener::bind("127.0.0.1:0").await?;
+                    let target =
+                        normalize_remote_control_url(&remote_control_url_for_listener(&listener))?;
+                    let mut auth_recovery = auth_manager.unauthorized_recovery();
+                    let mut auth_change_rx = auth_manager.auth_change_receiver();
+                    let expected_enrollment =
+                        remote_control_enrollment(Some(TEST_REMOTE_CONTROL_SERVER_TOKEN));
+                    let current_enrollment =
+                        test_current_enrollment(Some(expected_enrollment.clone()));
+                    let (status_publisher, status_rx) = remote_control_status_channel();
+                    let desired_state_tx = enabled_desired_state_sender();
+                    let persistence_lock = Semaphore::new(1);
+                    let (entered_tx, entered_rx) = oneshot::channel();
+                    let (release_tx, release_rx) = std::sync::mpsc::channel();
+                    let blocker = tokio::task::spawn_blocking(move || {
+                        entered_tx.send(()).expect("worker admission receiver");
+                        let _ = release_rx.recv_timeout(Duration::from_secs(5));
+                    });
+                    entered_rx.await.expect("blocking worker must be occupied");
+
+                    let mut connect = Box::pin(connect_remote_control_websocket(
+                        &target,
+                        /*state_db*/ None,
+                        RemoteControlAuthContext {
+                            auth_manager: &auth_manager,
+                            auth_recovery: &mut auth_recovery,
+                            auth_change_rx: &mut auth_change_rx,
+                        },
+                        &current_enrollment,
+                        RemoteControlConnectOptions {
+                            installation_id: TEST_INSTALLATION_ID,
+                            server_name: "test-server",
+                            subscribe_cursor: None,
+                            app_server_client_name: None,
+                            desired_state_tx: &desired_state_tx,
+                            desired_state_persistence_lock: &persistence_lock,
+                            http_clients: &http_clients,
+                        },
+                        &status_publisher,
+                    ));
+                    assert!(
+                        futures::poll!(&mut connect).is_pending(),
+                        "CA preparation must wait for its blocking worker"
+                    );
+                    assert!(
+                        timeout(Duration::from_millis(20), &mut connect)
+                            .await
+                            .is_err(),
+                        "executor timer must progress while CA preparation waits"
+                    );
+                    assert_eq!(
+                        current_enrollment.snapshot(),
+                        Some(expected_enrollment.clone())
+                    );
+                    assert!(!status_rx.has_changed().expect("status channel open"));
+
+                    if case == "invalid-ca" {
+                        release_tx.send(()).expect("release CA worker");
+                        let error = connect
+                            .await
+                            .expect_err("missing CA must fail before enrollment");
+                        assert!(
+                            error
+                                .to_string()
+                                .contains("Failed to read CA certificate file"),
+                            "{error}"
+                        );
+                        assert!(error.to_string().contains("missing-ca.pem"), "{error}");
+                    } else {
+                        if case == "deadline" {
+                            tokio::time::pause();
+                            tokio::time::advance(REMOTE_CONTROL_WEBSOCKET_CONNECT_TIMEOUT).await;
+                            let error = connect
+                                .await
+                                .expect_err("CA preparation must have a deadline");
+                            assert_eq!(error.kind(), ErrorKind::TimedOut);
+                            assert!(
+                                error
+                                    .to_string()
+                                    .contains("preparing remote control websocket TLS")
+                            );
+                            tokio::time::resume();
+                        } else {
+                            drop(connect);
+                        }
+                        release_tx.send(()).expect("release occupied worker");
+                    }
+                    blocker.await.expect("worker completed");
+                    tokio::task::spawn_blocking(|| {})
+                        .await
+                        .expect("drain blocking queue");
+                    assert_eq!(
+                        current_enrollment.snapshot(),
+                        Some(expected_enrollment),
+                        "CA failure/cancellation must not clear enrollment"
+                    );
+                    assert!(!status_rx.has_changed().expect("status channel open"));
+                    assert!(desired_state_tx.borrow().is_enabled());
+                    assert!(
+                        timeout(Duration::from_millis(20), listener.accept())
+                            .await
+                            .is_err(),
+                        "CA failure/cancellation must not reach enrollment or websocket network I/O"
+                    );
+                }
+                Ok::<(), io::Error>(())
+            })?;
+        println!("{PASSED}");
+        Ok(())
     }
 
     #[tokio::test]

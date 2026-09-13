@@ -4082,7 +4082,7 @@ async fn make_test_app() -> App {
         initial_history_replay_buffer: None,
         enhanced_keys_supported: false,
         keymap: crate::keymap::RuntimeKeymap::defaults(),
-        commit_anim_running: Arc::new(AtomicBool::new(false)),
+        commit_animation_task: None,
         status_line_invalid_items_warned: Arc::new(AtomicBool::new(false)),
         terminal_title_invalid_items_warned: Arc::new(AtomicBool::new(false)),
         skill_load_warnings: SkillLoadWarningState::default(),
@@ -4149,7 +4149,7 @@ async fn make_test_app_with_channels() -> (
             initial_history_replay_buffer: None,
             enhanced_keys_supported: false,
             keymap: crate::keymap::RuntimeKeymap::defaults(),
-            commit_anim_running: Arc::new(AtomicBool::new(false)),
+            commit_animation_task: None,
             status_line_invalid_items_warned: Arc::new(AtomicBool::new(false)),
             terminal_title_invalid_items_warned: Arc::new(AtomicBool::new(false)),
             skill_load_warnings: SkillLoadWarningState::default(),
@@ -7968,7 +7968,9 @@ async fn overridden_remote_features_preserve_known_values_and_reject_malformed_u
 #[cfg(windows)]
 #[tokio::test]
 async fn desktop_open_event_waits_without_blocking_and_reports_process_result() -> Result<()> {
-    for rejected in [false, true] {
+    for outcome in ["success", "rejected", "timeout"] {
+        let rejected = outcome == "rejected";
+        let timed_out = outcome == "timeout";
         let (mut app, mut events, mut op_rx) = Box::pin(make_test_app_with_channels()).await;
         let mut app_server = start_config_write_test_app_server(&app).await?;
         let mut tui = crate::tui::test_support::make_test_tui()?;
@@ -7992,8 +7994,8 @@ async fn desktop_open_event_waits_without_blocking_and_reports_process_result() 
             // Only replace the external program. App dispatch, process waiting and visible
             // success/error handling are production code; this script never launches Desktop.
             let script = format!(
-                "[IO.File]::WriteAllText('{ready_literal}', 'ready'); \
-                 $deadline = [DateTime]::UtcNow.AddSeconds(5); \
+                "[IO.File]::WriteAllText('{ready_literal}', $PID.ToString()); \
+                 $deadline = [DateTime]::UtcNow.AddSeconds(60); \
                  while (-not (Test-Path -LiteralPath '{release_literal}')) {{ \
                    if ([DateTime]::UtcNow -gt $deadline) {{ exit 92 }}; \
                    Start-Sleep -Milliseconds 10 \
@@ -8031,7 +8033,13 @@ async fn desktop_open_event_waits_without_blocking_and_reports_process_result() 
             op_rx.try_recv().is_err(),
             "opening Desktop must not modify the thread"
         );
-        tokio::fs::write(&release, b"release").await?;
+        if timed_out {
+            tokio::time::pause();
+            tokio::time::advance(std::time::Duration::from_secs(15)).await;
+            tokio::time::resume();
+        } else {
+            tokio::fs::write(&release, b"release").await?;
+        }
         tokio::time::timeout(std::time::Duration::from_secs(5), opening)
             .await
             .expect("released child must finish")?;
@@ -8045,7 +8053,23 @@ async fn desktop_open_event_waits_without_blocking_and_reports_process_result() 
             .map(ToString::to_string)
             .collect::<Vec<_>>()
             .join("\n");
-        if rejected {
+        if timed_out {
+            assert!(text.contains("Failed to open this session in Codex Desktop: timed out waiting for the Codex Desktop launcher."), "{text:?}");
+            assert!(!text.contains("Opened this session"), "{text:?}");
+            let launcher_pid: u32 = tokio::fs::read_to_string(&ready).await?.parse()?;
+            let script = format!(
+                "$deadline = [DateTime]::UtcNow.AddSeconds(5); \
+                 while (Get-Process -Id {launcher_pid} -ErrorAction SilentlyContinue) {{ \
+                   if ([DateTime]::UtcNow -gt $deadline) {{ exit 1 }}; \
+                   Start-Sleep -Milliseconds 10 \
+                 }}"
+            );
+            let status = tokio::process::Command::new("powershell.exe")
+                .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+                .status()
+                .await?;
+            assert!(status.success(), "timed-out launcher must be terminated");
+        } else if rejected {
             assert!(text.contains("Failed to open this session in Codex Desktop: controlled opener rejection. Install or launch Codex Desktop and try again."), "{text:?}");
             assert!(!text.contains("Opened this session"), "{text:?}");
         } else {
@@ -8062,5 +8086,63 @@ async fn desktop_open_event_waits_without_blocking_and_reports_process_result() 
         );
         app_server.shutdown().await?;
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn commit_animation_events_stop_on_restart_and_app_drop() -> Result<()> {
+    let (mut app, mut events, _op_rx) = Box::pin(make_test_app_with_channels()).await;
+    let mut app_server = start_config_write_test_app_server(&app).await?;
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    while events.try_recv().is_ok() {}
+    tokio::time::pause();
+
+    for event in [AppEvent::StartCommitAnimation, AppEvent::StartCommitAnimation] {
+        app.handle_event(&mut tui, &mut app_server, event).await?;
+    }
+    // Receive through the channel so the producer and Tokio's rounded timer
+    // deadline are polled before checking its observable output.
+    assert!(matches!(
+        tokio::time::timeout(COMMIT_ANIMATION_TICK * 2, events.recv()).await?,
+        Some(AppEvent::CommitTick)
+    ));
+    assert!(
+        tokio::time::timeout(COMMIT_ANIMATION_TICK / 2, events.recv()).await.is_err(),
+        "duplicate start must not add a worker"
+    );
+
+    // Restart without yielding: the old sleeping worker must not be revived.
+    app.handle_event(&mut tui, &mut app_server, AppEvent::StopCommitAnimation).await?;
+    app.handle_event(&mut tui, &mut app_server, AppEvent::StartCommitAnimation).await?;
+    assert!(matches!(
+        tokio::time::timeout(COMMIT_ANIMATION_TICK * 2, events.recv()).await?,
+        Some(AppEvent::CommitTick)
+    ));
+    assert!(
+        tokio::time::timeout(COMMIT_ANIMATION_TICK * 3 / 4, events.recv()).await.is_err(),
+        "restart must retain exactly one worker"
+    );
+
+    app.handle_event(&mut tui, &mut app_server, AppEvent::StopCommitAnimation).await?;
+    assert!(
+        tokio::time::timeout(COMMIT_ANIMATION_TICK * 3, events.recv()).await.is_err(),
+        "stop must prevent later ticks"
+    );
+
+    app.handle_event(&mut tui, &mut app_server, AppEvent::StartCommitAnimation).await?;
+    assert!(matches!(
+        tokio::time::timeout(COMMIT_ANIMATION_TICK * 2, events.recv()).await?,
+        Some(AppEvent::CommitTick)
+    ));
+    drop(app);
+    assert!(
+        matches!(
+            tokio::time::timeout(COMMIT_ANIMATION_TICK * 3, events.recv()).await,
+            Err(_) | Ok(None)
+        ),
+        "dropping App must stop its animation producer"
+    );
+    tokio::time::resume();
+    app_server.shutdown().await?;
     Ok(())
 }

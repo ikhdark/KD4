@@ -281,12 +281,15 @@ async fn resume_includes_initial_messages_from_reasoning_events() -> Result<()> 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn resume_preserves_persisted_model_and_base_instructions() -> Result<()> {
+async fn resume_preserves_persisted_model_and_refreshes_base_instructions() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
+    const PERSISTED_INSTRUCTIONS: &str = "Preserve this specific instruction across cold resume.";
+    const RESUMED_INSTRUCTIONS: &str = "Use these current instructions after cold resume.";
     let server = start_mock_server().await;
     let mut builder = test_codex().with_config(|config| {
         config.model = Some("gpt-5.2".to_string());
+        config.base_instructions = Some(PERSISTED_INSTRUCTIONS.to_string());
     });
     let initial = builder.build(&server).await?;
     let codex = Arc::clone(&initial.codex);
@@ -323,12 +326,11 @@ async fn resume_preserves_persisted_model_and_base_instructions() -> Result<()> 
     )
     .await;
 
-    let initial_body = initial_mock.single_request().body_json();
-    let initial_instructions = initial_body
-        .get("instructions")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string();
+    assert_eq!(
+        initial_mock.single_request().instructions_text(),
+        PERSISTED_INSTRUCTIONS
+    );
+    codex.shutdown_and_wait().await?;
 
     let resumed_mock = mount_sse_sequence(
         &server,
@@ -349,6 +351,7 @@ async fn resume_preserves_persisted_model_and_base_instructions() -> Result<()> 
 
     let mut resume_builder = test_codex().with_config(|config| {
         config.model = Some("gpt-5.4".to_string());
+        config.base_instructions = Some(RESUMED_INSTRUCTIONS.to_string());
     });
     let resumed = resume_builder.resume(&server, home, rollout_path).await?;
     resumed
@@ -395,7 +398,7 @@ async fn resume_preserves_persisted_model_and_base_instructions() -> Result<()> 
     assert_eq!(requests.len(), 2, "expected two resumed requests");
 
     let first_resumed = &requests[0];
-    assert_eq!(first_resumed.instructions_text(), initial_instructions);
+    assert_eq!(first_resumed.instructions_text(), RESUMED_INSTRUCTIONS);
     assert_eq!(first_resumed.body_json()["model"].as_str(), Some("gpt-5.2"));
     let first_developer_texts = first_resumed.message_input_texts("developer");
     let first_model_switch_count = first_developer_texts
@@ -408,7 +411,7 @@ async fn resume_preserves_persisted_model_and_base_instructions() -> Result<()> 
     );
 
     let second_resumed = &requests[1];
-    assert_eq!(second_resumed.instructions_text(), initial_instructions);
+    assert_eq!(second_resumed.instructions_text(), RESUMED_INSTRUCTIONS);
     assert_eq!(
         second_resumed.body_json()["model"].as_str(),
         Some("gpt-5.2")

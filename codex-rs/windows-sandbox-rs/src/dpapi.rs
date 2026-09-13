@@ -27,6 +27,8 @@ pub fn protect(data: &[u8]) -> Result<Vec<u8>> {
         cbData: 0,
         pbData: std::ptr::null_mut(),
     };
+    // SAFETY: in_blob borrows data for the call with a checked u32 length; out_blob is writable
+    // output storage and optional inputs are null.
     let ok = unsafe {
         CryptProtectData(
             &mut in_blob,
@@ -44,8 +46,15 @@ pub fn protect(data: &[u8]) -> Result<Vec<u8>> {
             GetLastError()
         }));
     }
-    let slice =
-        unsafe { std::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize) }.to_vec();
+    let slice = if out_blob.cbData == 0 {
+        Vec::new()
+    } else {
+        // SAFETY: the successful CryptProtectData call returned a live allocation containing cbData
+        // initialized bytes. Empty output is handled separately so no null slice is formed.
+        unsafe { std::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize) }.to_vec()
+    };
+    // SAFETY: A successful CryptProtectData allocated out_blob.pbData with LocalAlloc; the
+    // copied result no longer borrows it before LocalFree.
     unsafe {
         if !out_blob.pbData.is_null() {
             LocalFree(out_blob.pbData as HLOCAL);
@@ -61,6 +70,8 @@ pub fn unprotect(blob: &[u8]) -> Result<Vec<u8>> {
         cbData: 0,
         pbData: std::ptr::null_mut(),
     };
+    // SAFETY: in_blob borrows blob for the call with a checked u32 length; out_blob is writable
+    // output storage and optional inputs are null.
     let ok = unsafe {
         CryptUnprotectData(
             &mut in_blob,
@@ -78,8 +89,15 @@ pub fn unprotect(blob: &[u8]) -> Result<Vec<u8>> {
             GetLastError()
         }));
     }
-    let slice =
-        unsafe { std::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize) }.to_vec();
+    let slice = if out_blob.cbData == 0 {
+        Vec::new()
+    } else {
+        // SAFETY: the successful CryptUnprotectData call returned a live allocation containing cbData
+        // initialized bytes. Empty output is handled separately so no null slice is formed.
+        unsafe { std::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize) }.to_vec()
+    };
+    // SAFETY: A successful CryptUnprotectData allocated out_blob.pbData with LocalAlloc; the
+    // copied result no longer borrows it before LocalFree.
     unsafe {
         if !out_blob.pbData.is_null() {
             LocalFree(out_blob.pbData as HLOCAL);
@@ -95,10 +113,11 @@ mod tests {
     #[test]
     fn public_dpapi_roundtrip_preserves_binary_input_and_rejects_invalid_ciphertext()
     -> anyhow::Result<()> {
-        let plaintext = b"offline\0credential\xff\x80";
-        let ciphertext = crate::dpapi_protect(plaintext)?;
-        assert_ne!(ciphertext, plaintext);
-        assert_eq!(crate::dpapi_unprotect(&ciphertext)?, plaintext);
+        for plaintext in [b"offline\0credential\xff\x80".as_slice(), b"".as_slice()] {
+            let ciphertext = crate::dpapi_protect(plaintext)?;
+            assert_ne!(ciphertext, plaintext);
+            assert_eq!(crate::dpapi_unprotect(&ciphertext)?, plaintext);
+        }
         let error = crate::dpapi_unprotect(b"not a DPAPI ciphertext")
             .expect_err("invalid ciphertext must fail");
         assert!(error.to_string().contains("CryptUnprotectData failed"));

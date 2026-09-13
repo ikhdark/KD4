@@ -1745,11 +1745,11 @@ impl ContextManager {
 
     fn invalidate_prepared_history(&mut self) {
         self.projection_revision = self.projection_revision.saturating_add(1);
-        *self
-            .prepared_history
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-        self.clear_item_token_estimates();
+        // Prompt preparation may still be using a cloned history snapshot. Detach
+        // this revision's caches instead of waiting for that snapshot's cache locks
+        // while a tool dispatch holds the session state lock.
+        self.prepared_history = Arc::new(StdMutex::new(None));
+        self.item_token_estimates = Arc::new(StdMutex::new(HashMap::new()));
     }
 }
 

@@ -70,15 +70,17 @@ mod tests {
 
     #[test]
     fn windows_path_comparison_is_ascii_case_insensitive() {
-        assert!(path_values_equal(
-            PathBuf::from(r"C:\Users\Codex").as_path(),
-            PathBuf::from(r"c:\users\codex").as_path(),
-            true,
+        assert!(paths_match_after_normalization(
+            r"C:\missing\Codex",
+            r"c:\MISSING\codex",
         ));
-        assert!(!path_values_equal(
-            PathBuf::from("Alpha").as_path(),
-            PathBuf::from("alpha").as_path(),
-            false,
+        assert!(!paths_match_after_normalization(
+            r"C:\missing\Codex",
+            r"c:\missing\other",
+        ));
+        assert!(!paths_match_after_normalization(
+            r"C:\missing\Ä",
+            r"c:\missing\ä",
         ));
     }
 

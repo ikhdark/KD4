@@ -316,6 +316,68 @@ async fn pipe_process_round_trips_stdin() -> anyhow::Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pipe_writer_closes_after_child_closes_stdin() -> anyhow::Result<()> {
+    use anyhow::Context;
+
+    let python = find_python()
+        .ok_or_else(|| anyhow::anyhow!("Python is required to verify native pipe stdin closure"))?;
+    // Launch the interpreter itself: a Python launcher can retain the inherited stdin
+    // handle after its interpreter child closes fd 0.
+    let interpreter = std::process::Command::new(&python)
+        .args([
+            "-c",
+            "import sys; sys.stdout.buffer.write(sys.executable.encode('utf-8'))",
+        ])
+        .output()
+        .context("resolve the Python interpreter for the pipe closure fixture")?;
+    anyhow::ensure!(
+        interpreter.status.success(),
+        "Python interpreter resolution failed: {}",
+        String::from_utf8_lossy(&interpreter.stderr)
+    );
+    let python =
+        String::from_utf8(interpreter.stdout).context("Python interpreter path must be UTF-8")?;
+    anyhow::ensure!(
+        !python.is_empty(),
+        "Python reported an empty interpreter path"
+    );
+    let marker = "__CODEX_STDIN_CLOSED__";
+    let args = vec![
+        "-c".to_string(),
+        format!("import os,time; os.close(0); print('{marker}', flush=True); time.sleep(30)"),
+    ];
+    let env_map: HashMap<String, String> = std::env::vars().collect();
+    let spawned = spawn_pipe_process(&python, &args, Path::new("."), &env_map, &None).await?;
+    let (session, mut output_rx, exit_rx) = combine_spawned_output(spawned);
+    wait_for_output_contains(&mut output_rx, marker, 5_000).await?;
+    assert_eq!(
+        session.exit_code(),
+        None,
+        "the child must remain alive after closing stdin"
+    );
+
+    let writer = session.writer_sender();
+    writer
+        .send(b"first write discovers closure".to_vec())
+        .await?;
+    tokio::time::timeout(std::time::Duration::from_secs(5), writer.closed())
+        .await
+        .context("pipe writer did not close after the native child closed stdin")?;
+    assert!(writer.send(b"must not be accepted".to_vec()).await.is_err());
+    assert_eq!(
+        session.exit_code(),
+        None,
+        "input closure must not terminate the child"
+    );
+
+    session.request_terminate()?;
+    tokio::time::timeout(std::time::Duration::from_secs(5), exit_rx)
+        .await
+        .context("pipe child did not exit after explicit termination")??;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pipe_and_pty_share_interface() -> anyhow::Result<()> {
     let env_map: HashMap<String, String> = std::env::vars().collect();
 

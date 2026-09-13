@@ -89,6 +89,7 @@ use updates::updates_check;
 
 const OPENAI_BETA_HEADER: &str = "OpenAI-Beta";
 const WEBSOCKET_IMMEDIATE_CLOSE_GRACE: Duration = Duration::from_millis(250);
+const DNS_LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
 const SLOW_CHECK_PROGRESS_THRESHOLD: Duration = Duration::from_secs(2);
 const SLOW_CHECK_PROGRESS_INTERVAL: Duration = Duration::from_secs(1);
 const PROXY_ENV_VARS: &[&str] = &[
@@ -2389,8 +2390,8 @@ fn auth_mode_name(auth: &CodexAuth) -> &'static str {
 }
 
 async fn dns_address_family_details(host: &str, port: u16) -> Vec<String> {
-    match tokio::net::lookup_host((host, port)).await {
-        Ok(addresses) => {
+    match tokio::time::timeout(DNS_LOOKUP_TIMEOUT, tokio::net::lookup_host((host, port))).await {
+        Ok(Ok(addresses)) => {
             let addresses = addresses.collect::<Vec<_>>();
             let ipv4_count = addresses
                 .iter()
@@ -2411,7 +2412,8 @@ async fn dns_address_family_details(host: &str, port: u16) -> Vec<String> {
                 "DNS: {ipv4_count} IPv4, {ipv6_count} IPv6, first {first_family}"
             )]
         }
-        Err(err) => vec![format!("DNS: lookup failed ({err})")],
+        Ok(Err(err)) => vec![format!("DNS: lookup failed ({err})")],
+        Err(_) => vec!["DNS: lookup timed out".to_string()],
     }
 }
 
@@ -3077,6 +3079,52 @@ mod tests {
             progress_impl.events(),
             vec!["begin test".to_string(), "finish test Warning".to_string()]
         );
+    }
+
+    #[test]
+    fn websocket_reachability_reports_a_stalled_resolver() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let codex_home = tempfile::tempdir().expect("codex home");
+            let mut config = Config::load_default_with_cli_overrides_for_codex_home(
+                codex_home.path().to_path_buf(),
+                Vec::new(),
+            )
+            .await
+            .expect("config");
+            config.model_provider.base_url = Some("http://localhost:9/v1".to_string());
+            config.model_provider.supports_websockets = true;
+            config.model_provider.requires_openai_auth = false;
+            config.model_provider.env_key = None;
+            config.model_provider.websocket_connect_timeout_ms = Some(50);
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let occupied = tokio::task::spawn_blocking(move || {
+                started_tx.send(()).expect("worker started");
+                let _ = release_rx.recv_timeout(Duration::from_secs(5));
+            });
+            started_rx.await.expect("worker occupied");
+            // A hostname uses the real blocking resolver, which must queue behind
+            // the occupied worker. Literal IPs would bypass that boundary.
+            let check = websocket_reachability_check(&config, None).await;
+            let _ = release_tx.send(());
+            occupied.await.expect("release worker");
+            assert_eq!(check.id, "network.websocket_reachability");
+            assert_eq!(check.status, CheckStatus::Warning);
+            assert!(check.details.contains(&"DNS: lookup timed out".to_string()));
+            assert!(
+                check
+                    .details
+                    .contains(&"endpoint: ws://localhost:9/v1/responses".to_string())
+            );
+
+            let details = dns_address_family_details("127.0.0.1", 443).await;
+            assert_eq!(details, vec!["DNS: 1 IPv4, 0 IPv6, first IPv4".to_string()]);
+        });
     }
 
     #[test]

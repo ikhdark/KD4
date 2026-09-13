@@ -94,6 +94,9 @@ impl PrivateDesktop {
         let mut rng = SmallRng::from_os_rng();
         let name = format!("CodexSandboxDesktop-{:x}", rng.random::<u128>());
         let name_wide = to_wide(&name);
+        // SAFETY: name_wide is a live NUL-terminated buffer; null device, mode and security
+        // arguments request defaults, and the returned desktop handle is checked before
+        // use.
         let handle = unsafe {
             CreateDesktopW(
                 name_wide.as_ptr(),
@@ -105,6 +108,8 @@ impl PrivateDesktop {
             )
         };
         if handle.is_null() {
+            // SAFETY: Read the thread-local error immediately after CreateDesktopW reports failure;
+            // the call takes no pointers.
             let err = unsafe { GetLastError() } as i32;
             logging::debug_log(
                 &format!(
@@ -117,6 +122,8 @@ impl PrivateDesktop {
             return Err(anyhow::anyhow!("CreateDesktopW failed: {err}"));
         }
 
+        // SAFETY: handle is the successfully created desktop and remains owned here while its ACL
+        // is updated; failure closes it before ownership could reach PrivateDesktop.
         unsafe {
             if let Err(err) = grant_desktop_access(handle, logs_base_dir) {
                 let _ = CloseDesktop(handle);
@@ -133,8 +140,9 @@ impl PrivateDesktop {
 
 unsafe fn grant_desktop_access(handle: HDESK, logs_base_dir: Option<&Path>) -> Result<()> {
     let token = get_current_token_for_restriction()?;
-    let mut logon_sid = get_logon_sid_bytes(token)?;
+    let logon_sid = get_logon_sid_bytes(token);
     CloseHandle(token);
+    let mut logon_sid = logon_sid?;
 
     let entries = [EXPLICIT_ACCESS_W {
         grfAccessPermissions: DESKTOP_ALL_ACCESS,
@@ -194,6 +202,8 @@ unsafe fn grant_desktop_access(handle: HDESK, logs_base_dir: Option<&Path>) -> R
 impl Drop for PrivateDesktop {
     fn drop(&mut self) {
         let handle = self.handle as HDESK;
+        // SAFETY: PrivateDesktop owns this handle from CreateDesktopW, and Drop releases it once
+        // after the launch lifetime ends.
         unsafe {
             if !handle.is_null() {
                 let _ = CloseDesktop(handle);

@@ -94,8 +94,12 @@ pub fn conpty_supported() -> bool {
 
 fn windows_build_number() -> Option<u32> {
     let ntdll = Ntdll::open(Path::new("ntdll.dll")).ok()?;
+    // SAFETY: OSVERSIONINFOW contains integer and fixed-array fields for which the zero
+    // representation is valid.
     let mut info: OSVERSIONINFOW = unsafe { mem::zeroed() };
     info.dwOSVersionInfoSize = mem::size_of::<OSVERSIONINFOW>() as u32;
+    // SAFETY: info is writable OSVERSIONINFOW storage with its size initialized, and ntdll
+    // keeps the function pointer loaded for this call.
     let status = unsafe { (ntdll.RtlGetVersion)(&mut info) };
     if status == STATUS_SUCCESS {
         Some(info.dwBuildNumber)
@@ -112,11 +116,18 @@ pub struct PsuedoCon {
     _output: FileDescriptor,
 }
 
+// SAFETY: The pseudoconsole and its pipe handles are process-owned resources with no creator-
+// thread affinity; moving this sole owner preserves their lifetime and exclusive cleanup.
 unsafe impl Send for PsuedoCon {}
+// SAFETY: Shared methods only read the owned handle and issue Win32 resize or process-creation
+// requests. They do not mutate Rust fields, and exclusive Drop prevents closing the
+// pseudoconsole while borrowed.
 unsafe impl Sync for PsuedoCon {}
 
 impl Drop for PsuedoCon {
     fn drop(&mut self) {
+        // SAFETY: self owns the successfully created pseudoconsole; its retained input and
+        // output handles are dropped only after this call.
         unsafe { (CONPTY.ClosePseudoConsole)(self.con) };
     }
 }
@@ -128,6 +139,8 @@ impl PsuedoCon {
 
     pub fn new(size: COORD, input: FileDescriptor, output: FileDescriptor) -> Result<Self, Error> {
         let mut con: HPCON = INVALID_HANDLE_VALUE;
+        // SAFETY: input and output own live pipe handles; con is writable HPCON storage, and
+        // both pipes are retained in Self on success.
         let result = unsafe {
             (CONPTY.CreatePseudoConsole)(
                 size,
@@ -149,6 +162,8 @@ impl PsuedoCon {
     }
 
     pub fn resize(&self, size: COORD) -> Result<(), Error> {
+        // SAFETY: self owns the live pseudoconsole for this call; dimensions are scalar values
+        // validated by Windows.
         let result = unsafe { (CONPTY.ResizePseudoConsole)(self.con, size) };
         ensure!(
             result == S_OK,
@@ -162,6 +177,8 @@ impl PsuedoCon {
 
     pub fn spawn_command(&self, cmd: CommandBuilder) -> anyhow::Result<WinChild> {
         let job = Arc::new(JobObject::create()?);
+        // SAFETY: STARTUPINFOEXW is an integer-and-pointer Windows structure with a valid all-
+        // zero initial representation.
         let mut si: STARTUPINFOEXW = unsafe { mem::zeroed() };
         si.StartupInfo.cb = mem::size_of::<STARTUPINFOEXW>() as u32;
         si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
@@ -174,6 +191,8 @@ impl PsuedoCon {
         attrs.set_job(job.as_raw_handle().cast())?;
         si.lpAttributeList = attrs.as_mut_ptr();
 
+        // SAFETY: PROCESS_INFORMATION contains integer and handle fields for which the zero
+        // initial representation is valid.
         let mut pi: PROCESS_INFORMATION = unsafe { mem::zeroed() };
 
         let (mut exe, mut cmdline) = build_cmdline(&cmd)?;
@@ -182,6 +201,9 @@ impl PsuedoCon {
         let cwd = resolve_current_directory(&cmd);
         let mut env_block = build_environment_block(&cmd);
 
+        // SAFETY: exe, cmdline, cwd, and env_block are terminated buffers retained for the
+        // call; si and pi are initialized writable structures and attrs retains the console/job
+        // attributes.
         let res = unsafe {
             CreateProcessW(
                 exe.as_mut_ptr(),
@@ -208,7 +230,11 @@ impl PsuedoCon {
             bail!("{msg}");
         }
 
+        // SAFETY: Successful CreateProcessW returned this new thread handle, whose sole
+        // ownership is transferred to OwnedHandle.
         let _main_thread = unsafe { OwnedHandle::from_raw_handle(pi.hThread as _) };
+        // SAFETY: Successful CreateProcessW returned this new process handle, whose sole
+        // ownership is transferred to OwnedHandle.
         let proc = unsafe { OwnedHandle::from_raw_handle(pi.hProcess as _) };
 
         Ok(WinChild::new(proc, job))

@@ -61,7 +61,7 @@ async fn apply_diff(diff: &str, cwd: Option<PathBuf>) -> anyhow::Result<()> {
         revert: false,
         preflight: false,
     };
-    let res = apply_git_patch(&req)?;
+    let res = tokio::task::spawn_blocking(move || apply_git_patch(&req)).await??;
     if res.exit_code != 0 {
         anyhow::bail!(
             "Git apply failed (applied={}, skipped={}, conflicts={})\nstdout:\n{}\nstderr:\n{}",

@@ -3,6 +3,8 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 use serde::Deserialize;
 use std::ffi::OsStr;
 use std::fs;
+use std::io;
+use std::io::Read;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
@@ -115,15 +117,26 @@ fn pack_npm_package(
 }
 
 fn find_npm_package_archive(destination: &Path) -> Result<PathBuf, String> {
-    let mut archives = fs::read_dir(destination)
-        .map_err(|err| format!("failed to read npm pack destination: {err}"))?
-        .filter_map(std::result::Result::ok)
-        .filter_map(|entry| {
-            let path = entry.path();
-            let is_file = entry.file_type().is_ok_and(|file_type| file_type.is_file());
-            (is_file && path.extension() == Some(OsStr::new("tgz"))).then_some(path)
-        })
-        .collect::<Vec<_>>();
+    let entries = fs::read_dir(destination)
+        .map_err(|err| format!("failed to read npm pack destination: {err}"))?;
+    find_npm_package_archive_in(entries)
+}
+
+fn find_npm_package_archive_in(
+    entries: impl IntoIterator<Item = io::Result<fs::DirEntry>>,
+) -> Result<PathBuf, String> {
+    let mut archives = Vec::new();
+    for entry in entries {
+        let entry =
+            entry.map_err(|err| format!("failed to read npm pack destination entry: {err}"))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|err| format!("failed to inspect npm pack destination entry: {err}"))?;
+        let path = entry.path();
+        if file_type.is_file() && path.extension() == Some(OsStr::new("tgz")) {
+            archives.push(path);
+        }
+    }
     if archives.len() != 1 {
         return Err(format!(
             "npm pack completed with {} package archives; expected exactly one",
@@ -134,7 +147,10 @@ fn find_npm_package_archive(destination: &Path) -> Result<PathBuf, String> {
 }
 
 fn read_npm_package_archive(archive_path: &Path) -> Result<Vec<u8>, String> {
-    let archive_size = fs::metadata(archive_path)
+    let archive = fs::File::open(archive_path)
+        .map_err(|err| format!("failed to open npm package archive: {err}"))?;
+    let archive_size = archive
+        .metadata()
         .map_err(|err| format!("failed to inspect npm package archive: {err}"))?
         .len();
     if archive_size > NPM_PLUGIN_SOURCE_MAX_ARCHIVE_BYTES {
@@ -142,7 +158,21 @@ fn read_npm_package_archive(archive_path: &Path) -> Result<Vec<u8>, String> {
             "npm package archive is {archive_size} bytes, exceeding maximum size of {NPM_PLUGIN_SOURCE_MAX_ARCHIVE_BYTES} bytes"
         ));
     }
-    fs::read(archive_path).map_err(|err| format!("failed to read npm package archive: {err}"))
+    read_npm_package_archive_bytes(archive)
+}
+
+fn read_npm_package_archive_bytes(reader: impl Read) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::new();
+    reader
+        .take(NPM_PLUGIN_SOURCE_MAX_ARCHIVE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|err| format!("failed to read npm package archive: {err}"))?;
+    if bytes.len() as u64 > NPM_PLUGIN_SOURCE_MAX_ARCHIVE_BYTES {
+        return Err(format!(
+            "npm package archive exceeds maximum size of {NPM_PLUGIN_SOURCE_MAX_ARCHIVE_BYTES} bytes"
+        ));
+    }
+    Ok(bytes)
 }
 
 fn validate_npm_package_metadata(plugin_root: &Path, package: &str) -> Result<(), String> {
@@ -175,4 +205,130 @@ fn validate_npm_package_metadata(plugin_root: &Path, package: &str) -> Result<()
 
 fn npm_command() -> &'static str {
     "npm.cmd"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn archive_inventory_rejects_an_error_after_a_discovered_archive() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("package.tgz"), b"archive").unwrap();
+        let archive = fs::read_dir(directory.path()).unwrap().next().unwrap();
+        let error = io::Error::new(io::ErrorKind::PermissionDenied, "incomplete inventory");
+        let result = find_npm_package_archive_in([archive, Err(error)]);
+        assert!(result.unwrap_err().contains("incomplete inventory"));
+    }
+
+    #[test]
+    fn archive_reader_rejects_growth_and_stops_after_the_size_sentinel() {
+        let mut reader = Cursor::new(vec![0; NPM_PLUGIN_SOURCE_MAX_ARCHIVE_BYTES as usize + 32]);
+        let result = read_npm_package_archive_bytes(&mut reader);
+        assert!(result.unwrap_err().contains("exceeds maximum size"));
+        assert_eq!(reader.position(), NPM_PLUGIN_SOURCE_MAX_ARCHIVE_BYTES + 1);
+        assert_eq!(
+            read_npm_package_archive_bytes(Cursor::new(b"archive")).unwrap(),
+            b"archive"
+        );
+    }
+
+    #[cfg(windows)]
+    fn fake_npm(directory: &Path, package_name: &str, extra_archive: bool) -> PathBuf {
+        let archive_path = directory.join("fixture.tgz");
+        let encoder = flate2::write::GzEncoder::new(
+            fs::File::create(&archive_path).unwrap(),
+            flate2::Compression::default(),
+        );
+        let mut archive = tar::Builder::new(encoder);
+        let metadata = serde_json::json!({ "name": package_name }).to_string();
+        let mut header = tar::Header::new_gnu();
+        header.set_size(metadata.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        archive
+            .append_data(&mut header, "package/package.json", metadata.as_bytes())
+            .unwrap();
+        archive.into_inner().unwrap().finish().unwrap();
+        let command = directory.join("npm.cmd");
+        let extra = if extra_archive {
+            "copy /y package.tgz other.tgz >nul\r\n"
+        } else {
+            ""
+        };
+        fs::write(
+            &command,
+            format!(
+                "@echo off\r\ncopy /y \"{}\" package.tgz >nul\r\n{extra}exit /b 0\r\n",
+                archive_path.display()
+            ),
+        )
+        .unwrap();
+        command
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn npm_materialization_validates_package_and_keeps_staging_until_drop() {
+        let directory = tempfile::tempdir().unwrap();
+        let command = fake_npm(directory.path(), "@test/plugin", false);
+        let (plugin, staging) = materialize_npm_plugin_source_with_command(
+            directory.path(),
+            "@test/plugin",
+            Some("1.0.0"),
+            None,
+            command.as_os_str(),
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(plugin.as_path().join("package.json")).unwrap(),
+            r#"{"name":"@test/plugin"}"#
+        );
+        assert!(plugin.as_path().starts_with(staging.path()));
+        drop(staging);
+        assert!(!plugin.as_path().exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn npm_materialization_rejects_invalid_inventory_metadata_and_size_without_staging() {
+        for (package_name, extra_archive, oversized, expected_error) in [
+            (
+                "wrong-package",
+                false,
+                false,
+                "does not match requested package",
+            ),
+            ("@test/plugin", true, false, "2 package archives"),
+            ("@test/plugin", false, true, "exceeding maximum size"),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let command = fake_npm(directory.path(), package_name, extra_archive);
+            if oversized {
+                fs::OpenOptions::new()
+                    .write(true)
+                    .open(directory.path().join("fixture.tgz"))
+                    .unwrap()
+                    .set_len(NPM_PLUGIN_SOURCE_MAX_ARCHIVE_BYTES + 1)
+                    .unwrap();
+            }
+            let error = materialize_npm_plugin_source_with_command(
+                directory.path(),
+                "@test/plugin",
+                None,
+                None,
+                command.as_os_str(),
+            )
+            .unwrap_err();
+            assert!(error.contains(expected_error), "{error}");
+            assert_eq!(
+                fs::read_dir(directory.path().join(NPM_PLUGIN_SOURCE_STAGING_DIR))
+                    .unwrap()
+                    .count(),
+                0,
+                "rejected materialization must not retain extracted or staged files"
+            );
+        }
+    }
 }

@@ -406,6 +406,98 @@ mod tests {
             .expect("processor should join");
     }
 
+    #[test]
+    fn registered_http_route_bounds_preparation_and_releases_stream_reservation() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let registry = SessionRegistry::new(crate::ExecServerTelemetry::default());
+            let (mut writer, mut lines, task) = spawn_test_connection(registry, "http-preparation");
+            send_request(
+                &mut writer,
+                1,
+                INITIALIZE_METHOD,
+                &InitializeParams {
+                    client_name: "http-preparation-test".into(),
+                    resume_session_id: None,
+                },
+            )
+            .await;
+            let _: InitializeResponse = read_response(&mut lines, 1).await;
+            send_notification(&mut writer, INITIALIZED_METHOD, &()).await;
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("listener");
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                let _ = started_tx.send(());
+                let _ = release_rx.recv();
+            });
+            started_rx.await.expect("worker occupied");
+            let mut results = Vec::new();
+            // Reusing the streaming request ID must reach preparation again, proving failed
+            // preparation released the handler's stream reservation through normal routing.
+            for id in [2, 3] {
+                send_request(
+                    &mut writer,
+                    id,
+                    crate::protocol::HTTP_REQUEST_METHOD,
+                    &crate::protocol::HttpRequestParams {
+                        method: "GET".into(),
+                        url: format!(
+                            "http://{}/must-not-send",
+                            listener.local_addr().expect("address")
+                        ),
+                        headers: Vec::new(),
+                        body: None,
+                        timeout_ms: Some(50),
+                        redirect_policy: crate::protocol::HttpRedirectPolicy::Follow,
+                        request_id: "reusable-stream".into(),
+                        stream_response: true,
+                    },
+                )
+                .await;
+                results.push(timeout(Duration::from_millis(500), lines.next_line()).await);
+            }
+            release_tx.send(()).expect("release worker");
+            blocker.await.expect("worker joined");
+            tokio::task::spawn_blocking(|| ())
+                .await
+                .expect("queued preparation drained");
+            for (id, result) in [2, 3].into_iter().zip(results) {
+                let line = result
+                    .expect("request deadline must return through router")
+                    .expect("read response")
+                    .expect("response line");
+                let message: JSONRPCMessage = serde_json::from_str(&line).expect("decode response");
+                let JSONRPCMessage::Error(error) = message else {
+                    panic!("expected timeout error: {message:?}");
+                };
+                assert_eq!(error.id, RequestId::Integer(id));
+                assert_eq!(
+                    error.error.message,
+                    "http/request timed out preparing HTTP client"
+                );
+            }
+            assert!(
+                timeout(Duration::from_millis(50), listener.accept())
+                    .await
+                    .is_err(),
+                "expired routed requests must not connect after preparation resumes"
+            );
+            drop(writer);
+            drop(lines);
+            timeout(Duration::from_secs(1), task)
+                .await
+                .expect("processor exits")
+                .expect("processor joins");
+        });
+    }
+
     #[tokio::test]
     async fn transport_disconnect_detaches_session_during_in_flight_read() {
         let registry = SessionRegistry::new(crate::ExecServerTelemetry::default());

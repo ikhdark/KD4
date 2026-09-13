@@ -7,6 +7,7 @@ use super::start_control_socket_acceptor;
 use codex_app_server_protocol::JSONRPCMessage;
 use codex_app_server_protocol::JSONRPCNotification;
 use codex_core::config::find_codex_home;
+use codex_uds::UnixListener;
 use codex_uds::UnixStream;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use futures::SinkExt;
@@ -59,6 +60,19 @@ fn listen_unix_socket_accepts_relative_custom_path() {
 async fn control_socket_acceptor_upgrades_and_forwards_websocket_text_messages_and_pings() {
     let temp_dir = tempfile::TempDir::new().expect("temp dir");
     let socket_path = test_socket_path(temp_dir.path());
+    codex_uds::prepare_private_socket_directory(socket_path.parent().expect("socket parent"))
+        .await
+        .expect("socket directory");
+    let stale_listener = UnixListener::bind(socket_path.as_path())
+        .await
+        .expect("create stale socket");
+    drop(stale_listener);
+    assert!(
+        tokio::fs::try_exists(socket_path.as_path())
+            .await
+            .expect("stale socket metadata"),
+        "the restart must exercise replacement of an existing socket path"
+    );
     let (transport_event_tx, mut transport_event_rx) =
         mpsc::channel::<TransportEvent>(CHANNEL_CAPACITY);
     let shutdown_token = CancellationToken::new();
@@ -140,7 +154,43 @@ async fn control_socket_acceptor_upgrades_and_forwards_websocket_text_messages_a
 
     shutdown_token.cancel();
     accept_handle.await.expect("acceptor should join");
-    assert_socket_path_removed(socket_path.as_path());
+    assert_socket_path_removed(socket_path.as_path()).await;
+}
+
+#[tokio::test]
+async fn control_socket_acceptor_preserves_an_active_listener() {
+    let temp_dir = tempfile::TempDir::new().expect("temp dir");
+    let socket_path = test_socket_path(temp_dir.path());
+    let (transport_event_tx, _transport_event_rx) =
+        mpsc::channel::<TransportEvent>(CHANNEL_CAPACITY);
+    let shutdown_token = CancellationToken::new();
+    let accept_handle = start_control_socket_acceptor(
+        socket_path.clone(),
+        transport_event_tx.clone(),
+        shutdown_token.clone(),
+    )
+    .await
+    .expect("first acceptor should start");
+
+    let error = start_control_socket_acceptor(
+        socket_path.clone(),
+        transport_event_tx,
+        CancellationToken::new(),
+    )
+    .await
+    .expect_err("an active socket must not be replaced");
+    assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
+    let stream = connect_to_socket(socket_path.as_path())
+        .await
+        .expect("original listener must remain reachable");
+    let (mut websocket, response) = client_async("ws://localhost/rpc", stream)
+        .await
+        .expect("original listener still handles websocket handshakes");
+    assert_eq!(response.status().as_u16(), 101);
+    websocket.close(None).await.expect("close client");
+    shutdown_token.cancel();
+    accept_handle.await.expect("acceptor should join");
+    assert_socket_path_removed(socket_path.as_path()).await;
 }
 
 #[tokio::test]
@@ -196,7 +246,7 @@ async fn control_socket_shutdown_closes_incomplete_websocket_handshakes() {
         ),
         Ok(count) => panic!("shutdown must close the socket, not deliver {count} bytes"),
     }
-    assert_socket_path_removed(socket_path.as_path());
+    assert_socket_path_removed(socket_path.as_path()).await;
 }
 
 #[tokio::test]
@@ -252,7 +302,11 @@ async fn connect_to_socket(socket_path: &Path) -> IoResult<UnixStream> {
     UnixStream::connect(socket_path).await
 }
 
-fn assert_socket_path_removed(_socket_path: &Path) {
-    // uds_windows uses a regular filesystem path as its rendezvous point,
-    // but there is no Unix socket filesystem node to assert on.
+async fn assert_socket_path_removed(socket_path: &Path) {
+    assert!(
+        !tokio::fs::try_exists(socket_path)
+            .await
+            .expect("socket metadata after shutdown"),
+        "shutdown must remove the socket rendezvous path"
+    );
 }

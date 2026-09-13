@@ -152,6 +152,9 @@ pub(crate) fn prepare_legacy_session_security(
     capability_roots: impl IntoIterator<Item = PathBuf>,
 ) -> Result<LegacySessionSecurity> {
     let caps = load_or_create_cap_sids(codex_home)?;
+    // SAFETY: LocalSid owners retain every capability SID through token construction. The base
+    // token is closed before propagating construction failure, and the successful
+    // restricted token transfers to LegacySessionSecurity.
     let (h_token, readonly_sid, readonly_sid_str, write_root_sids) = unsafe {
         if uses_write_capabilities {
             let write_root_sids = root_capability_sids(codex_home, cwd, capability_roots)?;
@@ -269,6 +272,8 @@ pub(crate) fn allow_null_device_for_workspace_write(is_workspace_write: bool) {
         return;
     }
 
+    // SAFETY: The base token stays open while its SID is copied; tmp retains that valid SID through
+    // the synchronous NUL-device update, and the token is closed afterward.
     unsafe {
         if let Ok(base) = get_current_token_for_restriction() {
             if let Ok(bytes) = get_logon_sid_bytes(base) {
@@ -293,6 +298,8 @@ pub(crate) fn apply_legacy_session_acl_rules(
 ) -> Result<()> {
     let AllowDenyPaths { allow, mut deny } =
         compute_allow_paths_for_permissions(permissions, current_dir, env_map);
+    // SAFETY: LegacyAclSids borrows LocalSid owners that outlive these synchronous ACL operations,
+    // so the readonly and root-capability pointers remain valid throughout each call.
     unsafe {
         for path in additional_deny_write_paths {
             // Explicit carveouts must exist before the command starts so the
@@ -462,6 +469,8 @@ pub(crate) fn prepare_elevated_spawn_context_for_permissions(
         sandbox_capability_sid_strings(uses_write_capabilities, write_root_sids, &caps.readonly);
     let psid_to_use = LocalSid::from_string(&cap_sids[0])?;
 
+    // SAFETY: psid_to_use owns the valid converted SID until the synchronous NUL-device ACL update
+    // has returned.
     unsafe {
         allow_null_device(psid_to_use.as_ptr());
     }
@@ -832,6 +841,9 @@ mod tests {
             )?;
             assert_eq!(root_sids.len(), 1);
             let has_write_deny = || -> anyhow::Result<bool> {
+                // SAFETY: The fetched descriptor keeps its DACL live for the comparison, and
+                // root_sids retains the valid comparison SID; the descriptor is released
+                // after the query.
                 unsafe {
                     let (dacl, descriptor) = crate::acl::fetch_dacl_handle(&protected)?;
                     let denied =

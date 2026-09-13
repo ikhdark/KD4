@@ -396,7 +396,7 @@ fn layer_mtimes_changed(layers: &[LayerMtime]) -> bool {
     layers.iter().any(|layer| {
         let metadata = std::fs::metadata(&layer.path).ok();
         match (metadata.and_then(|m| m.modified().ok()), layer.mtime) {
-            (Some(new_mtime), Some(old_mtime)) => new_mtime > old_mtime,
+            (Some(new_mtime), Some(old_mtime)) => new_mtime != old_mtime,
             (Some(_), None) => true,
             (None, Some(_)) => true,
             (None, None) => false,

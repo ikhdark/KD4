@@ -12,6 +12,54 @@ use pretty_assertions::assert_eq;
 use tempfile::tempdir;
 use toml::Value as TomlValue;
 
+#[tokio::test(flavor = "current_thread")]
+async fn async_project_trust_write_yields_while_persistence_lock_is_held() {
+    let tmp = tempdir().expect("tmpdir");
+    let project = tempdir().expect("project");
+    let config_path = tmp.path().join(CONFIG_TOML_FILE);
+    let initial = "model = \"existing-model\"\n";
+    std::fs::write(&config_path, initial).expect("seed config");
+    let lock = acquire_atomic_write_lock(&config_path).expect("hold persistence lock");
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let lock_holder = std::thread::spawn(move || {
+        // The timeout only releases a regressed blocking implementation so the
+        // test can fail instead of deadlocking its single runtime thread.
+        let released_by_runtime = release_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .is_ok();
+        drop(lock);
+        released_by_runtime
+    });
+
+    let apply = ConfigEditsBuilder::new(tmp.path())
+        .set_project_trust_level(project.path(), TrustLevel::Trusted)
+        .apply();
+    tokio::pin!(apply);
+    let first_poll = std::future::poll_fn(|cx| {
+        std::task::Poll::Ready(std::future::Future::poll(apply.as_mut(), cx))
+    })
+    .await;
+    let before_release = std::fs::read_to_string(&config_path).expect("read locked config");
+    let _ = release_tx.send(());
+    assert!(
+        lock_holder.join().expect("lock holder"),
+        "the async writer must yield so its runtime can release the lock"
+    );
+    assert!(first_poll.is_pending());
+    assert_eq!(before_release, initial);
+    apply.await.expect("persist project trust");
+
+    let persisted: TomlValue =
+        toml::from_str(&std::fs::read_to_string(config_path).expect("read persisted config"))
+            .expect("parse persisted config");
+    assert_eq!(persisted["model"].as_str(), Some("existing-model"));
+    let project_key = codex_config::loader::project_trust_key(project.path());
+    assert_eq!(
+        persisted["projects"][&project_key]["trust_level"].as_str(),
+        Some("trusted")
+    );
+}
+
 #[test]
 fn expected_version_is_compared_under_the_persistence_lock() {
     let tmp = tempdir().expect("tmpdir");

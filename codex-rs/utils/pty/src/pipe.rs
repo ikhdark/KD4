@@ -110,12 +110,16 @@ fn duplicate_process_handle(process: RawHandle) -> io::Result<OwnedHandle> {
     {
         return duplicate(process);
     }
+    // SAFETY: The sole caller keeps its Child alive through duplication, so this borrowed
+    // process handle remains valid until try_clone_to_owned returns.
     unsafe { BorrowedHandle::borrow_raw(process) }.try_clone_to_owned()
 }
 
 #[cfg(windows)]
 fn terminate_process(process: &OwnedHandle) -> io::Result<()> {
     let success =
+        // SAFETY: process owns the live process handle for the entire TerminateProcess call;
+        // Windows validates its access rights.
         unsafe { winapi::um::processthreadsapi::TerminateProcess(process.as_raw_handle() as _, 1) };
     if success == 0 {
         Err(io::Error::last_os_error())
@@ -171,16 +175,21 @@ async fn spawn_process_with_stdin_mode(
         command.arg0(arg0);
     }
     #[cfg(target_os = "linux")]
+    // SAFETY: getpid takes no pointers and has no memory or lifetime preconditions.
     let parent_pid = unsafe { libc::getpid() };
     #[cfg(unix)]
-    let inherited_fds = inherited_fds.to_vec();
+    let mut inherited_fds = inherited_fds.to_vec();
     #[cfg(unix)]
+    inherited_fds.sort_unstable();
+    #[cfg(unix)]
+    // SAFETY: The child callback uses only native process setup and async-signal-safe
+    // descriptor marking; its descriptor vector is allocated and sorted before fork.
     unsafe {
         command.pre_exec(move || {
             crate::process_group::detach_from_tty()?;
             #[cfg(target_os = "linux")]
             crate::process_group::set_parent_death_signal(parent_pid)?;
-            crate::pty::close_inherited_fds_except(&inherited_fds);
+            crate::pty::mark_inherited_fds_cloexec_except(&inherited_fds);
             Ok(())
         });
     }
@@ -272,8 +281,9 @@ async fn finish_pipe_process_setup(
         tokio::spawn(async move {
             let mut writer = stdin;
             while let Some(bytes) = writer_rx.recv().await {
-                let _ = writer.write_all(&bytes).await;
-                let _ = writer.flush().await;
+                if writer.write_all(&bytes).await.is_err() || writer.flush().await.is_err() {
+                    break;
+                }
             }
         })
     } else {

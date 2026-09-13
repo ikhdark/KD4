@@ -496,7 +496,11 @@ fn summarize_json(value: &Value) -> String {
     let mut summary =
         serde_json::to_string(value).unwrap_or_else(|_| "<unserializable json>".to_string());
     if summary.len() > MAX_JSON_SUMMARY_LEN {
-        summary.truncate(MAX_JSON_SUMMARY_LEN);
+        let mut end = MAX_JSON_SUMMARY_LEN;
+        while !summary.is_char_boundary(end) {
+            end -= 1;
+        }
+        summary.truncate(end);
         summary.push_str("...");
     }
     summary

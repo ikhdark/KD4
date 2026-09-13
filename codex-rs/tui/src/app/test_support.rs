@@ -40,7 +40,7 @@ pub(super) async fn make_test_app() -> App {
         initial_history_replay_buffer: None,
         enhanced_keys_supported: false,
         keymap: crate::keymap::RuntimeKeymap::defaults(),
-        commit_anim_running: Arc::new(AtomicBool::new(false)),
+        commit_animation_task: None,
         status_line_invalid_items_warned: Arc::new(AtomicBool::new(false)),
         terminal_title_invalid_items_warned: Arc::new(AtomicBool::new(false)),
         skill_load_warnings: SkillLoadWarningState::default(),

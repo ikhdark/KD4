@@ -5,7 +5,6 @@ use std::fs::OpenOptions;
 use std::io::BufRead;
 use std::io::BufReader;
 use std::io::Write;
-use std::net::TcpStream;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Child;
@@ -73,16 +72,15 @@ use codex_protocol::dynamic_tools::normalize_dynamic_tool_specs;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::W3cTraceContext;
 use codex_utils_cli::CliConfigOverrides;
+use futures::SinkExt;
+use futures::StreamExt;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use tokio_tungstenite::tungstenite::Message;
 use tracing::info_span;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use tungstenite::Message;
-use tungstenite::WebSocket;
-use tungstenite::connect;
-use tungstenite::stream::MaybeTlsStream;
 use url::Url;
 use uuid::Uuid;
 
@@ -1366,6 +1364,173 @@ fn parse_dynamic_tools_arg(dynamic_tools: &Option<String>) -> Result<Option<Vec<
     Ok(Some(tools))
 }
 
+enum WebSocketOperation {
+    Read(mpsc::Sender<Result<Message>>),
+    Send(Message, mpsc::Sender<Result<()>>),
+}
+
+/// Own the async socket and runtime together so connection cancellation closes
+/// the socket, including during proxy, TLS, and HTTP handshakes. The rest of the
+/// interactive client keeps its synchronous request/response interface.
+struct BlockingWebSocket {
+    operations: Option<mpsc::Sender<WebSocketOperation>>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl BlockingWebSocket {
+    fn connect(url: &str) -> Result<Self> {
+        Self::connect_with_runtime(url, Duration::from_secs(10), || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+        })
+    }
+
+    fn connect_with_runtime(
+        url: &str,
+        timeout: Duration,
+        build_runtime: impl FnOnce() -> std::io::Result<tokio::runtime::Runtime> + Send + 'static,
+    ) -> Result<Self> {
+        let (operations_tx, operations_rx) = mpsc::channel();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let url = url.to_string();
+        let worker = thread::spawn(move || {
+            let runtime = match build_runtime() {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    // If the receiver has gone away, there is no caller left to report to.
+                    let _ = ready_tx.send(Err(anyhow::Error::from(error)));
+                    return;
+                }
+            };
+            let connection = runtime.block_on(async {
+                let mut last_error = None;
+                let result = tokio::time::timeout(timeout, async {
+                    loop {
+                        let mut target = url.clone();
+                        // Blocking tungstenite::connect followed up to three redirects.
+                        for redirect in 0..=3 {
+                            match tokio_tungstenite::connect_async_with_config(
+                                target.as_str(),
+                                None,
+                                true,
+                            )
+                            .await
+                            {
+                                Ok((socket, _response)) => return socket,
+                                Err(tokio_tungstenite::tungstenite::Error::Http(response))
+                                    if response.status().is_redirection() && redirect < 3 =>
+                                {
+                                    let Some(location) = response.headers().get("Location") else {
+                                        last_error = Some(
+                                            tokio_tungstenite::tungstenite::Error::Http(response),
+                                        );
+                                        break;
+                                    };
+                                    let Ok(location) = location.to_str() else {
+                                        last_error = Some(
+                                            tokio_tungstenite::tungstenite::Error::Http(response),
+                                        );
+                                        break;
+                                    };
+                                    target = location.to_string();
+                                }
+                                Err(error) => {
+                                    last_error = Some(error);
+                                    break;
+                                }
+                            }
+                        }
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                })
+                .await;
+                match result {
+                    Ok(socket) => Ok(socket),
+                    Err(error) => Err(last_error
+                        .map(anyhow::Error::from)
+                        .unwrap_or_else(|| error.into()))
+                    .context("websocket connection deadline expired"),
+                }
+            });
+            let mut socket = match connection {
+                Ok(socket) => socket,
+                Err(error) => {
+                    // A timed-out connect has dropped its owned socket futures.
+                    // An already-running OS DNS lookup cannot be cancelled; do
+                    // not make runtime teardown extend the caller's deadline.
+                    runtime.shutdown_timeout(Duration::ZERO);
+                    let _ = ready_tx.send(Err(error));
+                    return;
+                }
+            };
+            if ready_tx.send(Ok(())).is_err() {
+                return;
+            }
+            while let Ok(operation) = operations_rx.recv() {
+                match operation {
+                    WebSocketOperation::Read(response) => {
+                        let result = runtime
+                            .block_on(socket.next())
+                            .context("websocket stream ended")
+                            .and_then(|result| result.map_err(anyhow::Error::from));
+                        if response.send(result).is_err() {
+                            break;
+                        }
+                    }
+                    WebSocketOperation::Send(message, response) => {
+                        let result = runtime
+                            .block_on(socket.send(message))
+                            .map_err(anyhow::Error::from);
+                        if response.send(result).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        let client = Self {
+            operations: Some(operations_tx),
+            worker: Some(worker),
+        };
+        ready_rx
+            .recv()
+            .context("websocket connection worker stopped")??;
+        Ok(client)
+    }
+
+    fn read(&self) -> Result<Message> {
+        let (response, receiver) = mpsc::channel();
+        self.operations
+            .as_ref()
+            .context("websocket worker closed")?
+            .send(WebSocketOperation::Read(response))
+            .context("websocket worker stopped")?;
+        receiver.recv().context("websocket read worker stopped")?
+    }
+
+    fn send(&self, message: Message) -> Result<()> {
+        let (response, receiver) = mpsc::channel();
+        self.operations
+            .as_ref()
+            .context("websocket worker closed")?
+            .send(WebSocketOperation::Send(message, response))
+            .context("websocket worker stopped")?;
+        receiver.recv().context("websocket write worker stopped")?
+    }
+}
+
+impl Drop for BlockingWebSocket {
+    fn drop(&mut self) {
+        drop(self.operations.take());
+        if let Some(worker) = self.worker.take()
+            && worker.join().is_err()
+        {
+            eprintln!("websocket client worker panicked");
+        }
+    }
+}
+
 enum ClientTransport {
     Stdio {
         child: std::sync::Arc<std::sync::Mutex<Child>>,
@@ -1374,7 +1539,7 @@ enum ClientTransport {
     },
     WebSocket {
         url: String,
-        socket: Box<WebSocket<MaybeTlsStream<TcpStream>>>,
+        socket: Box<BlockingWebSocket>,
     },
 }
 
@@ -1481,22 +1646,11 @@ impl CodexClient {
 
     fn connect_websocket(url: &str) -> Result<Self> {
         let parsed = Url::parse(url).with_context(|| format!("invalid websocket URL `{url}`"))?;
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let (socket, _response) = loop {
-            match connect(parsed.as_str()) {
-                Ok(result) => break result,
-                Err(err) => {
-                    if Instant::now() >= deadline {
-                        return Err(err).with_context(|| {
-                            format!(
-                                "failed to connect to websocket app-server at `{url}`; if no server is running, start one with `codex-app-server-test-client serve --listen {url}`"
-                            )
-                        });
-                    }
-                    thread::sleep(Duration::from_millis(50));
-                }
-            }
-        };
+        let socket = BlockingWebSocket::connect(parsed.as_str()).with_context(|| {
+            format!(
+                "failed to connect to websocket app-server at `{url}`; if no server is running, start one with `codex-app-server-test-client serve --listen {url}`"
+            )
+        })?;
         Ok(Self {
             transport: ClientTransport::WebSocket {
                 url: url.to_string(),
@@ -2303,8 +2457,6 @@ impl Drop for CodexClient {
 
 #[cfg(test)]
 mod tests {
-    use super::NOTIFICATIONS_TO_OPT_OUT;
-
     #[test]
     fn background_app_server_reports_bound_port_and_accepts_initialization() {
         use super::*;
@@ -2440,8 +2592,209 @@ mod tests {
     }
 
     #[test]
-    fn retired_file_change_output_delta_is_not_requested() {
-        assert!(!NOTIFICATIONS_TO_OPT_OUT.contains(&"item/fileChange/outputDelta"));
+    fn websocket_connection_deadline_does_not_wait_for_blocked_dns_worker() {
+        use super::*;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind DNS target");
+        listener
+            .set_nonblocking(true)
+            .expect("observe absent connection");
+        let port = listener.local_addr().expect("DNS target port").port();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .expect("single resolver worker runtime");
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let blocker = runtime.spawn_blocking(move || {
+            started_tx
+                .send(())
+                .expect("announce occupied resolver worker");
+            release_rx.recv().expect("release resolver worker");
+        });
+        started_rx.recv().expect("resolver worker is occupied");
+        let (result_tx, result_rx) = mpsc::channel();
+        let caller = thread::spawn(move || {
+            let result = BlockingWebSocket::connect_with_runtime(
+                &format!("ws://localhost:{port}"),
+                Duration::from_millis(100),
+                || Ok(runtime),
+            );
+            result_tx
+                .send(result.map(|_| ()))
+                .expect("return connection result");
+        });
+        // Capture the result before releasing the blocking worker. An ordinary
+        // Runtime drop would keep the caller waiting here after its timeout.
+        let result = result_rx.recv_timeout(Duration::from_secs(2));
+        release_tx.send(()).expect("release test-owned blocker");
+        caller.join().expect("join connection caller");
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("blocker join runtime")
+            .block_on(blocker)
+            .expect("join test-owned blocking job");
+        let connection = listener.accept();
+        let error = result
+            .expect("caller deadline does not wait for DNS teardown")
+            .expect_err("queued hostname resolution cannot establish a connection");
+        assert!(
+            format!("{error:#}").contains("websocket connection deadline expired"),
+            "{error:#}"
+        );
+        assert!(
+            matches!(connection, Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "expiry must not start a later TCP connection"
+        );
+    }
+
+    #[test]
+    fn websocket_connection_deadline_closes_stalled_handshake() {
+        use super::*;
+        use std::io::Read;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind stalled peer");
+        let address = listener.local_addr().expect("stalled peer address");
+        let peer = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept normal client connection");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(12)))
+                .expect("bound regression peer");
+            let mut reader = BufReader::new(stream);
+            let mut request_line = String::new();
+            reader
+                .read_line(&mut request_line)
+                .expect("read upgrade request");
+            assert!(request_line.starts_with("GET / HTTP/1.1"), "{request_line}");
+            loop {
+                let mut header = String::new();
+                assert_ne!(
+                    reader.read_line(&mut header).expect("read upgrade headers"),
+                    0
+                );
+                if header == "\r\n" {
+                    break;
+                }
+            }
+            // Never answer the handshake. The connection deadline must close
+            // the owned socket; the original blocking connect waits until this
+            // independent 12-second peer timeout and fails both assertions.
+            let mut byte = [0];
+            reader.read(&mut byte)
+        });
+        let started = Instant::now();
+        let error = match CodexClient::connect(&Endpoint::ConnectWs(format!("ws://{address}")), &[])
+        {
+            Ok(_) => panic!("a stalled handshake cannot establish a client"),
+            Err(error) => error,
+        };
+        let elapsed = started.elapsed();
+        let peer_result = peer.join().expect("join stalled peer");
+        assert!(
+            format!("{error:#}").contains("websocket connection deadline expired"),
+            "{error:#}"
+        );
+        assert!(elapsed >= Duration::from_secs(10), "{elapsed:?}");
+        assert!(elapsed < Duration::from_secs(12), "{elapsed:?}");
+        assert_eq!(
+            peer_result.expect("deadline closes the connection before peer timeout"),
+            0
+        );
+    }
+
+    #[test]
+    fn initialize_advertises_supported_notification_opt_outs_and_finishes_handshake() {
+        use super::*;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback peer");
+        let address = listener.local_addr().expect("bound peer address");
+        let codex_home = tempfile::tempdir().expect("peer codex home");
+        let response_home = codex_home.path().to_path_buf();
+        let peer = thread::spawn(move || {
+            let (redirect_stream, _) = listener.accept().expect("accept initial connection");
+            redirect_stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("bound redirect request");
+            let mut redirect_reader = BufReader::new(redirect_stream);
+            loop {
+                let mut header = String::new();
+                assert_ne!(
+                    redirect_reader
+                        .read_line(&mut header)
+                        .expect("read redirect request"),
+                    0
+                );
+                if header == "\r\n" {
+                    break;
+                }
+            }
+            write!(redirect_reader.get_mut(), "HTTP/1.1 302 Found\r\nLocation: ws://{address}/redirected\r\nContent-Length: 0\r\n\r\n")
+                .expect("redirect to the actual websocket peer");
+            drop(redirect_reader);
+            let (stream, _) = listener.accept().expect("accept client connection");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("bound peer reads");
+            stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .expect("bound peer writes");
+            let mut socket = tungstenite::accept(stream).expect("accept websocket handshake");
+            let request: Value = serde_json::from_str(
+                socket
+                    .read()
+                    .expect("receive initialize request")
+                    .to_text()
+                    .expect("initialize is a text frame"),
+            )
+            .expect("initialize is JSON");
+            socket
+                .send(tungstenite::Message::Text(
+                    serde_json::json!({
+                        "id": request["id"],
+                        "result": {
+                            "userAgent": "loopback-initialize-peer",
+                            "codexHome": response_home,
+                            "platformFamily": "windows",
+                            "platformOs": "windows"
+                        }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .expect("send initialize response");
+            let initialized: Value = serde_json::from_str(
+                socket
+                    .read()
+                    .expect("receive initialized notification")
+                    .to_text()
+                    .expect("initialized is a text frame"),
+            )
+            .expect("initialized is JSON");
+            (request, initialized)
+        });
+
+        let mut client = CodexClient::connect(&Endpoint::ConnectWs(format!("ws://{address}")), &[])
+            .expect("connect production client to loopback peer");
+        let response = client.initialize().expect("complete initialize handshake");
+        let (request, initialized) = peer.join().expect("loopback peer completes");
+
+        assert_eq!(response.user_agent, "loopback-initialize-peer");
+        assert_eq!(response.codex_home.as_path(), codex_home.path());
+        assert_eq!(request["method"], "initialize");
+        assert_eq!(request["params"]["capabilities"]["experimentalApi"], true);
+        assert_eq!(
+            request["params"]["capabilities"]["optOutNotificationMethods"],
+            serde_json::json!([
+                "command/exec/outputDelta",
+                "item/agentMessage/delta",
+                "item/plan/delta",
+                "item/reasoning/summaryTextDelta",
+                "item/reasoning/textDelta"
+            ]),
+            "the actual initialize request must advertise supported methods and omit retired ones"
+        );
+        assert_eq!(initialized, serde_json::json!({ "method": "initialized" }));
     }
     /// Real stdio peer; the production deadline owns/terminates it just like its app-server child.
     pub(super) fn smoke_deadline_client(log: &std::path::Path, body: &str) -> super::CodexClient {

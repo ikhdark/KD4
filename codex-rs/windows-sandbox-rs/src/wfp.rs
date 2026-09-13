@@ -214,6 +214,8 @@ struct Engine {
 impl Engine {
     fn open() -> Result<Self> {
         let session_name = to_wide(OsStr::new(SESSION_NAME));
+        // SAFETY: FWPM_SESSION0 contains integers and nullable pointers, so zero is valid
+        // initialization before the live display-name pointer and timeout are assigned.
         let mut session: FWPM_SESSION0 = unsafe { zeroed() };
         session.displayData = FWPM_DISPLAY_DATA0 {
             name: session_name.as_ptr() as *mut _,
@@ -222,6 +224,9 @@ impl Engine {
         session.txnWaitTimeoutInMSec = INFINITE;
 
         let mut handle = HANDLE::default();
+        // SAFETY: session_name is NUL-terminated and retained through engine creation; session and
+        // the handle output slot are valid, and the returned engine is immediately owned by
+        // Engine.
         let result = unsafe {
             FwpmEngineOpen0(
                 null(),
@@ -236,6 +241,8 @@ impl Engine {
     }
 
     fn begin_transaction(&self) -> Result<Transaction<'_>> {
+        // SAFETY: self retains the open engine handle throughout transaction creation; the returned
+        // Transaction borrows Engine to preserve that lifetime.
         let result = unsafe { FwpmTransactionBegin0(self.handle, 0) };
         ensure_success(result, "FwpmTransactionBegin0")?;
         Ok(Transaction {
@@ -247,6 +254,8 @@ impl Engine {
 
 impl Drop for Engine {
     fn drop(&mut self) {
+        // SAFETY: Engine owns the handle from successful FwpmEngineOpen0; all Transaction borrows
+        // have ended before its single close in Drop.
         unsafe {
             FwpmEngineClose0(self.handle);
         }
@@ -261,6 +270,8 @@ struct Transaction<'a> {
 
 impl Transaction<'_> {
     fn commit(&mut self) -> Result<()> {
+        // SAFETY: Transaction borrows its live Engine and represents a successfully begun
+        // transaction; commitment changes no engine ownership.
         let result = unsafe { FwpmTransactionCommit0(self.engine.handle) };
         ensure_success(result, "FwpmTransactionCommit0")?;
         self.committed = true;
@@ -271,6 +282,8 @@ impl Transaction<'_> {
 impl Drop for Transaction<'_> {
     fn drop(&mut self) {
         if !self.committed {
+            // SAFETY: The uncommitted Transaction still borrows its live Engine, so its native
+            // transaction can be aborted before that engine is closed.
             unsafe {
                 FwpmTransactionAbort0(self.engine.handle);
             }
@@ -287,7 +300,11 @@ struct UserMatchCondition {
 impl UserMatchCondition {
     fn for_account(account: &str) -> Result<Self> {
         let account_w = to_wide(OsStr::new(account));
+        // SAFETY: EXPLICIT_ACCESS_W contains integers and nullable pointers; zero is a valid
+        // representation before the native initializer fills it.
         let mut access: EXPLICIT_ACCESS_W = unsafe { zeroed() };
+        // SAFETY: access is writable and account_w is a live NUL-terminated account name; its
+        // borrowed pointer remains live through the descriptor construction below.
         unsafe {
             BuildExplicitAccessWithNameW(
                 &mut access,
@@ -300,6 +317,9 @@ impl UserMatchCondition {
 
         let mut security_descriptor: PSECURITY_DESCRIPTOR = null_mut();
         let mut security_descriptor_len = 0;
+        // SAFETY: The single access record borrows the still-live account name; the descriptor
+        // pointer and length are writable outputs, and UserMatchCondition owns the
+        // successful allocation.
         let result = unsafe {
             BuildSecurityDescriptorW(
                 null(),
@@ -328,6 +348,8 @@ impl UserMatchCondition {
 impl Drop for UserMatchCondition {
     fn drop(&mut self) {
         if !self.security_descriptor.is_null() {
+            // SAFETY: UserMatchCondition owns the converted security descriptor and its blob only
+            // borrows that allocation; Drop frees it once after condition consumers return.
             unsafe {
                 LocalFree(self.security_descriptor as HLOCAL);
             }
@@ -350,6 +372,8 @@ fn ensure_provider(engine: HANDLE) -> Result<()> {
         serviceName: null_mut(),
     };
 
+    // SAFETY: The caller retains the engine; provider strings and provider remain live for
+    // synchronous addition, and null security requests the default descriptor.
     let result = unsafe { FwpmProviderAdd0(engine, &provider, null_mut()) };
     ensure_success_or(result, "FwpmProviderAdd0", &[FWP_E_ALREADY_EXISTS as u32])
 }
@@ -371,6 +395,8 @@ fn ensure_sublayer(engine: HANDLE) -> Result<()> {
         weight: 0x8000,
     };
 
+    // SAFETY: The caller retains the engine; the sublayer strings, provider GUID and structure all
+    // remain live for the synchronous add operation.
     let result = unsafe { FwpmSubLayerAdd0(engine, &sublayer, null_mut()) };
     ensure_success_or(result, "FwpmSubLayerAdd0", &[FWP_E_ALREADY_EXISTS as u32])
 }
@@ -440,6 +466,9 @@ fn add_filter_parts(
     };
 
     let mut filter_id = 0_u64;
+    // SAFETY: The caller retains the engine and user_condition; filter, its condition array, GUIDs
+    // and strings remain live through the synchronous call, and filter_id is a writable
+    // output.
     let result = unsafe { FwpmFilterAdd0(engine, &filter, null_mut(), &mut filter_id) };
     ensure_success(result, &format!("FwpmFilterAdd0({name})"))
 }
@@ -537,6 +566,8 @@ fn build_conditions(
 
 /// Deletes an old copy of a filter before re-adding it.
 fn delete_filter_if_present(engine: HANDLE, key: &GUID) -> Result<()> {
+    // SAFETY: The caller retains the engine and key is a borrowed valid GUID for this synchronous
+    // filter deletion.
     let result = unsafe { FwpmFilterDeleteByKey0(engine, key) };
     ensure_success_or(
         result,
@@ -574,6 +605,8 @@ fn empty_blob() -> FWP_BYTE_BLOB {
 fn empty_value() -> FWP_VALUE0 {
     FWP_VALUE0 {
         r#type: FWP_EMPTY,
+        // SAFETY: The union contains native scalar/pointer representations valid as zero; the
+        // accompanying FWP_EMPTY tag tells the native API not to read a payload.
         Anonymous: unsafe { zeroed() },
     }
 }

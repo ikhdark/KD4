@@ -1293,7 +1293,7 @@ mod tests {
         let command = windows_powershell_path();
 
         assert_parsed(
-            &vec_str(&[command.as_str(), "-NoProfile", "-c", "Write-Host hi"]),
+            &vec_str(&[command.as_str(), "-NoProfile", "-Command", "Write-Host hi"]),
             vec![ParsedCommand::Unknown {
                 cmd: "Write-Host hi".to_string(),
             }],

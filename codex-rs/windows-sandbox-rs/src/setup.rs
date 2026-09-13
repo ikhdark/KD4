@@ -383,6 +383,8 @@ impl SandboxUsersFile {
 }
 
 fn is_elevated() -> Result<bool> {
+    // SAFETY: AllocateAndInitializeSid receives a valid authority and writable SID output; the SID
+    // stays allocated through CheckTokenMembership and is released with FreeSid afterward.
     unsafe {
         let mut administrators_group: *mut c_void = std::ptr::null_mut();
         let ok = AllocateAndInitializeSid(
@@ -811,6 +813,8 @@ fn run_setup_exe(payload: &SetupPayload, needs_elevation: bool, codex_home: &Pat
     let params = quote_arg(&payload_b64);
     let params_w = crate::winutil::to_wide(params);
     let verb_w = crate::winutil::to_wide("runas");
+    // SAFETY: SHELLEXECUTEINFOW contains integer fields and nullable pointers, so zero is a valid
+    // initial representation before required fields are assigned.
     let mut sei: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
     sei.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
     sei.fMask = SEE_MASK_NOCLOSEPROCESS;
@@ -819,8 +823,13 @@ fn run_setup_exe(payload: &SetupPayload, needs_elevation: bool, codex_home: &Pat
     sei.lpParameters = params_w.as_ptr();
     // Hide the window for the elevated helper.
     sei.nShow = 0; // SW_HIDE
+    // SAFETY: sei has its required size and points to live NUL-terminated verb, executable and
+    // parameter buffers; the process handle output remains in sei for checked ownership
+    // below.
     let ok = unsafe { ShellExecuteExW(&mut sei) };
     if ok == 0 || sei.hProcess.is_null() {
+        // SAFETY: Read the thread-local ShellExecuteExW status before any further native call can
+        // replace it; GetLastError takes no pointers.
         let last_error = unsafe { GetLastError() };
         let code = if last_error == ERROR_CANCELLED {
             SetupErrorCode::OrchestratorHelperLaunchCanceled
@@ -832,6 +841,8 @@ fn run_setup_exe(payload: &SetupPayload, needs_elevation: bool, codex_home: &Pat
             format!("ShellExecuteExW failed to launch setup helper: {last_error}"),
         ));
     }
+    // SAFETY: sei.hProcess is the checked successful handle retained by this function; the exit-
+    // code slot is writable, and the handle is closed once after the wait and query.
     unsafe {
         WaitForSingleObject(sei.hProcess, INFINITE);
         let mut code: u32 = 1;

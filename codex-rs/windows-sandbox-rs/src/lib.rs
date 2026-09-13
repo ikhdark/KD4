@@ -538,6 +538,8 @@ mod windows_impl {
     }
 
     fn wait_outcome(process: HANDLE, timeout_ms: u32) -> WaitOutcome {
+        // SAFETY: The capture caller keeps the process handle open through this synchronous wait
+        // and releases it only after wait handling completes.
         let wait_result = unsafe { WaitForSingleObject(process, timeout_ms) };
         match wait_result {
             WAIT_OBJECT_0 => WaitOutcome::Exited,
@@ -645,6 +647,9 @@ mod windows_impl {
     impl Drop for OwnedCapturePipeHandle {
         fn drop(&mut self) {
             if !self.0.is_null() && self.0 != INVALID_HANDLE_VALUE {
+                // SAFETY: OwnedCapturePipeHandle is the sole owner of this transferred pipe end and
+                // closes it once after the reader finishes; invalid sentinel handles are
+                // excluded.
                 unsafe {
                     CloseHandle(self.0);
                 }
@@ -678,6 +683,8 @@ mod windows_impl {
             }
 
             let mut read_bytes = 0u32;
+            // SAFETY: The local handle owner retains the pipe; tmp and read_bytes are writable for
+            // this synchronous read, whose size is bounded by tmp.len().
             let ok = unsafe {
                 windows_sys::Win32::Storage::FileSystem::ReadFile(
                     handle,
@@ -699,6 +706,8 @@ mod windows_impl {
                     false
                 }
             } else {
+                // SAFETY: Read the thread-local error immediately after ReadFile reports failure;
+                // this call takes no pointers.
                 let error = unsafe { GetLastError() };
                 match error {
                     ERROR_BROKEN_PIPE => break,
@@ -928,8 +937,13 @@ mod windows_impl {
                 write_root_sids: &security.write_root_sids,
             },
         )?;
+        // SAFETY: setup_stdio_pipes owns its native allocation steps and returns successful pipe
+        // handles whose cleanup obligations are handled below.
         let (stdin_pair, stdout_pair, stderr_pair) = unsafe { setup_stdio_pipes()? };
         let ((in_r, in_w), (out_r, out_w), (err_r, err_w)) = (stdin_pair, stdout_pair, stderr_pair);
+        // SAFETY: security retains the valid restricted token, and all child pipe ends remain open
+        // while process creation duplicates them. The command, cwd and environment remain
+        // borrowed throughout the synchronous call.
         let spawn_res = unsafe {
             create_process_as_user(
                 security.h_token,
@@ -945,6 +959,9 @@ mod windows_impl {
         let created = match spawn_res {
             Ok(v) => v,
             Err(err) => {
+                // SAFETY: Process creation failed before ownership transfer; these six successfully
+                // allocated pipe ends and the restricted token are still owned here and are
+                // closed once.
                 unsafe {
                     CloseHandle(in_r);
                     CloseHandle(in_w);
@@ -961,6 +978,9 @@ mod windows_impl {
         let job = Arc::clone(&created.job);
         let _desktop = created;
 
+        // SAFETY: The child has duplicated its pipe ends, so their parent-owned originals can be
+        // released; closing in_w supplies EOF, while reader ownership is transferred
+        // separately below.
         unsafe {
             CloseHandle(in_r);
             // Close the parent's stdin write end so the child sees EOF immediately.
@@ -995,6 +1015,8 @@ mod windows_impl {
         }
         let mut exit_code_u32: u32 = 1;
         if process_exited {
+            // SAFETY: The process handle remains open after a successful wait, and exit_code_u32 is
+            // a writable output slot.
             unsafe {
                 GetExitCodeProcess(pi.hProcess, &mut exit_code_u32);
             }
@@ -1005,6 +1027,8 @@ mod windows_impl {
                     &format!("capture failed to terminate process tree: {job_err}"),
                     logs_base_dir,
                 );
+                // SAFETY: The capture scope retains the process handle while requesting
+                // termination; its close occurs after subsequent wait handling.
                 let root_result = unsafe {
                     windows_sys::Win32::System::Threading::TerminateProcess(pi.hProcess, 1)
                 };
@@ -1042,6 +1066,9 @@ mod windows_impl {
             );
         }
 
+        // SAFETY: This capture invocation still owns the process/thread handles and restricted
+        // token after wait handling; it releases each non-null process handle once before
+        // collecting separately owned pipe readers.
         unsafe {
             if !pi.hThread.is_null() {
                 CloseHandle(pi.hThread);
@@ -1173,7 +1200,11 @@ mod windows_impl {
 
         fn capture_pipe_with_open_writer() -> (super::CapturePipeReader, HANDLE) {
             let ((in_r, in_w), (out_r, out_w), (err_r, err_w)) =
+                // SAFETY: The helper returns successful pipe allocations to the test, which
+                // transfers out_r to its reader and closes every remaining end.
                 unsafe { super::setup_stdio_pipes() }.expect("create capture pipes");
+            // SAFETY: These four pipe ends belong to the test and are unused; the stdout pair is
+            // excluded because its ownership continues below.
             unsafe {
                 CloseHandle(in_r);
                 CloseHandle(in_w);
@@ -1189,6 +1220,9 @@ mod windows_impl {
         fn write_pipe(handle: HANDLE, mut bytes: &[u8]) -> io::Result<()> {
             while !bytes.is_empty() {
                 let mut written = 0u32;
+                // SAFETY: The test retains handle during synchronous writes; bytes is a live
+                // readable slice and written is a writable output slot, with no OVERLAPPED
+                // operation.
                 let ok = unsafe {
                     WriteFile(
                         handle,
@@ -1219,6 +1253,8 @@ mod windows_impl {
                 let (reader, out_w) = capture_pipe_with_open_writer();
                 let output = reader.stop_and_collect();
                 let write_after_join = write_pipe(out_w, b"x");
+                // SAFETY: The test owns out_w and both the reader join and final write attempt have
+                // completed before its single close.
                 unsafe {
                     CloseHandle(out_w);
                 }
@@ -1243,6 +1279,8 @@ mod windows_impl {
             write_pipe(out_w, expected).expect("buffer output");
 
             let output = reader.stop_and_collect();
+            // SAFETY: The test owns out_w and all writes have finished before its single close
+            // after reader collection.
             unsafe {
                 CloseHandle(out_w);
             }
@@ -1263,6 +1301,8 @@ mod windows_impl {
                 while write_pipe(out_w, &chunk).is_ok() {
                     std::thread::sleep(Duration::from_millis(2));
                 }
+                // SAFETY: The writer thread received sole ownership of out_w and has finished its
+                // write loop before closing that pipe end once.
                 unsafe {
                     CloseHandle(out_w);
                 }

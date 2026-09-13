@@ -10,10 +10,14 @@ use tokio::process::Child;
 
 #[cfg(target_os = "linux")]
 pub fn set_parent_death_signal(parent_pid: libc::pid_t) -> io::Result<()> {
+    // SAFETY: PR_SET_PDEATHSIG consumes the scalar SIGTERM argument and does not access caller-
+    // owned memory.
     if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) } == -1 {
         return Err(io::Error::last_os_error());
     }
+    // SAFETY: getppid takes no pointers and has no memory or lifetime preconditions.
     if unsafe { libc::getppid() } != parent_pid {
+        // SAFETY: SIGTERM is a valid signal number; raise does not borrow caller-owned memory.
         unsafe { libc::raise(libc::SIGTERM) };
     }
     Ok(())
@@ -26,6 +30,7 @@ pub fn set_parent_death_signal(_parent_pid: i32) -> io::Result<()> {
 
 #[cfg(unix)]
 pub fn detach_from_tty() -> io::Result<()> {
+    // SAFETY: setsid takes no arguments and does not access caller-owned memory.
     let result = unsafe { libc::setsid() };
     if result == -1 {
         let err = io::Error::last_os_error();
@@ -44,6 +49,8 @@ pub fn detach_from_tty() -> io::Result<()> {
 
 #[cfg(unix)]
 pub fn set_process_group() -> io::Result<()> {
+    // SAFETY: The zero PID and group select the calling process; setpgid does not access
+    // caller-owned memory.
     if unsafe { libc::setpgid(0, 0) } == -1 {
         Err(io::Error::last_os_error())
     } else {
@@ -59,6 +66,8 @@ pub fn set_process_group() -> io::Result<()> {
 #[cfg(unix)]
 pub fn kill_process_group_by_pid(pid: u32) -> io::Result<()> {
     let pid = pid as libc::pid_t;
+    // SAFETY: getpgid takes only a scalar PID and reports invalid or missing processes through
+    // its return value.
     let pgid = unsafe { libc::getpgid(pid) };
     if pgid == -1 {
         return ignore_missing_process(io::Error::last_os_error());
@@ -82,6 +91,8 @@ fn ignore_missing_process(error: io::Error) -> io::Result<()> {
 
 #[cfg(unix)]
 fn signal_process_group_id(pgid: libc::pid_t, signal: libc::c_int) -> io::Result<bool> {
+    // SAFETY: killpg takes scalar group and signal identifiers; OS validation errors are
+    // returned to the caller.
     if unsafe { libc::killpg(pgid, signal) } == -1 {
         let error = io::Error::last_os_error();
         if error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH) {

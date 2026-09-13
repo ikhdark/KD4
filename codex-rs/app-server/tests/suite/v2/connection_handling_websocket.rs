@@ -787,18 +787,16 @@ pub(super) async fn connect_websocket_with_bearer(
 ) -> Result<WsClient> {
     let url = format!("ws://{}", connectable_bind_addr(bind_addr));
     let request = websocket_request(url.as_str(), bearer_token, /*origin*/ None)?;
-    let deadline = Instant::now() + DEFAULT_READ_TIMEOUT;
-    loop {
-        match connect_async(request.clone()).await {
-            Ok((stream, _response)) => return Ok(stream),
-            Err(err) => {
-                if Instant::now() >= deadline {
-                    bail!("failed to connect websocket to {url}: {err}");
-                }
-                sleep(Duration::from_millis(50)).await;
+    timeout(DEFAULT_READ_TIMEOUT, async {
+        loop {
+            match connect_async(request.clone()).await {
+                Ok((stream, _response)) => return stream,
+                Err(_) => sleep(Duration::from_millis(50)).await,
             }
         }
-    }
+    })
+    .await
+    .with_context(|| format!("timed out connecting websocket to {url}"))
 }
 
 async fn assert_websocket_connect_rejected(
@@ -863,23 +861,59 @@ async fn run_websocket_server_to_completion_with_args(
 
 async fn http_get(client: &HttpClient, bind_addr: SocketAddr, path: &str) -> Result<HttpResponse> {
     let connectable_bind_addr = connectable_bind_addr(bind_addr);
-    let deadline = Instant::now() + DEFAULT_READ_TIMEOUT;
-    loop {
-        match client
-            .get(format!("http://{connectable_bind_addr}{path}"))
-            .send()
-            .await
-            .with_context(|| format!("failed to GET http://{connectable_bind_addr}{path}"))
-        {
-            Ok(response) => return Ok(response),
-            Err(err) => {
-                if Instant::now() >= deadline {
-                    bail!("failed to GET http://{connectable_bind_addr}{path}: {err}");
-                }
-                sleep(Duration::from_millis(50)).await;
+    timeout(DEFAULT_READ_TIMEOUT, async {
+        loop {
+            match client
+                .get(format!("http://{connectable_bind_addr}{path}"))
+                .send()
+                .await
+            {
+                Ok(response) => return response,
+                Err(_) => sleep(Duration::from_millis(50)).await,
             }
         }
+    })
+    .await
+    .with_context(|| format!("timed out getting http://{connectable_bind_addr}{path}"))
+}
+
+#[tokio::test]
+async fn connection_helpers_bound_stalled_handshakes_and_http_responses() -> Result<()> {
+    use tokio::io::AsyncReadExt;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let websocket = tokio::spawn(async move { connect_websocket(address).await.map(|_| ()) });
+    let client = HttpClientBuilder::new().build_direct()?;
+    let http = tokio::spawn(async move { http_get(&client, address, "/readyz").await.map(|_| ()) });
+
+    // Establish both requests before advancing time: the peer accepts TCP and
+    // receives request bytes, but deliberately sends neither response.
+    let mut connections = Vec::new();
+    for _ in 0..2 {
+        let (mut stream, _) = timeout(Duration::from_secs(10), listener.accept()).await??;
+        let mut first_byte = [0];
+        timeout(Duration::from_secs(10), stream.read_exact(&mut first_byte)).await??;
+        assert_eq!(first_byte, [b'G']);
+        connections.push(stream);
     }
+    tokio::time::pause();
+    tokio::time::advance(DEFAULT_READ_TIMEOUT).await;
+
+    let websocket_error = timeout(Duration::from_secs(1), websocket)
+        .await??
+        .expect_err("a stalled websocket handshake must exhaust its total timeout");
+    assert!(
+        websocket_error
+            .to_string()
+            .contains("timed out connecting websocket")
+    );
+    let http_error = timeout(Duration::from_secs(1), http)
+        .await??
+        .expect_err("a stalled HTTP response must exhaust its total timeout");
+    assert!(http_error.to_string().contains("timed out getting http"));
+    drop(connections);
+    Ok(())
 }
 
 fn websocket_request(

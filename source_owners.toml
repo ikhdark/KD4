@@ -720,6 +720,13 @@ cwd = "codex-rs"
 argv = ["just", "core-test-fast", "core_lib", "-E", "test(tools::command_output_artifact::hardening_tests)"]
 role = "focused_tests"
 
+[[owners.relationships]]
+category = "callers_consumers"
+kind = "consumed_by"
+target = "path:codex-rs/core/src/tools/registry.rs"
+confidence = "declared"
+evidence = [{ path = "codex-rs/core/src/tools/registry.rs", symbol = "project_model_output" }]
+
 [[owners]]
 id = "app-server-protocol-contracts"
 concern_ids = ["app-server-protocol", "schema-generation", "desktop-contract"]
@@ -873,4 +880,804 @@ role = "focused_tests"
 id = "live-agent-benchmark-focused"
 cwd = "."
 argv = ["python", "-m", "unittest", "scripts.test_kd4_live_agent_benchmark"]
+role = "focused_tests"
+
+# Manually reviewed KDA repair ownership; relationships use declared provenance.
+
+[[owners]]
+id = "agent-identity-contracts"
+concern_ids = ["agent-identity-contracts"]
+aliases = ["agent identity contracts"]
+phrases = []
+roots = ["codex-rs/agent-identity"]
+primary_entries = [{ path = "codex-rs/agent-identity/src/lib.rs", symbol = "authorization_header_for_agent_task" }]
+instructions = ["AGENTS.md"]
+consumers = ["codex-rs/model-provider/src/auth.rs", "codex-rs/login/src/auth/agent_identity.rs"]
+contracts = ["codex-rs/agent-identity/src/lib.rs"]
+generated_mirrors = []
+tests = ["codex-rs/agent-identity/src/lib.rs"]
+
+[owners.facet_exclusions]
+configuration_and_gates = "The assertion boundary takes typed key material and task identity; upstream login configuration is resolved by its callers."
+generated_artifacts = "Scoped searches for AgentAssertionEnvelope and AgentIdentityKey in agent-identity, protocol and app-server-protocol find the authored envelope in agent-identity and no generated mirror."
+
+[[owners.relationships]]
+category = "control_flow"
+kind = "calls"
+target = "path:codex-rs/agent-identity/src/lib.rs"
+confidence = "declared"
+evidence = [{ path = "codex-rs/agent-identity/src/lib.rs", symbol = "sign_agent_assertion_payload" }, { path = "codex-rs/agent-identity/src/lib.rs", symbol = "serialize_agent_assertion" }]
+
+[[owners.relationships]]
+category = "callers_consumers"
+kind = "consumed_by"
+target = "path:codex-rs/model-provider/src/auth.rs"
+confidence = "declared"
+evidence = [{ path = "codex-rs/model-provider/src/auth.rs", symbol = "authorization_header_for_agent_task" }]
+
+[[owners.relationships]]
+category = "callers_consumers"
+kind = "consumed_by"
+target = "path:codex-rs/login/src/auth/agent_identity.rs"
+confidence = "declared"
+evidence = [{ path = "codex-rs/login/src/auth/agent_identity.rs", symbol = "register_agent_identity" }]
+
+[[owners.relationships]]
+category = "runtime_registration"
+kind = "registers"
+target = "path:codex-rs/Cargo.toml"
+confidence = "manifest_derived"
+evidence = [{ path = "codex-rs/Cargo.toml", symbol = "codex-agent-identity" }]
+
+[[owners.relationships]]
+category = "tests_contracts"
+kind = "validated_by"
+target = "path:codex-rs/agent-identity/src/lib.rs"
+confidence = "declared"
+evidence = [{ path = "codex-rs/agent-identity/src/lib.rs", symbol = "authorization_header_for_agent_task_serializes_signed_agent_assertion" }]
+
+[[owners.invariants]]
+id = "agent-identity-contracts-behavior"
+kind = "semantic"
+statement = "Calling authorization_header_for_agent_task with a known signing key and agent/task IDs produces an AgentAssertion header whose decoded IDs match the inputs and whose Ed25519 signature independently verifies against the public key; wrong identity, scheme or signing payload is rejected by the scenario."
+evidence = [{ path = "codex-rs/agent-identity/src/lib.rs", symbol = "authorization_header_for_agent_task" }]
+tests = ["codex-rs/agent-identity/src/lib.rs"]
+
+[[owners.invariants]]
+id = "agent-identity-contracts-compatibility"
+kind = "compatibility"
+statement = "Preserve the AgentAssertion scheme, base64url JSON envelope and signature over the runtime ID, task ID and timestamp."
+evidence = [{ path = "codex-rs/agent-identity/src/lib.rs", symbol = "authorization_header_for_agent_task" }]
+tests = ["codex-rs/agent-identity/src/lib.rs"]
+
+[[owners.validation]]
+id = "agent-assertion"
+cwd = "codex-rs"
+argv = ["rustup", "run", "1.95.0", "cargo", "test", "-p", "codex-agent-identity", "--lib", "authorization_header_for_agent_task_serializes_signed_agent_assertion"]
+role = "focused_tests"
+
+[[owners]]
+id = "plugin-manifest-namespace"
+concern_ids = ["plugin-manifest-namespace"]
+aliases = ["plugin manifest namespace"]
+phrases = []
+roots = ["codex-rs/plugin/src/namespace.rs", "codex-rs/plugin/src/lib.rs", "codex-rs/plugin/Cargo.toml"]
+primary_entries = [{ path = "codex-rs/plugin/src/namespace.rs", symbol = "plugin_namespace_for_root_uri" }, { path = "codex-rs/plugin/src/namespace.rs", symbol = "plugin_namespace_for_skill_path" }]
+instructions = ["AGENTS.md"]
+consumers = ["codex-rs/core-skills/src/loader/namespace.rs"]
+contracts = ["codex-rs/plugin/src/namespace.rs"]
+generated_mirrors = []
+tests = ["codex-rs/plugin/src/namespace.rs"]
+
+[owners.facet_exclusions]
+configuration_and_gates = "Namespace discovery receives its filesystem and root or skill path explicitly; it has no repository feature gate."
+generated_artifacts = "The minimal RawPluginManifestName read shape and namespace resolvers are authored in namespace.rs; no generated schema or duplicate namespace implementation is modified."
+
+[[owners.relationships]]
+category = "control_flow"
+kind = "calls"
+target = "path:codex-rs/plugin/src/namespace.rs"
+confidence = "declared"
+evidence = [{ path = "codex-rs/plugin/src/namespace.rs", symbol = "plugin_namespace_for_skill_uri" }, { path = "codex-rs/plugin/src/namespace.rs", symbol = "DISCOVERABLE_PLUGIN_MANIFEST_PATHS" }]
+
+[[owners.relationships]]
+category = "callers_consumers"
+kind = "consumed_by"
+target = "path:codex-rs/core-skills/src/loader/namespace.rs"
+confidence = "declared"
+evidence = [{ path = "codex-rs/core-skills/src/loader/namespace.rs", symbol = "plugin_namespace_for_root_uri" }]
+
+[[owners.relationships]]
+category = "callers_consumers"
+kind = "calls"
+target = "path:codex-rs/file-system/src/lib.rs"
+confidence = "declared"
+evidence = [{ path = "codex-rs/file-system/src/lib.rs", symbol = "ExecutorFileSystem" }, { path = "codex-rs/plugin/src/namespace.rs", symbol = "ExecutorFileSystem" }]
+
+[[owners.relationships]]
+category = "runtime_registration"
+kind = "registers"
+target = "path:codex-rs/plugin/src/lib.rs"
+confidence = "declared"
+evidence = [{ path = "codex-rs/plugin/src/lib.rs", symbol = "plugin_namespace_for_root_uri" }]
+
+[[owners.relationships]]
+category = "tests_contracts"
+kind = "validated_by"
+target = "path:codex-rs/plugin/src/namespace.rs"
+confidence = "declared"
+evidence = [{ path = "codex-rs/plugin/src/namespace.rs", symbol = "resolves_nearest_manifest_name" }, { path = "codex-rs/plugin/src/namespace.rs", symbol = "recognizes_alternate_manifest_path" }]
+
+[[owners.invariants]]
+id = "plugin-manifest-namespace-behavior"
+kind = "semantic"
+statement = "The normal public skill namespace resolver reads real temporary .codex-plugin and .claude-plugin manifests and returns independently expected sample or alternate names and the alternate manifest path; bypassed namespace resolution or an ignored supported manifest path fails the scenario."
+evidence = [{ path = "codex-rs/plugin/src/namespace.rs", symbol = "plugin_namespace_for_root_uri" }, { path = "codex-rs/plugin/src/namespace.rs", symbol = "plugin_namespace_for_skill_path" }]
+tests = ["codex-rs/plugin/src/namespace.rs"]
+
+[[owners.invariants]]
+id = "plugin-manifest-namespace-compatibility"
+kind = "compatibility"
+statement = "ExecutorFileSystem is defined in codex-file-system and reexported by codex-exec-server; dependency routing preserves that trait identity and both supported manifest locations."
+evidence = [{ path = "codex-rs/plugin/src/namespace.rs", symbol = "plugin_namespace_for_root_uri" }, { path = "codex-rs/plugin/src/namespace.rs", symbol = "plugin_namespace_for_skill_path" }]
+tests = ["codex-rs/plugin/src/namespace.rs"]
+
+[[owners.validation]]
+id = "plugin-namespace"
+cwd = "codex-rs"
+argv = ["rustup", "run", "1.95.0", "cargo", "test", "-p", "codex-plugin", "--lib", "namespace::tests"]
+role = "focused_tests"
+
+[[owners]]
+id = "remote-plugin-lifecycle"
+concern_ids = ["remote-plugin-lifecycle"]
+aliases = ["remote plugin lifecycle"]
+phrases = []
+roots = ["codex-rs/core-plugins/src/remote.rs", "codex-rs/core-plugins/src/remote_tests.rs", "codex-rs/core-plugins/src/remote"]
+primary_entries = [{ path = "codex-rs/core-plugins/src/remote.rs", symbol = "install_remote_plugin" }, { path = "codex-rs/core-plugins/src/remote.rs", symbol = "uninstall_remote_plugin" }, { path = "codex-rs/core-plugins/src/remote/share.rs", symbol = "save_remote_plugin_share" }]
+instructions = ["AGENTS.md"]
+consumers = ["codex-rs/app-server/src/request_processors/plugins.rs"]
+contracts = ["codex-rs/core-plugins/src/remote.rs", "codex-rs/core-plugins/src/remote/share.rs"]
+generated_mirrors = []
+tests = ["codex-rs/core-plugins/src/remote_tests.rs", "codex-rs/core-plugins/src/remote/share/tests.rs"]
+
+[owners.facet_exclusions]
+configuration_and_gates = "Authenticated client, base URL and operation IDs come from the existing runtime callers; this owner adds no repository feature or policy gate."
+generated_artifacts = "URL construction, filesystem cache cleanup and share orchestration are authored implementation. Existing plugin DTOs, InvalidRequest wire reason and generated protocol schemas retain their shapes."
+
+[[owners.relationships]]
+category = "control_flow"
+kind = "calls"
+target = "path:codex-rs/core-plugins/src/remote.rs"
+confidence = "declared"
+evidence = [{ path = "codex-rs/core-plugins/src/remote.rs", symbol = "fetch_plugin_detail" }]
+
+[[owners.relationships]]
+category = "callers_consumers"
+kind = "consumed_by"
+target = "path:codex-rs/app-server/src/request_processors/plugins.rs"
+confidence = "declared"
+evidence = [{ path = "codex-rs/app-server/src/request_processors/plugins.rs", symbol = "install_remote_plugin" }, { path = "codex-rs/app-server/src/request_processors/plugins.rs", symbol = "fetch_remote_plugin_skill_detail" }, { path = "codex-rs/app-server/src/request_processors/plugins.rs", symbol = "save_remote_plugin_share" }]
+
+[[owners.relationships]]
+category = "runtime_registration"
+kind = "registers"
+target = "path:codex-rs/core-plugins/src/lib.rs"
+confidence = "declared"
+evidence = [{ path = "codex-rs/core-plugins/src/lib.rs", symbol = "pub mod remote;" }]
+
+[[owners.relationships]]
+category = "callers_consumers"
+kind = "consumed_by"
+target = "path:codex-rs/core-plugins/src/remote/share/checkout.rs"
+confidence = "declared"
+evidence = [{ path = "codex-rs/core-plugins/src/remote/share/checkout.rs", symbol = "fetch_remote_plugin_detail_with_download_urls" }]
+
+[[owners.relationships]]
+category = "tests_contracts"
+kind = "validated_by"
+target = "path:codex-rs/core-plugins/src/remote_tests.rs"
+confidence = "declared"
+evidence = [{ path = "codex-rs/core-plugins/src/remote_tests.rs", symbol = "install_remote_plugin_preserves_opaque_id_in_request_path" }, { path = "codex-rs/core-plugins/src/remote_tests.rs", symbol = "uninstall_remote_plugin_preserves_paths_outside_the_canonical_cache" }, { path = "codex-rs/core-plugins/src/remote_tests.rs", symbol = "install_remote_plugin_rejects_dot_segments_before_sending" }, { path = "codex-rs/core-plugins/src/remote_tests.rs", symbol = "fetch_remote_plugin_skill_detail_rejects_dot_segments_before_sending" }]
+
+[[owners.relationships]]
+category = "tests_contracts"
+kind = "validated_by"
+target = "path:codex-rs/core-plugins/src/remote/share/tests.rs"
+confidence = "declared"
+evidence = [{ path = "codex-rs/core-plugins/src/remote/share/tests.rs", symbol = "save_remote_plugin_share_updates_existing_workspace_plugin" }, { path = "codex-rs/core-plugins/src/remote/share/tests.rs", symbol = "update_remote_plugin_share_targets_updates_targets" }, { path = "codex-rs/core-plugins/src/remote/share/tests.rs", symbol = "delete_remote_plugin_share_deletes_workspace_plugin" }, { path = "codex-rs/core-plugins/src/remote/share/tests.rs", symbol = "save_remote_plugin_share_rejects_dot_segments_before_upload" }]
+
+[[owners.invariants]]
+id = "remote-plugin-lifecycle-request-and-cache"
+kind = "semantic"
+statement = "Normal public install and resolve/uninstall operations preserve raw opaque IDs while emitting independently expected encoded HTTP paths; canonical cache removal leaves an outside traversal sentinel unchanged. Normal install and skill-detail reject dot-only path segments with InvalidRequest and retryable=false before any HTTP request."
+evidence = [{ path = "codex-rs/core-plugins/src/remote_tests.rs", symbol = "uninstall_remote_plugin_preserves_paths_outside_the_canonical_cache" }]
+tests = ["codex-rs/core-plugins/src/remote_tests.rs"]
+
+[[owners.invariants]]
+id = "remote-plugin-lifecycle-share-requests"
+kind = "semantic"
+statement = "Normal public save, target update and delete share operations emit independently expected encoded HTTP routes and preserve raw IDs. Saving a share with a dot-only update ID returns InvalidRequest with retryable=false before any HTTP request or upload and leaves saved local-path mappings empty."
+evidence = [{ path = "codex-rs/core-plugins/src/remote/share/tests.rs", symbol = "save_remote_plugin_share_updates_existing_workspace_plugin" }]
+tests = ["codex-rs/core-plugins/src/remote/share/tests.rs"]
+
+[[owners.invariants]]
+id = "remote-plugin-lifecycle-compatibility"
+kind = "compatibility"
+statement = "Retain opaque backend IDs in JSON and local identity checks, the existing InvalidRequest/nonretryable wire classification, and canonical PluginStore uninstall; unsafe legacy path components never authorize deletion outside the cache."
+evidence = [{ path = "codex-rs/core-plugins/src/remote.rs", symbol = "install_remote_plugin" }, { path = "codex-rs/core-plugins/src/remote.rs", symbol = "uninstall_remote_plugin" }, { path = "codex-rs/core-plugins/src/remote/share.rs", symbol = "save_remote_plugin_share" }]
+tests = ["codex-rs/core-plugins/src/remote_tests.rs", "codex-rs/core-plugins/src/remote/share/tests.rs"]
+
+[[owners.validation]]
+id = "remote-plugin-install"
+cwd = "codex-rs"
+argv = ["rustup", "run", "1.95.0", "cargo", "test", "-p", "codex-core-plugins", "--lib", "install_remote_plugin_"]
+role = "focused_tests"
+
+[[owners.validation]]
+id = "remote-plugin-uninstall"
+cwd = "codex-rs"
+argv = ["rustup", "run", "1.95.0", "cargo", "test", "-p", "codex-core-plugins", "--lib", "uninstall_remote_plugin_preserves_paths_outside_the_canonical_cache"]
+role = "focused_tests"
+
+[[owners.validation]]
+id = "remote-plugin-skill"
+cwd = "codex-rs"
+argv = ["rustup", "run", "1.95.0", "cargo", "test", "-p", "codex-core-plugins", "--lib", "fetch_remote_plugin_skill_detail_rejects_dot_segments_before_sending"]
+role = "focused_tests"
+
+[[owners.validation]]
+id = "remote-plugin-share"
+cwd = "codex-rs"
+argv = ["rustup", "run", "1.95.0", "cargo", "test", "-p", "codex-core-plugins", "--lib", "save_remote_plugin_share_"]
+role = "focused_tests"
+
+[[owners.validation]]
+id = "remote-plugin-share-targets"
+cwd = "codex-rs"
+argv = ["rustup", "run", "1.95.0", "cargo", "test", "-p", "codex-core-plugins", "--lib", "update_remote_plugin_share_targets_updates_targets"]
+role = "focused_tests"
+
+[[owners.validation]]
+id = "remote-plugin-share-delete"
+cwd = "codex-rs"
+argv = ["rustup", "run", "1.95.0", "cargo", "test", "-p", "codex-core-plugins", "--lib", "delete_remote_plugin_share_deletes_workspace_plugin"]
+role = "focused_tests"
+
+[[owners]]
+id = "tui-session-logging"
+concern_ids = ["tui-session-logging"]
+aliases = ["tui session logging"]
+phrases = []
+roots = ["codex-rs/tui/src/session_log.rs"]
+primary_entries = [{ path = "codex-rs/tui/src/session_log.rs", symbol = "SessionLogger" }, { path = "codex-rs/tui/src/session_log.rs", symbol = "maybe_init" }]
+instructions = ["AGENTS.md"]
+consumers = ["codex-rs/tui/src/lib.rs", "codex-rs/tui/src/app_event_sender.rs", "codex-rs/tui/src/app/thread_routing.rs", "codex-rs/tui/src/chatwidget.rs"]
+contracts = ["codex-rs/tui/src/session_log.rs"]
+generated_mirrors = []
+tests = ["codex-rs/tui/src/session_log.rs"]
+
+[owners.facet_exclusions]
+generated_artifacts = "Session JSONL is runtime diagnostic output, not a checked-in generated artifact. Scoped TUI/scripts searches find no runtime replay reader; the independent line/JSON parser is in the owned tests."
+
+[[owners.relationships]]
+category = "control_flow"
+kind = "calls"
+target = "path:codex-rs/tui/src/session_log.rs"
+confidence = "declared"
+evidence = [{ path = "codex-rs/tui/src/session_log.rs", symbol = "write_records" }, { path = "codex-rs/tui/src/session_log.rs", symbol = "write_json_line" }]
+
+[[owners.relationships]]
+category = "callers_consumers"
+kind = "consumed_by"
+target = "path:codex-rs/tui/src/lib.rs"
+confidence = "declared"
+evidence = [{ path = "codex-rs/tui/src/lib.rs", symbol = "session_log::maybe_init" }, { path = "codex-rs/tui/src/lib.rs", symbol = "session_log::log_session_end" }]
+
+[[owners.relationships]]
+category = "callers_consumers"
+kind = "consumed_by"
+target = "path:codex-rs/tui/src/app_event_sender.rs"
+confidence = "declared"
+evidence = [{ path = "codex-rs/tui/src/app_event_sender.rs", symbol = "session_log" }]
+
+[[owners.relationships]]
+category = "configuration"
+kind = "reads_config"
+target = "path:codex-rs/tui/src/session_log.rs"
+confidence = "declared"
+evidence = [{ path = "codex-rs/tui/src/session_log.rs", symbol = "CODEX_TUI_RECORD_SESSION" }, { path = "codex-rs/tui/src/session_log.rs", symbol = "CODEX_TUI_SESSION_LOG_PATH" }]
+
+[[owners.relationships]]
+category = "runtime_registration"
+kind = "registers"
+target = "path:codex-rs/tui/src/lib.rs"
+confidence = "declared"
+evidence = [{ path = "codex-rs/tui/src/lib.rs", symbol = "session_log::maybe_init" }]
+
+[[owners.relationships]]
+category = "tests_contracts"
+kind = "validated_by"
+target = "path:codex-rs/tui/src/session_log.rs"
+confidence = "declared"
+evidence = [{ path = "codex-rs/tui/src/session_log.rs", symbol = "session_logger_shutdown_drains_records_in_order" }, { path = "codex-rs/tui/src/session_log.rs", symbol = "session_logger_open_failure_leaves_recording_disabled" }]
+
+[[owners.invariants]]
+id = "tui-session-logging-behavior"
+kind = "semantic"
+statement = "Opening the real logger, accepting 513 numbered records and shutting it down yields the exact independent 0..513 sequence as parseable JSON lines, including escaped embedded newlines; writes after shutdown leave the file unchanged. Opening under a parent file fails with recording disabled and preserves that parent file."
+evidence = [{ path = "codex-rs/tui/src/session_log.rs", symbol = "SessionLogger" }, { path = "codex-rs/tui/src/session_log.rs", symbol = "maybe_init" }]
+tests = ["codex-rs/tui/src/session_log.rs"]
+
+[[owners.invariants]]
+id = "tui-session-logging-compatibility"
+kind = "compatibility"
+statement = "Preserve ordered newline-delimited JSON, queue/backpressure semantics and the flush/drain guarantees at record and shutdown boundaries."
+evidence = [{ path = "codex-rs/tui/src/session_log.rs", symbol = "SessionLogger" }, { path = "codex-rs/tui/src/session_log.rs", symbol = "maybe_init" }]
+tests = ["codex-rs/tui/src/session_log.rs"]
+
+[[owners.validation]]
+id = "session-log"
+cwd = "codex-rs"
+argv = ["rustup", "run", "1.95.0", "cargo", "test", "-p", "codex-tui", "--lib", "session_log::tests"]
+role = "focused_tests"
+
+[[owners]]
+id = "tui-onboarding-auth"
+concern_ids = ["tui-onboarding-auth"]
+aliases = ["tui onboarding auth"]
+phrases = []
+roots = ["codex-rs/tui/src/onboarding/auth.rs"]
+primary_entries = [{ path = "codex-rs/tui/src/onboarding/auth.rs", symbol = "AuthModeWidget" }]
+instructions = ["AGENTS.md"]
+consumers = ["codex-rs/tui/src/onboarding/onboarding_screen.rs"]
+contracts = ["codex-rs/tui/src/onboarding/auth.rs"]
+generated_mirrors = []
+tests = ["codex-rs/tui/src/onboarding/auth.rs"]
+
+[owners.facet_exclusions]
+generated_artifacts = "This owner changes authored implementation only and owns no generated wire or schema representation."
+configuration_and_gates = "Existing forced-login selection and typed authentication state belong to AuthModeWidget inputs; attempt completion is driven by keyboard events and matching account notifications, without a new repository gate."
+
+[[owners.relationships]]
+category = "control_flow"
+kind = "calls"
+target = "path:codex-rs/tui/src/onboarding/auth.rs"
+confidence = "declared"
+evidence = [{ path = "codex-rs/tui/src/onboarding/auth.rs", symbol = "handle_key_event" }, { path = "codex-rs/tui/src/onboarding/auth.rs", symbol = "on_account_login_completed" }]
+
+[[owners.relationships]]
+category = "callers_consumers"
+kind = "consumed_by"
+target = "path:codex-rs/tui/src/onboarding/onboarding_screen.rs"
+confidence = "declared"
+evidence = [{ path = "codex-rs/tui/src/onboarding/onboarding_screen.rs", symbol = "Step::Auth" }, { path = "codex-rs/tui/src/onboarding/onboarding_screen.rs", symbol = "get_step_state" }]
+
+[[owners.relationships]]
+category = "runtime_registration"
+kind = "registers"
+target = "path:codex-rs/tui/src/onboarding/onboarding_screen.rs"
+confidence = "declared"
+evidence = [{ path = "codex-rs/tui/src/onboarding/onboarding_screen.rs", symbol = "Step::Auth" }]
+
+[[owners.relationships]]
+category = "tests_contracts"
+kind = "validated_by"
+target = "path:codex-rs/tui/src/onboarding/auth.rs"
+confidence = "declared"
+evidence = [{ path = "codex-rs/tui/src/onboarding/auth.rs", symbol = "browser_login_completion_respects_current_keyboard_attempt" }]
+
+[[owners.invariants]]
+id = "tui-onboarding-auth-behavior"
+kind = "semantic"
+statement = "Normal Enter/Esc/3 keyboard events start, cancel or replace a browser login attempt. A real loopback WebSocket service double completes current, canceled and API-key-replaced attempts with success or error; the UI preserves typed keys, hides stale errors, cancels stale backend attempts and advances to Complete only after a matching completion followed by Enter."
+evidence = [{ path = "codex-rs/tui/src/onboarding/auth.rs", symbol = "AuthModeWidget" }]
+tests = ["codex-rs/tui/src/onboarding/auth.rs"]
+
+[[owners.invariants]]
+id = "tui-onboarding-auth-compatibility"
+kind = "compatibility"
+statement = "SignInState remains internal; LoginAccount request/response and AccountLoginCompletedNotification shapes remain compatible with app-server-protocol."
+evidence = [{ path = "codex-rs/tui/src/onboarding/auth.rs", symbol = "AuthModeWidget" }]
+tests = ["codex-rs/tui/src/onboarding/auth.rs"]
+
+[[owners.validation]]
+id = "browser-login-attempt"
+cwd = "codex-rs"
+argv = ["rustup", "run", "1.95.0", "cargo", "test", "-p", "codex-tui", "--lib", "onboarding::auth::tests::browser_login_completion_respects_current_keyboard_attempt"]
+role = "focused_tests"
+
+[[owners]]
+id = "tui-platform-presentation"
+concern_ids = ["tui-platform-presentation"]
+aliases = ["tui platform presentation"]
+phrases = []
+roots = ["codex-rs/tui/src/tui/windows_console.rs", "codex-rs/tui/src/tui.rs", "codex-rs/tui/src/terminal_probe.rs", "codex-rs/tui/src/pets/image_protocol.rs"]
+primary_entries = [{ path = "codex-rs/tui/src/tui/windows_console.rs", symbol = "set_input_record_mode" }, { path = "codex-rs/tui/src/tui/windows_console.rs", symbol = "restore_input_mode" }, { path = "codex-rs/tui/src/terminal_probe.rs", symbol = "default_colors" }, { path = "codex-rs/tui/src/pets/image_protocol.rs", symbol = "detect_pet_image_support" }]
+instructions = ["AGENTS.md"]
+consumers = ["codex-rs/tui/src/lib.rs", "codex-rs/tui/src/pets/mod.rs"]
+contracts = ["codex-rs/tui/src/tui/windows_console.rs", "codex-rs/tui/src/terminal_probe.rs", "codex-rs/tui/src/pets/image_protocol.rs"]
+generated_mirrors = []
+tests = ["codex-rs/tui/src/tui.rs", "codex-rs/tui/src/terminal_probe.rs", "codex-rs/tui/src/pets/image_protocol.rs"]
+
+[owners.facet_exclusions]
+configuration_and_gates = "Existing terminal/platform and image-capability detection selects behavior. SAFETY rationale edits add no configuration or feature gate."
+generated_artifacts = "Console, color probe and image-protocol helpers have no generated API representation. The retired windows_degraded approval snapshot has no remaining snapshot-producing call and is not an active mirror."
+
+[[owners.relationships]]
+category = "control_flow"
+kind = "calls"
+target = "path:codex-rs/tui/src/tui/windows_console.rs"
+confidence = "declared"
+evidence = [{ path = "codex-rs/tui/src/tui.rs", symbol = "windows_console::set_input_record_mode" }, { path = "codex-rs/tui/src/tui.rs", symbol = "windows_console::restore_input_mode" }]
+
+[[owners.relationships]]
+category = "callers_consumers"
+kind = "consumed_by"
+target = "path:codex-rs/tui/src/tui.rs"
+confidence = "declared"
+evidence = [{ path = "codex-rs/tui/src/tui.rs", symbol = "terminal_probe::default_colors" }]
+
+[[owners.relationships]]
+category = "callers_consumers"
+kind = "consumed_by"
+target = "path:codex-rs/tui/src/pets/mod.rs"
+confidence = "declared"
+evidence = [{ path = "codex-rs/tui/src/pets/mod.rs", symbol = "kitty_transmit_png_with_id" }, { path = "codex-rs/tui/src/pets/mod.rs", symbol = "sixel_frame" }]
+
+[[owners.relationships]]
+category = "runtime_registration"
+kind = "registers"
+target = "path:codex-rs/tui/src/tui.rs"
+confidence = "declared"
+evidence = [{ path = "codex-rs/tui/src/tui.rs", symbol = "fn set_modes" }]
+
+[[owners.relationships]]
+category = "tests_contracts"
+kind = "validated_by"
+target = "path:codex-rs/tui/src/tui.rs"
+confidence = "declared"
+evidence = [{ path = "codex-rs/tui/src/tui.rs", symbol = "with_restored_runs_callback_with_fixed_keep_raw_policy" }]
+
+[[owners.relationships]]
+category = "tests_contracts"
+kind = "validated_by"
+target = "path:codex-rs/tui/src/terminal_probe.rs"
+confidence = "declared"
+evidence = [{ path = "codex-rs/tui/src/terminal_probe.rs", symbol = "decodes_console_color_attribute_indices" }, { path = "codex-rs/tui/src/terminal_probe.rs", symbol = "parses_osc_colors_with_bel_and_st" }]
+
+[[owners.relationships]]
+category = "tests_contracts"
+kind = "validated_by"
+target = "path:codex-rs/tui/src/pets/image_protocol.rs"
+confidence = "declared"
+evidence = [{ path = "codex-rs/tui/src/pets/image_protocol.rs", symbol = "sixel_frame_encodes_without_external_crate" }]
+
+[[owners.invariants]]
+id = "tui-platform-presentation-restore-callback"
+kind = "semantic"
+statement = "The normal set_modes/with_restored path runs in a real ConPTY child: its callback waits for broker/input-mode restoration, the child observes original VT input, and native key x is delivered after resume."
+evidence = [{ path = "codex-rs/tui/src/tui.rs", symbol = "with_restored_runs_callback_with_fixed_keep_raw_policy" }]
+tests = ["codex-rs/tui/src/tui.rs"]
+
+[[owners.invariants]]
+id = "tui-platform-presentation-terminal-colors"
+kind = "semantic"
+statement = "Normal color decode and OSC parser functions return independently expected RGB values for console attributes and BEL/ST-terminated OSC input; wrong channel interpretation or ignored terminators fail the scenarios."
+evidence = [{ path = "codex-rs/tui/src/terminal_probe.rs", symbol = "parses_osc_colors_with_bel_and_st" }]
+tests = ["codex-rs/tui/src/terminal_probe.rs"]
+
+[[owners.invariants]]
+id = "tui-platform-presentation-sixel-frame"
+kind = "semantic"
+statement = "Calling the production sixel_frame function on a real one-pixel red PNG creates an output file whose independently expected Sixel prefix, red palette command, pixel command and terminating escape are all present."
+evidence = [{ path = "codex-rs/tui/src/pets/image_protocol.rs", symbol = "sixel_frame_encodes_without_external_crate" }]
+tests = ["codex-rs/tui/src/pets/image_protocol.rs"]
+
+[[owners.invariants]]
+id = "tui-platform-presentation-compatibility"
+kind = "compatibility"
+statement = "Borrowed Win32 handles retain their owner lifetime, terminal modes are restored around callbacks, and existing OSC/Kitty/Sixel output remains unchanged."
+evidence = [{ path = "codex-rs/tui/src/tui/windows_console.rs", symbol = "set_input_record_mode" }, { path = "codex-rs/tui/src/tui/windows_console.rs", symbol = "restore_input_mode" }, { path = "codex-rs/tui/src/terminal_probe.rs", symbol = "default_colors" }, { path = "codex-rs/tui/src/pets/image_protocol.rs", symbol = "detect_pet_image_support" }]
+tests = ["codex-rs/tui/src/tui.rs", "codex-rs/tui/src/terminal_probe.rs", "codex-rs/tui/src/pets/image_protocol.rs"]
+
+[[owners.validation]]
+id = "terminal-restore"
+cwd = "codex-rs"
+argv = ["rustup", "run", "1.95.0", "cargo", "test", "-p", "codex-tui", "--lib", "with_restored_runs_callback_with_fixed_keep_raw_policy"]
+role = "focused_tests"
+
+[[owners.validation]]
+id = "terminal-probe"
+cwd = "codex-rs"
+argv = ["rustup", "run", "1.95.0", "cargo", "test", "-p", "codex-tui", "--lib", "terminal_probe::"]
+role = "focused_tests"
+
+[[owners.validation]]
+id = "pet-image-protocol"
+cwd = "codex-rs"
+argv = ["rustup", "run", "1.95.0", "cargo", "test", "-p", "codex-tui", "--lib", "pets::image_protocol::tests"]
+role = "focused_tests"
+
+[[owners]]
+id = "app-server-test-client-handshake"
+concern_ids = ["app-server-test-client-handshake"]
+aliases = ["app server test client handshake"]
+phrases = []
+roots = ["codex-rs/app-server-test-client"]
+primary_entries = [{ path = "codex-rs/app-server-test-client/src/main.rs", symbol = "main", ambiguous = true }]
+instructions = ["AGENTS.md"]
+consumers = ["codex-rs/cli/src/main.rs", "justfile"]
+contracts = ["codex-rs/app-server-test-client/src/main.rs"]
+generated_mirrors = []
+tests = ["codex-rs/app-server-test-client/src/lib.rs"]
+
+[owners.facet_exclusions]
+generated_artifacts = "This client consumes InitializeParams, InitializeCapabilities and InitializeResponse from app-server-protocol; generated protocol representations are owned by app-server-protocol-contracts, with no local generated mirror."
+
+[[owners.relationships]]
+category = "control_flow"
+kind = "calls"
+target = "path:codex-rs/app-server-test-client/src/lib.rs"
+confidence = "declared"
+evidence = [{ path = "codex-rs/app-server-test-client/src/main.rs", symbol = "codex_app_server_test_client::run" }, { path = "codex-rs/app-server-test-client/src/lib.rs", symbol = "initialize_with_experimental_api" }]
+
+[[owners.relationships]]
+category = "callers_consumers"
+kind = "consumed_by"
+target = "path:codex-rs/cli/src/main.rs"
+confidence = "declared"
+evidence = [{ path = "codex-rs/cli/src/main.rs", symbol = "codex_app_server_test_client::send_message_v2" }]
+
+[[owners.relationships]]
+category = "configuration"
+kind = "reads_config"
+target = "path:codex-rs/app-server-test-client/src/lib.rs"
+confidence = "declared"
+evidence = [{ path = "codex-rs/app-server-test-client/src/lib.rs", symbol = "CODEX_BIN" }, { path = "codex-rs/app-server-test-client/src/lib.rs", symbol = "CODEX_APP_SERVER_URL" }, { path = "codex-rs/app-server-test-client/src/lib.rs", symbol = "experimental_api" }]
+
+[[owners.relationships]]
+category = "runtime_registration"
+kind = "registers"
+target = "path:codex-rs/Cargo.toml"
+confidence = "manifest_derived"
+evidence = [{ path = "codex-rs/Cargo.toml", symbol = "codex-app-server-test-client" }]
+
+[[owners.relationships]]
+category = "runtime_registration"
+kind = "registers"
+target = "path:justfile"
+confidence = "declared"
+evidence = [{ path = "justfile", symbol = "_app-server-test-client-reserved" }]
+
+[[owners.relationships]]
+category = "tests_contracts"
+kind = "validated_by"
+target = "path:codex-rs/app-server-test-client/src/lib.rs"
+confidence = "declared"
+evidence = [{ path = "codex-rs/app-server-test-client/src/lib.rs", symbol = "initialize_advertises_supported_notification_opt_outs_and_finishes_handshake" }]
+
+[[owners.invariants]]
+id = "app-server-test-client-handshake-behavior"
+kind = "semantic"
+statement = "CodexClient::connect over a real loopback WebSocket and its normal initialize method emit an actual Initialize request containing the five independently expected supported opt-out methods and experimentalApi=true, consume independent userAgent/codexHome response values, then emit exactly the initialized notification; constant-only checks cannot satisfy this scenario."
+evidence = [{ path = "codex-rs/app-server-test-client/src/main.rs", symbol = "main", ambiguous = true }]
+tests = ["codex-rs/app-server-test-client/src/lib.rs"]
+
+[[owners.invariants]]
+id = "app-server-test-client-handshake-compatibility"
+kind = "compatibility"
+statement = "Preserve shared app-server JSON-RPC handshake types and method names; advertise supported notification opt-outs without retired methods."
+evidence = [{ path = "codex-rs/app-server-test-client/src/main.rs", symbol = "main", ambiguous = true }]
+tests = ["codex-rs/app-server-test-client/src/lib.rs"]
+
+[[owners.validation]]
+id = "initialize-handshake"
+cwd = "codex-rs"
+argv = ["rustup", "run", "1.95.0", "cargo", "test", "-p", "codex-app-server-test-client", "--lib", "initialize_advertises_supported_notification_opt_outs_and_finishes_handshake"]
+role = "focused_tests"
+
+[[owners]]
+id = "uds-transport-adapter"
+concern_ids = ["uds-transport-adapter"]
+aliases = ["uds transport adapter"]
+phrases = []
+roots = ["codex-rs/uds"]
+primary_entries = [{ path = "codex-rs/uds/src/lib.rs", symbol = "UnixListener" }, { path = "codex-rs/uds/src/lib.rs", symbol = "UnixStream" }, { path = "codex-rs/uds/src/lib.rs", symbol = "prepare_private_socket_directory" }]
+instructions = ["AGENTS.md"]
+consumers = ["codex-rs/app-server-transport/src/transport/unix_socket.rs", "codex-rs/app-server-client/src/remote.rs", "codex-rs/stdio-to-uds/src/lib.rs"]
+contracts = ["codex-rs/uds/src/lib.rs"]
+generated_mirrors = []
+tests = ["codex-rs/uds/src/lib_tests.rs"]
+
+[owners.facet_exclusions]
+configuration_and_gates = "The current implementation wraps Windows uds_windows sockets; callers supply the configured path through typed crate APIs. No alternate native backend or repository feature gate is declared."
+generated_artifacts = "Scoped searches for UnixListener, WindowsUnixStream and codex_uds in protocol/app-server-protocol find no generated wire or schema representation of the adapter."
+
+[[owners.relationships]]
+category = "control_flow"
+kind = "calls"
+target = "path:codex-rs/uds/src/lib.rs"
+confidence = "declared"
+evidence = [{ path = "codex-rs/uds/src/lib.rs", symbol = "bind_listener" }, { path = "codex-rs/uds/src/lib.rs", symbol = "connect_stream" }, { path = "codex-rs/uds/src/lib.rs", symbol = "poll_shutdown" }]
+
+[[owners.relationships]]
+category = "callers_consumers"
+kind = "consumed_by"
+target = "path:codex-rs/app-server-transport/src/transport/unix_socket.rs"
+confidence = "declared"
+evidence = [{ path = "codex-rs/app-server-transport/src/transport/unix_socket.rs", symbol = "UnixListener::bind" }, { path = "codex-rs/app-server-transport/src/transport/unix_socket.rs", symbol = "is_stale_socket_path" }]
+
+[[owners.relationships]]
+category = "callers_consumers"
+kind = "consumed_by"
+target = "path:codex-rs/app-server-client/src/remote.rs"
+confidence = "declared"
+evidence = [{ path = "codex-rs/app-server-client/src/remote.rs", symbol = "connect_unix_socket_endpoint" }]
+
+[[owners.relationships]]
+category = "callers_consumers"
+kind = "consumed_by"
+target = "path:codex-rs/stdio-to-uds/src/lib.rs"
+confidence = "declared"
+evidence = [{ path = "codex-rs/stdio-to-uds/src/lib.rs", symbol = "UnixStream::connect" }]
+
+[[owners.relationships]]
+category = "runtime_registration"
+kind = "registers"
+target = "path:codex-rs/uds/Cargo.toml"
+confidence = "manifest_derived"
+evidence = [{ path = "codex-rs/uds/Cargo.toml", symbol = "codex_uds" }]
+
+[[owners.relationships]]
+category = "tests_contracts"
+kind = "validated_by"
+target = "path:codex-rs/uds/src/lib_tests.rs"
+confidence = "declared"
+evidence = [{ path = "codex-rs/uds/src/lib_tests.rs", symbol = "stream_round_trips_data_between_listener_and_client" }]
+
+[[owners.invariants]]
+id = "uds-transport-adapter-behavior"
+kind = "semantic"
+statement = "Normal public bind, accept and connect over a real OS socket transfer literal request and response bytes with independent expectations at both ends; broken wrappers fail. The scenario is unverified if the environment takes its PermissionDenied skip branch."
+evidence = [{ path = "codex-rs/uds/src/lib.rs", symbol = "UnixListener" }, { path = "codex-rs/uds/src/lib.rs", symbol = "UnixStream" }, { path = "codex-rs/uds/src/lib.rs", symbol = "prepare_private_socket_directory" }]
+tests = ["codex-rs/uds/src/lib_tests.rs"]
+
+[[owners.invariants]]
+id = "uds-transport-adapter-compatibility"
+kind = "compatibility"
+statement = "Preserve Tokio AsyncRead/AsyncWrite behavior and borrowed descriptor lifetimes; shutdown flushes and half-closes the socket write side while owner objects keep handles alive."
+evidence = [{ path = "codex-rs/uds/src/lib.rs", symbol = "UnixListener" }, { path = "codex-rs/uds/src/lib.rs", symbol = "UnixStream" }, { path = "codex-rs/uds/src/lib.rs", symbol = "prepare_private_socket_directory" }]
+tests = ["codex-rs/uds/src/lib_tests.rs"]
+
+[[owners.validation]]
+id = "uds-round-trip"
+cwd = "codex-rs"
+argv = ["rustup", "run", "1.95.0", "cargo", "test", "-p", "codex-uds", "--lib", "lib_tests::stream_round_trips_data_between_listener_and_client", "--", "--exact", "--nocapture"]
+role = "focused_tests"
+
+[[owners]]
+id = "windows-sandbox-runtime"
+concern_ids = ["windows-sandbox-runtime"]
+aliases = ["windows sandbox runtime"]
+phrases = []
+roots = ["codex-rs/windows-sandbox-rs"]
+primary_entries = [{ path = "codex-rs/windows-sandbox-rs/src/wrapper.rs", symbol = "run_windows_sandbox_wrapper_main" }, { path = "codex-rs/windows-sandbox-rs/src/winutil.rs", symbol = "string_from_sid_bytes" }]
+instructions = ["AGENTS.md"]
+consumers = ["codex-rs/arg0/src/lib.rs", "codex-rs/core/src/exec.rs"]
+contracts = ["codex-rs/windows-sandbox-rs/src/wrapper.rs", "codex-rs/windows-sandbox-rs/src/winutil.rs"]
+generated_mirrors = []
+tests = ["codex-rs/windows-sandbox-rs/src/winutil.rs", "codex-rs/windows-sandbox-rs/src/dpapi.rs", "codex-rs/windows-sandbox-rs/src/elevated/runner_pipe.rs"]
+
+[owners.facet_exclusions]
+configuration_and_gates = "Permission profiles and selected elevated or legacy level are supplied by core's existing execution boundary; native helper repairs do not add a repository feature gate."
+generated_artifacts = "Native SID/handle ownership and DPAPI credential bytes are authored helpers with no generated API mirror. Existing IPC framing and setup versions remain their own runtime compatibility boundaries."
+
+[[owners.relationships]]
+category = "control_flow"
+kind = "calls"
+target = "path:codex-rs/windows-sandbox-rs/src/elevated/runner_pipe.rs"
+confidence = "declared"
+evidence = [{ path = "codex-rs/windows-sandbox-rs/src/elevated/runner_client.rs", symbol = "create_named_pipe" }]
+
+[[owners.relationships]]
+category = "callers_consumers"
+kind = "consumed_by"
+target = "path:codex-rs/arg0/src/lib.rs"
+confidence = "declared"
+evidence = [{ path = "codex-rs/arg0/src/lib.rs", symbol = "CODEX_WINDOWS_SANDBOX_ARG1" }, { path = "codex-rs/arg0/src/lib.rs", symbol = "run_windows_sandbox_wrapper_main" }]
+
+[[owners.relationships]]
+category = "callers_consumers"
+kind = "consumed_by"
+target = "path:codex-rs/core/src/exec.rs"
+confidence = "declared"
+evidence = [{ path = "codex-rs/core/src/exec.rs", symbol = "run_windows_sandbox_capture_for_permission_profile_elevated" }, { path = "codex-rs/core/src/exec.rs", symbol = "run_windows_sandbox_capture_with_filesystem_overrides_and_output_sink" }]
+
+[[owners.relationships]]
+category = "runtime_registration"
+kind = "registers"
+target = "path:codex-rs/windows-sandbox-rs/Cargo.toml"
+confidence = "manifest_derived"
+evidence = [{ path = "codex-rs/windows-sandbox-rs/Cargo.toml", symbol = "codex_windows_sandbox" }, { path = "codex-rs/windows-sandbox-rs/Cargo.toml", symbol = "codex-windows-sandbox-setup" }, { path = "codex-rs/windows-sandbox-rs/Cargo.toml", symbol = "codex-command-runner" }]
+
+[[owners.relationships]]
+category = "runtime_registration"
+kind = "registers"
+target = "path:codex-rs/windows-sandbox-rs/src/bin/setup_main/main.rs"
+confidence = "declared"
+evidence = [{ path = "codex-rs/windows-sandbox-rs/src/bin/setup_main/main.rs", symbol = "win::main()" }]
+
+[[owners.relationships]]
+category = "runtime_registration"
+kind = "registers"
+target = "path:codex-rs/windows-sandbox-rs/src/bin/command_runner/main.rs"
+confidence = "declared"
+evidence = [{ path = "codex-rs/windows-sandbox-rs/src/bin/command_runner/main.rs", symbol = "win::main()" }]
+
+[[owners.relationships]]
+category = "tests_contracts"
+kind = "validated_by"
+target = "path:codex-rs/windows-sandbox-rs/src/winutil.rs"
+confidence = "declared"
+evidence = [{ path = "codex-rs/windows-sandbox-rs/src/winutil.rs", symbol = "public_sid_conversion_checks_lengths_and_accepts_unaligned_bytes" }]
+
+[[owners.relationships]]
+category = "tests_contracts"
+kind = "validated_by"
+target = "path:codex-rs/windows-sandbox-rs/src/dpapi.rs"
+confidence = "declared"
+evidence = [{ path = "codex-rs/windows-sandbox-rs/src/dpapi.rs", symbol = "public_dpapi_roundtrip_preserves_binary_input_and_rejects_invalid_ciphertext" }]
+
+[[owners.relationships]]
+category = "tests_contracts"
+kind = "validated_by"
+target = "path:codex-rs/windows-sandbox-rs/src/elevated/runner_pipe.rs"
+confidence = "declared"
+evidence = [{ path = "codex-rs/windows-sandbox-rs/src/elevated/runner_pipe.rs", symbol = "invalid_named_pipe_name_preserves_the_creation_error" }]
+
+[[owners.invariants]]
+id = "windows-sandbox-runtime-sid-conversion"
+kind = "semantic"
+statement = "The public SID conversion independently returns S-1-5-32-544 for a valid variable-length SID, rejects every truncated prefix and accepts unaligned input."
+evidence = [{ path = "codex-rs/windows-sandbox-rs/src/winutil.rs", symbol = "public_sid_conversion_checks_lengths_and_accepts_unaligned_bytes" }]
+tests = ["codex-rs/windows-sandbox-rs/src/winutil.rs"]
+
+[[owners.invariants]]
+id = "windows-sandbox-runtime-credential-roundtrip"
+kind = "semantic"
+statement = "Public dpapi_protect and dpapi_unprotect produce different ciphertext, preserve independently supplied binary and empty inputs through a real OS round trip, and reject invalid ciphertext with a CryptUnprotectData failure."
+evidence = [{ path = "codex-rs/windows-sandbox-rs/src/dpapi.rs", symbol = "public_dpapi_roundtrip_preserves_binary_input_and_rejects_invalid_ciphertext" }]
+tests = ["codex-rs/windows-sandbox-rs/src/dpapi.rs"]
+
+[[owners.invariants]]
+id = "windows-sandbox-runtime-pipe-error"
+kind = "semantic"
+statement = "Normal create_named_pipe with an invalid pipe name returns the independently expected ERROR_INVALID_NAME, preserving the creation failure across security descriptor cleanup."
+evidence = [{ path = "codex-rs/windows-sandbox-rs/src/elevated/runner_pipe.rs", symbol = "invalid_named_pipe_name_preserves_the_creation_error" }]
+tests = ["codex-rs/windows-sandbox-rs/src/elevated/runner_pipe.rs"]
+
+[[owners.invariants]]
+id = "windows-sandbox-runtime-compatibility"
+kind = "compatibility"
+statement = "Preserve public Win32 SID/handle ownership and credential byte semantics, IPC_PROTOCOL_VERSION and framing and SETUP_VERSION while retaining elevated and legacy capture callers."
+evidence = [{ path = "codex-rs/windows-sandbox-rs/src/wrapper.rs", symbol = "run_windows_sandbox_wrapper_main" }, { path = "codex-rs/windows-sandbox-rs/src/winutil.rs", symbol = "string_from_sid_bytes" }, { path = "codex-rs/windows-sandbox-rs/src/elevated/ipc_framed.rs", symbol = "IPC_PROTOCOL_VERSION" }, { path = "codex-rs/windows-sandbox-rs/src/setup.rs", symbol = "SETUP_VERSION" }]
+tests = ["codex-rs/windows-sandbox-rs/src/winutil.rs", "codex-rs/windows-sandbox-rs/src/dpapi.rs", "codex-rs/windows-sandbox-rs/src/elevated/runner_pipe.rs"]
+
+[[owners.validation]]
+id = "sandbox-sid"
+cwd = "codex-rs"
+argv = ["rustup", "run", "1.95.0", "cargo", "test", "-p", "codex-windows-sandbox", "--lib", "public_sid_conversion"]
+role = "focused_tests"
+
+[[owners.validation]]
+id = "sandbox-dpapi"
+cwd = "codex-rs"
+argv = ["rustup", "run", "1.95.0", "cargo", "test", "-p", "codex-windows-sandbox", "--lib", "public_dpapi_roundtrip"]
+role = "focused_tests"
+
+[[owners.validation]]
+id = "sandbox-named-pipe"
+cwd = "codex-rs"
+argv = ["rustup", "run", "1.95.0", "cargo", "test", "-p", "codex-windows-sandbox", "--lib", "invalid_named_pipe_name"]
 role = "focused_tests"

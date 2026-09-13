@@ -191,8 +191,12 @@ where
             .cmp(&right.name)
             .then_with(|| left.id.cmp(&right.id))
     });
-    write_cached_directory_connectors(&cache_context, &connectors);
-    Ok(connectors)
+    tokio::task::spawn_blocking(move || {
+        write_cached_directory_connectors(&cache_context, &connectors);
+        connectors
+    })
+    .await
+    .map_err(anyhow::Error::from)
 }
 
 fn write_cached_directory_connectors(
@@ -601,6 +605,58 @@ mod tests {
             })
         );
         Ok(())
+    }
+
+    #[test]
+    fn directory_cache_publication_yields_and_persists_fetched_connectors() -> anyhow::Result<()> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()?;
+        runtime.block_on(async {
+            let _cache_guard = CONNECTOR_DIRECTORY_CACHE_TEST_LOCK.lock().await;
+            clear_directory_memory_cache();
+            let codex_home = TempDir::new()?;
+            let context = cache_context(&codex_home, "publication-worker");
+            let cache_path = context.cache_path();
+            let (started, ready) = tokio::sync::oneshot::channel();
+            let (release, wait) = std::sync::mpsc::channel::<()>();
+            let blocker = tokio::task::spawn_blocking(move || {
+                let _ = started.send(());
+                let _ = wait.recv();
+            });
+            ready.await?;
+            let listing =
+                list_all_connectors_with_options(context.clone(), false, true, |_| async {
+                    Ok(DirectoryListResponse {
+                        apps: vec![app("alpha", "Alpha")],
+                        next_token: None,
+                    })
+                });
+            tokio::pin!(listing);
+            let publication_waits_for_worker =
+                tokio::time::timeout(Duration::from_millis(20), &mut listing)
+                    .await
+                    .is_err();
+            let published_before_worker = cache_path.exists();
+            drop(release);
+            blocker.await?;
+            assert!(
+                publication_waits_for_worker,
+                "disk publication must yield to a blocking worker"
+            );
+            assert!(
+                !published_before_worker,
+                "cache must not be written on the runtime thread"
+            );
+            let connectors = listing.await?;
+            let mut expected = directory_app_to_app_info(app("alpha", "Alpha"));
+            expected.install_url = Some("https://chatgpt.com/apps/alpha/alpha".to_string());
+            assert_eq!(connectors, vec![expected.clone()]);
+            clear_directory_memory_cache();
+            assert_eq!(cached_directory_connectors(&context), Some(vec![expected]));
+            Ok(())
+        })
     }
 
     #[tokio::test]

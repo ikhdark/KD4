@@ -317,23 +317,20 @@ impl App {
                 }
             }
             AppEvent::StartCommitAnimation => {
-                if self
-                    .commit_anim_running
-                    .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-                    .is_ok()
-                {
+                if self.commit_animation_task.is_none() {
                     let tx = self.app_event_tx.clone();
-                    let running = self.commit_anim_running.clone();
-                    thread::spawn(move || {
-                        while running.load(Ordering::Relaxed) {
-                            thread::sleep(COMMIT_ANIMATION_TICK);
-                            tx.send(AppEvent::CommitTick);
-                        }
-                    });
+                    self.commit_animation_task = Some(tokio_util::task::AbortOnDropHandle::new(
+                        tokio::spawn(async move {
+                            loop {
+                                tokio::time::sleep(COMMIT_ANIMATION_TICK).await;
+                                tx.send(AppEvent::CommitTick);
+                            }
+                        }),
+                    ));
                 }
             }
             AppEvent::StopCommitAnimation => {
-                self.commit_anim_running.store(false, Ordering::Release);
+                self.commit_animation_task = None;
             }
             AppEvent::CommitTick => {
                 self.chat_widget.on_commit_tick();
@@ -488,7 +485,7 @@ impl App {
                 // Clear the in-progress state in the bottom pane
                 self.chat_widget.on_diff_complete();
                 // Enter alternate screen using TUI helper and build pager lines
-                let _ = tui.enter_alt_screen();
+                tui.enter_alt_screen()?;
                 let pager_lines: Vec<ratatui::text::Line<'static>> = if text.trim().is_empty() {
                     vec!["No changes detected.".italic().into()]
                 } else {
@@ -1970,7 +1967,7 @@ impl App {
             }
             AppEvent::FullScreenApprovalRequest(request) => match request {
                 ApprovalRequest::ApplyPatch { cwd, changes, .. } => {
-                    let _ = tui.enter_alt_screen();
+                    tui.enter_alt_screen()?;
                     let diff_summary = DiffSummary::new(changes, cwd);
                     self.overlay = Some(Overlay::new_static_with_renderables(
                         vec![diff_summary.into()],
@@ -1979,7 +1976,7 @@ impl App {
                     ));
                 }
                 ApprovalRequest::Exec { command, .. } => {
-                    let _ = tui.enter_alt_screen();
+                    tui.enter_alt_screen()?;
                     let full_cmd = strip_bash_lc_and_escape(&command);
                     let full_cmd_lines = highlight_bash_to_lines(&full_cmd);
                     self.overlay = Some(Overlay::new_static_with_lines(
@@ -1994,7 +1991,7 @@ impl App {
                     reason,
                     ..
                 } => {
-                    let _ = tui.enter_alt_screen();
+                    tui.enter_alt_screen()?;
                     let mut lines = Vec::new();
                     if let Some(environment_id) = environment_id {
                         lines.push(Line::from(vec![
@@ -2026,7 +2023,7 @@ impl App {
                     message,
                     ..
                 } => {
-                    let _ = tui.enter_alt_screen();
+                    tui.enter_alt_screen()?;
                     let paragraph = Paragraph::new(vec![
                         Line::from(vec!["Server: ".into(), server_name.bold()]),
                         Line::from(""),

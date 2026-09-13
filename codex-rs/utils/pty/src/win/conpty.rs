@@ -29,8 +29,6 @@ use portable_pty::PtySize;
 use portable_pty::PtySystem;
 use portable_pty::SlavePty;
 use portable_pty::cmdbuilder::CommandBuilder;
-use std::mem::ManuallyDrop;
-use std::ptr;
 use std::sync::Arc;
 use std::sync::Mutex;
 use winapi::um::wincon::COORD;
@@ -78,14 +76,12 @@ impl RawConPty {
     }
 
     pub fn into_handles(self) -> (PsuedoCon, FileDescriptor, FileDescriptor) {
-        let me = ManuallyDrop::new(self);
-        unsafe {
-            (
-                ptr::read(&me.con),
-                ptr::read(&me.input_write),
-                ptr::read(&me.output_read),
-            )
-        }
+        let Self {
+            con,
+            input_write,
+            output_read,
+        } = self;
+        (con, input_write, output_read)
     }
 }
 

@@ -1077,12 +1077,16 @@ async fn read_http_request(listener: &TcpListener) -> Result<HttpRequest> {
         let mut reader = BufReader::new(stream);
 
         let mut request_line = String::new();
-        reader.read_line(&mut request_line).await?;
+        if reader.read_line(&mut request_line).await? == 0 {
+            anyhow::bail!("HTTP connection closed before the request line");
+        }
         let mut content_length = 0;
         let mut headers = HashMap::new();
         loop {
             let mut line = String::new();
-            reader.read_line(&mut line).await?;
+            if reader.read_line(&mut line).await? == 0 {
+                anyhow::bail!("HTTP connection closed before the end of request headers");
+            }
             if line == "\r\n" {
                 break;
             }
@@ -1115,6 +1119,23 @@ async fn read_http_request(listener: &TcpListener) -> Result<HttpRequest> {
             reader,
         });
     }
+}
+
+#[tokio::test]
+async fn remote_control_http_fixture_rejects_eof_before_headers_complete() -> Result<()> {
+    for request in ["", "POST /enroll HTTP/1.1\r\nHost: localhost\r\n"] {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let mut stream = TcpStream::connect(listener.local_addr()?).await?;
+        stream.write_all(request.as_bytes()).await?;
+        stream.shutdown().await?;
+
+        let result = timeout(Duration::from_secs(1), read_http_request(&listener)).await?;
+        let error = result
+            .err()
+            .context("an incomplete request must fail at EOF")?;
+        assert!(error.to_string().contains("HTTP connection closed before"));
+    }
+    Ok(())
 }
 
 async fn respond_with_json(stream: TcpStream, body: serde_json::Value) -> Result<()> {

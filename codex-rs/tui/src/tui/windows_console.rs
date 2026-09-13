@@ -37,6 +37,8 @@ fn current_input_mode() -> std::io::Result<Option<(windows_sys::Win32::Foundatio
     use windows_sys::Win32::System::Console::GetStdHandle;
     use windows_sys::Win32::System::Console::STD_INPUT_HANDLE;
 
+    // SAFETY: GetStdHandle has no pointer preconditions; invalid results are checked below.
+    // The returned process-owned handle is borrowed and is never closed here.
     let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
     if handle == INVALID_HANDLE_VALUE {
         return Err(std::io::Error::last_os_error());
@@ -46,6 +48,7 @@ fn current_input_mode() -> std::io::Result<Option<(windows_sys::Win32::Foundatio
     }
 
     let mut mode = 0;
+    // SAFETY: handle is a checked, borrowed standard input handle and mode is writable.
     if unsafe { GetConsoleMode(handle, &mut mode) } == 0 {
         return Err(std::io::Error::last_os_error());
     }
@@ -63,6 +66,7 @@ pub(super) fn set_input_record_mode() -> std::io::Result<()> {
         return Ok(());
     };
     let requested_mode = input_record_mode(mode);
+    // SAFETY: current_input_mode validated the borrowed handle; requested_mode contains console flags.
     if requested_mode != mode && unsafe { SetConsoleMode(handle, requested_mode) } == 0 {
         return Err(std::io::Error::last_os_error());
     }
@@ -98,6 +102,7 @@ pub(super) fn ensure_input_record_mode() -> std::io::Result<()> {
         return Ok(());
     };
     let requested_mode = input_record_mode(mode);
+    // SAFETY: current_input_mode validated the borrowed handle; requested_mode contains console flags.
     if requested_mode != mode && unsafe { SetConsoleMode(handle, requested_mode) } == 0 {
         return Err(std::io::Error::last_os_error());
     }
@@ -126,6 +131,7 @@ pub(super) fn restore_input_mode() -> std::io::Result<()> {
         return Ok(());
     };
     let requested_mode = restored_input_mode(mode, original);
+    // SAFETY: current_input_mode validated the borrowed handle; requested_mode restores saved console flags.
     if requested_mode != mode && unsafe { SetConsoleMode(handle, requested_mode) } == 0 {
         snapshot.restore_failed = true;
         return Err(std::io::Error::last_os_error());

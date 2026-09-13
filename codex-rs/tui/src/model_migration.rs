@@ -137,13 +137,13 @@ pub(crate) fn migration_copy_for_models(
 pub(crate) async fn run_model_migration_prompt(
     tui: &mut Tui,
     copy: ModelMigrationCopy,
-) -> ModelMigrationOutcome {
-    let alt = AltScreenGuard::enter(tui);
+) -> color_eyre::Result<ModelMigrationOutcome> {
+    let alt = AltScreenGuard::enter(tui)?;
     let mut screen = ModelMigrationScreen::new(alt.tui.frame_requester(), copy);
 
-    let _ = alt.tui.draw(u16::MAX, |frame| {
+    alt.tui.draw(u16::MAX, |frame| {
         frame.render_widget_ref(&screen, frame.area());
-    });
+    })?;
 
     let events = alt.tui.event_stream();
     tokio::pin!(events);
@@ -154,9 +154,9 @@ pub(crate) async fn run_model_migration_prompt(
                 TuiEvent::Key(key_event) => screen.handle_key(key_event),
                 TuiEvent::Paste(_) => {}
                 TuiEvent::Draw | TuiEvent::Resize => {
-                    let _ = alt.tui.draw(u16::MAX, |frame| {
+                    alt.tui.draw(u16::MAX, |frame| {
                         frame.render_widget_ref(&screen, frame.area());
-                    });
+                    })?;
                 }
             }
         } else {
@@ -165,7 +165,7 @@ pub(crate) async fn run_model_migration_prompt(
         }
     }
 
-    screen.outcome()
+    Ok(screen.outcome())
 }
 
 struct ModelMigrationScreen {
@@ -383,15 +383,17 @@ struct AltScreenGuard<'a> {
 }
 
 impl<'a> AltScreenGuard<'a> {
-    fn enter(tui: &'a mut Tui) -> Self {
-        let _ = tui.enter_alt_screen();
-        Self { tui }
+    fn enter(tui: &'a mut Tui) -> color_eyre::Result<Self> {
+        tui.enter_alt_screen()?;
+        Ok(Self { tui })
     }
 }
 
 impl Drop for AltScreenGuard<'_> {
     fn drop(&mut self) {
-        let _ = self.tui.leave_alt_screen();
+        if let Err(err) = self.tui.leave_alt_screen() {
+            tracing::warn!("failed to leave model migration alternate screen: {err}");
+        }
     }
 }
 

@@ -301,6 +301,54 @@ async fn yields_and_resumes() {
 }
 
 #[tokio::test]
+async fn yields_again_after_the_previous_yield_was_observed() {
+    let (delegate, mut events_rx) = BlockingDelegate::new();
+    let service = InProcessCodeModeSession::with_delegate(delegate.clone());
+    let cell = service
+        .execute(ExecuteRequest {
+            enabled_tools: vec![blocking_tool()],
+            source: r#"yield_control(); await tools.block({}); text("second"); yield_control();"#
+                .to_string(),
+            yield_time_ms: Some(60_000),
+            ..execute_request("")
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        cell.initial_response().await.unwrap(),
+        RuntimeResponse::ExplicitYield {
+            cell_id: cell_id("1"),
+            content_items: vec![],
+        }
+    );
+    assert_eq!(next_event(&mut events_rx).await, DelegateEvent::ToolStarted);
+
+    let mut waiting = Box::pin(service.wait(WaitRequest {
+        cell_id: cell_id("1"),
+        yield_time_ms: 60_000,
+    }));
+    std::future::poll_fn(|cx| {
+        assert!(waiting.as_mut().poll(cx).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
+    delegate.tool_release.notify_one();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("second yield must be delivered")
+            .unwrap(),
+        WaitOutcome::LiveCell(RuntimeResponse::ExplicitYield {
+            cell_id: cell_id("1"),
+            content_items: vec![FunctionCallOutputContentItem::InputText {
+                text: "second".to_string(),
+            }],
+        })
+    );
+    service.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn bounded_parallel_nested_tool_timeout_rejects_only_the_expired_call() {
     let (delegate, mut events_rx) = BlockingDelegate::new();
     let service = InProcessCodeModeSession::with_delegate(delegate);

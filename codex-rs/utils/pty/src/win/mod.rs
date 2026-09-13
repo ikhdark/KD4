@@ -96,6 +96,8 @@ impl WinChild {
         )?;
         // A terminating process can publish its exit code before its handle is
         // signaled. Only the native wait proves that the process has exited.
+        // SAFETY: proc is an owned duplicate of the process handle and remains live for the
+        // entire zero-duration wait.
         match unsafe { WaitForSingleObject(proc.as_raw_handle() as _, 0) } {
             winapi::shared::winerror::WAIT_TIMEOUT => return Ok(None),
             WAIT_FAILED_RESULT => return Err(IoError::last_os_error()),
@@ -106,6 +108,8 @@ impl WinChild {
                 )));
             }
         }
+        // SAFETY: proc owns a live process handle and status is writable DWORD storage for the
+        // exit-code output.
         let res = unsafe { GetExitCodeProcess(proc.as_raw_handle() as _, &mut status) };
         if res != 0 {
             self.preserve_descendants();
@@ -162,6 +166,8 @@ fn terminate_process(process: &Mutex<OwnedHandle>) -> IoResult<()> {
     let process = process
         .lock()
         .map_err(|_| IoError::other("process handle lock poisoned"))?;
+    // SAFETY: The mutex guard keeps the owned process handle live and prevents replacement
+    // until TerminateProcess returns.
     let terminated = unsafe { TerminateProcess(process.as_raw_handle() as _, 1) };
     if terminated == 0 {
         Err(IoError::last_os_error())
@@ -202,6 +208,8 @@ impl Child for WinChild {
                 .lock()
                 .map_err(|_| IoError::other("process handle lock poisoned"))?,
         )?;
+        // SAFETY: proc owns the duplicated process handle throughout the wait, so it cannot be
+        // closed concurrently.
         let wait_result = unsafe { WaitForSingleObject(proc.as_raw_handle() as _, INFINITE) };
         if wait_result == WAIT_FAILED_RESULT {
             return Err(IoError::last_os_error());
@@ -212,6 +220,8 @@ impl Child for WinChild {
             )));
         }
         let mut status: DWORD = 0;
+        // SAFETY: proc remains owned and status is writable DWORD storage for the duration of
+        // GetExitCodeProcess.
         let res = unsafe { GetExitCodeProcess(proc.as_raw_handle() as _, &mut status) };
         if res != 0 {
             self.preserve_descendants();
@@ -222,6 +232,8 @@ impl Child for WinChild {
     }
 
     fn process_id(&self) -> Option<u32> {
+        // SAFETY: The mutex guard keeps the owned process handle live while GetProcessId reads
+        // its process identity.
         let res = unsafe { GetProcessId(self.proc.lock().unwrap().as_raw_handle() as _) };
         if res == 0 { None } else { Some(res) }
     }
@@ -251,6 +263,8 @@ impl std::future::Future for WinChild {
                         .name("codex-process-wait".into())
                         .spawn(move || {
                             let result =
+                                // SAFETY: The waiter thread owns proc until this wait
+                                // completes; no other owner closes that duplicated handle.
                                 unsafe { WaitForSingleObject(proc.as_raw_handle() as _, INFINITE) };
                             let result = if result == WAIT_OBJECT_0_RESULT {
                                 Ok(())
@@ -322,6 +336,8 @@ mod waiter_tests {
         let mut child = console.spawn_command(command)?;
         let native = {
             let process = child.proc.lock().unwrap();
+            // SAFETY: The process mutex guard keeps the original handle alive until it has been
+            // duplicated into a separate OwnedHandle.
             unsafe { BorrowedHandle::borrow_raw(process.as_raw_handle()) }.try_clone_to_owned()?
         };
         assert_eq!(
@@ -392,6 +408,8 @@ mod waiter_tests {
                 .stderr(Stdio::null())
                 .spawn()?,
         );
+        // SAFETY: OpenProcess receives a scalar PID and access mask; its result is checked
+        // before ownership is assumed.
         let raw = unsafe {
             OpenProcess(
                 winapi::um::winnt::PROCESS_QUERY_INFORMATION
@@ -403,6 +421,8 @@ mod waiter_tests {
             )
         };
         assert!(!raw.is_null());
+        // SAFETY: The checked, non-null result of OpenProcess is transferred into its sole
+        // owning handle wrapper.
         let owned = unsafe { OwnedHandle::from_raw_handle(raw.cast()) };
         let job = Arc::new(JobObject::create()?);
         job.assign_process(owned.as_raw_handle())?;

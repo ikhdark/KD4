@@ -51,6 +51,8 @@ impl Drop for ConptyInstance {
     fn drop(&mut self) {
         let input_write = self.input_write as HANDLE;
         let output_read = self.output_read as HANDLE;
+        // SAFETY: The instance owns any nonzero pipe handles; take_input_write and
+        // take_output_read clear transferred handles before Drop.
         unsafe {
             if !input_write.is_null() && input_write != INVALID_HANDLE_VALUE {
                 CloseHandle(input_write);
@@ -108,6 +110,8 @@ pub unsafe fn spawn_conpty_process_as_user(
         .join(" ");
     let mut cmdline: Vec<u16> = to_wide(&cmdline_str);
     let env_block = make_env_block(env_map);
+    // SAFETY: STARTUPINFOEXW contains integer and pointer fields with a valid all-zero initial
+    // representation.
     let mut si: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
     si.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
     si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
@@ -133,7 +137,11 @@ pub unsafe fn spawn_conpty_process_as_user(
     attrs.set_job(job.as_raw_handle() as HANDLE)?;
     si.lpAttributeList = attrs.as_mut_ptr();
 
+    // SAFETY: PROCESS_INFORMATION contains integer and handle fields with a valid all-zero
+    // initial representation.
     let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: The caller keeps h_token valid; command, environment, cwd, desktop, attribute
+    // storage, and conpty/job owners all remain live during CreateProcessAsUserW.
     let ok = unsafe {
         CreateProcessAsUserW(
             h_token,
@@ -150,6 +158,8 @@ pub unsafe fn spawn_conpty_process_as_user(
         )
     };
     if ok == 0 {
+        // SAFETY: GetLastError reads the current thread's native error immediately after
+        // process creation failed.
         let err = unsafe { GetLastError() } as i32;
         let message = format!(
             "CreateProcessAsUserW failed: {} ({}) | cwd={} | cmd={} | env_u16_len={}",

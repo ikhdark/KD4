@@ -105,6 +105,30 @@ mode = "full"
         entry.maybe_reload().await.unwrap().is_none(),
         "successful reload must commit the changed config mtime"
     );
+
+    // Restoring a saved config can move its timestamp backwards. The normal reloader
+    // must still publish the restored mode and domain policy, then acknowledge it.
+    fs::write(
+        &config_path,
+        initial_config.replace("blocked.example.com", "restored.example.com"),
+    )
+    .unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&config_path)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(initial_mtime))
+        .unwrap();
+    let restored = entry
+        .maybe_reload()
+        .await
+        .unwrap()
+        .expect("an older timestamp must trigger config reload");
+    assert_eq!(restored.config.mode, NetworkMode::Full);
+    assert!(restored.mitm.is_none());
+    assert!(restored.deny_set.is_match("restored.example.com"));
+    assert!(!restored.deny_set.is_match("blocked.example.com"));
+    assert!(entry.maybe_reload().await.unwrap().is_none());
 }
 
 #[test]

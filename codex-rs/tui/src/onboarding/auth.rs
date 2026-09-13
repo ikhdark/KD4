@@ -77,6 +77,9 @@ mod headless_chatgpt_login;
 #[derive(Clone)]
 pub(crate) enum SignInState {
     PickMode,
+    ChatGptStarting {
+        request_id: Uuid,
+    },
     ChatGptContinueInBrowser(ContinueInBrowserState),
     #[allow(dead_code)]
     ChatGptDeviceCode(ContinueWithDeviceCodeState),
@@ -200,15 +203,19 @@ impl KeyboardHandler for AuthModeWidget {
             return;
         }
         if keys::CONFIRM.is_pressed(key_event) {
-            let sign_in_state = { (*self.sign_in_state.read().unwrap()).clone() };
-            match sign_in_state {
-                SignInState::PickMode => {
-                    self.handle_sign_in_option(self.highlighted_mode);
+            let start_login = {
+                let mut state = self.sign_in_state.write().unwrap();
+                match &*state {
+                    SignInState::PickMode => true,
+                    SignInState::ChatGptSuccessMessage => {
+                        *state = SignInState::ChatGptSuccess;
+                        false
+                    }
+                    _ => false,
                 }
-                SignInState::ChatGptSuccessMessage => {
-                    *self.sign_in_state.write().unwrap() = SignInState::ChatGptSuccess;
-                }
-                _ => {}
+            };
+            if start_login {
+                self.handle_sign_in_option(self.highlighted_mode);
             }
             return;
         }
@@ -245,13 +252,16 @@ impl AuthModeWidget {
     pub(crate) fn should_suppress_animations(&self) -> bool {
         matches!(
             &*self.sign_in_state.read().unwrap(),
-            SignInState::ChatGptContinueInBrowser(_) | SignInState::ChatGptDeviceCode(_)
+            SignInState::ChatGptStarting { .. }
+                | SignInState::ChatGptContinueInBrowser(_)
+                | SignInState::ChatGptDeviceCode(_)
         )
     }
 
     pub(crate) fn cancel_active_attempt(&self) {
         let mut sign_in_state = self.sign_in_state.write().unwrap();
         match &*sign_in_state {
+            SignInState::ChatGptStarting { .. } => {}
             SignInState::ChatGptContinueInBrowser(state) => {
                 let request_handle = self.app_server_request_handle.clone();
                 let login_id = state.login_id.clone();
@@ -883,13 +893,16 @@ impl AuthModeWidget {
             return;
         }
 
+        let request_id = Uuid::new_v4();
+        *self.sign_in_state.write().unwrap() = SignInState::ChatGptStarting { request_id };
         self.set_error(/*message*/ None);
+        self.request_frame.schedule_frame();
         let request_handle = self.app_server_request_handle.clone();
         let sign_in_state = self.sign_in_state.clone();
         let error = self.error.clone();
         let request_frame = self.request_frame.clone();
         tokio::spawn(async move {
-            match request_handle
+            let result = request_handle
                 .request_typed::<LoginAccountResponse>(ClientRequest::LoginAccount {
                     request_id: onboarding_request_id(),
                     params: LoginAccountParams::Chatgpt {
@@ -898,27 +911,48 @@ impl AuthModeWidget {
                         use_hosted_login_success_page: false,
                     },
                 })
-                .await
-            {
-                Ok(LoginAccountResponse::Chatgpt { login_id, auth_url }) => {
-                    maybe_open_auth_url_in_browser(&request_handle, &auth_url);
-                    *error.write().unwrap() = None;
-                    *sign_in_state.write().unwrap() =
-                        SignInState::ChatGptContinueInBrowser(ContinueInBrowserState {
-                            login_id,
-                            auth_url,
-                        });
+                .await;
+            let mut auth_url_to_open = None;
+            let stale_login_id = {
+                let mut state = sign_in_state.write().unwrap();
+                // Reject replies whose pending attempt was already canceled or replaced. Only an
+                // accepted reply may update the UI and hand off its URL after releasing the lock.
+                if matches!(&*state, SignInState::ChatGptStarting { request_id: current }
+                    if *current == request_id)
+                {
+                    match result {
+                        Ok(LoginAccountResponse::Chatgpt { login_id, auth_url }) => {
+                            auth_url_to_open = Some(auth_url.clone());
+                            *error.write().unwrap() = None;
+                            *state =
+                                SignInState::ChatGptContinueInBrowser(ContinueInBrowserState {
+                                    login_id,
+                                    auth_url,
+                                });
+                        }
+                        Ok(other) => {
+                            *state = SignInState::PickMode;
+                            *error.write().unwrap() = Some(format!(
+                                "Unexpected account/login/start response: {other:?}"
+                            ));
+                        }
+                        Err(err) => {
+                            *state = SignInState::PickMode;
+                            *error.write().unwrap() = Some(err.to_string());
+                        }
+                    }
+                    None
+                } else if let Ok(LoginAccountResponse::Chatgpt { login_id, .. }) = result {
+                    Some(login_id)
+                } else {
+                    None
                 }
-                Ok(other) => {
-                    *sign_in_state.write().unwrap() = SignInState::PickMode;
-                    *error.write().unwrap() = Some(format!(
-                        "Unexpected account/login/start response: {other:?}"
-                    ));
-                }
-                Err(err) => {
-                    *sign_in_state.write().unwrap() = SignInState::PickMode;
-                    *error.write().unwrap() = Some(err.to_string());
-                }
+            };
+            if let Some(login_id) = stale_login_id {
+                cancel_login_attempt(&request_handle, login_id).await;
+            }
+            if let Some(auth_url) = auth_url_to_open {
+                maybe_open_auth_url_in_browser(&request_handle, &auth_url);
             }
             request_frame.schedule_frame();
         });
@@ -987,6 +1021,7 @@ impl StepStateProvider for AuthModeWidget {
         match &*sign_in_state {
             SignInState::PickMode
             | SignInState::ApiKeyEntry(_)
+            | SignInState::ChatGptStarting { .. }
             | SignInState::ChatGptContinueInBrowser(_)
             | SignInState::ChatGptDeviceCode(_)
             | SignInState::ChatGptSuccessMessage => StepState::InProgress,
@@ -1001,6 +1036,19 @@ impl WidgetRef for AuthModeWidget {
         match &*sign_in_state {
             SignInState::PickMode => {
                 self.render_pick_mode(area, buf);
+            }
+            SignInState::ChatGptStarting { .. } => {
+                Paragraph::new(vec![
+                    Line::from("  Preparing browser sign-in..."),
+                    Line::default(),
+                    Line::from(vec![
+                        "  Press ".dim(),
+                        self.cancel_binding().into(),
+                        " to cancel".dim(),
+                    ]),
+                ])
+                .wrap(Wrap { trim: false })
+                .render(area, buf);
             }
             SignInState::ChatGptContinueInBrowser(_) => {
                 self.render_continue_in_browser(area, buf);
@@ -1050,6 +1098,204 @@ mod tests {
     use pretty_assertions::assert_eq;
     use std::sync::Arc;
     use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn browser_login_completion_respects_current_keyboard_attempt() {
+        use codex_app_server_client::RemoteAppServerClient;
+        use codex_app_server_client::RemoteAppServerConnectArgs;
+        use codex_app_server_client::RemoteAppServerEndpoint;
+        use futures::SinkExt;
+        use futures::StreamExt;
+        use std::time::Duration;
+        use tokio::sync::broadcast;
+        use tokio::sync::mpsc;
+        use tokio_tungstenite::tungstenite::Message;
+
+        for response_error in [false, true] {
+            for replacement in ["current", "cancel", "api-key"] {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+                let (arrived_tx, mut arrived_rx) = mpsc::channel(1);
+                let (release_tx, mut release_rx) = mpsc::channel(1);
+                let peer = tokio::spawn(async move {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                    let init = socket.next().await.unwrap().unwrap();
+                    let init: serde_json::Value =
+                        serde_json::from_str(init.to_text().unwrap()).unwrap();
+                    assert_eq!(init["method"], "initialize");
+                    socket
+                        .send(Message::Text(
+                            serde_json::json!({"id":init["id"],"result":{}})
+                                .to_string()
+                                .into(),
+                        ))
+                        .await
+                        .unwrap();
+                    let initialized = socket.next().await.unwrap().unwrap();
+                    let initialized: serde_json::Value =
+                        serde_json::from_str(initialized.to_text().unwrap()).unwrap();
+                    assert_eq!(initialized["method"], "initialized");
+                    let request = socket.next().await.unwrap().unwrap();
+                    let request: serde_json::Value =
+                        serde_json::from_str(request.to_text().unwrap()).unwrap();
+                    assert_eq!(request["method"], "account/login/start");
+                    assert_eq!(request["params"]["type"], "chatgpt");
+                    arrived_tx.send(()).await.unwrap();
+                    release_rx.recv().await.unwrap();
+                    let response = if response_error {
+                        serde_json::json!({"id":request["id"],"error":{"code":-32000,"message":"browser login rejected"}})
+                    } else {
+                        serde_json::json!({"id":request["id"],"result":{"type":"chatgpt","loginId":"browser-login","authUrl":"https://example.test/login"}})
+                    };
+                    socket
+                        .send(Message::Text(response.to_string().into()))
+                        .await
+                        .unwrap();
+                    if replacement != "current" && !response_error {
+                        let cancel = socket.next().await.unwrap().unwrap();
+                        let cancel: serde_json::Value =
+                            serde_json::from_str(cancel.to_text().unwrap()).unwrap();
+                        assert_eq!(cancel["method"], "account/login/cancel");
+                        assert_eq!(cancel["params"]["loginId"], "browser-login");
+                        socket
+                            .send(Message::Text(
+                                serde_json::json!({"id":cancel["id"],"result":{"status":"canceled"}})
+                                    .to_string()
+                                    .into(),
+                            ))
+                            .await
+                            .unwrap();
+                    }
+                    // Keep the transport alive until the UI has consumed the reply.
+                    let _ = release_rx.recv().await;
+                });
+                let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+                    endpoint: RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: endpoint,
+                        auth_token: None,
+                    },
+                    client_name: "codex-tui-test".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: true,
+                    mcp_server_openai_form_elicitation: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 8,
+                })
+                .await
+                .unwrap();
+                let (draw_tx, mut draw_rx) = broadcast::channel(16);
+                let mut widget = AuthModeWidget {
+                    request_frame: FrameRequester::new(draw_tx),
+                    highlighted_mode: SignInOption::ChatGpt,
+                    error: Arc::new(RwLock::new(None)),
+                    sign_in_state: Arc::new(RwLock::new(SignInState::PickMode)),
+                    login_status: LoginStatus::NotAuthenticated,
+                    app_server_request_handle: AppServerRequestHandle::Remote(
+                        client.request_handle(),
+                    ),
+                    forced_login_method: None,
+                    animations_enabled: false,
+                    animations_suppressed: Cell::new(false),
+                };
+                let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+                widget.handle_key_event(key(KeyCode::Enter));
+                arrived_rx.recv().await.unwrap();
+                tokio::time::timeout(Duration::from_secs(2), draw_rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(widget.get_step_state(), StepState::InProgress);
+                assert!(widget.should_suppress_animations());
+                let area = Rect::new(0, 0, 64, 4);
+                let mut buffer = Buffer::empty(area);
+                widget.render_ref(area, &mut buffer);
+                let rendered: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+                assert!(rendered.contains("Preparing browser sign-in..."));
+                assert!(rendered.contains("to cancel"));
+
+                match replacement {
+                    "cancel" => widget.handle_key_event(key(KeyCode::Esc)),
+                    "api-key" => {
+                        widget.handle_key_event(key(KeyCode::Char('3')));
+                        widget.handle_paste("sk-new-test".to_string());
+                    }
+                    _ => {}
+                }
+                if replacement != "current" {
+                    // Consume input's redraw so the next one witnesses the old reply's handling.
+                    tokio::time::timeout(Duration::from_secs(2), draw_rx.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                }
+                release_tx.send(()).await.unwrap();
+                tokio::time::timeout(Duration::from_secs(2), draw_rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(widget.get_step_state(), StepState::InProgress);
+                if replacement == "api-key" {
+                    assert!(matches!(
+                        &*widget.sign_in_state.read().unwrap(),
+                        SignInState::ApiKeyEntry(input) if input.value == "sk-new-test"
+                    ));
+                    assert_eq!(widget.error_message(), None);
+                } else if replacement == "cancel" {
+                    assert!(matches!(
+                        &*widget.sign_in_state.read().unwrap(),
+                        SignInState::PickMode
+                    ));
+                    assert_eq!(widget.error_message(), None);
+                } else if response_error {
+                    assert!(matches!(
+                        &*widget.sign_in_state.read().unwrap(),
+                        SignInState::PickMode
+                    ));
+                    assert!(
+                        widget
+                            .error_message()
+                            .unwrap()
+                            .contains("browser login rejected")
+                    );
+                } else {
+                    assert!(matches!(
+                        &*widget.sign_in_state.read().unwrap(),
+                        SignInState::ChatGptContinueInBrowser(state)
+                            if state.login_id == "browser-login"
+                                && state.auth_url == "https://example.test/login"
+                    ));
+                    assert_eq!(widget.error_message(), None);
+                    widget.on_account_login_completed(AccountLoginCompletedNotification {
+                        login_id: Some("unrelated-login".to_string()),
+                        success: true,
+                        error: None,
+                    });
+                    assert!(matches!(
+                        &*widget.sign_in_state.read().unwrap(),
+                        SignInState::ChatGptContinueInBrowser(_)
+                    ));
+                    widget.on_account_login_completed(AccountLoginCompletedNotification {
+                        login_id: Some("browser-login".to_string()),
+                        success: true,
+                        error: None,
+                    });
+                    assert!(matches!(
+                        &*widget.sign_in_state.read().unwrap(),
+                        SignInState::ChatGptSuccessMessage
+                    ));
+                    widget.handle_key_event(key(KeyCode::Enter));
+                    assert_eq!(widget.get_step_state(), StepState::Complete);
+                    assert!(matches!(
+                        &*widget.sign_in_state.read().unwrap(),
+                        SignInState::ChatGptSuccess
+                    ));
+                }
+                drop(release_tx);
+                peer.await.unwrap();
+            }
+        }
+    }
 
     #[tokio::test]
     async fn api_key_completion_respects_current_keyboard_attempt() {

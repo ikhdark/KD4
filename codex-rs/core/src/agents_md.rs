@@ -135,7 +135,6 @@ struct LoadedProjectDoc {
 struct ProjectDocCandidate {
     path: PathUri,
     size: u64,
-    modified_at_ms: i64,
 }
 
 pub(crate) struct ProjectInstructionsDiscovery {
@@ -151,43 +150,10 @@ struct EnvironmentProjectInstructionsDiscovery {
     result: io::Result<Vec<ProjectDocCandidate>>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ProjectInstructionsSourceFingerprint(
-    Vec<EnvironmentProjectInstructionsFingerprint>,
-);
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct EnvironmentProjectInstructionsFingerprint {
-    environment_id: String,
-    cwd: PathUri,
-    candidates: Vec<ProjectDocCandidate>,
-}
-
 impl ProjectInstructionsDiscovery {
     #[cfg(test)]
     pub(crate) fn config_identity(&self) -> usize {
         self.config_identity
-    }
-
-    pub(crate) fn source_fingerprint(&self) -> Option<ProjectInstructionsSourceFingerprint> {
-        let mut environments = Vec::with_capacity(self.environments.len());
-        for discovery in &self.environments {
-            let candidates = discovery.result.as_ref().ok()?;
-            // Some remote filesystems cannot provide a meaningful mtime. Do not
-            // treat size alone as a trustworthy content identity in that case.
-            if candidates
-                .iter()
-                .any(|candidate| candidate.modified_at_ms <= 0)
-            {
-                return None;
-            }
-            environments.push(EnvironmentProjectInstructionsFingerprint {
-                environment_id: discovery.environment_id.clone(),
-                cwd: discovery.cwd.clone(),
-                candidates: candidates.clone(),
-            });
-        }
-        Some(ProjectInstructionsSourceFingerprint(environments))
     }
 }
 
@@ -1029,7 +995,6 @@ async fn agents_md_paths_with_metrics_and_markers(
                         return Ok(Some(ProjectDocCandidate {
                             path: candidate,
                             size: metadata.size,
-                            modified_at_ms: metadata.modified_at_ms,
                         }));
                     }
                     Ok(_) => {}

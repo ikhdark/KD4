@@ -9,6 +9,7 @@ use std::time::Duration;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::io::BufReader;
+use tokio::io::Lines;
 use tokio::process::Child;
 use tokio::process::ChildStdin;
 use tokio::process::ChildStdout;
@@ -134,7 +135,7 @@ pub struct TestAppServer {
     #[allow(dead_code)]
     process: Child,
     stdin: Option<ChildStdin>,
-    stdout: BufReader<ChildStdout>,
+    stdout: Lines<BufReader<ChildStdout>>,
     pending_messages: VecDeque<JSONRPCMessage>,
     auto_env: Option<TestEnv>,
     json_logs: JsonLogCapture,
@@ -260,7 +261,7 @@ impl TestAppServer {
             .stdout
             .take()
             .ok_or_else(|| anyhow::format_err!("mcp should have stdout fd"))?;
-        let stdout = BufReader::new(stdout);
+        let stdout = BufReader::new(stdout).lines();
 
         // Forward child's stderr to our stderr so failures are visible even
         // when stdout/stderr are captured by the test harness.
@@ -1454,8 +1455,12 @@ impl TestAppServer {
     }
 
     async fn read_jsonrpc_message(&mut self) -> anyhow::Result<JSONRPCMessage> {
-        let mut line = String::new();
-        self.stdout.read_line(&mut line).await?;
+        // Keep partial lines in the reader when a caller cancels a timed wait.
+        let line = self
+            .stdout
+            .next_line()
+            .await?
+            .context("app-server stdout closed before the next JSON-RPC message")?;
         let message = serde_json::from_str::<JSONRPCMessage>(&line)?;
         eprintln!("read message from stdout: {message:?}");
         Ok(message)
@@ -1888,5 +1893,68 @@ impl Drop for TestAppServer {
                 Err(_) => return,
             }
         }
+    }
+}
+
+#[cfg(all(test, any(unix, windows)))]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cancelled_message_read_preserves_partial_json_and_following_message()
+    -> anyhow::Result<()> {
+        // The child models an external server splitting one response across writes.
+        // It cannot finish that response until the client explicitly releases it.
+        #[cfg(unix)]
+        let (program, args) = (
+            Path::new("/bin/sh"),
+            vec![
+                "-c",
+                r#"printf '%s\n' '{"method":"ready"}'; printf '%s' '{"id":7,"res'; read -r release; printf '%s\n' 'ult":{"preserved":true}}' '{"id":8,"result":"next"}'"#,
+            ],
+        );
+        #[cfg(windows)]
+        let (program, args) = (
+            Path::new("powershell.exe"),
+            vec![
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                r#"[Console]::WriteLine('{"method":"ready"}'); [Console]::Write('{"id":7,"res'); [Console]::Out.Flush(); $null = [Console]::ReadLine(); [Console]::WriteLine('ult":{"preserved":true}}'); [Console]::WriteLine('{"id":8,"result":"next"}')"#,
+            ],
+        );
+        let mut server = TestAppServer::builder()
+            .without_auto_env()
+            .with_plugin_startup_tasks()
+            .with_program(program)
+            .with_args(&args)
+            .build()
+            .await?;
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            server.read_stream_until_notification_message("ready"),
+        )
+        .await??;
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), server.read_next_message())
+                .await
+                .is_err()
+        );
+        server.send_raw_request("release", None).await?;
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(10),
+            server.read_stream_until_response_message(RequestId::Integer(7)),
+        )
+        .await??;
+        assert_eq!(response.result, serde_json::json!({"preserved": true}));
+        let following = tokio::time::timeout(
+            Duration::from_secs(10),
+            server.read_stream_until_response_message(RequestId::Integer(8)),
+        )
+        .await??;
+        assert_eq!(following.result, serde_json::json!("next"));
+        Ok(())
     }
 }

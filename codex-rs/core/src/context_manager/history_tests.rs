@@ -2626,6 +2626,120 @@ fn tool_history_mutation_advances_projection_revision_once() {
     assert_eq!(history.projection_revision, initial_revision + 1);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tool_history_registration_does_not_wait_for_snapshot_cache_locks() {
+    let (session, turn) = crate::session::tests::make_session_and_context().await;
+    let session = Arc::new(session);
+    let mut message = agent_message("retained history");
+    message.set_id(Some(ResponseItemId::with_suffix("msg", "retained-history")));
+    message.set_turn_id_if_missing(&turn.sub_id);
+    session
+        .record_conversation_items(&turn, std::slice::from_ref(&message))
+        .await;
+    let snapshot = session.clone_history().await;
+    let prepared = snapshot
+        .clone()
+        .prepare_for_prompt(&default_input_modalities());
+    let prepared_guard = snapshot.prepared_history.lock().expect("prepared cache");
+    let estimates_guard = snapshot
+        .item_token_estimates
+        .lock()
+        .expect("token estimate cache");
+
+    let registration_session = Arc::clone(&session);
+    let mut registration = tokio::spawn(async move {
+        registration_session
+            .register_non_workspace_code_mode_call(
+                turn.config.codex_home.as_path(),
+                "independent-tool-call".to_string(),
+            )
+            .await;
+    });
+    let completed =
+        tokio::time::timeout(std::time::Duration::from_secs(2), &mut registration).await;
+    // Release the guards even on failure so a regressed blocking worker can exit.
+    drop(estimates_guard);
+    drop(prepared_guard);
+    if completed.is_err() {
+        registration.await.expect("registration worker");
+    }
+    completed
+        .expect("registration must finish while snapshot caches remain locked")
+        .expect("registration worker");
+
+    let current = session.clone_history().await;
+    let persisted_state = serde_json::to_value(current.tool_history_state()).expect("tool state");
+    assert_eq!(
+        persisted_state["non_workspace_code_mode_calls"],
+        serde_json::json!(["independent-tool-call"])
+    );
+    assert_eq!(
+        current.projection_revision,
+        snapshot.projection_revision + 1
+    );
+    assert_eq!(
+        current
+            .prepare_for_prompt(&default_input_modalities())
+            .items(),
+        &[message]
+    );
+    assert_eq!(
+        snapshot
+            .prepare_for_prompt(&default_input_modalities())
+            .items(),
+        prepared.items(),
+        "registration must preserve the older immutable snapshot"
+    );
+}
+
+#[test]
+fn tool_history_budget_drops_complete_local_shell_pairs() {
+    let mut canonical = Vec::new();
+    for call_id in ["older-shell", "newer-shell"] {
+        canonical.push(ResponseItem::LocalShellCall {
+            id: None,
+            call_id: Some(call_id.to_string()),
+            status: LocalShellStatus::Completed,
+            action: LocalShellAction::Exec(LocalShellExecAction {
+                command: vec!["echo".to_string(), call_id.to_string()],
+                timeout_ms: None,
+                working_directory: None,
+                env: None,
+                user: None,
+            }),
+            internal_chat_message_metadata_passthrough: None,
+        });
+        canonical.push(ResponseItem::FunctionCallOutput {
+            id: None,
+            call_id: call_id.to_string(),
+            output: FunctionCallOutputPayload::from_text("x".repeat(24_000)),
+            internal_chat_message_metadata_passthrough: None,
+        });
+    }
+    let mut history = ContextManager::new();
+    history.record_items(canonical.iter(), TruncationPolicy::Tokens(24_000));
+    let prepared = history
+        .clone()
+        .prepare_for_prompt_with_completed_tool_projection_target(
+            &default_input_modalities(),
+            StableContextTarget::FailOpen,
+            None,
+            None,
+        );
+
+    // Two 6,000-token results exceed the 10,000-token aggregate ceiling. Keep
+    // the newer complete pair in every transport form, including raw fallback.
+    let expected = &canonical[2..];
+    assert_eq!(prepared.items(), expected);
+    assert_eq!(prepared.shared_unreplaced_items().as_ref(), expected);
+    assert_eq!(prepared.shared_fallback_items().as_ref(), expected);
+    assert_eq!(
+        prepared.shared_unreplaced_fallback_items().as_ref(),
+        expected
+    );
+    assert_eq!(history.raw_items(), canonical);
+}
+
 #[test]
 fn tool_history_candidate_lifecycle_preserves_prepared_base_and_refreshes_projection() {
     let call_id = "call-cached-tool-history";
@@ -2646,10 +2760,22 @@ fn tool_history_candidate_lifecycle_preserves_prepared_base_and_refreshes_projec
         output: FunctionCallOutputPayload::from_text(bounded_output.clone()),
         internal_chat_message_metadata_passthrough: None,
     };
-    let mut history = create_history_with_items(vec![call, output]);
+    let mut history = ContextManager::new();
+    // Consumption requires the exact bounded output recorded by the candidate.
+    // The shared fixture helper's 10,000-token policy would truncate this body.
+    history.record_items([&call, &output], TruncationPolicy::Tokens(24_000));
+    // This synthetic code-mode result has no workspace dependencies. Record that
+    // classification just as dispatch does, so freshness validation can retain it.
+    assert!(history.apply_tool_history_mutation(
+        &crate::tool_history::ToolHistoryMutation::RegisterNonWorkspaceCodeModeCall {
+            call_id: call_id.to_string(),
+        },
+    ));
+    assert!(!history.requires_workspace_evidence_validation());
     let prepared = history
         .clone()
         .prepare_for_prompt(&default_input_modalities());
+    assert_eq!(prepared.items(), &[call, output]);
     let prepared_base = prepared.shared_items();
     let initial_revision = history.projection_revision;
     let candidate = ToolHistoryCandidate {
@@ -2733,6 +2859,29 @@ fn tool_history_candidate_lifecycle_preserves_prepared_base_and_refreshes_projec
         projected
             .iter()
             .any(crate::tool_history::response_item_has_valid_tool_history_receipt)
+    );
+    assert_eq!(
+        projected.len(),
+        2,
+        "the call and recoverable result must remain"
+    );
+    let ResponseItem::FunctionCallOutput {
+        call_id: projected_call_id,
+        output,
+        ..
+    } = &projected[1]
+    else {
+        panic!("expected the projected tool output");
+    };
+    assert_eq!(projected_call_id, call_id);
+    let receipt: serde_json::Value =
+        serde_json::from_str(&output.body.to_text().expect("receipt text")).expect("receipt JSON");
+    assert_eq!(receipt["call_id"], call_id);
+    assert_eq!(receipt["artifact_id"], "artifact-cached-tool-history");
+    assert_eq!(receipt["bytes"], 96_000);
+    assert_eq!(
+        receipt["sha256"],
+        crate::tool_history::sha256(b"canonical artifact")
     );
 }
 

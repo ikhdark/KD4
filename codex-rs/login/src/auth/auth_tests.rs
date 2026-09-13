@@ -525,6 +525,152 @@ async fn login_with_access_token_rejects_invalid_jwt() {
     );
 }
 
+#[derive(Debug)]
+struct GatedStorage {
+    inner: Arc<dyn AuthStorageBackend>,
+    save_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    release_save: Mutex<std::sync::mpsc::Receiver<()>>,
+    fail_save: bool,
+}
+
+impl AuthStorageBackend for GatedStorage {
+    fn load(&self) -> std::io::Result<Option<AuthDotJson>> {
+        self.inner.load()
+    }
+
+    fn save(&self, auth: &AuthDotJson) -> std::io::Result<()> {
+        if let Some(started) = self.save_started.lock().unwrap().take() {
+            let _ = started.send(());
+            self.release_save
+                .lock()
+                .unwrap()
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .map_err(std::io::Error::other)?;
+        }
+        if self.fail_save {
+            return Err(std::io::Error::other("injected credential save failure"));
+        }
+        self.inner.save(auth)
+    }
+
+    fn delete(&self) -> std::io::Result<bool> {
+        self.inner.delete()
+    }
+}
+
+#[tokio::test]
+#[serial(codex_auth_env)]
+async fn refresh_persistence_keeps_runtime_responsive_and_updates_cache_only_after_save()
+-> anyhow::Result<()> {
+    let _access_token_guard = remove_access_token_env_var();
+    let server = MockServer::start().await;
+    let _endpoint_guard = EnvVarGuard::set(
+        REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR,
+        &format!("{}/oauth/token", server.uri()),
+    );
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .and(body_partial_json(json!({
+            "grant_type": "refresh_token",
+            "refresh_token": "test-refresh-token",
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "rotated-access-token",
+            "refresh_token": "rotated-refresh-token",
+        })))
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    for fail_save in [false, true] {
+        let codex_home = tempdir()?;
+        write_auth_file(
+            AuthFileParams {
+                openai_api_key: None,
+                chatgpt_plan_type: Some("pro".to_string()),
+                chatgpt_account_id: Some("account-123".to_string()),
+            },
+            codex_home.path(),
+        )?;
+        let mut auth = super::load_auth(
+            codex_home.path(),
+            false,
+            AuthCredentialsStoreMode::File,
+            None,
+            None,
+            None,
+            AuthKeyringBackendKind::Direct,
+            None,
+            &crate::test_support::transport_default_auth_route_config(),
+        )
+        .await?
+        .expect("auth should load");
+        let (save_started_tx, save_started_rx) = tokio::sync::oneshot::channel();
+        let (release_save_tx, release_save_rx) = std::sync::mpsc::channel();
+        let CodexAuth::Chatgpt(chatgpt_auth) = &mut auth else {
+            panic!("expected managed ChatGPT auth");
+        };
+        chatgpt_auth.storage = Arc::new(GatedStorage {
+            inner: chatgpt_auth.storage.clone(),
+            save_started: Mutex::new(Some(save_started_tx)),
+            release_save: Mutex::new(release_save_rx),
+            fail_save,
+        });
+        let manager =
+            AuthManager::from_auth_for_testing_with_home(auth, codex_home.path().to_path_buf());
+        let refresh = manager.refresh_token_from_authority();
+        tokio::pin!(refresh);
+        tokio::select! {
+            result = &mut refresh => panic!("refresh finished before storage was released: {result:?}"),
+            started = save_started_rx => started?,
+        }
+        tokio::select! {
+            result = &mut refresh => panic!("refresh finished before storage was released: {result:?}"),
+            () = tokio::time::sleep(std::time::Duration::from_millis(20)) => {},
+        }
+        let file_storage = FileAuthStorage::new(codex_home.path().to_path_buf());
+        let before_save = file_storage.load()?.expect("original auth should remain");
+        assert_eq!(
+            before_save.tokens.as_ref().unwrap().access_token,
+            "test-access-token"
+        );
+        assert_eq!(
+            manager
+                .auth_cached()
+                .unwrap()
+                .get_token_data()?
+                .access_token,
+            "test-access-token"
+        );
+        release_save_tx.send(())?;
+        let result = refresh.await;
+        let stored = file_storage.load()?.expect("auth should remain");
+        let cached_tokens = manager.auth_cached().unwrap().get_token_data()?;
+        if fail_save {
+            assert!(
+                result
+                    .expect_err("save failure must propagate")
+                    .to_string()
+                    .contains("injected credential save failure")
+            );
+            assert_eq!(stored, before_save);
+            assert_eq!(cached_tokens, before_save.tokens.unwrap());
+        } else {
+            result?;
+            let stored_tokens = stored.tokens.unwrap();
+            assert_eq!(stored_tokens.access_token, "rotated-access-token");
+            assert_eq!(stored_tokens.refresh_token, "rotated-refresh-token");
+            assert_eq!(
+                stored_tokens.id_token.chatgpt_account_id.as_deref(),
+                Some("account-123")
+            );
+            assert_eq!(stored_tokens.id_token, before_save.tokens.unwrap().id_token);
+            assert_eq!(cached_tokens, stored_tokens);
+        }
+    }
+    Ok(())
+}
+
 #[tokio::test]
 #[serial(codex_auth_env)]
 async fn chatgpt_auth_registers_agent_identity_when_enabled() -> anyhow::Result<()> {
@@ -537,7 +683,7 @@ async fn chatgpt_auth_registers_agent_identity_when_enabled() -> anyhow::Result<
         },
         codex_home.path(),
     )?;
-    let auth = super::load_auth(
+    let mut auth = super::load_auth(
         codex_home.path(),
         /*enable_codex_api_key_env*/ false,
         AuthCredentialsStoreMode::File,
@@ -582,16 +728,42 @@ async fn chatgpt_auth_registers_agent_identity_when_enabled() -> anyhow::Result<
         .await;
     mock_agent_task_registration(&server, "", "agent-runtime-123", "task-123").await;
 
-    let agent_auth = auth
-        .agent_identity_auth(
-            AgentIdentityAuthPolicy::ChatGptAuth,
-            Some(&server.uri()),
-            /*forced_chatgpt_workspace_id*/ None,
-            &crate::test_support::transport_default_auth_route_config(),
-            SessionSource::Cli,
-        )
-        .await?
-        .expect("agent identity should register");
+    let (save_started_tx, save_started_rx) = tokio::sync::oneshot::channel();
+    let (release_save_tx, release_save_rx) = std::sync::mpsc::channel();
+    let CodexAuth::Chatgpt(chatgpt_auth) = &mut auth else {
+        panic!("expected managed ChatGPT auth");
+    };
+    chatgpt_auth.storage = Arc::new(GatedStorage {
+        inner: chatgpt_auth.storage.clone(),
+        save_started: Mutex::new(Some(save_started_tx)),
+        release_save: Mutex::new(release_save_rx),
+        fail_save: false,
+    });
+    let manager = AuthManager::from_auth_for_testing_with_agent_identity_authapi_base_url(
+        auth.clone(),
+        server.uri(),
+    );
+    let registration =
+        manager.agent_identity_auth(AgentIdentityAuthPolicy::ChatGptAuth, SessionSource::Cli);
+    tokio::pin!(registration);
+    tokio::select! {
+        result = &mut registration => panic!("registration finished before storage was released: {result:?}"),
+        started = save_started_rx => started?,
+    }
+    // The current-thread executor must keep running while the real file save is gated.
+    tokio::select! {
+        result = &mut registration => panic!("registration finished before storage was released: {result:?}"),
+        () = tokio::time::sleep(std::time::Duration::from_millis(20)) => {},
+    }
+    assert!(
+        FileAuthStorage::new(codex_home.path().to_path_buf())
+            .load()?
+            .expect("original auth should remain")
+            .agent_identity
+            .is_none()
+    );
+    release_save_tx.send(())?;
+    let agent_auth = registration.await?.expect("agent identity should register");
     let reused = auth
         .agent_identity_auth(
             AgentIdentityAuthPolicy::ChatGptAuth,

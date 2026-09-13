@@ -77,6 +77,7 @@ coverage/
 /docs/benchmarks/turn-latency/
 
 # personal files
+/current-diff.txt
 personal/
 /kd-ui/
 .codex/locks/

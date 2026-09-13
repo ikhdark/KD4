@@ -223,10 +223,14 @@ impl ManagedRootProcess {
         use winapi::um::winnt::PROCESS_SET_QUOTA;
         use winapi::um::winnt::PROCESS_TERMINATE;
 
+        // SAFETY: OpenProcess takes only scalar arguments; a successful non-null result is a
+        // new owned process handle.
         let raw = unsafe { OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid) };
         if raw.is_null() {
             return Err(io::Error::last_os_error());
         }
+        // SAFETY: The null failure result was rejected, and this is the sole owner of the
+        // handle returned by OpenProcess.
         let _process = unsafe { OwnedHandle::from_raw_handle(raw.cast()) };
         self.job.assign_process(raw.cast())
     }
@@ -405,29 +409,45 @@ fn resume_process_threads(pid: u32) -> io::Result<()> {
     use winapi::um::tlhelp32::Thread32Next;
     use winapi::um::winnt::THREAD_SUSPEND_RESUME;
 
+    // SAFETY: The snapshot flags and PID are scalar values; failure is checked before the
+    // returned handle is used.
     let raw_snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
     if raw_snapshot == INVALID_HANDLE_VALUE {
         return Err(io::Error::last_os_error());
     }
+    // SAFETY: CreateToolhelp32Snapshot succeeded and transfers one handle, which this
+    // OwnedHandle closes exactly once.
     let snapshot = unsafe { OwnedHandle::from_raw_handle(raw_snapshot.cast()) };
+    // SAFETY: THREADENTRY32 contains only integer fields; zero is a valid value for every field
+    // before dwSize is set.
     let mut entry: THREADENTRY32 = unsafe { std::mem::zeroed() };
     entry.dwSize = size_of::<THREADENTRY32>() as u32;
+    // SAFETY: snapshot owns a live snapshot handle; entry is writable and its dwSize describes
+    // the complete THREADENTRY32.
     let mut has_entry = unsafe { Thread32First(snapshot.as_raw_handle().cast(), &mut entry) } != 0;
     let mut resumed = 0usize;
 
     while has_entry {
         if entry.th32OwnerProcessID == pid {
             let raw_thread =
+                // SAFETY: The requested access and thread ID are scalar arguments; the returned
+                // handle is checked for failure.
                 unsafe { OpenThread(THREAD_SUSPEND_RESUME, FALSE, entry.th32ThreadID) };
             if raw_thread.is_null() {
                 return Err(io::Error::last_os_error());
             }
+            // SAFETY: OpenThread returned a non-null owned handle that has no other owning
+            // wrapper.
             let thread = unsafe { OwnedHandle::from_raw_handle(raw_thread.cast()) };
+            // SAFETY: thread owns the live handle opened with THREAD_SUSPEND_RESUME access for
+            // this call.
             if unsafe { ResumeThread(thread.as_raw_handle().cast()) } == u32::MAX {
                 return Err(io::Error::last_os_error());
             }
             resumed += 1;
         }
+        // SAFETY: snapshot and the writable, size-initialized entry remain alive throughout
+        // enumeration.
         has_entry = unsafe { Thread32Next(snapshot.as_raw_handle().cast(), &mut entry) } != 0;
     }
 
@@ -606,6 +626,8 @@ mod tests {
                 io::Error::last_os_error()
             );
             Self {
+                // SAFETY: OpenProcess succeeded above; this wrapper takes sole ownership of the
+                // returned process handle.
                 handle: unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(raw.cast()) },
             }
         }

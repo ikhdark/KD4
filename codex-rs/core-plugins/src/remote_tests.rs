@@ -731,3 +731,193 @@ fn recommended_plugins_ignore_invalid_remote_plugin_ids() {
         }
     );
 }
+
+#[tokio::test]
+async fn install_remote_plugin_preserves_opaque_id_in_request_path() {
+    let server = wiremock::MockServer::start().await;
+    let config = RemotePluginServiceConfig::new(
+        format!("{}/backend-api", server.uri()),
+        HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+    );
+    let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
+    let remote_id = "plugin/requested?query#fragment%";
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path(
+            "/backend-api/ps/plugins/plugin%2Frequested%3Fquery%23fragment%25/install",
+        ))
+        .and(wiremock::matchers::query_param(
+            "includeAppsNeedingAuth",
+            "true",
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": remote_id,
+                "enabled": true,
+                "app_ids_needing_auth": ["connector_123"],
+            })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let result = install_remote_plugin(
+        &config,
+        Some(&auth),
+        REMOTE_GLOBAL_MARKETPLACE_NAME,
+        remote_id,
+    )
+    .await
+    .expect("opaque remote ID should install");
+
+    assert_eq!(
+        result.app_ids_needing_auth,
+        Some(vec!["connector_123".to_string()])
+    );
+    let requests = server.received_requests().await.expect("recorded requests");
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].url.query(), Some("includeAppsNeedingAuth=true"));
+}
+
+#[tokio::test]
+async fn uninstall_remote_plugin_preserves_paths_outside_the_canonical_cache() {
+    for (remote_id, encoded_id) in [
+        ("../../../outside", "..%2F..%2F..%2Foutside"),
+        (
+            "plugin/requested?query#fragment%",
+            "plugin%2Frequested%3Fquery%23fragment%25",
+        ),
+    ] {
+        let server = wiremock::MockServer::start().await;
+        let config = RemotePluginServiceConfig::new(
+            server.uri(),
+            HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+        );
+        let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
+        let home = tempfile::tempdir().expect("temporary Codex home");
+        let cache = home
+            .path()
+            .join(PLUGINS_CACHE_DIR)
+            .join(REMOTE_GLOBAL_MARKETPLACE_NAME)
+            .join("requested");
+        fs::create_dir_all(&cache).expect("create canonical plugin cache");
+        fs::write(cache.join("installed.txt"), "installed plugin").expect("write canonical cache");
+        let outside = home.path().join("outside");
+        fs::create_dir_all(&outside).expect("create unrelated directory");
+        fs::write(outside.join("retained.txt"), "unrelated user data").expect("write sentinel");
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(format!(
+                "/ps/plugins/{encoded_id}"
+            )))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(directory_plugin(remote_id, "requested")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(format!(
+                "/ps/plugins/{encoded_id}/uninstall"
+            )))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": remote_id,
+                    "enabled": false,
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let target = resolve_remote_plugin_uninstall_target(&config, Some(&auth), remote_id)
+            .await
+            .expect("matching detail identity should resolve");
+        assert_eq!(target.remote_plugin_id, remote_id);
+        assert_eq!(target.plugin_id.plugin_name(), "requested");
+        uninstall_remote_plugin(&config, Some(&auth), home.path().to_path_buf(), target)
+            .await
+            .expect("opaque remote ID should uninstall");
+        assert!(
+            !cache.exists(),
+            "successful uninstall removes its canonical cache"
+        );
+        assert_eq!(
+            fs::read_to_string(outside.join("retained.txt")).expect("outside sentinel must remain"),
+            "unrelated user data"
+        );
+        let requests = server.received_requests().await.expect("recorded requests");
+        assert_eq!(requests.len(), 2);
+        assert!(requests.iter().all(|request| request.url.query().is_none()));
+    }
+}
+
+#[tokio::test]
+async fn install_remote_plugin_rejects_dot_segments_before_sending() {
+    let server = wiremock::MockServer::start().await;
+    let config = RemotePluginServiceConfig::new(
+        server.uri(),
+        HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+    );
+    let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
+    for remote_id in [".", ".."] {
+        let error = install_remote_plugin(
+            &config,
+            Some(&auth),
+            REMOTE_GLOBAL_MARKETPLACE_NAME,
+            remote_id,
+        )
+        .await
+        .expect_err("a dot segment must not target a different endpoint");
+        assert_eq!(
+            error.error_data(),
+            PluginRemoteErrorData {
+                reason: PluginRemoteErrorReason::InvalidRequest,
+                retryable: false,
+            }
+        );
+        assert!(
+            matches!(error, RemotePluginCatalogError::InvalidRequestPathSegment { segment }
+            if segment == remote_id)
+        );
+    }
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn fetch_remote_plugin_skill_detail_rejects_dot_segments_before_sending() {
+    let server = wiremock::MockServer::start().await;
+    let config = RemotePluginServiceConfig::new(
+        server.uri(),
+        HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+    );
+    let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
+    for (remote_id, skill_name, invalid_segment) in [
+        (".", "skill", "."),
+        ("..", "skill", ".."),
+        ("plugin", ".", "."),
+        ("plugin", "..", ".."),
+    ] {
+        let error = fetch_remote_plugin_skill_detail(
+            &config,
+            Some(&auth),
+            REMOTE_GLOBAL_MARKETPLACE_NAME,
+            remote_id,
+            skill_name,
+        )
+        .await
+        .expect_err("a dot segment must not target a different endpoint");
+        assert_eq!(
+            error.error_data(),
+            PluginRemoteErrorData {
+                reason: PluginRemoteErrorReason::InvalidRequest,
+                retryable: false,
+            }
+        );
+        assert!(
+            matches!(error, RemotePluginCatalogError::InvalidRequestPathSegment { segment }
+            if segment == invalid_segment)
+        );
+    }
+    assert!(server.received_requests().await.unwrap().is_empty());
+}

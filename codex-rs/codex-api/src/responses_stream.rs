@@ -592,7 +592,7 @@ fn try_parse_retry_after(error: &Error) -> Option<Duration> {
     if unit == "s" || unit.starts_with("second") {
         Duration::try_from_secs_f64(value).ok()
     } else if unit == "ms" {
-        Some(Duration::from_millis(value as u64))
+        Duration::try_from_secs_f64(value / 1000.0).ok()
     } else {
         None
     }
@@ -795,8 +795,12 @@ mod tests {
 
     #[test]
     fn interpreter_preserves_rate_limit_error_with_overflowing_retry_delay() {
-        for seconds in ["18446744073709551616".to_string(), "9".repeat(400)] {
-            let message = format!("Please try again in {seconds} seconds.");
+        for delay in [
+            "18446744073709551616 seconds".to_string(),
+            format!("{} seconds", "9".repeat(400)),
+            format!("{}ms", "9".repeat(400)),
+        ] {
+            let message = format!("Please try again in {delay}.");
             let payload = json!({
                 "type": "response.failed",
                 "response": { "error": {
@@ -824,20 +828,28 @@ mod tests {
     fn parses_retry_after_units() {
         for (message, expected) in [
             ("Please try again in 28ms.", Duration::from_millis(28)),
-            (
-                "Please try again in 1.898s.",
-                Duration::from_secs_f64(1.898),
-            ),
+            ("Please try again in 1.5ms.", Duration::from_micros(1_500)),
+            ("Please try again in 1.898s.", Duration::from_millis(1_898)),
             ("Try again in 35 seconds.", Duration::from_secs(35)),
         ] {
-            let error = Error {
-                r#type: None,
-                code: Some("rate_limit_exceeded".to_string()),
-                message: Some(message.to_string()),
-                plan_type: None,
-                resets_at: None,
-            };
-            assert_eq!(try_parse_retry_after(&error), Some(expected));
+            let payload = json!({
+                "type": "response.failed",
+                "response": { "error": {
+                    "code": "rate_limit_exceeded",
+                    "message": message,
+                } },
+            });
+            let mut interpreter =
+                ResponsesEventInterpreter::new(&ResponsesStreamMetadata::default(), None);
+            let error = interpreter
+                .process_payload(&payload.to_string())
+                .unwrap_err();
+            assert!(
+                matches!(error, ResponsesEventError::Api(ApiError::Retryable {
+                delay: Some(actual_delay),
+                message: actual_message,
+            }) if actual_delay == expected && actual_message == message)
+            );
         }
     }
 }

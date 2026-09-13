@@ -19,6 +19,8 @@ pub(super) struct SetupMutexGuard {
 
 impl Drop for SetupMutexGuard {
     fn drop(&mut self) {
+        // SAFETY: This guard owns the mutex handle acquired by a successful wait; its handle is
+        // closed exactly once on drop.
         unsafe {
             let _ = ReleaseMutex(self.handle);
             CloseHandle(self.handle);
@@ -32,6 +34,8 @@ pub(super) fn acquire_setup_mutex() -> Result<SetupMutexGuard> {
 
 fn acquire_named_setup_mutex(name: &str) -> Result<SetupMutexGuard> {
     let name = to_wide(OsStr::new(name));
+    // SAFETY: name is a terminated UTF-16 buffer retained for the call, and the optional
+    // security attributes are null.
     let handle = unsafe { CreateMutexW(std::ptr::null_mut(), 0, name.as_ptr()) };
     if handle.is_null() {
         return Err(anyhow::anyhow!("CreateMutexW failed: {}", unsafe {
@@ -39,9 +43,15 @@ fn acquire_named_setup_mutex(name: &str) -> Result<SetupMutexGuard> {
         }));
     }
 
+    // SAFETY: handle is the live mutex handle returned by CreateMutexW and is not closed while
+    // the wait is in progress.
     let wait_result = unsafe { WaitForSingleObject(handle, INFINITE) };
     if wait_result != WAIT_OBJECT_0 && wait_result != WAIT_ABANDONED {
+        // SAFETY: GetLastError reads only this thread's error code immediately after the
+        // unsuccessful wait.
         let err = unsafe { GetLastError() };
+        // SAFETY: The failed wait did not transfer handle ownership to a guard, so this closes
+        // the newly created handle once.
         unsafe {
             CloseHandle(handle);
         }

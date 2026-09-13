@@ -232,10 +232,13 @@ mod tests {
             ),
         });
 
-        let tool_names = registry
+        let tools = registry
             .tool_contributors()
             .iter()
             .flat_map(|contributor| contributor.tools(&session_store, &thread_store))
+            .collect::<Vec<_>>();
+        let tool_names = tools
+            .iter()
             .map(|tool| (tool.tool_name(), tool.supports_parallel_tool_calls()))
             .collect::<Vec<_>>();
 
@@ -243,5 +246,18 @@ mod tests {
             tool_names,
             vec![(ToolName::namespaced(WEB_NAMESPACE, RUN_TOOL_NAME), true)]
         );
+        let codex_extension_api::ToolSpec::Namespace(namespace) = tools[0].spec() else {
+            panic!("web.run must expose a namespace specification");
+        };
+        assert_eq!(namespace.name, WEB_NAMESPACE);
+        let [codex_tools::ResponsesApiNamespaceTool::Function(run)] = namespace.tools.as_slice()
+        else {
+            panic!("web must expose exactly one function");
+        };
+        assert_eq!(run.name, RUN_TOOL_NAME);
+        assert!(run.description.contains(
+            "Follow these special cases unless a higher-priority instruction conflicts."
+        ));
+        assert!(!run.description.contains("conflict with any other instructions"));
     }
 }

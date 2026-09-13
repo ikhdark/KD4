@@ -170,6 +170,8 @@ mod platform {
 
     impl AsSocket for WindowsUnixListener {
         fn as_socket(&self) -> BorrowedSocket<'_> {
+            // SAFETY: The wrapper owns this socket, and the returned borrow cannot
+            // outlive the shared borrow of its owner.
             unsafe { BorrowedSocket::borrow_raw(self.as_raw_socket()) }
         }
     }
@@ -192,6 +194,8 @@ mod platform {
 
     impl AsSocket for WindowsUnixStream {
         fn as_socket(&self) -> BorrowedSocket<'_> {
+            // SAFETY: The wrapper owns this socket, and the returned borrow cannot
+            // outlive the shared borrow of its owner.
             unsafe { BorrowedSocket::borrow_raw(self.as_raw_socket()) }
         }
     }
@@ -245,7 +249,11 @@ mod platform {
         }
     }
 
+    // SAFETY: This listener owns its socket and has no I/O trait implementation
+    // that can drop or replace the underlying I/O source.
     unsafe impl async_io::IoSafe for WindowsUnixListener {}
+    // SAFETY: Read and Write delegate to the owned stream without dropping or
+    // replacing its socket, including on error.
     unsafe impl async_io::IoSafe for WindowsUnixStream {}
 }
 

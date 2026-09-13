@@ -270,16 +270,7 @@ mod tests {
     use codex_extension_items::web_search::WebSearchAction;
     use pretty_assertions::assert_eq;
 
-    use super::WEB_RUN_DESCRIPTION;
     use super::command_action;
-
-    #[test]
-    fn description_defers_to_higher_priority_instructions() {
-        assert!(WEB_RUN_DESCRIPTION.contains(
-            "Follow these special cases unless a higher-priority instruction conflicts."
-        ));
-        assert!(!WEB_RUN_DESCRIPTION.contains("conflict with any other instructions"));
-    }
 
     #[test]
     fn command_action_reports_queries_and_navigation_detail() {

@@ -33,10 +33,14 @@ enum JobState {
 impl JobObject {
     /// Creates a Job Object configured to terminate all members when its last handle closes.
     pub fn create() -> io::Result<Self> {
+        // SAFETY: Both null arguments request the default security descriptor and an unnamed
+        // job; the returned handle is checked before use.
         let handle = unsafe { CreateJobObjectW(std::ptr::null_mut(), std::ptr::null()) };
         if handle.is_null() {
             return Err(io::Error::last_os_error());
         }
+        // SAFETY: CreateJobObjectW succeeded and returned this uniquely owned handle;
+        // OwnedHandle closes it once.
         let handle = unsafe { OwnedHandle::from_raw_handle(handle.cast()) };
 
         Self::set_limit_flags(
@@ -51,8 +55,12 @@ impl JobObject {
     }
 
     fn set_limit_flags(handle: &OwnedHandle, flags: u32) -> io::Result<()> {
+        // SAFETY: JOBOBJECT_EXTENDED_LIMIT_INFORMATION contains integer and pointer fields that
+        // all admit the zero representation.
         let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
         limits.BasicLimitInformation.LimitFlags = flags;
+        // SAFETY: handle owns the job; limits is initialized and remains writable for the exact
+        // structure size passed to Windows.
         let configured = unsafe {
             SetInformationJobObject(
                 handle.as_raw_handle().cast(),
@@ -101,6 +109,8 @@ impl JobObject {
     /// Assignment is not retroactive: descendants created before this call
     /// completes are not guaranteed to become members of the job.
     pub fn assign_process(&self, process_handle: RawHandle) -> io::Result<()> {
+        // SAFETY: The owned job handle remains live for this call. Windows validates the opaque
+        // process handle; it is not dereferenced as a Rust pointer.
         let assigned = unsafe {
             AssignProcessToJobObject(self.handle.as_raw_handle().cast(), process_handle.cast())
         };
@@ -159,6 +169,8 @@ impl JobObject {
             JobState::TerminationRequested => {}
         }
 
+        // SAFETY: self.handle owns the live job throughout the call; the exit code is a scalar
+        // and the state mutex serializes transitions.
         let terminated = unsafe {
             TerminateJobObject(self.handle.as_raw_handle().cast(), /*uExitCode*/ 1)
         };

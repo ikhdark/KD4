@@ -507,15 +507,19 @@ fn flush_terminal_input_buffer() {
     use windows_sys::Win32::System::Console::GetStdHandle;
     use windows_sys::Win32::System::Console::STD_INPUT_HANDLE;
 
+    // SAFETY: GetStdHandle has no pointer preconditions; invalid results are checked below.
     let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
     if handle == INVALID_HANDLE_VALUE || handle.is_null() {
+        // SAFETY: GetLastError reads thread-local error state and has no preconditions.
         let err = unsafe { GetLastError() };
         tracing::warn!("failed to get stdin handle for flush: error {err}");
         return;
     }
 
+    // SAFETY: handle is a checked, borrowed standard input handle and is not closed here.
     let result = unsafe { FlushConsoleInputBuffer(handle) };
     if result == 0 {
+        // SAFETY: GetLastError reads thread-local error state and has no preconditions.
         let err = unsafe { GetLastError() };
         tracing::warn!("failed to flush stdin buffer: error {err}");
     }
@@ -735,7 +739,9 @@ impl Tui {
         // Leave alt screen if active to avoid conflicts with external program `f`.
         let was_alt_screen = self.is_alt_screen_active();
         if was_alt_screen {
-            let _ = self.leave_alt_screen();
+            if let Err(err) = self.leave_alt_screen() {
+                tracing::warn!("failed to leave alternate screen before external program: {err}");
+            }
         }
 
         if let Err(err) = tokio::task::spawn_blocking(restore_keep_raw)
@@ -757,7 +763,9 @@ impl Tui {
         .expect("terminal mode resume worker panicked");
 
         if was_alt_screen {
-            let _ = self.enter_alt_screen();
+            if let Err(err) = self.enter_alt_screen() {
+                tracing::warn!("failed to restore alternate screen after external program: {err}");
+            }
         }
 
         let broker = Arc::clone(&self.event_broker);
@@ -810,21 +818,29 @@ impl Tui {
         if !self.alt_screen_enabled {
             return Ok(());
         }
-        let _ = execute!(self.terminal.backend_mut(), EnterAlternateScreen);
-        // Enable "alternate scroll" so terminals may translate wheel to arrows
-        let _ = execute!(self.terminal.backend_mut(), EnableAlternateScroll);
-        if let Ok(size) = self.terminal.size() {
-            self.alt_saved_viewport = Some(self.terminal.viewport_area);
+        let size = self.terminal.size()?;
+        execute!(self.terminal.backend_mut(), EnterAlternateScreen)?;
+        self.alt_saved_viewport = Some(self.terminal.viewport_area);
+        self.alt_screen_active.store(true, Ordering::Relaxed);
+        let setup = (|| -> Result<()> {
+            // Enable "alternate scroll" so terminals may translate wheel to arrows.
+            execute!(self.terminal.backend_mut(), EnableAlternateScroll)?;
             self.terminal.set_viewport_area(ratatui::layout::Rect::new(
                 0,
                 0,
                 size.width,
                 size.height,
             ));
-            let _ = self.terminal.clear();
+            self.terminal.clear()?;
+            Ok(())
+        })();
+        if setup.is_err() {
+            // Entry already succeeded: restore the inline screen before returning the failure.
+            if let Err(err) = self.leave_alt_screen() {
+                tracing::warn!("failed to restore terminal after alternate-screen setup: {err}");
+            }
         }
-        self.alt_screen_active.store(true, Ordering::Relaxed);
-        Ok(())
+        setup
     }
 
     /// Leave alternate screen and restore the previously saved inline viewport, if any.
@@ -833,12 +849,14 @@ impl Tui {
             return Ok(());
         }
         // Disable alternate scroll when leaving alt-screen
-        let _ = execute!(self.terminal.backend_mut(), DisableAlternateScroll);
-        let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
+        let scroll_result = execute!(self.terminal.backend_mut(), DisableAlternateScroll);
+        // Still attempt to leave if disabling scroll failed. Keep the saved state if leaving fails.
+        execute!(self.terminal.backend_mut(), LeaveAlternateScreen)?;
         if let Some(saved) = self.alt_saved_viewport.take() {
             self.terminal.set_viewport_area(saved);
         }
         self.alt_screen_active.store(false, Ordering::Relaxed);
+        scroll_result?;
         Ok(())
     }
 
@@ -1132,6 +1150,7 @@ fn ensure_virtual_terminal_processing() -> Result<()> {
         }
 
         let mut mode = 0;
+        // SAFETY: The borrowed handle has been checked, and mode is writable for the call.
         if unsafe { GetConsoleMode(handle, &mut mode) } == 0 {
             return Ok(());
         }
@@ -1141,6 +1160,7 @@ fn ensure_virtual_terminal_processing() -> Result<()> {
             return Ok(());
         }
 
+        // SAFETY: GetConsoleMode validated this borrowed handle; the new value adds console flags.
         if unsafe { SetConsoleMode(handle, mode | requested) } == 0 {
             return Err(std::io::Error::last_os_error());
         }
@@ -1148,9 +1168,11 @@ fn ensure_virtual_terminal_processing() -> Result<()> {
         Ok(())
     }
 
+    // SAFETY: GetStdHandle has no pointer preconditions; enable_for_handle checks invalid results.
     let stdout_handle = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
     enable_for_handle(stdout_handle)?;
 
+    // SAFETY: GetStdHandle has no pointer preconditions; enable_for_handle checks invalid results.
     let stderr_handle = unsafe { GetStdHandle(STD_ERROR_HANDLE) };
     enable_for_handle(stderr_handle)?;
 

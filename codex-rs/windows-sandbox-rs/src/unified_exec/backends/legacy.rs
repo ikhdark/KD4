@@ -201,6 +201,8 @@ fn spawn_input_writer(
             }
         }
         if let Some(handle) = input_write {
+            // SAFETY: The input writer owns the transferred input_write pipe end; after its
+            // receive/write loop finishes it closes that end exactly once.
             unsafe {
                 CloseHandle(handle as HANDLE);
             }
@@ -220,6 +222,8 @@ fn terminate_job_or_process(
         );
         if let Ok(guard) = process_handle.lock()
             && let Some(handle) = guard.as_ref()
+            // SAFETY: The mutex guard keeps the process-handle slot from being taken and closed
+            // while TerminateProcess borrows its value.
             && unsafe { TerminateProcess(raw_handle(*handle), 1) } == 0
         {
             let process_err = std::io::Error::last_os_error();
@@ -243,6 +247,8 @@ fn native_write_request_len(remaining: usize) -> u32 {
 fn write_all_handle(handle: HANDLE, mut bytes: &[u8]) -> Result<()> {
     while !bytes.is_empty() {
         let mut written = 0u32;
+        // SAFETY: The writer retains handle; bytes is live for a synchronous write bounded by its
+        // remaining length and the native u32 limit, and written is writable.
         let ok = unsafe {
             WriteFile(
                 handle,
@@ -253,6 +259,8 @@ fn write_all_handle(handle: HANDLE, mut bytes: &[u8]) -> Result<()> {
             )
         };
         if ok == 0 {
+            // SAFETY: Read the thread-local error immediately after WriteFile reports failure; this
+            // call takes no pointers.
             let err = unsafe { GetLastError() } as i32;
             return Err(anyhow::anyhow!("WriteFile failed: {err}"));
         }
@@ -283,10 +291,14 @@ fn finalize_exit(
         Ok(guard) => match guard.as_ref() {
             Some(handle) => {
                 let handle = raw_handle(*handle);
+                // SAFETY: The process-handle mutex guard prevents finalization from taking and
+                // closing the handle during this synchronous wait.
                 let wait_result = unsafe { WaitForSingleObject(handle, wait_timeout) };
                 match wait_result {
                     WAIT_OBJECT_0 => {
                         let mut raw_exit = 1u32;
+                        // SAFETY: The guard still protects the process handle after the successful
+                        // wait, and raw_exit is a writable output slot.
                         if unsafe { GetExitCodeProcess(handle, &mut raw_exit) } == 0 {
                             log_note(
                                 &format!(
@@ -348,6 +360,8 @@ fn finalize_exit(
     }
     let _ = exit_tx.send(exit_code);
 
+    // SAFETY: finalize_exit owns the thread handle; taking the process handle under its mutex
+    // removes shared access before its single close.
     unsafe {
         let thread_handle = raw_handle(thread_handle);
         if !thread_handle.is_null() && thread_handle != INVALID_HANDLE_VALUE {
@@ -375,6 +389,8 @@ fn resize_conpty_handle(hpc: &Arc<StdMutex<Option<isize>>>, size: TerminalSize) 
         .as_ref()
         .copied()
         .ok_or_else(|| anyhow::anyhow!("process is not attached to a PTY"))?;
+    // SAFETY: The mutex guard prevents the wait thread from clearing this ConPTY handle and
+    // dropping its owner until the resize call returns.
     let result = unsafe {
         ResizePseudoConsole(
             hpc,
@@ -572,6 +588,8 @@ fn spawn_windows_sandbox_session_legacy_blocking(
         let process_handle = raw_handle(process_handle_addr);
         let _desktop = desktop;
         let timeout = crate::windows_wait_timeout(timeout_ms);
+        // SAFETY: This wait thread retains the process handle until finalize_exit; concurrent
+        // termination borrows it but does not close it.
         let wait_res = unsafe { WaitForSingleObject(process_handle, timeout) };
         let termination_requested = match wait_res {
             WAIT_OBJECT_0 => {
@@ -594,6 +612,8 @@ fn spawn_windows_sandbox_session_legacy_blocking(
                 true
             }
             WAIT_FAILED => {
+                // SAFETY: Read the thread-local error immediately after WaitForSingleObject reports
+                // failure; this call takes no pointers.
                 let wait_error = unsafe { GetLastError() };
                 log_note(
                     &format!(
@@ -631,6 +651,8 @@ fn spawn_windows_sandbox_session_legacy_blocking(
             let _ = guard.take();
         }
         drop(conpty_owner.take());
+        // SAFETY: The restricted token was transferred to this wait thread, remains owned until
+        // process waiting completes, and is closed once here.
         unsafe {
             let token_handle = raw_handle(token_handle_addr);
             if !token_handle.is_null() && token_handle != INVALID_HANDLE_VALUE {

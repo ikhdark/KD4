@@ -129,8 +129,13 @@ impl OwnedWinHandle {
         if handle.is_null() || handle == INVALID_HANDLE_VALUE {
             anyhow::bail!("cannot duplicate an invalid Windows handle");
         }
+        // SAFETY: GetCurrentProcess returns a borrowed pseudo-handle and takes no pointers or
+        // ownership.
         let current_process = unsafe { GetCurrentProcess() };
         let mut duplicate = std::ptr::null_mut();
+        // SAFETY: The caller keeps handle open through duplication; current_process is its process
+        // pseudo-handle, and duplicate is a writable output slot. A successful duplicate is
+        // immediately owned by this wrapper.
         let duplicated = unsafe {
             DuplicateHandle(
                 current_process,
@@ -161,6 +166,8 @@ impl Drop for OwnedWinHandle {
     fn drop(&mut self) {
         let handle = self.raw();
         if !handle.is_null() && handle != INVALID_HANDLE_VALUE {
+            // SAFETY: This wrapper owns the non-null, non-invalid handle; into_raw clears it before
+            // ownership transfer, so Drop closes it only once.
             unsafe {
                 CloseHandle(handle);
             }
@@ -171,6 +178,9 @@ impl Drop for OwnedWinHandle {
 /// Open a named pipe created by the parent process.
 fn open_pipe(name: &str, access: u32) -> Result<HANDLE> {
     let path = to_wide(name);
+    // SAFETY: path is NUL-terminated UTF-16 and lives through CreateFileW. The null
+    // security/template pointers request defaults, and failure is checked before returning
+    // the owned handle.
     let handle = unsafe {
         CreateFileW(
             path.as_ptr(),
@@ -183,6 +193,8 @@ fn open_pipe(name: &str, access: u32) -> Result<HANDLE> {
         )
     };
     if handle == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+        // SAFETY: GetLastError reads this thread's last-error value immediately after CreateFileW
+        // fails.
         let err = unsafe { GetLastError() };
         return Err(anyhow::anyhow!("CreateFileW failed for pipe {name}: {err}"));
     }
@@ -237,14 +249,20 @@ fn read_spawn_request(reader: &mut File) -> Result<SpawnRequest> {
 
 fn read_acl_mutex_exists() -> Result<bool> {
     let name = to_wide(OsStr::new(READ_ACL_MUTEX_NAME));
+    // SAFETY: name is a live NUL-terminated UTF-16 mutex name; the access flags are scalar and the
+    // returned handle is checked before use.
     let handle = unsafe { OpenMutexW(MUTEX_ALL_ACCESS, 0, name.as_ptr()) };
     if handle.is_null() {
+        // SAFETY: GetLastError reads this thread's last-error value immediately after OpenMutexW
+        // fails.
         let err = unsafe { GetLastError() };
         if err == ERROR_FILE_NOT_FOUND {
             return Ok(false);
         }
         return Err(anyhow::anyhow!("OpenMutexW failed: {err}"));
     }
+    // SAFETY: OpenMutexW returned a non-null handle owned by this function; it is closed once after
+    // the existence probe.
     unsafe {
         CloseHandle(handle);
     }
@@ -297,7 +315,12 @@ fn spawn_ipc_process(req: &SpawnRequest) -> Result<IpcSpawnedProcess> {
     // wrappers for as long as possible. That way any failure after SID parsing but before the
     // child is fully spawned still releases the backing LocalAlloc memory automatically.
     let cap_psid_ptrs: Vec<*mut _> = cap_psids.iter().map(LocalSid::as_ptr).collect();
+    // SAFETY: The token helper returns a newly opened token handle, which is immediately put under
+    // OwnedWinHandle ownership.
     let base = OwnedWinHandle::new(unsafe { get_current_token_for_restriction()? });
+    // SAFETY: base owns the valid source token; cap_psids owns every SID referenced by
+    // cap_psid_ptrs throughout the synchronous token creation. The returned token is
+    // immediately owned.
     let h_token = OwnedWinHandle::new(unsafe {
         match token_mode {
             WindowsSandboxTokenMode::ReadOnlyCapability => {
@@ -308,6 +331,8 @@ fn spawn_ipc_process(req: &SpawnRequest) -> Result<IpcSpawnedProcess> {
             }
         }
     }?);
+    // SAFETY: cap_psids retains every LocalAlloc-backed SID while the synchronous ACL helpers
+    // borrow its raw pointers.
     unsafe {
         // These ACL adjustments need the raw SID values, but ownership stays with `cap_psids`.
         // We do not manually `LocalFree` anything here; the wrappers handle every return path.
@@ -344,6 +369,8 @@ fn spawn_ipc_process(req: &SpawnRequest) -> Result<IpcSpawnedProcess> {
         let stdin_handle = if req.stdin_open {
             Some(input_write)
         } else {
+            // SAFETY: take_input_write transferred this pipe end out of the ConPTY owner. No stdin
+            // consumer is created in this branch, so this is its sole close.
             unsafe {
                 CloseHandle(input_write);
             }
@@ -445,6 +472,8 @@ fn terminate_job_or_process(job: &JobObject, process: HANDLE, log_dir: Option<&P
             &format!("runner failed to terminate process tree: {job_err}"),
             log_dir,
         );
+        // SAFETY: The caller retains its process handle while termination is requested;
+        // TerminateProcess does not transfer or close that handle.
         if unsafe { TerminateProcess(process, 1) } == 0 {
             log_note(
                 &format!("runner failed to terminate root process: {}", unsafe {
@@ -457,12 +486,15 @@ fn terminate_job_or_process(job: &JobObject, process: HANDLE, log_dir: Option<&P
 }
 
 fn wait_for_process(process: HANDLE, timeout_ms: u32) -> ProcessWaitOutcome {
+    // SAFETY: The caller keeps the process handle open for the duration of this synchronous wait.
     let wait_result = unsafe { WaitForSingleObject(process, timeout_ms) };
     match wait_result {
         WAIT_OBJECT_0 => ProcessWaitOutcome::Exited,
         WAIT_TIMEOUT => ProcessWaitOutcome::TimedOut,
         WAIT_FAILED => ProcessWaitOutcome::Failed {
             wait_result,
+            // SAFETY: GetLastError reads this thread's last-error value immediately after
+            // WaitForSingleObject reports WAIT_FAILED.
             windows_error: Some(unsafe { GetLastError() }),
         },
         _ => ProcessWaitOutcome::Failed {
@@ -601,6 +633,9 @@ where
                         && let Some(hpc) = guard.as_ref()
                     {
                         let result =
+                            // SAFETY: The mutex guard prevents the shared pseudoconsole handle from
+                            // being cleared during resizing; the validated dimensions fit
+                            // COORD and the owner remains alive.
                             unsafe { ResizePseudoConsole(*hpc, COORD { X: cols, Y: rows }) };
                         if result != 0 {
                             log_note(
@@ -642,6 +677,9 @@ fn spawn_stdin_writer(handle: HANDLE, log_dir: Option<PathBuf>) -> mpsc::Sender<
                 let chunk = &bytes[offset..];
                 let chunk_len = chunk.len().min(u32::MAX as usize);
                 let mut written = 0u32;
+                // SAFETY: This worker owns handle until its final CloseHandle. chunk is readable
+                // for chunk_len bytes, written is a writable u32, and null OVERLAPPED
+                // requests synchronous IO.
                 let ok = unsafe {
                     windows_sys::Win32::Storage::FileSystem::WriteFile(
                         handle,
@@ -671,6 +709,8 @@ fn spawn_stdin_writer(handle: HANDLE, log_dir: Option<PathBuf>) -> mpsc::Sender<
                 offset += written as usize;
             }
         }
+        // SAFETY: Ownership of the stdin write handle was transferred to this worker, which closes
+        // it exactly once after its write loop ends.
         unsafe {
             CloseHandle(handle);
         }
@@ -702,7 +742,11 @@ pub fn main() -> Result<()> {
     // then becomes responsible for closing them.
     let h_pipe_in = OwnedWinHandle::new(open_pipe(&pipe_in, FILE_GENERIC_READ)?);
     let h_pipe_out = OwnedWinHandle::new(open_pipe(&pipe_out, FILE_GENERIC_WRITE)?);
+    // SAFETY: into_raw relinquishes the sole OwnedWinHandle ownership of the open pipe; File takes
+    // that ownership and will close it.
     let mut pipe_read = unsafe { File::from_raw_handle(h_pipe_in.into_raw() as _) };
+    // SAFETY: into_raw relinquishes the sole OwnedWinHandle ownership of the open pipe; File takes
+    // that ownership before being shared under the mutex.
     let pipe_write = Arc::new(StdMutex::new(unsafe {
         File::from_raw_handle(h_pipe_out.into_raw() as _)
     }));
@@ -746,6 +790,8 @@ pub fn main() -> Result<()> {
         version: IPC_PROTOCOL_VERSION,
         message: Message::SpawnReady {
             payload: SpawnReady {
+                // SAFETY: pi.hProcess is the live process handle retained by ipc_spawn until
+                // process cleanup; GetProcessId only queries it.
                 process_id: unsafe { GetProcessId(pi.hProcess) },
             },
         },
@@ -824,6 +870,9 @@ pub fn main() -> Result<()> {
     };
 
     let exit_code: i32;
+    // SAFETY: The spawn result owns both process/thread handles until this cleanup. raw_exit is
+    // writable for GetExitCodeProcess, and each non-null handle is closed once after
+    // waiting.
     unsafe {
         if timed_out {
             exit_code = 128 + 64;
@@ -955,6 +1004,9 @@ mod tests {
 
         let mut stdin_read: HANDLE = std::ptr::null_mut();
         let mut stdin_write: HANDLE = std::ptr::null_mut();
+        // SAFETY: Both output pointers refer to writable HANDLE slots; default security and buffer
+        // size are requested. The test checks success before transferring ownership of
+        // either end.
         let pipe_created = unsafe { CreatePipe(&mut stdin_read, &mut stdin_write, ptr::null(), 0) };
         assert_ne!(pipe_created, 0, "CreatePipe failed: {}", unsafe {
             windows_sys::Win32::Foundation::GetLastError()
@@ -1029,9 +1081,13 @@ mod tests {
 
         let mut control_read: HANDLE = std::ptr::null_mut();
         let mut control_write: HANDLE = std::ptr::null_mut();
+        // SAFETY: Both output pointers refer to writable HANDLE slots; default security and buffer
+        // size are requested. Failure is checked before using either returned pipe end.
         if unsafe { CreatePipe(&mut control_read, &mut control_write, ptr::null_mut(), 0) } == 0 {
             return Err(std::io::Error::last_os_error().into());
         }
+        // SAFETY: CreatePipe succeeded and control_read is an owned, unshared read handle; File
+        // takes sole responsibility for closing it.
         let reader = unsafe { File::from_raw_handle(control_read as _) };
         let control_writer = OwnedWinHandle::new(control_write);
         let process_observer = OwnedWinHandle::duplicate(root.as_raw_handle() as HANDLE)?;

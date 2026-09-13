@@ -329,6 +329,7 @@ async fn run_cell<H: CellHost>(
                         }
                     }
                     RuntimeEvent::YieldRequested => {
+                        output_admission.release_yield();
                         let yield_observer = matches!(
                             observer.as_ref().map(|observer| observer.mode),
                             Some(ObserveMode::YieldAfter(_) | ObserveMode::StateChange)

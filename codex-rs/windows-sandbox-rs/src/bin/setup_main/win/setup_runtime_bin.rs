@@ -30,12 +30,16 @@ pub(super) fn ensure_codex_app_runtime_paths_readable(
             continue;
         }
 
-        let has_access = match path_mask_allows(
-            &runtime_path,
-            &[sandbox_group_psid],
-            read_execute_mask,
-            /*require_all_bits*/ true,
-        ) {
+        // SAFETY: The setup caller retains its converted sandbox-group SID for
+        // this synchronous check and the subsequent grant.
+        let has_access = match unsafe {
+            path_mask_allows(
+                &runtime_path,
+                &[sandbox_group_psid],
+                read_execute_mask,
+                /*require_all_bits*/ true,
+            )
+        } {
             Ok(has_access) => has_access,
             Err(err) => {
                 refresh_errors.push(format!(
@@ -63,6 +67,8 @@ pub(super) fn ensure_codex_app_runtime_paths_readable(
                 runtime_path.display()
             ),
         )?;
+        // SAFETY: The setup caller retains the converted sandbox-group SID throughout this
+        // synchronous runtime-path grant; the ACL helper does not take SID ownership.
         let result = unsafe {
             ensure_allow_mask_aces_with_inheritance(
                 &runtime_path,

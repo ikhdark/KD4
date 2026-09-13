@@ -116,7 +116,7 @@ pub fn arg0_dispatch() -> Option<Arg0PathEntryGuard> {
         prepare_path_entry_for_codex_aliases,
     );
     if let Some(updated_path_env_var) = updated_path_env_var {
-        // It is safe to call set_var() because our process is single-threaded at
+        // SAFETY: It is safe to call set_var() because our process is single-threaded at
         // this point in its execution.
         unsafe {
             std::env::set_var("PATH", updated_path_env_var);
@@ -293,7 +293,7 @@ where
 {
     for (key, value) in iter.into_iter().flatten() {
         if !key.to_ascii_uppercase().starts_with(ILLEGAL_ENV_VAR_PREFIX) {
-            // It is safe to call set_var() because our process is
+            // SAFETY: It is safe to call set_var() because our process is
             // single-threaded at this point in its execution.
             unsafe { std::env::set_var(&key, &value) };
         }

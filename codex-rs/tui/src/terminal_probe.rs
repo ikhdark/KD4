@@ -79,8 +79,11 @@ mod imp {
     }
 
     fn query_console_default_colors(output: HANDLE) -> io::Result<Option<DefaultColors>> {
+        // SAFETY: This C struct contains integer fields only, for which zero is valid.
+        // The API-required cbSize is initialized before the struct is passed to Windows.
         let mut info = unsafe { std::mem::zeroed::<CONSOLE_SCREEN_BUFFER_INFOEX>() };
         info.cbSize = std::mem::size_of::<CONSOLE_SCREEN_BUFFER_INFOEX>() as u32;
+        // SAFETY: output is a borrowed standard handle, and info is writable with the correct cbSize.
         if unsafe { GetConsoleScreenBufferInfoEx(output, &mut info) } == 0 {
             return Err(io::Error::last_os_error());
         }
@@ -110,6 +113,8 @@ mod imp {
     }
 
     fn std_handle(kind: u32) -> io::Result<HANDLE> {
+        // SAFETY: GetStdHandle has no pointer preconditions; invalid results are checked below.
+        // The returned process-owned handle is borrowed and is never closed here.
         let handle = unsafe { GetStdHandle(kind) };
         if handle.is_null() || handle == INVALID_HANDLE_VALUE {
             return Err(io::Error::last_os_error());
@@ -125,11 +130,13 @@ mod imp {
     impl VirtualTerminalInputMode {
         fn enable(handle: HANDLE) -> io::Result<Self> {
             let mut original_mode = 0;
+            // SAFETY: handle is a borrowed standard input handle, and original_mode is writable.
             if unsafe { GetConsoleMode(handle, &mut original_mode) } == 0 {
                 return Err(io::Error::last_os_error());
             }
 
             let requested_mode = original_mode | ENABLE_VIRTUAL_TERMINAL_INPUT;
+            // SAFETY: GetConsoleMode validated this borrowed handle; requested_mode contains console flags.
             if unsafe { SetConsoleMode(handle, requested_mode) } == 0 {
                 return Err(io::Error::last_os_error());
             }
@@ -143,6 +150,7 @@ mod imp {
 
     impl Drop for VirtualTerminalInputMode {
         fn drop(&mut self) {
+            // SAFETY: The borrowed standard handle is still open, and original_mode came from GetConsoleMode.
             unsafe {
                 SetConsoleMode(self.handle, self.original_mode);
             }
@@ -152,6 +160,8 @@ mod imp {
     fn write_all(handle: HANDLE, mut bytes: &[u8]) -> io::Result<()> {
         while !bytes.is_empty() {
             let mut written = 0;
+            // SAFETY: The borrowed output handle and bytes remain live for this synchronous call.
+            // The length is bounded by bytes, written is writable, and no OVERLAPPED is used.
             let ok = unsafe {
                 WriteFile(
                     handle,
@@ -192,6 +202,7 @@ mod imp {
                 .saturating_duration_since(now)
                 .as_millis()
                 .min(u32::MAX as u128) as u32;
+            // SAFETY: The borrowed input handle remains open throughout this bounded wait.
             match unsafe { WaitForSingleObject(handle, timeout_ms) } {
                 WAIT_OBJECT_0 => read_once(handle, &mut buffer)?,
                 WAIT_TIMEOUT => return Ok(None),
@@ -203,6 +214,8 @@ mod imp {
     fn read_once(handle: HANDLE, buffer: &mut Vec<u8>) -> io::Result<()> {
         let mut chunk = [0_u8; 256];
         let mut read = 0;
+        // SAFETY: The borrowed input handle, chunk, and read remain live for the synchronous call.
+        // The requested length fits chunk, and no OVERLAPPED is used.
         let ok = unsafe {
             ReadFile(
                 handle,

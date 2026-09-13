@@ -54,7 +54,7 @@ pub(crate) struct PendingReqwestHttpBodyStream {
 /// Validates `http/request` parameters and runs the actual HTTP call used
 /// by the exec-server route and the local [`HttpClient`] backend.
 pub(crate) struct ReqwestHttpRequestRunner {
-    client: Arc<SharedHttpClient>,
+    redirect_policy: HttpRedirectPolicy,
     timeout: Option<Duration>,
 }
 
@@ -107,8 +107,7 @@ impl HttpClient for ReqwestHttpClient {
         params: HttpRequestParams,
     ) -> BoxFuture<'_, Result<HttpRequestResponse, ExecServerError>> {
         async move {
-            let runner = ReqwestHttpRequestRunner::new(params.timeout_ms, params.redirect_policy)
-                .map_err(|error| ExecServerError::HttpRequest(error.message))?;
+            let runner = ReqwestHttpRequestRunner::new(params.timeout_ms, params.redirect_policy);
             let (response, _) = runner
                 .run(HttpRequestParams {
                     stream_response: false,
@@ -126,8 +125,7 @@ impl HttpClient for ReqwestHttpClient {
         params: HttpRequestParams,
     ) -> BoxFuture<'_, Result<(HttpRequestResponse, HttpResponseBodyStream), ExecServerError>> {
         async move {
-            let runner = ReqwestHttpRequestRunner::new(params.timeout_ms, params.redirect_policy)
-                .map_err(|error| ExecServerError::HttpRequest(error.message))?;
+            let runner = ReqwestHttpRequestRunner::new(params.timeout_ms, params.redirect_policy);
             let (response, pending_stream) = runner
                 .run(HttpRequestParams {
                     stream_response: true,
@@ -150,16 +148,11 @@ impl HttpClient for ReqwestHttpClient {
 }
 
 impl ReqwestHttpRequestRunner {
-    pub(crate) fn new(
-        timeout_ms: Option<u64>,
-        redirect_policy: HttpRedirectPolicy,
-    ) -> Result<Self, JSONRPCErrorError> {
-        let client = ReqwestHttpClient::shared_client(redirect_policy)
-            .map_err(|error| internal_error(error.to_string()))?;
-        Ok(Self {
-            client,
+    pub(crate) fn new(timeout_ms: Option<u64>, redirect_policy: HttpRedirectPolicy) -> Self {
+        Self {
+            redirect_policy,
             timeout: timeout_ms.map(Duration::from_millis),
-        })
+        }
     }
 
     pub(crate) async fn run(
@@ -167,6 +160,14 @@ impl ReqwestHttpRequestRunner {
         params: HttpRequestParams,
     ) -> Result<(HttpRequestResponse, Option<PendingReqwestHttpBodyStream>), JSONRPCErrorError>
     {
+        let deadline = self
+            .timeout
+            .map(|timeout| {
+                tokio::time::Instant::now()
+                    .checked_add(timeout)
+                    .ok_or_else(|| invalid_params("http/request timeout is too large".into()))
+            })
+            .transpose()?;
         let method = Method::from_bytes(params.method.as_bytes())
             .map_err(|error| invalid_params(format!("http/request method is invalid: {error}")))?;
         let url = params
@@ -194,11 +195,31 @@ impl ReqwestHttpRequestRunner {
         );
         let mut headers = Self::build_headers(params.headers)?;
         codex_otel::inject_span_w3c_trace_headers(&request_span, &mut headers);
-        let mut request = self
-            .client
+        // Client construction can read custom certificates and platform roots. Keep it off the
+        // async worker and inside the same deadline as the request; this worker never sends HTTP.
+        let redirect_policy = self.redirect_policy;
+        let prepare =
+            tokio::task::spawn_blocking(move || ReqwestHttpClient::shared_client(redirect_policy));
+        let client = match deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline, prepare)
+                .await
+                .map_err(|_| {
+                    internal_error("http/request timed out preparing HTTP client".into())
+                })?,
+            None => prepare.await,
+        }
+        .map_err(|error| internal_error(format!("http client preparation failed: {error}")))?
+        .map_err(|error| internal_error(error.to_string()))?;
+        let mut request = client
             .request(method.clone(), params.url.clone())
             .headers(headers);
-        if let Some(timeout) = self.timeout {
+        if let Some(deadline) = deadline {
+            let timeout = deadline
+                .checked_duration_since(tokio::time::Instant::now())
+                .filter(|timeout| !timeout.is_zero())
+                .ok_or_else(|| {
+                    internal_error("http/request timed out preparing HTTP client".into())
+                })?;
             request = request.timeout(timeout);
         }
         if let Some(body) = params.body {
@@ -377,6 +398,84 @@ mod tests {
     use super::*;
 
     #[test]
+    fn http_client_preparation_obeys_deadline_and_cancellation_without_network() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("listener");
+            for (stream, cancel) in [(false, false), (true, false), (false, true)] {
+                let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+                let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+                let blocker = tokio::task::spawn_blocking(move || {
+                    let _ = started_tx.send(());
+                    let _ = release_rx.recv();
+                });
+                started_rx.await.expect("worker occupied");
+                let params = HttpRequestParams {
+                    method: "GET".into(),
+                    url: format!(
+                        "http://{}/must-not-send",
+                        listener.local_addr().expect("address")
+                    ),
+                    headers: Vec::new(),
+                    body: None,
+                    timeout_ms: if cancel { None } else { Some(50) },
+                    redirect_policy: HttpRedirectPolicy::Follow,
+                    request_id: "preparation".into(),
+                    stream_response: stream,
+                };
+                let request = async {
+                    if stream {
+                        ReqwestHttpClient
+                            .http_request_stream(params)
+                            .await
+                            .map(|_| ())
+                    } else {
+                        ReqwestHttpClient.http_request(params).await.map(|_| ())
+                    }
+                };
+                let result = tokio::time::timeout(
+                    Duration::from_millis(if cancel { 50 } else { 500 }),
+                    request,
+                )
+                .await;
+                release_tx.send(()).expect("release worker");
+                blocker.await.expect("worker joined");
+                tokio::task::spawn_blocking(|| ())
+                    .await
+                    .expect("queued preparation drained");
+                if cancel {
+                    assert!(
+                        result.is_err(),
+                        "caller cancellation drops preparation wait"
+                    );
+                } else {
+                    let error = result
+                        .expect("request deadline must win")
+                        .expect_err("must time out");
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("http/request timed out preparing HTTP client"),
+                        "{error}"
+                    );
+                }
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                        .await
+                        .is_err(),
+                    "expired or cancelled preparation must never send a late HTTP request"
+                );
+            }
+        });
+    }
+
+    #[test]
     fn request_runners_reuse_client_per_redirect_policy() {
         let first = ReqwestHttpClient::shared_client(HttpRedirectPolicy::Follow)
             .expect("build first HTTP client");
@@ -398,8 +497,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(201).set_body_bytes(b"created".to_vec()))
             .mount(&server)
             .await;
-        let runner = ReqwestHttpRequestRunner::new(Some(2_000), HttpRedirectPolicy::Follow)
-            .expect("build request runner");
+        let runner = ReqwestHttpRequestRunner::new(Some(2_000), HttpRedirectPolicy::Follow);
 
         let (response, pending_stream) = runner
             .run(HttpRequestParams {

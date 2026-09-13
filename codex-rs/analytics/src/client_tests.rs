@@ -135,6 +135,127 @@ fn client_with_receiver() -> (AnalyticsEventsClient, mpsc::Receiver<AnalyticsFac
     (AnalyticsEventsClient { queue: Some(queue) }, receiver)
 }
 
+#[tokio::test]
+#[cfg(debug_assertions)]
+async fn pending_analytics_queue_delivers_bounded_correlations_and_recovers() {
+    use crate::analytics_client_tests::sample_command_approval_request;
+    use crate::analytics_client_tests::sample_initialize_fact;
+
+    let capture_path = unique_capture_path("pending-correlations");
+    let destination = AnalyticsEventsDestination::from_base_url_and_capture_file(
+        "https://unused.example".to_string(),
+        Some(capture_path.clone()),
+    );
+    let queue = AnalyticsEventsQueue::new(
+        codex_login::AuthManager::from_auth_for_testing(
+            CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+        ),
+        destination,
+        HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+    );
+    let client = AnalyticsEventsClient { queue: Some(queue) };
+    // Reserve and release one slot immediately before the synchronous public call.
+    // This sole producer cannot lose facts to queue throughput while testing retention.
+    async fn ready(client: &AnalyticsEventsClient) {
+        drop(
+            client
+                .queue
+                .as_ref()
+                .unwrap()
+                .sender
+                .reserve()
+                .await
+                .unwrap(),
+        );
+    }
+    client.record_fact(sample_initialize_fact(7));
+    client.track_response(7, RequestId::Integer(-1), sample_thread_start_response());
+    for id in 0..=4096 {
+        ready(&client).await;
+        client.track_request(7, RequestId::Integer(id), &sample_turn_steer_request());
+        ready(&client).await;
+        client.track_server_request(7, &sample_command_approval_request(id, None));
+    }
+    // Replacing an existing correlation at capacity must preserve the latest input.
+    let mut replacement = sample_turn_steer_request();
+    if let ClientRequest::TurnSteer { params, .. } = &mut replacement {
+        params.expected_turn_id = "replacement-turn".to_string();
+    }
+    ready(&client).await;
+    client.track_request(7, RequestId::Integer(0), &replacement);
+    ready(&client).await;
+    client.track_server_request(7, &sample_command_approval_request(0, Some("replacement")));
+    for id in 0..=4096 {
+        ready(&client).await;
+        client.track_error_response(7, RequestId::Integer(id), None);
+        ready(&client).await;
+        client.track_server_request_aborted(2000, RequestId::Integer(id));
+    }
+    ready(&client).await;
+    client.track_request(7, RequestId::Integer(4096), &sample_turn_steer_request());
+    ready(&client).await;
+    client.track_server_request(7, &sample_command_approval_request(4096, None));
+    ready(&client).await;
+    client.track_error_response(7, RequestId::Integer(4096), None);
+    ready(&client).await;
+    client.track_server_request_aborted(2000, RequestId::Integer(4096));
+    // A later emitted fact provides an observable FIFO delivery barrier.
+    ready(&client).await;
+    client.track_response(7, RequestId::Integer(-2), sample_thread_resume_response());
+    let events = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            let events = fs::read_to_string(&capture_path)
+                .unwrap()
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .flat_map(|payload| payload["events"].as_array().unwrap().clone())
+                .collect::<Vec<_>>();
+            if events
+                .iter()
+                .any(|event| event["event_params"]["thread_id"] == "thread-2")
+            {
+                break events;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("queue delivers terminal facts and FIFO barrier");
+    let steers = events
+        .iter()
+        .filter(|event| event["event_type"] == "codex_turn_steer_event")
+        .collect::<Vec<_>>();
+    let reviews = events
+        .iter()
+        .filter(|event| event["event_type"] == "codex_review_event")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        steers.len(),
+        4097,
+        "overflow has no event, retry after completion does"
+    );
+    assert_eq!(
+        reviews.len(),
+        4097,
+        "review overflow has no event, retry recovers"
+    );
+    assert_eq!(
+        steers[0]["event_params"]["expected_turn_id"],
+        "replacement-turn"
+    );
+    assert!(
+        reviews
+            .iter()
+            .all(|event| event["event_params"]["status"] == "aborted")
+    );
+    assert_ne!(
+        reviews[0]["event_params"]["trigger"],
+        reviews[1]["event_params"]["trigger"]
+    );
+    drop(client);
+    fs::remove_file(capture_path).expect("remove capture file");
+}
+
 #[test]
 #[cfg(debug_assertions)]
 fn analytics_destination_uses_explicit_capture_file() {

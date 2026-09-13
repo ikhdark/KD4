@@ -135,7 +135,9 @@ fn git_check_from_inputs(inputs: GitCheckInputs) -> DoctorCheck {
             .remedy("Install Git or fix PATH so Codex can inspect repository metadata.")
             .field("selected git"),
         );
-    } else if let Some(cause) = old_windows_git_warning(inputs.git_version.as_deref(), true) {
+    } else if let Some(cause) =
+        old_windows_git_warning(inputs.git_version.as_deref(), cfg!(windows))
+    {
         check.status = CheckStatus::Warning;
         check.summary = cause.clone();
         check = check.issue(
@@ -325,6 +327,73 @@ mod tests {
                 /*is_windows*/ false
             ),
             None
+        );
+    }
+
+    #[test]
+    fn old_git_warning_follows_platform_through_git_probe() {
+        const CHILD_ENV: &str = "CODEX_TEST_DOCTOR_OLD_GIT_PROBE";
+        const VERSION: &str = "git version 2.34.1";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            let cwd = std::env::current_dir().expect("cwd");
+            let check = runtime.block_on(git_check(&cwd));
+            assert!(check.details.contains(&format!("git version: {VERSION}")));
+            if cfg!(windows) {
+                assert_eq!(check.status, CheckStatus::Warning);
+                assert_eq!(
+                    check.summary,
+                    "old Git for Windows may corrupt Windows TUI rendering"
+                );
+                assert_eq!(check.issues.len(), 1);
+            } else {
+                assert_eq!(check.status, CheckStatus::Ok);
+                assert_eq!(check.summary, VERSION);
+                assert!(check.issues.is_empty());
+            }
+            return;
+        }
+
+        // Isolate PATH in a child so concurrent tests keep their real Git.
+        let directory = tempfile::tempdir().expect("fake Git directory");
+        #[cfg(windows)]
+        std::fs::write(
+            directory.path().join("git.cmd"),
+            format!("@echo off\r\necho {VERSION}\r\n"),
+        )
+        .expect("fake Git command");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let path = directory.path().join("git");
+            std::fs::write(&path, format!("#!/bin/sh\nprintf '%s\\n' '{VERSION}'\n"))
+                .expect("fake Git command");
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+                .expect("executable Git command");
+        }
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "doctor::git::tests::old_git_warning_follows_platform_through_git_probe",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .env("PATH", directory.path())
+            .current_dir(directory.path())
+            .output()
+            .expect("run isolated Git probe");
+        assert!(
+            output.status.success(),
+            "Git probe failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
+            "isolated Git probe must execute its assertions"
         );
     }
 

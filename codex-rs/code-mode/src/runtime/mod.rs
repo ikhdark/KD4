@@ -74,6 +74,7 @@ pub(crate) enum RuntimeEvent {
 pub(crate) struct OutputAdmission {
     state: Mutex<OutputAdmissionState>,
     max_bytes: usize,
+    yield_pending: AtomicBool,
 }
 
 struct OutputAdmissionState {
@@ -89,7 +90,18 @@ impl OutputAdmission {
                 overflow_reported: false,
             }),
             max_bytes,
+            yield_pending: AtomicBool::new(false),
         }
+    }
+
+    pub(super) fn admit_yield(&self) -> Option<RuntimeEvent> {
+        // Repeated requests while the actor has not observed the first one have
+        // the same effect. Keep synchronous JavaScript loops from flooding IPC.
+        (!self.yield_pending.swap(true, Ordering::AcqRel)).then_some(RuntimeEvent::YieldRequested)
+    }
+
+    pub(crate) fn release_yield(&self) {
+        self.yield_pending.store(false, Ordering::Release);
     }
 
     fn admit(&self, item: FunctionCallOutputContentItem) -> Option<RuntimeEvent> {
@@ -725,6 +737,38 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn yield_admission_bounds_a_synchronous_flood() {
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let (_runtime_tx, _runtime_terminate_handle) = spawn_runtime(
+            HashMap::new(),
+            execute_request("for (let i = 0; i < 100_000; i++) yield_control();"),
+            60_000,
+            event_tx,
+            std::sync::Arc::new(OutputAdmission::new(super::MAX_BUFFERED_OUTPUT_BYTES)),
+            None,
+        )
+        .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            assert!(matches!(event_rx.recv().await, Some(RuntimeEvent::Started)));
+            assert!(matches!(
+                event_rx.recv().await,
+                Some(RuntimeEvent::YieldRequested)
+            ));
+            assert!(matches!(
+                event_rx.recv().await,
+                Some(RuntimeEvent::Result {
+                    error_text: None,
+                    ..
+                })
+            ));
+            assert!(event_rx.recv().await.is_none());
+        })
+        .await
+        .expect("yield flood must complete without a retained event backlog");
     }
 
     #[tokio::test]

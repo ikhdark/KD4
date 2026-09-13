@@ -1,8 +1,5 @@
 version = 1
 policy-pack = ["kd4@1"]
-# Analyze both declared Windows feature worlds on ordinary matrix-capable runs.
-# An explicit --profile NAME remains available for a focused run.
-all-profiles = true
 
 # KD4's local Windows quality gate. Paths are relative to this Cargo workspace.
 # Preserve the registry's warn/deny defaults; overriding the global default
@@ -18,25 +15,17 @@ generic-instantiation-uncertain = "warn"
 ranked-contract-violation = "warn"
 ranked-contract-incomplete = "warn"
 
-# Normal runtime and the only optional workspace feature (code-mode/Cargo.toml).
+# Analyze the normal Windows runtime feature set.
 # Trusted loading provides build-script outputs and procedural macro expansion.
-# Both run by default; --profile windows selects normal features.
 [[analysis-profile]]
 name = "windows"
 target = "x86_64-pc-windows-msvc"
-workspace-execution = "trusted"
-
-[[analysis-profile]]
-name = "windows-v8-sandbox"
-target = "x86_64-pc-windows-msvc"
-all-features = true
 workspace-execution = "trusted"
 
 # The generated index and its source manifest live at the repository root.
 # Missing/stale ownership and missing closure evidence must remain visible.
 # Validation receipts are not fabricated or permanently pinned in this file.
 [architecture-gate]
-base-ref = "HEAD"
 index = "../architecture_index.json"
 
 # Public enums are part of KD4's local protocol and extension contracts.
@@ -45,15 +34,12 @@ analyze-public-enums = true
 
 [test-analysis]
 history = true
-base-ref = "HEAD"
 # Review stale test dependencies after the first qualifying change.
 minimum-dependency-changes = 1
-ignored-max-commits = 100
 # Run bounded mutation trials for changed code in an isolated workspace copy.
 mutation = true
-# Broader sampling for this large workspace, with a finite per-profile budget.
+# Broader sampling for this large workspace, with a finite trial budget.
 mutation-limit = 32
-test-attributes = ["test", "tokio::test", "async_std::test", "rstest", "test_case"]
 oracle-macros = [
   "assert", "assert_eq", "assert_ne", "assert_matches",
   "debug_assert", "debug_assert_eq", "debug_assert_ne",

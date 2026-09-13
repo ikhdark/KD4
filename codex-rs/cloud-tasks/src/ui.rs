@@ -302,7 +302,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &mut App) {
     let mut status_line = app.status.replace('\n', " ");
     if status_line.len() > 2000 {
         // hard cap to avoid TUI noise
-        status_line.truncate(2000);
+        status_line.truncate(status_line.floor_char_boundary(2000));
         status_line.push('…');
     }
     // Clear the status row to avoid trailing characters when the message shrinks.
@@ -1075,6 +1075,24 @@ mod tests {
             .collect::<String>();
 
         assert!(text.contains("Codex Cloud • All  • 0%"));
+    }
+
+    #[test]
+    fn draw_truncates_unicode_status_at_a_character_boundary() {
+        let mut terminal = Terminal::new(TestBackend::new(2020, 6)).expect("terminal");
+        let mut app = App::new();
+        let prefix = "x".repeat(1999);
+        app.status = format!("{prefix}é trailing detail");
+        let original_status = app.status.clone();
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("draw Unicode status");
+        let rendered: String = terminal.backend().buffer().content()[2020 * 5..]
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert_eq!(rendered.trim_end(), format!("{prefix}…"));
+        assert_eq!(app.status, original_status);
     }
 
     #[test]

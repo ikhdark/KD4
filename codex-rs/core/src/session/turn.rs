@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
+use std::sync::Weak;
 use std::sync::atomic::Ordering;
 
 use crate::agents_md::RepositoryStableContextBundle;
@@ -3263,29 +3264,32 @@ struct ResolvedRequestScaffold {
 /// the scaffold cache compares this token first and only acquires the artifact on a miss.
 /// `router` is the registry identity and `activation_revision` advances whenever deferred
 /// tool activation changes the exposed surface, which together determine the artifact the
-/// router would hand back.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// router would hand back. Keeping a weak reference reserves the allocation identity after
+/// the router drops, so a later router cannot reuse its address and match a stale token.
+#[derive(Clone, Debug)]
 struct ToolSchemaSurfaceToken {
-    router: *const ToolRouter,
+    router: Weak<ToolRouter>,
     activation_revision: u64,
     terminal_completion_only: bool,
 }
 
-// The pointer is only ever compared for identity; it is never dereferenced.
-unsafe impl Send for ToolSchemaSurfaceToken {}
-unsafe impl Sync for ToolSchemaSurfaceToken {}
-
 impl ToolSchemaSurfaceToken {
     fn capture(
-        router: &ToolRouter,
+        router: &Arc<ToolRouter>,
         turn: &crate::session::turn_context::TurnContext,
         terminal_completion_only: bool,
     ) -> Self {
         Self {
-            router: std::ptr::from_ref(router),
+            router: Arc::downgrade(router),
             activation_revision: turn.deferred_tool_activation_revision(),
             terminal_completion_only,
         }
+    }
+
+    fn matches(&self, other: &Self) -> bool {
+        Weak::ptr_eq(&self.router, &other.router)
+            && self.activation_revision == other.activation_revision
+            && self.terminal_completion_only == other.terminal_completion_only
     }
 }
 
@@ -3308,7 +3312,7 @@ impl RequestScaffoldCache {
         &mut self,
         prepared: &PreparedPromptInput,
         sess: &Session,
-        router: &ToolRouter,
+        router: &Arc<ToolRouter>,
         step_context: &StepContext,
         base_instructions: &BaseInstructions,
         terminal_completion_only: bool,
@@ -3323,7 +3327,7 @@ impl RequestScaffoldCache {
         // Check the cheap surface token before materializing the schema artifact so a repeated
         // request with an unchanged tool surface never touches the router schema cache.
         if let Some(entry) = self.entry.as_ref()
-            && entry.tool_schema_surface == tool_schema_surface
+            && entry.tool_schema_surface.matches(&tool_schema_surface)
             && entry
                 .owner
                 .matches(prepared, step_context, exec_policy.as_ref())
@@ -3615,7 +3619,7 @@ async fn run_sampling_request(
         .resolve(
             &prepared_input,
             sess.as_ref(),
-            router.as_ref(),
+            &router,
             step_context.as_ref(),
             base_instructions,
             terminal_completion_only,

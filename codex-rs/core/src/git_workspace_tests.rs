@@ -152,6 +152,113 @@ async fn create_clean_git_repo() -> (TempDir, AbsolutePathBuf) {
 }
 
 #[tokio::test]
+async fn git_config_signature_tracks_configuration_changes() {
+    let (_temp, repo) = create_clean_git_repo().await;
+    let git = which::which("git").expect("Git executable");
+    let original = git_config_signature(&git, repo.as_path())
+        .await
+        .expect("configuration signature");
+    run_git(
+        repo.as_path(),
+        &["config", "codex.signatureTest", "changed"],
+    )
+    .await;
+    let changed = git_config_signature(&git, repo.as_path())
+        .await
+        .expect("changed configuration signature");
+    assert_ne!(original, changed);
+    run_git(
+        repo.as_path(),
+        &["config", "--unset", "codex.signatureTest"],
+    )
+    .await;
+    assert_eq!(
+        git_config_signature(&git, repo.as_path()).await,
+        Some(original)
+    );
+}
+
+#[tokio::test]
+#[cfg(windows)]
+async fn git_config_signature_timeout_terminates_wrapper_and_descendant() {
+    assert_git_config_signature_cleans_wrapper_tree(false).await;
+}
+
+#[tokio::test]
+#[cfg(windows)]
+async fn git_config_signature_cancellation_terminates_wrapper_and_descendant() {
+    assert_git_config_signature_cleans_wrapper_tree(true).await;
+}
+
+#[cfg(windows)]
+async fn assert_git_config_signature_cleans_wrapper_tree(cancel_after_spawn: bool) {
+    let temp = TempDir::new().expect("temporary Git wrapper directory");
+    let helper = temp.path().join("git-wrapper.ps1");
+    let executable = temp.path().join("git.cmd");
+    let pids = temp.path().join("wrapper-pids.txt");
+    let pids_literal = pids.display().to_string().replace('\'', "''");
+    std::fs::write(
+        &helper,
+        format!(
+            "$child = Start-Process powershell.exe -ArgumentList '-NoProfile', '-Command', 'Start-Sleep -Seconds 60' -WindowStyle Hidden -PassThru\n[IO.File]::WriteAllText('{pids_literal}', \"$PID $($child.Id)\")\nStart-Sleep -Seconds 60\n"
+        ),
+    )
+    .expect("write Git wrapper helper");
+    std::fs::write(
+        &executable,
+        format!(
+            "@echo off\r\npowershell.exe -NoProfile -ExecutionPolicy Bypass -File \"{}\"\r\n",
+            helper.display()
+        ),
+    )
+    .expect("write Git wrapper");
+
+    let result = if cancel_after_spawn {
+        let operation = git_config_signature(&executable, temp.path());
+        tokio::pin!(operation);
+        tokio::select! {
+            result = &mut operation => panic!("configuration probe completed before cancellation: {result:?}"),
+            _ = async {
+                while !std::fs::read_to_string(&pids).is_ok_and(|contents| {
+                    contents.split_whitespace().filter_map(|pid| pid.parse::<u32>().ok()).count() == 2
+                }) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            } => {}
+        }
+        None
+    } else {
+        git_config_signature(&executable, temp.path()).await
+    };
+    let ids = std::fs::read_to_string(&pids)
+        .expect("configuration probe must launch the wrapper")
+        .split_whitespace()
+        .map(|pid| pid.parse::<u32>().expect("recorded process id").to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(ids.len(), 2);
+    let ids = ids.join(",");
+    let observed = Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-Command",
+            &format!("$live = @(Get-Process -Id {ids} -ErrorAction SilentlyContinue); $live | ForEach-Object {{ $_.Id }}; $live | Stop-Process -Force -ErrorAction SilentlyContinue"),
+        ])
+        .output()
+        .await
+        .expect("observe and clean up wrapper processes");
+    assert_eq!(
+        result, None,
+        "incomplete configuration must not publish a signature"
+    );
+    assert!(observed.status.success());
+    assert!(
+        observed.stdout.is_empty(),
+        "configuration probe left wrapper processes alive: {}",
+        String::from_utf8_lossy(&observed.stdout)
+    );
+}
+
+#[tokio::test]
 #[cfg(windows)]
 async fn workspace_evidence_timeout_terminates_clean_filter_and_descendant() {
     assert_workspace_evidence_cleans_filter_tree(false).await;

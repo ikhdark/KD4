@@ -559,8 +559,7 @@ async fn connect_rendezvous(
 > {
     let started_at = Instant::now();
     let result = async {
-        let connector = websocket_connector_with_custom_ca()
-            .map_err(|error| tokio_tungstenite::tungstenite::Error::Io(error.into()))?;
+        let connector = websocket_connector_with_custom_ca().await?;
         let mut request = url.into_client_request()?;
         request
             .headers_mut()

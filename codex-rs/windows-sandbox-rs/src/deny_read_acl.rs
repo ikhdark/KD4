@@ -50,6 +50,8 @@ pub(crate) fn lexical_path_key(path: &Path) -> String {
 /// Caller must pass a valid SID pointer for the sandbox principal being denied.
 pub unsafe fn apply_deny_read_acls(paths: &[PathBuf], psid: *mut c_void) -> Result<Vec<PathBuf>> {
     let planned = plan_deny_read_acl_paths(paths);
+    // SAFETY: The caller's valid-SID requirement is forwarded unchanged to the synchronous planned-
+    // path helper.
     unsafe { apply_planned_deny_read_acls(planned, psid) }
 }
 
@@ -149,6 +151,9 @@ mod tests {
         }
         let principal = crate::cap::load_or_create_cap_sids(home.path())?.readonly;
         let sid = crate::token::LocalSid::from_string(&principal)?;
+        // SAFETY: sid owns the valid SID throughout the ACL updates and comparisons. Each fetched
+        // descriptor keeps its DACL live until the comparison finishes and is then released
+        // once.
         unsafe {
             assert!(crate::acl::add_deny_read_ace(&existing, sid.as_ptr())?);
             let error = super::apply_deny_read_acls(

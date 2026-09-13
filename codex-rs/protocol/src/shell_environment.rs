@@ -123,7 +123,16 @@ where
     }
 
     // Step 4 - Apply user-provided overrides.
-    for (key, val) in &policy.r#set {
+    let mut overrides = policy.r#set.iter().collect::<Vec<_>>();
+    if is_windows {
+        // Explicit aliases use the lexicographically last spelling so HashMap
+        // iteration cannot decide which value a Windows child receives.
+        overrides.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+    }
+    for (key, val) in overrides {
+        if is_windows {
+            env_map.retain(|existing, _| !existing.eq_ignore_ascii_case(key));
+        }
         env_map.insert(key.clone(), val.clone());
     }
 
@@ -134,6 +143,9 @@ where
 
     // Step 6 - Populate the thread ID environment variable when provided.
     if let Some(thread_id) = thread_id {
+        if is_windows {
+            env_map.retain(|existing, _| !existing.eq_ignore_ascii_case(CODEX_THREAD_ID_ENV_VAR));
+        }
         env_map.insert(CODEX_THREAD_ID_ENV_VAR.to_string(), thread_id.to_string());
     }
 
@@ -184,6 +196,96 @@ mod tests {
             .iter()
             .map(|(key, value)| (key.to_string(), value.to_string()))
             .collect()
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn public_environment_overrides_reach_windows_child_without_case_aliases() {
+        let policy = ShellEnvironmentPolicy {
+            inherit: ShellEnvironmentPolicyInherit::All,
+            r#set: HashMap::from([
+                ("PATH".to_string(), "replacement-path".to_string()),
+                ("Codex_Thread_Id".to_string(), "policy-thread".to_string()),
+            ]),
+            ..Default::default()
+        };
+        let env = create_env_from_vars(
+            make_vars(&[
+                ("Path", "inherited-path"),
+                ("codex_thread_id", "old-thread"),
+            ]),
+            &policy,
+            Some("current-thread"),
+        );
+        assert_eq!(
+            env,
+            HashMap::from([
+                ("PATH".to_string(), "replacement-path".to_string()),
+                ("CODEX_THREAD_ID".to_string(), "current-thread".to_string()),
+                ("PATHEXT".to_string(), ".COM;.EXE;.BAT;.CMD".to_string()),
+            ])
+        );
+
+        let cmd = std::path::PathBuf::from(std::env::var_os("SystemRoot").expect("SystemRoot"))
+            .join("System32")
+            .join("cmd.exe");
+        let output = std::process::Command::new(cmd)
+            .args(["/d", "/c", "echo %PATH%;%CODEX_THREAD_ID%"])
+            .env_clear()
+            .envs(env)
+            .output()
+            .expect("run Windows child with the public environment");
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            String::from_utf8(output.stdout).expect("ASCII child output"),
+            "replacement-path;current-thread\r\n"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn explicit_windows_aliases_have_deterministic_precedence() {
+        for pairs in [
+            [("PATH", "upper"), ("Path", "mixed")],
+            [("Path", "mixed"), ("PATH", "upper")],
+        ] {
+            let policy = ShellEnvironmentPolicy {
+                inherit: ShellEnvironmentPolicyInherit::None,
+                r#set: make_vars(&pairs).into_iter().collect(),
+                include_only: vec![EnvironmentVariablePattern::new_case_insensitive("PATH")],
+                ..Default::default()
+            };
+            assert_eq!(
+                create_env_from_vars(Vec::new(), &policy, None),
+                HashMap::from([("Path".to_string(), "mixed".to_string())])
+            );
+        }
+    }
+
+    #[test]
+    fn unix_overrides_preserve_distinct_case_names() {
+        let policy = ShellEnvironmentPolicy {
+            inherit: ShellEnvironmentPolicyInherit::All,
+            r#set: HashMap::from([("PATH".to_string(), "replacement-path".to_string())]),
+            ..Default::default()
+        };
+        assert_eq!(
+            populate_env_for_platform(
+                make_vars(&[
+                    ("Path", "inherited-path"),
+                    ("codex_thread_id", "old-thread")
+                ]),
+                &policy,
+                Some("current-thread"),
+                false,
+            ),
+            HashMap::from([
+                ("PATH".to_string(), "replacement-path".to_string()),
+                ("Path".to_string(), "inherited-path".to_string()),
+                ("codex_thread_id".to_string(), "old-thread".to_string()),
+                ("CODEX_THREAD_ID".to_string(), "current-thread".to_string()),
+            ])
+        );
     }
 
     #[test]

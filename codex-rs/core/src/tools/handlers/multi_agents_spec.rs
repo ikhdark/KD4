@@ -956,7 +956,7 @@ fn typed_assignment_schema() -> JsonSchema {
         Some(false.into()),
     );
     schema.description = Some(
-        "Durable typed assignment. Use either assignment or legacy message, never both. Typed assignments require an explicit typed-capable agent_type (a built-in role or its configured kd4_ alias). With omitted or `none` fork_turns, one structured TaskCapsule replaces the plaintext typed bootstrap message and is the sole initial task input."
+        "Durable typed assignment. Use either assignment or legacy message, never both. Typed assignments require an explicit built-in agent_type: architect, explorer, worker, reviewer, verifier, or integrator. With omitted or `none` fork_turns, one structured TaskCapsule replaces the plaintext typed bootstrap message and is the sole initial task input."
             .to_string(),
     );
     schema
@@ -1056,7 +1056,7 @@ The spawned agent receives a durable task binding. Explicitly typed agents canno
 Only call this tool for a concrete, bounded subtask that can run independently alongside useful local work; otherwise continue locally.
 It will be able to send you and other running agents messages, and its final answer will be provided to you when it finishes.
 The new agent's canonical task name will be provided to it along with the message.
-Use `assignment` for explicitly scoped typed coordination or `message` for a compatibility task admitted with a repository-wide diagnostic claim; exactly one is required. Both forms are durably admitted, record overlap without rejecting it, and return an `assignment_id`. Typed assignments require an explicit typed-capable `agent_type` (a built-in role or its configured `kd4_` alias).
+Use `assignment` for explicitly scoped typed coordination or `message` for a compatibility task admitted with a repository-wide diagnostic claim; exactly one is required. Both forms are durably admitted, record overlap without rejecting it, and return an `assignment_id`. Typed assignments require an explicit built-in `agent_type`: `architect`, `explorer`, `worker`, `reviewer`, `verifier`, or `integrator`.
 
     {full_history_override_guidance}
 Omitted `fork_turns` and `fork_turns="none"` create a lineage-preserving TaskCapsule fork: the capsule is the sole structured bootstrap and no parent conversation or conversation-derived capability selection is inherited. Integers from 1 through 5 retain bounded history. `fork_turns="all"` is disabled by default and is only available with the configuration escape hatch."#

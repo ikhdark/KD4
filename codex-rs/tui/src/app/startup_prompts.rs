@@ -309,7 +309,7 @@ pub(super) async fn handle_model_migration_prompt_if_needed(
             can_opt_out,
         );
         match run_model_migration_prompt(tui, prompt_copy).await {
-            ModelMigrationOutcome::Accepted => {
+            Ok(ModelMigrationOutcome::Accepted) => {
                 apply_accepted_model_migration(
                     config,
                     app_event_tx,
@@ -318,13 +318,13 @@ pub(super) async fn handle_model_migration_prompt_if_needed(
                     target_preset.default_reasoning_effort.clone(),
                 );
             }
-            ModelMigrationOutcome::Rejected => {
+            Ok(ModelMigrationOutcome::Rejected) => {
                 app_event_tx.send(AppEvent::PersistModelMigrationPromptAcknowledged {
                     from_model: model.to_string(),
                     to_model: target_model.clone(),
                 });
             }
-            ModelMigrationOutcome::Exit => {
+            Ok(ModelMigrationOutcome::Exit) => {
                 return Some(AppExitInfo {
                     token_usage: TokenUsage::default(),
                     thread_id: None,
@@ -332,6 +332,11 @@ pub(super) async fn handle_model_migration_prompt_if_needed(
                     update_action: None,
                     exit_reason: ExitReason::UserRequested,
                 });
+            }
+            Err(err) => {
+                return Some(AppExitInfo::fatal(format!(
+                    "Failed to display model migration prompt: {err}"
+                )));
             }
         }
     }

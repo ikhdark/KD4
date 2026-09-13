@@ -957,7 +957,7 @@ async fn hydrate_wait_owner_assignments(
     };
     let descendant_prefix = format!("{consuming_agent_path}/");
     let assignment_ids = store
-        .list_agent_task_bindings(root_session_id.to_string(), Some(256))
+        .list_agent_task_bindings(root_session_id.to_string(), None)
         .await
         .map_err(|error| format!("wait_agent could not list its durable task owners: {error}"))?
         .into_iter()
@@ -1047,6 +1047,185 @@ fn take_pending_activity(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn registered_wait_includes_descendant_beyond_global_binding_limit() -> anyhow::Result<()>
+    {
+        use crate::agent::task_capabilities::TypedToolClass;
+        use crate::session::step_context::StepContext;
+        use crate::tools::parallel::ToolCallRuntime;
+        use crate::tools::registry::RegisteredTool;
+        use crate::tools::registry::ToolRegistry;
+        use crate::tools::router::ToolCall;
+        use crate::tools::router::ToolCallSource;
+        use crate::tools::router::ToolRouter;
+        use crate::turn_diff_tracker::TurnDiffTracker;
+        use codex_agent_task_store::AcceptanceCriterion;
+        use codex_agent_task_store::AgentRole;
+        use codex_agent_task_store::AgentTaskBindingDraft;
+        use codex_agent_task_store::AssignmentAdmissionOrigin;
+        use codex_agent_task_store::AssignmentDraft;
+        use codex_agent_task_store::CapabilityProfile;
+        use codex_agent_task_store::RepoScope;
+        use codex_agent_task_store::TaskActor;
+        use codex_agent_task_store::WorkspaceStrategy;
+        use codex_protocol::models::FunctionCallOutputBody;
+        use codex_protocol::protocol::SessionSource;
+        use codex_protocol::protocol::SubAgentSource;
+
+        let fixture = tempfile::tempdir()?;
+        let (session, mut turn) = crate::session::tests::make_session_and_context().await;
+        Arc::make_mut(&mut turn.config)
+            .multi_agent_v2
+            .min_wait_timeout_ms = 0;
+        turn.session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+            parent_thread_id: session.services.agent_control.session_id().into(),
+            depth: 1,
+            agent_path: Some(AgentPath::try_from("/root/waiter").expect("valid waiter path")),
+            agent_nickname: None,
+            agent_role: None,
+        });
+        let root_session_id = session.services.agent_control.session_id().to_string();
+        let coordinator = session.services.agent_control.task_coordinator();
+        coordinator
+            .initialize_for_workspace_coordination(
+                None,
+                fixture.path().join("state"),
+                turn.config.model_provider_id.clone(),
+                root_session_id.clone(),
+            )
+            .await?;
+        let store = coordinator.store().expect("initialized task store");
+        let mut child_assignment_id = None;
+        for index in 0..257 {
+            let (assignment, attempt) = store
+                .create_assignment(
+                    fixture.path(),
+                    AssignmentDraft {
+                        root_session_id: root_session_id.clone(),
+                        admission_origin: AssignmentAdmissionOrigin::Typed,
+                        role: AgentRole::Worker,
+                        capability_profile: CapabilityProfile::ScopedSourceWrite,
+                        objective: "Verify complete wait ownership".to_string(),
+                        acceptance_criteria: vec![AcceptanceCriterion {
+                            id: "wait-owner".to_string(),
+                            text: "The descendant remains visible to its waiter".to_string(),
+                        }],
+                        read_scope: Vec::new(),
+                        write_scope: vec![RepoScope {
+                            path: format!("task-{index}"),
+                            recursive: true,
+                        }],
+                        stop_condition: "Stop after the wait ownership check".to_string(),
+                        dependencies: Vec::new(),
+                        risk_hints: Vec::new(),
+                        required_evidence: Vec::new(),
+                        prohibited_changes: Vec::new(),
+                        contract_claims: Vec::new(),
+                        workspace_strategy: WorkspaceStrategy::Auto,
+                        relation: None,
+                        architecture_contract_ref: None,
+                    },
+                )
+                .await?;
+            store
+                .bind_agent_task(AgentTaskBindingDraft {
+                    assignment_id: assignment.assignment_id,
+                    attempt_id: attempt.attempt_id,
+                    agent_path: if index == 0 {
+                        "/root/waiter/child".to_string()
+                    } else {
+                        format!("/root/unrelated-{index}")
+                    },
+                    task_name: format!("task-{index}"),
+                    thread_id: None,
+                })
+                .await?;
+            if index == 0 {
+                child_assignment_id = Some(assignment.assignment_id);
+                store
+                    .abandon_agent_task(
+                        TaskActor::Root,
+                        assignment.assignment_id,
+                        "The child has finished its fixture work".to_string(),
+                    )
+                    .await?;
+            }
+        }
+        let child_assignment_id = child_assignment_id.expect("child assignment");
+        // Active siblings sort before the terminal child in the global listing.
+        let limited_bindings = store
+            .list_agent_task_bindings(root_session_id.clone(), Some(256))
+            .await?;
+        assert_eq!(limited_bindings.len(), 256);
+        assert!(
+            limited_bindings
+                .iter()
+                .all(|binding| { binding.assignment_id != child_assignment_id })
+        );
+
+        // Start after fixture progress so only the authoritative owner state can wake us.
+        let mut cursor = None;
+        loop {
+            let page = store
+                .read_wake_events(root_session_id.clone(), cursor)
+                .await?;
+            cursor = page.latest_event_id;
+            if page.remaining_count == 0 {
+                break;
+            }
+        }
+        let handler = Arc::new(Handler::default()) as Arc<dyn CoreToolRuntime>;
+        let router = Arc::new(ToolRouter::from_parts(
+            ToolRegistry::from_unique_registered_tools([RegisteredTool::new(
+                handler,
+                TypedToolClass::AgentCommunication,
+            )]),
+            Vec::new(),
+        ));
+        let step = StepContext::for_test(Arc::new(turn)).with_tool_router_for_test(router);
+        let runtime = ToolCallRuntime::new(
+            Arc::new(session),
+            step,
+            Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+        );
+        let result = runtime
+            .handle_tool_call_with_source(
+                ToolCall {
+                    tool_name: ToolName::plain("wait_agent"),
+                    call_id: "wait-complete-owner-set".to_string(),
+                    payload: ToolPayload::Function {
+                        arguments: json!({
+                            "timeout_ms": 0,
+                            "cursor": cursor.map(|value| value.to_string()),
+                        })
+                        .to_string(),
+                    },
+                },
+                ToolCallSource::Direct,
+                CancellationToken::new(),
+            )
+            .await?;
+        let signal = result
+            .sampling_request_signal()
+            .expect("terminal child owner signal");
+        assert_eq!(
+            signal["authoritative_wait_owner_v1"]["disposition"],
+            "terminal"
+        );
+        let ResponseInputItem::FunctionCallOutput { output, .. } = result.response() else {
+            panic!("wait must return a function output");
+        };
+        let FunctionCallOutputBody::Text(text) = output.body else {
+            panic!("wait must return JSON text");
+        };
+        let output: WaitAgentResult = serde_json::from_str(&text)?;
+        assert!(!output.timed_out);
+        assert_eq!(output.message, "Wait maintenance produced a state change.");
+        assert!(output.typed_deltas.is_empty());
+        assert!(output.nudged_assignment_ids.is_empty());
+        Ok(())
+    }
 
     #[test]
     fn durability_regression_not_found_worker_remains_recoverable() {

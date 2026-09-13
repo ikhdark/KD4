@@ -3163,7 +3163,11 @@ fn item_call_id(item: &ResponseItem) -> Option<&str> {
         | ResponseItem::CustomToolCall { call_id, .. }
         | ResponseItem::FunctionCallOutput { call_id, .. }
         | ResponseItem::CustomToolCallOutput { call_id, .. } => Some(call_id),
-        ResponseItem::ToolSearchCall {
+        ResponseItem::LocalShellCall {
+            call_id: Some(call_id),
+            ..
+        }
+        | ResponseItem::ToolSearchCall {
             call_id: Some(call_id),
             ..
         }

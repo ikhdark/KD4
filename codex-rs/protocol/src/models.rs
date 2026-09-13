@@ -1436,15 +1436,14 @@ pub fn format_allow_prefixes(prefixes: Vec<Vec<String>>) -> Option<String> {
         .collect::<Vec<_>>()
         .join("\n");
 
-    // truncate to last UTF8 char
     let mut output = full_text;
-    let byte_idx = output
-        .char_indices()
-        .nth(MAX_ALLOW_PREFIX_TEXT_BYTES)
-        .map(|(i, _)| i);
-    if let Some(byte_idx) = byte_idx {
+    if output.len() > MAX_ALLOW_PREFIX_TEXT_BYTES {
+        let mut end = MAX_ALLOW_PREFIX_TEXT_BYTES;
+        while !output.is_char_boundary(end) {
+            end -= 1;
+        }
+        output.truncate(end);
         truncated = true;
-        output = output[..byte_idx].to_string();
     }
 
     if truncated {
@@ -3041,22 +3040,30 @@ mod tests {
 
     #[test]
     fn format_allow_prefixes_limits_output() {
-        let mut exec_policy = Policy::empty();
-        for i in 0..200 {
-            exec_policy
-                .add_prefix_rule(
-                    &[format!("tool-{i:03}"), "x".repeat(500)],
-                    codex_execpolicy::Decision::Allow,
-                )
-                .expect("add rule");
-        }
+        for token in ["x", "\u{65e5}", "\u{1f600}"] {
+            let mut exec_policy = Policy::empty();
+            for i in 0..200 {
+                exec_policy
+                    .add_prefix_rule(
+                        &[format!("tool-{i:03}"), token.repeat(500)],
+                        codex_execpolicy::Decision::Allow,
+                    )
+                    .expect("add rule");
+            }
 
-        let output =
-            format_allow_prefixes(exec_policy.get_allowed_prefixes()).expect("formatted prefixes");
-        assert!(
-            output.len() <= MAX_ALLOW_PREFIX_TEXT_BYTES + TRUNCATED_MARKER.len(),
-            "output length exceeds expected limit: {output}",
-        );
+            let output = format_allow_prefixes(exec_policy.get_allowed_prefixes())
+                .expect("formatted prefixes");
+            let body = output
+                .strip_suffix("...\n[Some commands were truncated]")
+                .expect("long prefixes must be marked as truncated");
+            assert!(body.starts_with("- [\"tool-000\", \""));
+            assert!(body.contains(token));
+            assert!(
+                (4997..=5000).contains(&body.len()),
+                "rendered text must fill the 5000-byte budget up to a UTF-8 boundary: {} bytes",
+                body.len(),
+            );
+        }
     }
 
     #[test]

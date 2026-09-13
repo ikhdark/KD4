@@ -779,6 +779,67 @@ fn spawn_apply(
     true
 }
 
+fn dismiss_apply_modal(app: &mut app::App) {
+    app.apply_modal = None;
+    app.status = "Apply canceled".to_string();
+}
+
+// Return whether a completed apply requires refreshing the task list.
+fn handle_apply_completion(app: &mut app::App, event: app::AppEvent) -> bool {
+    match event {
+        app::AppEvent::ApplyPreflightFinished {
+            id,
+            title,
+            message,
+            level,
+            skipped,
+            conflicts,
+        } => {
+            // Closing the dialog does not cancel the backend operation. Release its
+            // gate when it finishes even if its dialog has since been dismissed.
+            app.apply_preflight_inflight = false;
+            if let Some(modal) = app.apply_modal.as_mut()
+                && modal.task_id == id
+            {
+                modal.title = title;
+                modal.result_message = Some(message);
+                modal.result_level = Some(level);
+                modal.skipped_paths = skipped;
+                modal.conflict_paths = conflicts;
+            }
+        }
+        app::AppEvent::ApplyFinished { id, result } => {
+            app.apply_inflight = false;
+            if app
+                .apply_modal
+                .as_ref()
+                .is_none_or(|modal| modal.task_id != id)
+            {
+                return false;
+            }
+            match result {
+                Ok(outcome) => {
+                    app.status = outcome.message;
+                    if matches!(
+                        outcome.status,
+                        codex_cloud_tasks_client::ApplyStatus::Success
+                    ) {
+                        app.apply_modal = None;
+                        app.diff_overlay = None;
+                        return true;
+                    }
+                }
+                Err(error) => {
+                    append_error_log(format!("apply_task failed for {}: {error}", id.0));
+                    app.status = format!("Apply failed: {error}");
+                }
+            }
+        }
+        _ => {}
+    }
+    false
+}
+
 fn spawn_task_list_refresh(
     app: &mut app::App,
     backend: &Arc<dyn codex_cloud_tasks_client::CloudBackend>,
@@ -1077,21 +1138,6 @@ pub async fn run_main(cli: Cli) -> anyhow::Result<()> {
                             }
                         }
                         // (removed TaskSummaryUpdated; unused in this prototype)
-                        app::AppEvent::ApplyPreflightFinished { id, title, message, level, skipped, conflicts } => {
-                            // Only update if modal is still open and ids match
-                            if let Some(m) = app.apply_modal.as_mut()
-                                && m.task_id == id
-                            {
-                                    m.title = title;
-                                    m.result_message = Some(message);
-                                    m.result_level = Some(level);
-                                    m.skipped_paths = skipped;
-                                    m.conflict_paths = conflicts;
-                                    app.apply_preflight_inflight = false;
-                                    needs_redraw = true;
-                                    let _ = frame_tx.send(Instant::now());
-                            }
-                        }
                         app::AppEvent::EnvironmentsLoaded(result) => {
                             app.apply_environments_loaded(result);
                             needs_redraw = true;
@@ -1201,8 +1247,6 @@ pub async fn run_main(cli: Cli) -> anyhow::Result<()> {
                                     base.status = attempt_status;
                                     base.attempt_placement = attempt_placement;
                                 }
-                                ov.base_turn_id = turn_id.clone();
-                                ov.sibling_turn_ids = sibling_turn_ids.clone();
                                 ov.attempt_total_hint = Some(sibling_turn_ids.len().saturating_add(1));
                                 if !ov.base_can_apply {
                                     ov.current_view = app::DetailView::Prompt;
@@ -1243,8 +1287,6 @@ pub async fn run_main(cli: Cli) -> anyhow::Result<()> {
                                     base.status = attempt_status;
                                     base.attempt_placement = attempt_placement;
                                 }
-                                overlay.base_turn_id = turn_id.clone();
-                                overlay.sibling_turn_ids = sibling_turn_ids.clone();
                                 overlay.attempt_total_hint = Some(sibling_turn_ids.len().saturating_add(1));
                                 overlay.current_view = app::DetailView::Prompt;
                                 overlay.apply_selection_to_fields();
@@ -1332,28 +1374,10 @@ pub async fn run_main(cli: Cli) -> anyhow::Result<()> {
                             app.details_inflight = false;
                             needs_redraw = true;
                         }
-                        app::AppEvent::ApplyFinished { id, result } => {
-                            // Only update if the modal still corresponds to this id.
-                            if let Some(m) = &app.apply_modal {
-                                if m.task_id != id { continue; }
-                            } else {
-                                continue;
-                            }
-                            app.apply_inflight = false;
-                            match result {
-                                Ok(outcome) => {
-                                    app.status = outcome.message.clone();
-                                    if matches!(outcome.status, codex_cloud_tasks_client::ApplyStatus::Success) {
-                                        app.apply_modal = None;
-                                        app.diff_overlay = None;
-                                        // Refresh tasks after successful apply
-                                        spawn_task_list_refresh(&mut app, &backend, &tx);
-                                    }
-                                }
-                                Err(e) => {
-                                    append_error_log(format!("apply_task failed for {}: {e}", id.0));
-                                    app.status = format!("Apply failed: {e}");
-                                }
+                        event @ (app::AppEvent::ApplyPreflightFinished { .. }
+                        | app::AppEvent::ApplyFinished { .. }) => {
+                            if handle_apply_completion(&mut app, event) {
+                                spawn_task_list_refresh(&mut app, &backend, &tx);
                             }
                             needs_redraw = true;
                         }
@@ -1398,8 +1422,7 @@ pub async fn run_main(cli: Cli) -> anyhow::Result<()> {
                                 app.best_of_modal = None;
                                 needs_redraw = true;
                             } else if app.apply_modal.is_some() {
-                                app.apply_modal = None;
-                                app.status = "Apply canceled".to_string();
+                                dismiss_apply_modal(&mut app);
                                 needs_redraw = true;
                             } else if app.new_task.is_some() {
                                 app.new_task = None;
@@ -1636,7 +1659,7 @@ pub async fn run_main(cli: Cli) -> anyhow::Result<()> {
                                 KeyCode::Esc
                                 | KeyCode::Char('n')
                                 | KeyCode::Char('q')
-                                | KeyCode::Char('Q') => { app.apply_modal = None; app.status = "Apply canceled".to_string(); needs_redraw = true; }
+                                | KeyCode::Char('Q') => { dismiss_apply_modal(&mut app); needs_redraw = true; }
                                 _ => {}
                             }
                         } else if app.diff_overlay.is_some() {
@@ -2199,6 +2222,112 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ratatui::buffer::Buffer;
     use ratatui::layout::Rect;
+
+    #[tokio::test]
+    async fn dismissed_apply_operations_release_the_gate_when_their_completion_arrives() {
+        for applying in [false, true] {
+            let backend: Arc<dyn codex_cloud_tasks_client::CloudBackend> = Arc::new(MockClient);
+            let mut app = app::App::new();
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let (frame_tx, _frame_rx) = tokio::sync::mpsc::unbounded_channel();
+            let modal = |task: &str| app::ApplyModalState {
+                task_id: TaskId(task.to_string()),
+                title: task.to_string(),
+                result_message: None,
+                result_level: None,
+                skipped_paths: Vec::new(),
+                conflict_paths: Vec::new(),
+                diff_override: None,
+            };
+            let job = |task: &str| ApplyJob {
+                task_id: TaskId(task.to_string()),
+                diff_override: None,
+            };
+            app.apply_modal = Some(modal("dismissed"));
+            if applying {
+                assert!(spawn_apply(
+                    &mut app,
+                    &backend,
+                    &tx,
+                    &frame_tx,
+                    job("dismissed")
+                ));
+            } else {
+                assert!(spawn_preflight(
+                    &mut app,
+                    &backend,
+                    &tx,
+                    &frame_tx,
+                    "dismissed".to_string(),
+                    job("dismissed"),
+                ));
+            }
+            // This current-thread test has not yielded: the spawned backend work
+            // cannot complete before the normal dismissal handler runs.
+            assert!(rx.try_recv().is_err());
+            dismiss_apply_modal(&mut app);
+            assert!(app.apply_inflight || app.apply_preflight_inflight);
+            assert!(!spawn_apply(
+                &mut app,
+                &backend,
+                &tx,
+                &frame_tx,
+                job("blocked")
+            ));
+            let status_after_dismissal = app.status.clone();
+            let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .expect("completion deadline")
+                .expect("completion event");
+            assert!(!handle_apply_completion(&mut app, event));
+            assert!(!app.apply_preflight_inflight);
+            assert!(!app.apply_inflight);
+            assert!(
+                app.apply_modal.is_none(),
+                "a late reply must not reopen a dismissed dialog"
+            );
+            assert_eq!(app.status, status_after_dismissal);
+            assert!(
+                rx.try_recv().is_err(),
+                "the rejected apply must not emit a completion"
+            );
+
+            app.apply_modal = Some(modal("next"));
+            assert!(spawn_preflight(
+                &mut app,
+                &backend,
+                &tx,
+                &frame_tx,
+                "Next task".to_string(),
+                job("next"),
+            ));
+            let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .expect("next preflight deadline")
+                .expect("next preflight event");
+            assert!(!handle_apply_completion(&mut app, event));
+            let displayed = app.apply_modal.as_ref().expect("next dialog stays open");
+            assert_eq!(displayed.title, "Next task");
+            assert_eq!(
+                displayed.result_message.as_deref(),
+                Some("Preflight passed for task next (mock)")
+            );
+            assert_eq!(displayed.result_level, Some(app::ApplyResultLevel::Success));
+            assert!(!app.apply_preflight_inflight);
+            assert!(spawn_apply(&mut app, &backend, &tx, &frame_tx, job("next")));
+            let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .expect("next apply deadline")
+                .expect("next apply event");
+            assert!(
+                handle_apply_completion(&mut app, event),
+                "successful visible apply requests a list refresh"
+            );
+            assert!(!app.apply_inflight);
+            assert!(app.apply_modal.is_none());
+            assert_eq!(app.status, "Applied task next locally (mock)");
+        }
+    }
 
     struct StubGitInfo {
         default_branch: Option<String>,

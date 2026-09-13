@@ -378,7 +378,7 @@ async fn save_remote_plugin_share_updates_existing_workspace_plugin() {
             "filename": "demo-plugin.tar.gz",
             "mime_type": "application/gzip",
             "size_bytes": archive_size,
-            "plugin_id": "plugins_123",
+            "plugin_id": "plugins/123?query#fragment%",
         })))
         .respond_with(ResponseTemplate::new(201).set_body_json(json!({
             "file_id": "file_456",
@@ -395,13 +395,15 @@ async fn save_remote_plugin_share_updates_existing_workspace_plugin() {
         .mount(&server)
         .await;
     Mock::given(method("POST"))
-        .and(path("/backend-api/public/plugins/workspace/plugins_123"))
+        .and(path(
+            "/backend-api/public/plugins/workspace/plugins%2F123%3Fquery%23fragment%25",
+        ))
         .and(body_json(json!({
             "file_id": "file_456",
             "etag": "\"upload_etag_456\"",
         })))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "plugin_id": "plugins_123",
+            "plugin_id": "plugins/123?query#fragment%",
         })))
         .expect(1)
         .mount(&server)
@@ -412,7 +414,7 @@ async fn save_remote_plugin_share_updates_existing_workspace_plugin() {
         Some(&auth),
         codex_home.path(),
         &plugin_path,
-        Some("plugins_123"),
+        Some("plugins/123?query#fragment%"),
         RemotePluginShareAccessPolicy::default(),
     )
     .await
@@ -421,9 +423,13 @@ async fn save_remote_plugin_share_updates_existing_workspace_plugin() {
     assert_eq!(
         result,
         RemotePluginShareSaveResult {
-            remote_plugin_id: "plugins_123".to_string(),
+            remote_plugin_id: "plugins/123?query#fragment%".to_string(),
             share_url: None,
         }
+    );
+    assert_eq!(
+        local_paths::load_plugin_share_local_paths(codex_home.path()).unwrap(),
+        BTreeMap::from([("plugins/123?query#fragment%".to_string(), plugin_path)])
     );
 }
 
@@ -434,7 +440,9 @@ async fn update_remote_plugin_share_targets_updates_targets() {
     let auth = test_auth();
 
     Mock::given(method("PUT"))
-        .and(path("/backend-api/ps/plugins/plugins_123/shares"))
+        .and(path(
+            "/backend-api/ps/plugins/plugins%2F123%3Fquery%23fragment%25/shares",
+        ))
         .and(header("authorization", "Bearer Access Token"))
         .and(header("chatgpt-account-id", "account_id"))
         .and(body_json(json!({
@@ -481,7 +489,7 @@ async fn update_remote_plugin_share_targets_updates_targets() {
     let result = update_remote_plugin_share_targets(
         &config,
         Some(&auth),
-        "plugins_123",
+        "plugins/123?query#fragment%",
         vec![
             RemotePluginShareTarget {
                 principal_type: RemotePluginSharePrincipalType::User,
@@ -766,13 +774,19 @@ async fn delete_remote_plugin_share_deletes_workspace_plugin() {
     let codex_home = TempDir::new().unwrap();
     let local_plugin_path =
         AbsolutePathBuf::try_from(codex_home.path().join("local-plugin")).unwrap();
-    write_plugin_share_local_path_mapping(codex_home.path(), "plugins_123", &local_plugin_path);
+    write_plugin_share_local_path_mapping(
+        codex_home.path(),
+        "plugins/123?query#fragment%",
+        &local_plugin_path,
+    );
     let server = MockServer::start().await;
     let config = test_config(&server);
     let auth = test_auth();
 
     Mock::given(method("DELETE"))
-        .and(path("/backend-api/public/plugins/workspace/plugins_123"))
+        .and(path(
+            "/backend-api/public/plugins/workspace/plugins%2F123%3Fquery%23fragment%25",
+        ))
         .and(header("authorization", "Bearer Access Token"))
         .and(header("chatgpt-account-id", "account_id"))
         .respond_with(ResponseTemplate::new(204))
@@ -780,11 +794,56 @@ async fn delete_remote_plugin_share_deletes_workspace_plugin() {
         .mount(&server)
         .await;
 
-    delete_remote_plugin_share(&config, Some(&auth), codex_home.path(), "plugins_123")
-        .await
-        .unwrap();
+    delete_remote_plugin_share(
+        &config,
+        Some(&auth),
+        codex_home.path(),
+        "plugins/123?query#fragment%",
+    )
+    .await
+    .unwrap();
     assert_eq!(
         local_paths::load_plugin_share_local_paths(codex_home.path()).unwrap(),
         BTreeMap::new()
+    );
+}
+
+#[tokio::test]
+async fn save_remote_plugin_share_rejects_dot_segments_before_upload() {
+    let codex_home = TempDir::new().unwrap();
+    let temp_dir = TempDir::new().unwrap();
+    let plugin_path =
+        AbsolutePathBuf::try_from(write_test_plugin(temp_dir.path(), "demo-plugin")).unwrap();
+    let server = MockServer::start().await;
+    let config = test_config(&server);
+    let auth = test_auth();
+    for remote_id in [".", ".."] {
+        let error = save_remote_plugin_share(
+            &config,
+            Some(&auth),
+            codex_home.path(),
+            &plugin_path,
+            Some(remote_id),
+            RemotePluginShareAccessPolicy::default(),
+        )
+        .await
+        .expect_err("an unsupported update ID must fail before uploading");
+        assert_eq!(
+            error.error_data(),
+            PluginRemoteErrorData {
+                reason: PluginRemoteErrorReason::InvalidRequest,
+                retryable: false,
+            }
+        );
+        assert!(
+            matches!(error, RemotePluginCatalogError::InvalidRequestPathSegment { segment }
+            if segment == remote_id)
+        );
+    }
+    assert!(server.received_requests().await.unwrap().is_empty());
+    assert!(
+        local_paths::load_plugin_share_local_paths(codex_home.path())
+            .unwrap()
+            .is_empty()
     );
 }

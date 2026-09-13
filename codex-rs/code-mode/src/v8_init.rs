@@ -89,7 +89,8 @@ mod tests {
             fn v8__V8__IsSandboxEnabled() -> bool;
         }
 
-        // `rusty_v8` exposes this symbol for its own sandbox verification tests.
+        // SAFETY: The linked rusty_v8 function takes no arguments and returns
+        // V8's compile-time sandbox flag; it does not access an isolate or require initialization.
         let linked_v8_has_sandbox = unsafe { v8__V8__IsSandboxEnabled() };
         assert_eq!(linked_v8_has_sandbox, cfg!(feature = "sandbox"));
     }

@@ -60,6 +60,8 @@ pub fn create_named_pipe(name: &str, access: u32, sandbox_username: &str) -> io:
         .map_err(|err| io::Error::new(io::ErrorKind::PermissionDenied, err))?;
     let sddl = to_wide(format!("D:(A;;GA;;;{sandbox_sid})"));
     let mut sd: PSECURITY_DESCRIPTOR = ptr::null_mut();
+    // SAFETY: sddl is a terminated UTF-16 buffer and sd is writable pointer storage; a
+    // successful conversion transfers its allocation to this function.
     let ok = unsafe {
         ConvertStringSecurityDescriptorToSecurityDescriptorW(
             sddl.as_ptr(),
@@ -69,6 +71,8 @@ pub fn create_named_pipe(name: &str, access: u32, sandbox_username: &str) -> io:
         )
     };
     if ok == 0 {
+        // SAFETY: GetLastError reads the current thread's native error immediately after
+        // descriptor conversion failed.
         return Err(io::Error::from_raw_os_error(unsafe {
             GetLastError() as i32
         }));
@@ -79,6 +83,8 @@ pub fn create_named_pipe(name: &str, access: u32, sandbox_username: &str) -> io:
         bInheritHandle: 0,
     };
     let wide = to_wide(name);
+    // SAFETY: wide is terminated and sa points to the live converted security descriptor;
+    // Windows copies the descriptor during pipe creation.
     let h = unsafe {
         CreateNamedPipeW(
             wide.as_ptr(),
@@ -91,15 +97,17 @@ pub fn create_named_pipe(name: &str, access: u32, sandbox_username: &str) -> io:
             &mut sa as *mut SECURITY_ATTRIBUTES,
         )
     };
+    let result = if h.is_null() || h == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(h)
+    };
+    // SAFETY: sd is the LocalAlloc-backed descriptor returned by successful conversion;
+    // CreateNamedPipeW no longer needs it after returning.
     unsafe {
         LocalFree(sd as HLOCAL);
     }
-    if h.is_null() || h == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
-        return Err(io::Error::from_raw_os_error(unsafe {
-            GetLastError() as i32
-        }));
-    }
-    Ok(h)
+    result
 }
 
 /// Waits for the runner to connect to a parent-created server pipe.
@@ -108,8 +116,12 @@ pub fn create_named_pipe(name: &str, access: u32, sandbox_username: &str) -> io:
 /// parent calls `ConnectNamedPipe`, tolerates the already-connected case, and
 /// verifies that the connected client is the runner process we just spawned.
 pub fn connect_pipe(h: HANDLE, expected_runner_pid: u32) -> io::Result<()> {
+    // SAFETY: The caller keeps its server pipe handle open through the connection attempt. It
+    // was opened for synchronous I/O, so no OVERLAPPED pointer is required.
     let ok = unsafe { ConnectNamedPipe(h, ptr::null_mut()) };
     if ok == 0 {
+        // SAFETY: Reading the thread-local last-error code requires no pointers and immediately
+        // follows the failed ConnectNamedPipe call.
         let err = unsafe { GetLastError() };
         const ERROR_PIPE_CONNECTED: u32 = 535;
         if err != ERROR_PIPE_CONNECTED {
@@ -117,8 +129,12 @@ pub fn connect_pipe(h: HANDLE, expected_runner_pid: u32) -> io::Result<()> {
         }
     }
     let mut client_pid = 0;
+    // SAFETY: The caller keeps the pipe handle live, and client_pid is valid writable storage
+    // for the returned process ID.
     let ok = unsafe { GetNamedPipeClientProcessId(h, &mut client_pid) };
     if ok == 0 {
+        // SAFETY: Reading the thread-local last-error code requires no pointers and immediately
+        // follows the failed GetNamedPipeClientProcessId call.
         return Err(io::Error::from_raw_os_error(unsafe {
             GetLastError() as i32
         }));
@@ -132,4 +148,21 @@ pub fn connect_pipe(h: HANDLE, expected_runner_pid: u32) -> io::Result<()> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn invalid_named_pipe_name_preserves_the_creation_error() {
+        let error = super::create_named_pipe(
+            "not-a-named-pipe-path",
+            super::PIPE_ACCESS_INBOUND,
+            "Everyone",
+        )
+        .expect_err("invalid pipe name must fail");
+        assert_eq!(
+            error.raw_os_error(),
+            Some(windows_sys::Win32::Foundation::ERROR_INVALID_NAME as i32)
+        );
+    }
 }

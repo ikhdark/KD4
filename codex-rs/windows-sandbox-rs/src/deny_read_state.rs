@@ -90,6 +90,8 @@ pub unsafe fn sync_persistent_deny_read_acls(
     store_state(&state_path, &state)
         .context("persist deny-read ACL intent before applying ACEs")?;
 
+    // SAFETY: The function's caller guarantees psid is a valid SID matching principal_sid; this
+    // synchronous helper borrows it without taking ownership.
     let applied_paths = unsafe { apply_planned_deny_read_acls(planned_paths, psid) }?;
     let desired_keys = applied_paths
         .iter()
@@ -107,6 +109,8 @@ pub unsafe fn sync_persistent_deny_read_acls(
         let revoke_result = match std::fs::symlink_metadata(&path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
             Err(error) => Err(anyhow::Error::from(error)),
+            // SAFETY: The caller-guaranteed SID remains live through this synchronous revocation;
+            // path is an owned retained journal entry.
             Ok(_) => unsafe { revoke_deny_read_ace(&path, psid) },
         };
         if let Err(error) = revoke_result {
@@ -233,6 +237,8 @@ mod tests {
             .share_mode(FILE_SHARE_READ)
             .open(&state_path)?;
         for _ in 0..2 {
+            // SAFETY: sid is a LocalSid retained for the entire reconciliation, and its pointer
+            // corresponds to principal used by this test.
             let error = unsafe {
                 sync_persistent_deny_read_acls(
                     home.path(),
@@ -251,6 +257,8 @@ mod tests {
             assert_eq!(std::fs::read(&state_path)?, before);
         }
         drop(locked);
+        // SAFETY: sid retains the valid principal SID while the synchronous reconciler applies the
+        // new paths.
         unsafe {
             sync_persistent_deny_read_acls(home.path(), &principal, &[new.clone()], sid.as_ptr())?;
         }
@@ -258,6 +266,8 @@ mod tests {
         assert!(has_deny(&new, &sid)?);
         let stored = load_state(&state_path)?;
         assert_eq!(stored.principals.get(&principal), Some(&vec![new.clone()]));
+        // SAFETY: The LocalSid remains alive while the synchronous reconciler revokes the test
+        // principal's tracked paths.
         unsafe {
             sync_persistent_deny_read_acls(home.path(), &principal, &[], sid.as_ptr())?;
         }
@@ -274,6 +284,10 @@ mod tests {
         use windows_sys::Win32::Security::ACE_HEADER;
         use windows_sys::Win32::Security::EqualSid;
         use windows_sys::Win32::Security::GetAce;
+        // SAFETY: The fetched descriptor retains its DACL and ACE storage through iteration; GetAce
+        // success is checked and only allowed/denied ACE layouts are interpreted. sid
+        // retains the comparison SID, and the descriptor is freed after the closure
+        // returns.
         unsafe {
             let (dacl, descriptor) = fetch_dacl_handle(path)?;
             let result = (|| -> Result<Vec<(u8, u8, u32)>> {
@@ -327,6 +341,8 @@ mod tests {
             let sid = LocalSid::from_string(&principal)?;
             let other_principal = crate::cap::load_or_create_cap_sids(other_home.path())?.readonly;
             let other_sid = LocalSid::from_string(&other_principal)?;
+            // SAFETY: sid and other_sid own valid converted SIDs through all synchronous ACL setup
+            // operations on the temporary file.
             unsafe {
                 assert!(ensure_allow_mask_aces(
                     &secret,
@@ -344,6 +360,8 @@ mod tests {
                 .filter(|entry| entry.0 == 0)
                 .collect::<Vec<_>>();
             assert!(!grants_before.is_empty());
+            // SAFETY: sid retains the valid principal SID throughout reconciliation and the
+            // subsequent synchronous write-deny update.
             unsafe {
                 sync_persistent_deny_read_acls(
                     home.path(),
@@ -366,6 +384,8 @@ mod tests {
                     .iter()
                     .any(|entry| entry.0 == 1 && entry.2 & FILE_WRITE_DATA != 0)
             );
+            // SAFETY: The LocalSid remains allocated while reconciliation removes this principal's
+            // tracked read denials.
             unsafe {
                 sync_persistent_deny_read_acls(home.path(), &principal, &[], sid.as_ptr())?;
             }
@@ -415,6 +435,9 @@ mod tests {
         std::fs::write(&secret, b"unchanged")?;
         let principal = crate::cap::load_or_create_cap_sids(home.path())?.readonly;
         let sid = LocalSid::from_string(&principal)?;
+        // SAFETY: sid retains the principal SID. The fetched descriptor keeps mutable ACE storage
+        // live through the native ACL update; successful GetAce calls provide the entries
+        // and only denied ACE masks are modified before the descriptor is released.
         unsafe {
             sync_persistent_deny_read_acls(
                 home.path(),
@@ -452,6 +475,8 @@ mod tests {
         }
         let before = native_entries_for_sid(&secret, &sid)?;
         for _ in 0..2 {
+            // SAFETY: sid retains the valid principal SID while the synchronous reconciler checks
+            // the custom deny mask.
             let error = unsafe {
                 sync_persistent_deny_read_acls(home.path(), &principal, &[], sid.as_ptr())
             }
@@ -489,6 +514,8 @@ mod tests {
             }
             let principal = crate::cap::load_or_create_cap_sids(home.path())?.readonly;
             let sid = LocalSid::from_string(&principal)?;
+            // SAFETY: sid retains the valid principal SID throughout the synchronous initial ACL
+            // reconciliation.
             unsafe {
                 sync_persistent_deny_read_acls(
                     home.path(),
@@ -502,6 +529,9 @@ mod tests {
                 &failing,
                 stage,
                 ERROR_ACCESS_DENIED,
+                // SAFETY: The fault-injection closure runs synchronously while sid and desired are
+                // borrowed and alive; sid supplies the valid principal SID required by
+                // reconciliation.
                 || unsafe {
                     sync_persistent_deny_read_acls(home.path(), &principal, &desired, sid.as_ptr())
                 },
@@ -530,6 +560,8 @@ mod tests {
                 load_state(&state_path)?.principals.get(&principal),
                 Some(&vec![old.clone(), first.clone(), failing.clone()])
             );
+            // SAFETY: The LocalSid and desired paths remain alive through the synchronous
+            // reconciliation retry.
             unsafe {
                 sync_persistent_deny_read_acls(home.path(), &principal, &desired, sid.as_ptr())?;
             }
@@ -540,6 +572,8 @@ mod tests {
                 load_state(&state_path)?.principals.get(&principal),
                 Some(&desired.to_vec())
             );
+            // SAFETY: sid owns the valid principal SID throughout the synchronous cleanup of
+            // tracked ACLs.
             unsafe {
                 sync_persistent_deny_read_acls(home.path(), &principal, &[], sid.as_ptr())?;
             }

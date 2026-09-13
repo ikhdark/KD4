@@ -24,6 +24,7 @@ use codex_plugin::PluginCapabilitySummary;
 use codex_plugin::PluginId;
 use codex_plugin::app_connector_ids_from_declarations;
 use codex_plugin::prompt_safe_plugin_description;
+use codex_plugin::validate_plugin_segment;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use serde::Deserialize;
 use serde::Serialize;
@@ -363,6 +364,9 @@ pub enum RemotePluginCatalogError {
     #[error("invalid remote plugin catalog base URL path")]
     InvalidBaseUrlPath,
 
+    #[error("remote plugin request path segment `{segment}` is not supported")]
+    InvalidRequestPathSegment { segment: String },
+
     #[error("remote marketplace `{marketplace_name}` is not supported")]
     UnknownMarketplace { marketplace_name: String },
 
@@ -428,6 +432,7 @@ impl RemotePluginCatalogError {
             Self::Decode { .. } => "remote_catalog_decode",
             Self::InvalidBaseUrl(_) => "remote_catalog_invalid_base_url",
             Self::InvalidBaseUrlPath => "remote_catalog_invalid_base_url_path",
+            Self::InvalidRequestPathSegment { .. } => "remote_catalog_invalid_request_path_segment",
             Self::UnknownMarketplace { .. } => "remote_catalog_unknown_marketplace",
             Self::UnexpectedPluginId { .. } => "remote_catalog_unexpected_plugin_id",
             Self::UnexpectedSkillName { .. } => "remote_catalog_unexpected_skill_name",
@@ -467,6 +472,7 @@ impl RemotePluginCatalogError {
                 PluginRemoteErrorReason::Transient
             }
             Self::InvalidPluginPath { .. }
+            | Self::InvalidRequestPathSegment { .. }
             | Self::ArchiveTooLarge { .. }
             | Self::UnknownMarketplace { .. } => PluginRemoteErrorReason::InvalidRequest,
             Self::PluginShareCheckoutNotAvailable { .. } => PluginRemoteErrorReason::NotFound,
@@ -1301,7 +1307,8 @@ pub async fn fetch_remote_plugin_skill_detail(
         });
     }
 
-    let url = remote_plugin_skill_detail_url(config, plugin_id, skill_name)?;
+    let url =
+        remote_plugin_service_url(config, &["ps", "plugins", plugin_id, "skills", skill_name])?;
     let client = &config.http_clients;
     let request = authenticated_request(client.get(&url), auth)?;
     let response: RemotePluginSkillDetailResponse = send_and_decode(request, &url).await?;
@@ -1456,7 +1463,7 @@ pub async fn install_remote_plugin(
     // Remote plugin IDs uniquely identify remote plugins, so the caller-provided
     // marketplace name is not validated before sending the install mutation.
 
-    let url = format!("{}/ps/plugins/{plugin_id}/install", config.chatgpt_base_url);
+    let url = remote_plugin_service_url(config, &["ps", "plugins", plugin_id, "install"])?;
     let client = &config.http_clients;
     let request = authenticated_request(
         client
@@ -1548,10 +1555,8 @@ pub async fn uninstall_remote_plugin(
     let marketplace_name = plugin_id.marketplace_name().to_string();
     let plugin_name = plugin_id.plugin_name().to_string();
 
-    let url = format!(
-        "{}/ps/plugins/{remote_plugin_id}/uninstall",
-        config.chatgpt_base_url
-    );
+    let url =
+        remote_plugin_service_url(config, &["ps", "plugins", &remote_plugin_id, "uninstall"])?;
     let client = &config.http_clients;
     let request = authenticated_request(client.post(&url), auth)?;
     let response: RemotePluginMutationResponse = send_and_decode(request, &url).await?;
@@ -1605,6 +1610,12 @@ fn remove_remote_plugin_cache(
             plugin_cache_root.display()
         )
     })?;
+
+    // Remote IDs are opaque; only IDs supported by the old single-segment
+    // cache layout can identify a legacy cache directory.
+    if validate_plugin_segment(&legacy_plugin_id, "legacy remote plugin id").is_err() {
+        return Ok(());
+    }
 
     let legacy_remote_plugin_cache_root = codex_home
         .join(PLUGINS_CACHE_DIR)
@@ -2065,7 +2076,7 @@ async fn fetch_plugin_detail(
     plugin_id: &str,
     include_download_urls: bool,
 ) -> Result<RemotePluginDirectoryItem, RemotePluginCatalogError> {
-    let url = format!("{}/ps/plugins/{plugin_id}", config.chatgpt_base_url);
+    let url = remote_plugin_service_url(config, &["ps", "plugins", plugin_id])?;
     let client = &config.http_clients;
     let mut request = authenticated_request(client.get(&url), auth)?;
     if include_download_urls {
@@ -2081,11 +2092,18 @@ async fn fetch_plugin_detail(
     Ok(plugin)
 }
 
-fn remote_plugin_skill_detail_url(
+fn remote_plugin_service_url(
     config: &RemotePluginServiceConfig,
-    plugin_id: &str,
-    skill_name: &str,
+    path_segments: &[&str],
 ) -> Result<String, RemotePluginCatalogError> {
+    for &segment in path_segments {
+        // URL path setters omit these segments, which would change the requested endpoint.
+        if matches!(segment, "." | "..") {
+            return Err(RemotePluginCatalogError::InvalidRequestPathSegment {
+                segment: segment.to_string(),
+            });
+        }
+    }
     let mut url =
         Url::parse(&config.chatgpt_base_url).map_err(RemotePluginCatalogError::InvalidBaseUrl)?;
     {
@@ -2093,11 +2111,7 @@ fn remote_plugin_skill_detail_url(
             .path_segments_mut()
             .map_err(|()| RemotePluginCatalogError::InvalidBaseUrlPath)?;
         segments.pop_if_empty();
-        segments.push("ps");
-        segments.push("plugins");
-        segments.push(plugin_id);
-        segments.push("skills");
-        segments.push(skill_name);
+        segments.extend(path_segments);
     }
     Ok(url.to_string())
 }

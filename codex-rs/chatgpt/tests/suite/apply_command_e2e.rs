@@ -74,20 +74,45 @@ async fn mock_get_task_with_fixture() -> anyhow::Result<GetTaskResponse> {
     Ok(response)
 }
 
-#[tokio::test]
-async fn test_apply_command_creates_fibonacci_file() {
-    let temp_repo = create_temp_git_repo()
-        .await
+#[test]
+fn test_apply_command_creates_fibonacci_file() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .expect("runtime");
+    let temp_repo = runtime
+        .block_on(create_temp_git_repo())
         .expect("Failed to create temp git repo");
     let repo_path = temp_repo.path();
 
-    let task_response = mock_get_task_with_fixture()
-        .await
+    let task_response = runtime
+        .block_on(mock_get_task_with_fixture())
         .expect("Failed to load fixture");
 
-    apply_diff_from_task(task_response, Some(repo_path.to_path_buf()))
-        .await
-        .expect("Failed to apply diff from task");
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let blocker = runtime.spawn_blocking(move || {
+        started_tx.send(()).expect("signal worker start");
+        release_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("scheduler must release worker");
+    });
+    started_rx.recv().expect("worker started");
+    runtime.block_on(async {
+        let apply = apply_diff_from_task(task_response, Some(repo_path.to_path_buf()));
+        let observer = async {
+            let applied_before_yield = repo_path.join("scripts/fibonacci.js").exists();
+            release_tx.send(()).expect("release patch worker");
+            assert!(
+                !applied_before_yield,
+                "patch application must yield before changing the worktree"
+            );
+        };
+        let (result, ()) = tokio::join!(biased; apply, observer);
+        result.expect("Failed to apply diff from task");
+        blocker.await.expect("blocking worker");
+    });
 
     // Assert that fibonacci.js was created in scripts/ directory
     let fibonacci_path = repo_path.join("scripts/fibonacci.js");

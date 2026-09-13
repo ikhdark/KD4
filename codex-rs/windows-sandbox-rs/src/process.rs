@@ -243,6 +243,9 @@ pub unsafe fn spawn_process_with_pipes(
     let mut out_w: HANDLE = ptr::null_mut();
     let mut err_r: HANDLE = ptr::null_mut();
     let mut err_w: HANDLE = ptr::null_mut();
+    // SAFETY: The handle output slots are writable and distinct; CreatePipe uses default non-
+    // inheritable security, and only successfully created pipe handles are closed on later
+    // failures.
     unsafe {
         if CreatePipe(&mut in_r, &mut in_w, ptr::null_mut(), 0) == 0 {
             return Err(anyhow!("CreatePipe stdin failed: {}", GetLastError()));
@@ -269,6 +272,8 @@ pub unsafe fn spawn_process_with_pipes(
     };
 
     let stdio = Some((in_r, out_w, stderr_handle));
+    // SAFETY: h_token is retained by the session-security caller, and all child pipe ends remain
+    // open until the synchronous process-creation helper duplicates them.
     let spawn_result = unsafe {
         create_process_as_user(
             h_token,
@@ -284,6 +289,9 @@ pub unsafe fn spawn_process_with_pipes(
     let created = match spawn_result {
         Ok(v) => v,
         Err(err) => {
+            // SAFETY: Process creation failed without taking ownership of these parent pipe
+            // handles; each successfully created end is closed once, with stderr
+            // conditional on its separate allocation.
             unsafe {
                 CloseHandle(in_r);
                 CloseHandle(in_w);
@@ -304,6 +312,8 @@ pub unsafe fn spawn_process_with_pipes(
         ..
     } = created;
 
+    // SAFETY: Process creation has duplicated the child ends, so the parent-owned originals can be
+    // closed. in_w is closed only when it will not be returned to the caller.
     unsafe {
         CloseHandle(in_r);
         CloseHandle(out_w);
@@ -346,6 +356,9 @@ where
         let mut buf = [0u8; 8192];
         loop {
             let mut read_bytes: u32 = 0;
+            // SAFETY: The reader thread retains the transferred pipe handle; buf and read_bytes are
+            // writable for a synchronous read bounded by buf.len(), with no OVERLAPPED
+            // operation.
             let ok = unsafe {
                 ReadFile(
                     handle,
@@ -360,6 +373,8 @@ where
             }
             on_chunk(&buf[..read_bytes as usize]);
         }
+        // SAFETY: The reader thread has finished reading its transferred handle and closes that
+        // owned pipe end exactly once.
         unsafe {
             CloseHandle(handle);
         }

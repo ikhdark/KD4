@@ -1,5 +1,6 @@
 use std::fs::File;
 use std::fs::OpenOptions;
+use std::io::BufWriter;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::LazyLock;
@@ -66,9 +67,10 @@ impl SessionLogger {
     }
 
     fn write_records(
-        mut file: File,
+        file: File,
         receiver: mpsc::Receiver<serde_json::Value>,
     ) -> std::io::Result<()> {
+        let mut file = BufWriter::new(file);
         for value in receiver {
             serde_json::to_writer(&mut file, &value)?;
             file.write_all(b"\n")?;

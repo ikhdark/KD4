@@ -329,8 +329,11 @@ async fn spawn_process_preserving_fds(
     let stdin = slave.try_clone()?;
     let stdout = slave.try_clone()?;
     let stderr = slave.try_clone()?;
-    let inherited_fds = inherited_fds.to_vec();
+    let mut inherited_fds = inherited_fds.to_vec();
+    inherited_fds.sort_unstable();
 
+    // SAFETY: The child callback uses native signal, terminal, and session operations plus
+    // async-signal-safe descriptor marking. All Rust buffers are prepared before fork.
     unsafe {
         command
             .stdin(Stdio::from(stdin))
@@ -359,7 +362,7 @@ async fn spawn_process_preserving_fds(
                     return Err(std::io::Error::last_os_error());
                 }
 
-                close_inherited_fds_except(&inherited_fds);
+                mark_inherited_fds_cloexec_except(&inherited_fds);
                 Ok(())
             });
     }
@@ -450,6 +453,8 @@ fn open_unix_pty(size: TerminalSize) -> Result<(File, File)> {
         ws_ypixel: 0,
     };
 
+    // SAFETY: master, slave, and size are writable storage of the required types; the null name
+    // and termios arguments are optional.
     let result = unsafe {
         libc::openpty(
             &mut master,
@@ -463,7 +468,11 @@ fn open_unix_pty(size: TerminalSize) -> Result<(File, File)> {
         anyhow::bail!("failed to openpty: {:?}", std::io::Error::last_os_error());
     }
 
+    // SAFETY: Successful openpty returned this new master descriptor, which is transferred into
+    // exactly one File owner.
     let master = unsafe { File::from_raw_fd(master) };
+    // SAFETY: Successful openpty returned this new slave descriptor, distinct from master,
+    // which is transferred into one File owner.
     let slave = unsafe { File::from_raw_fd(slave) };
     Ok(configure_owned_pty_files(master, slave, |file| {
         set_cloexec(file.as_raw_fd())
@@ -472,10 +481,14 @@ fn open_unix_pty(size: TerminalSize) -> Result<(File, File)> {
 
 #[cfg(unix)]
 fn set_cloexec(fd: RawFd) -> std::io::Result<()> {
+    // SAFETY: F_GETFD consumes only the scalar descriptor and requires no variadic pointer
+    // argument; invalid descriptors return an error.
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
     if flags == -1 {
         return Err(std::io::Error::last_os_error());
     }
+    // SAFETY: F_SETFD consumes the scalar descriptor flags, and no caller-owned memory is
+    // accessed.
     if unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } == -1 {
         return Err(std::io::Error::last_os_error());
     }
@@ -560,6 +573,123 @@ mod pty_fd_tests {
             "descriptor failure must precede any native child creation"
         );
         assert!(super::TEST_PTY_SYSTEM.with(|system| system.borrow().is_none()));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn public_pipe_and_pty_spawns_preserve_only_requested_descriptors() -> anyhow::Result<()>
+    {
+        use std::os::fd::AsRawFd;
+        use std::os::fd::FromRawFd;
+        use std::os::fd::OwnedFd;
+        use std::time::Duration;
+
+        let source = std::fs::File::open("/dev/null")?;
+        let duplicate = |minimum| -> std::io::Result<OwnedFd> {
+            // SAFETY: source owns a live descriptor; F_DUPFD returns a separate inheritable
+            // descriptor, with failure checked before ownership is transferred.
+            let fd = unsafe { libc::fcntl(source.as_raw_fd(), libc::F_DUPFD, minimum) };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // SAFETY: successful F_DUPFD created a new descriptor with no other owner.
+            Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+        };
+        let preserved = duplicate(128)?;
+        let excluded = duplicate(192)?;
+        let script = format!(
+            "test -e /dev/fd/{} && test ! -e /dev/fd/{} || exit 79; printf descriptor-contract-ok",
+            preserved.as_raw_fd(),
+            excluded.as_raw_fd()
+        );
+        let args = ["-c".to_string(), script];
+        let cwd = std::env::current_dir()?;
+        let env = std::env::vars().collect();
+        let preserved_fds = [preserved.as_raw_fd()];
+        for use_pty in [false, true] {
+            let spawned = if use_pty {
+                crate::pty::spawn_process_with_inherited_fds(
+                    "/bin/sh",
+                    &args,
+                    &cwd,
+                    &env,
+                    &None,
+                    crate::TerminalSize::default(),
+                    &preserved_fds,
+                )
+                .await?
+            } else {
+                crate::pipe::spawn_process_no_stdin_with_inherited_fds(
+                    "/bin/sh",
+                    &args,
+                    &cwd,
+                    &env,
+                    &None,
+                    &preserved_fds,
+                )
+                .await?
+            };
+            let crate::SpawnedProcess {
+                session,
+                mut stdout_rx,
+                exit_rx,
+                ..
+            } = spawned;
+            let mut output = Vec::new();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while output.len() < b"descriptor-contract-ok".len() {
+                    let Some(chunk) = stdout_rx.recv().await else {
+                        break;
+                    };
+                    output.extend(chunk);
+                }
+            })
+            .await?;
+            assert_eq!(output, b"descriptor-contract-ok");
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(5), exit_rx).await??,
+                0
+            );
+            drop(session);
+
+            for fd in [preserved.as_raw_fd(), excluded.as_raw_fd()] {
+                // SAFETY: the parent still owns both descriptors; F_GETFD only reads flags.
+                let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+                assert_eq!(
+                    flags, 0,
+                    "child filtering must not change parent descriptors"
+                );
+            }
+
+            let missing = "/codex-missing-executable-for-fd-filter-test";
+            let result = if use_pty {
+                crate::pty::spawn_process_with_inherited_fds(
+                    missing,
+                    &[],
+                    &cwd,
+                    &env,
+                    &None,
+                    crate::TerminalSize::default(),
+                    &preserved_fds,
+                )
+                .await
+            } else {
+                crate::pipe::spawn_process_no_stdin_with_inherited_fds(
+                    missing,
+                    &[],
+                    &cwd,
+                    &env,
+                    &None,
+                    &preserved_fds,
+                )
+                .await
+            };
+            assert!(
+                result.is_err(),
+                "the spawn error pipe must survive until exec fails"
+            );
+        }
         Ok(())
     }
 
@@ -699,28 +829,9 @@ mod pty_fd_tests {
 }
 
 #[cfg(unix)]
-pub(crate) fn close_inherited_fds_except(preserved_fds: &[RawFd]) {
-    if let Ok(dir) = std::fs::read_dir("/dev/fd") {
-        let mut fds = Vec::new();
-        for entry in dir {
-            let num = entry
-                .ok()
-                .map(|entry| entry.file_name())
-                .and_then(|name| name.into_string().ok())
-                .and_then(|name| name.parse::<RawFd>().ok());
-            if let Some(num) = num {
-                if num <= 2 || preserved_fds.contains(&num) {
-                    continue;
-                }
-                let flags = unsafe { libc::fcntl(num, libc::F_GETFD) };
-                if flags == -1 || flags & libc::FD_CLOEXEC != 0 {
-                    continue;
-                }
-                fds.push(num);
-            }
-        }
-        for fd in fds {
-            unsafe { libc::close(fd) };
-        }
-    }
+pub(crate) fn mark_inherited_fds_cloexec_except(preserved_fds: &[RawFd]) {
+    // This runs after fork: close_fds uses stack storage and native descriptor operations,
+    // without allocating or taking library locks. Marking descriptors preserves Command's
+    // close-on-exec error pipe until exec succeeds or the spawn error is reported.
+    close_fds::set_fds_cloexec(3, preserved_fds);
 }

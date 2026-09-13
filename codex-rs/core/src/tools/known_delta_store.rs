@@ -758,7 +758,6 @@ async fn atomic_write(path: &Path, bytes: &[u8]) -> Option<()> {
         .ok()
 }
 
-
 #[derive(Clone, Copy, Default)]
 struct QuarantineFaults {
     marker_publication: bool,
@@ -815,8 +814,11 @@ async fn git_stdout(cwd: &Path, args: &[&str]) -> Option<String> {
         .args(["-c", "core.hooksPath=NUL", "-c", "core.fsmonitor=false"])
         .args(args)
         .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .kill_on_drop(true);
-    let output = timeout(GIT_TIMEOUT, command.output()).await.ok()?.ok()?;
+    let output = git_probe_output(command, None).await?;
     if !output.status.success() {
         return None;
     }
@@ -848,17 +850,8 @@ async fn git_resolve_blob(cwd: &Path, spec: &str) -> Option<String> {
         .stderr(Stdio::null())
         .kill_on_drop(true);
 
-    let mut child = command.spawn().ok()?;
-    let mut stdin = child.stdin.take()?;
     let query = format!("{spec}\n");
-    let output = timeout(GIT_TIMEOUT, async move {
-        stdin.write_all(query.as_bytes()).await.ok()?;
-        stdin.shutdown().await.ok()?;
-        drop(stdin);
-        child.wait_with_output().await.ok()
-    })
-    .await
-    .ok()??;
+    let output = git_probe_output(command, Some(query.as_bytes())).await?;
     if !output.status.success() {
         return None;
     }
@@ -870,6 +863,49 @@ async fn git_resolve_blob(cwd: &Path, spec: &str) -> Option<String> {
         return None;
     }
     Some(object.to_string())
+}
+
+async fn git_probe_output(
+    mut command: Command,
+    input: Option<&[u8]>,
+) -> Option<std::process::Output> {
+    timeout(GIT_TIMEOUT, async move {
+        // A PATH-resolved Git wrapper can launch helpers. Keep the entire tree
+        // contained through stdin delivery and output collection, including when
+        // the caller drops this future or the probe deadline expires.
+        #[cfg(windows)]
+        let (_managed, mut child) = {
+            command.creation_flags(codex_utils_pty::WINDOWS_CREATE_SUSPENDED);
+            let managed = codex_utils_pty::ManagedRootProcess::reserve_with_reclaim()
+                .await
+                .ok()?;
+            managed.require_descendant_containment().ok()?;
+            tokio::task::spawn_blocking(move || {
+                let mut child = command.spawn()?;
+                let pid = child
+                    .id()
+                    .ok_or_else(|| std::io::Error::other("missing Git probe process id"))?;
+                if let Err(error) = managed.attach_and_resume(pid) {
+                    let _ = child.start_kill();
+                    return Err(error);
+                }
+                Ok((managed, child))
+            })
+            .await
+            .ok()?
+            .ok()?
+        };
+        #[cfg(not(windows))]
+        let mut child = command.spawn().ok()?;
+        if let Some(input) = input {
+            let mut stdin = child.stdin.take()?;
+            stdin.write_all(input).await.ok()?;
+            stdin.shutdown().await.ok()?;
+        }
+        child.wait_with_output().await.ok()
+    })
+    .await
+    .ok()?
 }
 
 async fn git_project_namespace(cwd: &Path) -> Option<String> {
@@ -939,6 +975,146 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[cfg(windows)]
+    async fn git_probe_timeout_terminates_wrapper_and_descendant() {
+        assert_git_probe_cleans_wrapper_tree(false).await;
+    }
+
+    #[tokio::test]
+    #[cfg(windows)]
+    async fn git_probe_cancellation_terminates_wrapper_and_descendant() {
+        assert_git_probe_cleans_wrapper_tree(true).await;
+    }
+
+    #[cfg(windows)]
+    async fn assert_git_probe_cleans_wrapper_tree(cancel_after_spawn: bool) {
+        const CHILD_PIDS: &str = "CODEX_KNOWN_DELTA_GIT_PROBE_CHILD_PIDS";
+        const CHILD_STDIN: &str = "CODEX_KNOWN_DELTA_GIT_PROBE_CHILD_STDIN";
+        if let Some(pids) = std::env::var_os(CHILD_PIDS) {
+            let pids = PathBuf::from(pids);
+            let cwd = pids.parent().expect("probe fixture parent");
+            let operation = async {
+                if std::env::var_os(CHILD_STDIN).is_some() {
+                    // Enter the actual cat-file probe with more bytes than the
+                    // wrapper's unread stdin pipe can hold.
+                    git_resolve_blob(cwd, &"x".repeat(128 * 1024)).await
+                } else {
+                    git_stdout(cwd, &["rev-parse", "--show-prefix"]).await
+                }
+            };
+            let result = if cancel_after_spawn {
+                tokio::pin!(operation);
+                tokio::select! {
+                    result = &mut operation => panic!("Git probe completed before cancellation: {result:?}"),
+                    _ = async {
+                        while !std::fs::read_to_string(&pids).is_ok_and(|contents| {
+                            contents.split_whitespace().filter_map(|pid| pid.parse::<u32>().ok()).count() == 2
+                        }) {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    } => {}
+                }
+                None
+            } else {
+                operation.await
+            };
+            assert!(result.is_none(), "incomplete probe must not publish output");
+            return;
+        }
+
+        let temp = TempDir::new().expect("temporary Git wrapper directory");
+        let helper = temp.path().join("git_wrapper.rs");
+        let executable = temp.path().join("git.exe");
+        // A native wrapper is required because Windows resolves an extensionless
+        // Command::new("git") to git.exe. It starts a real descendant immediately,
+        // so the production two-second deadline does not depend on shell startup.
+        std::fs::write(
+            &helper,
+            r#"use std::os::windows::process::CommandExt;
+fn main() {
+    let child = std::process::Command::new("powershell.exe")
+        .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 60"])
+        .creation_flags(0x08000000)
+        .spawn().unwrap();
+    let pids = std::env::var_os("CODEX_KNOWN_DELTA_GIT_PROBE_CHILD_PIDS").unwrap();
+    std::fs::write(pids, format!("{} {}", std::process::id(), child.id())).unwrap();
+    std::thread::sleep(std::time::Duration::from_secs(60));
+}
+"#,
+        )
+        .expect("write native Git wrapper fixture");
+        let compiled = Command::new(std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()))
+            .arg("--edition=2024")
+            .arg(&helper)
+            .arg("-o")
+            .arg(&executable)
+            .output()
+            .await
+            .expect("compile native Git wrapper fixture");
+        assert!(
+            compiled.status.success(),
+            "wrapper fixture compilation failed: {}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let existing_path = std::env::var_os("PATH").expect("test PATH");
+        let path = std::env::join_paths(
+            std::iter::once(temp.path().to_path_buf()).chain(std::env::split_paths(&existing_path)),
+        )
+        .expect("isolated Git wrapper PATH");
+        let test_name = if cancel_after_spawn {
+            "tools::known_delta_store::tests::git_probe_cancellation_terminates_wrapper_and_descendant"
+        } else {
+            "tools::known_delta_store::tests::git_probe_timeout_terminates_wrapper_and_descendant"
+        };
+        for pipe_input in [false, true] {
+            let pids = temp.path().join(format!("wrapper-pids-{pipe_input}.txt"));
+            let mut command = Command::new(std::env::current_exe().expect("test executable"));
+            command
+                .args(["--exact", test_name, "--nocapture"])
+                .current_dir(temp.path())
+                .env("PATH", &path)
+                .env(CHILD_PIDS, &pids)
+                .env_remove(CHILD_STDIN)
+                .kill_on_drop(true);
+            if pipe_input {
+                command.env(CHILD_STDIN, "1");
+            }
+            let result = timeout(Duration::from_secs(20), command.output())
+                .await
+                .expect("isolated normal Git probe must finish")
+                .expect("run isolated normal Git probe");
+            let ids = std::fs::read_to_string(&pids)
+                .expect("Git probe must launch the wrapper")
+                .split_whitespace()
+                .map(|pid| pid.parse::<u32>().expect("recorded process id").to_string())
+                .collect::<Vec<_>>();
+            assert_eq!(ids.len(), 2);
+            let ids = ids.join(",");
+            let observed = Command::new("powershell.exe")
+                .args([
+                    "-NoProfile",
+                    "-Command",
+                    &format!("$live = @(Get-Process -Id {ids} -ErrorAction SilentlyContinue); $live | ForEach-Object {{ $_.Id }}; $live | Stop-Process -Force -ErrorAction SilentlyContinue"),
+                ])
+                .output()
+                .await
+                .expect("observe and clean up wrapper processes");
+            assert!(
+                result.status.success(),
+                "normal Git probe failed: {}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            assert!(observed.status.success());
+            assert!(
+                observed.stdout.is_empty(),
+                "Git probe left wrapper processes alive (piped input: {pipe_input}): {}",
+                String::from_utf8_lossy(&observed.stdout)
+            );
+        }
+    }
 
     #[test]
     fn authorization_scope_tracks_effective_file_system_and_override_mode() {

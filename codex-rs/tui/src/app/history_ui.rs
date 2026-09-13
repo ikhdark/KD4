@@ -6,6 +6,7 @@
 use super::*;
 
 const DESKTOP_THREAD_OPENED_MESSAGE: &str = "Opened this session in Codex Desktop.";
+const DESKTOP_THREAD_OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 impl App {
     pub(super) fn insert_history_cell(&mut self, tui: &mut tui::Tui, cell: Box<dyn HistoryCell>) {
@@ -196,9 +197,12 @@ fn desktop_thread_open_command(url: &str) -> tokio::process::Command {
 }
 
 async fn open_desktop_thread_url(command: &mut tokio::process::Command) -> Result<(), String> {
-    let output = command
-        .output()
+    // The launcher must finish before event dispatch can resume. Kill a stalled launcher when
+    // its output future is dropped, while allowing the Desktop it starts to outlive it.
+    command.kill_on_drop(true);
+    let output = tokio::time::timeout(DESKTOP_THREAD_OPEN_TIMEOUT, command.output())
         .await
+        .map_err(|_| "timed out waiting for the Codex Desktop launcher".to_string())?
         .map_err(|err| format!("failed to launch Codex Desktop through PowerShell: {err}"))?;
 
     if output.status.success() {

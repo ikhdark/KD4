@@ -78,6 +78,8 @@ fn hide_users_in_winlogon(usernames: &[String], log_base: &Path) -> anyhow::Resu
     for username in usernames {
         let name_w = to_wide(OsStr::new(username));
         let value: u32 = 0;
+        // SAFETY: key is the open UserList key; name_w is NUL-terminated and value points to one
+        // live u32 whose byte size matches the REG_DWORD payload.
         let status = unsafe {
             RegSetValueExW(
                 key,
@@ -98,6 +100,8 @@ fn hide_users_in_winlogon(usernames: &[String], log_base: &Path) -> anyhow::Resu
             );
         }
     }
+    // SAFETY: This function owns key from create_userlist_key; all registry writes have finished
+    // borrowing it before its single close.
     unsafe {
         RegCloseKey(key);
     }
@@ -107,6 +111,8 @@ fn hide_users_in_winlogon(usernames: &[String], log_base: &Path) -> anyhow::Resu
 fn create_userlist_key() -> anyhow::Result<HKEY> {
     let key_path = to_wide(USERLIST_KEY_PATH);
     let mut key: HKEY = std::ptr::null_mut();
+    // SAFETY: The predefined parent key is borrowed, key_path is NUL-terminated, and key is a
+    // writable output slot for the new owned registry handle.
     let status = unsafe {
         RegCreateKeyExW(
             HKEY_LOCAL_MACHINE,
@@ -132,8 +138,12 @@ fn create_userlist_key() -> anyhow::Result<HKEY> {
 /// Sets HIDDEN|SYSTEM on `path` if needed, returning whether it changed anything.
 fn hide_directory(path: &Path) -> anyhow::Result<bool> {
     let wide = to_wide(path);
+    // SAFETY: wide is a live NUL-terminated path buffer and remains borrowed only for this
+    // synchronous attributes query.
     let attrs = unsafe { GetFileAttributesW(wide.as_ptr()) };
     if attrs == INVALID_FILE_ATTRIBUTES {
+        // SAFETY: Read the thread-local error immediately after GetFileAttributesW reports failure;
+        // this call takes no pointers.
         let err = unsafe { GetLastError() } as i32;
         return Err(anyhow!(
             "GetFileAttributesW failed for {}: {err} ({error})",
@@ -145,8 +155,12 @@ fn hide_directory(path: &Path) -> anyhow::Result<bool> {
     if new_attrs == attrs {
         return Ok(false);
     }
+    // SAFETY: wide is a live NUL-terminated path buffer and new_attrs preserves the successfully
+    // queried attributes while adding the requested flags.
     let ok = unsafe { SetFileAttributesW(wide.as_ptr(), new_attrs) };
     if ok == 0 {
+        // SAFETY: Read the thread-local error immediately after SetFileAttributesW reports failure;
+        // this call takes no pointers.
         let err = unsafe { GetLastError() } as i32;
         return Err(anyhow!(
             "SetFileAttributesW failed for {}: {err} ({error})",
