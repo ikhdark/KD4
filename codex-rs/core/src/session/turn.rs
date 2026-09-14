@@ -442,8 +442,13 @@ pub(crate) async fn run_turn(
     let turn_diff_tracker = Arc::new(tokio::sync::Mutex::new(
         TurnDiffTracker::with_environment_display_roots(display_roots),
     ));
+    let kd4_runtime = turn_context.config.features.enabled(Feature::Kd4Runtime);
     let mut reasoning_governor = SamplingReasoningGovernor::new_with_timing(
-        turn_context.config.reasoning_phase_efforts.as_ref(),
+        turn_context
+            .config
+            .reasoning_phase_efforts
+            .as_ref()
+            .filter(|_| kd4_runtime),
         Arc::clone(&turn_context.turn_timing_state),
     );
 
@@ -513,7 +518,11 @@ pub(crate) async fn run_turn(
                 turn_context.deferred_tool_activation_revision(),
             )
         };
-        let request_signals = reasoning_governor.collector(&request_baselines);
+        let request_signals = if kd4_runtime {
+            reasoning_governor.collector(&request_baselines)
+        } else {
+            SamplingRequestSignalCollector::default()
+        };
         let mut generation_request = pending_generation_request.take().unwrap_or_else(|| {
             if !has_started_generation {
                 reasoning_governor.initial_generation_request(&request_baselines)
@@ -736,15 +745,16 @@ pub(crate) async fn run_turn(
                 }
                 let progress_kinds =
                     request_signals.progress_kinds(&request_baselines, &settled_state);
-                let mut convergence_decision = if needs_follow_up && !has_pending_input {
-                    Some(reasoning_governor.evaluate_convergence(
-                        &request_baselines,
-                        &request_signals,
-                        &settled_state,
-                    ))
-                } else {
-                    None
-                };
+                let mut convergence_decision =
+                    if kd4_runtime && needs_follow_up && !has_pending_input {
+                        Some(reasoning_governor.evaluate_convergence(
+                            &request_baselines,
+                            &request_signals,
+                            &settled_state,
+                        ))
+                    } else {
+                        None
+                    };
                 let authoritative_wait_terminal_surface = convergence_decision
                     .as_ref()
                     .and_then(authoritative_wait_terminal_surface);
@@ -763,7 +773,8 @@ pub(crate) async fn run_turn(
                         &request_signals,
                         &settled_state,
                         has_pending_input,
-                        protocol_resample_completion_allowed(server_resample_eligible),
+                        kd4_runtime
+                            && protocol_resample_completion_allowed(server_resample_eligible),
                     )
                 });
                 if next_generation_request
@@ -5374,7 +5385,8 @@ async fn try_run_sampling_request(
         }
         return Err(CodexErr::TurnAborted);
     }
-    let request_policy = crate::session::reasoning_governor::resolve_request_policy_for_generation(
+    let request_policy = crate::session::reasoning_governor::resolve_request_policy_for_runtime(
+        turn_context.config.features.enabled(Feature::Kd4Runtime),
         reasoning_phase,
         turn_context.config.reasoning_phase_efforts.as_ref(),
         turn_context.configured_reasoning_effort.clone(),

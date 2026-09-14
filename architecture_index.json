@@ -1,7 +1,7 @@
 {
-  "index_sha256": "d52a9a163fcd736c4e26ae83ef9e5a6b620d6d80fe2a1113b1e1ba41ec4dfa76",
+  "index_sha256": "5b65c7a15ad4d199f9dd85c680efc34a45e850459da753eae07202b70aa17e93",
   "index_version": 1,
-  "manifest_sha256": "da7a4cd9da9e872f5c317ecc7800c0730d10a77758b4d7deccf4602696ce3f93",
+  "manifest_sha256": "c444eac5825b5ed5ecffa2d84b01edaed0859edcec6490590fc0a04db880b679",
   "omitted": {
     "relationships": 0
   },
@@ -926,6 +926,202 @@
     },
     {
       "configuration": [
+        "codex-rs/repo-benchmark/src/prepare.rs",
+        "codex-rs/repo-benchmark/src/schedule.rs",
+        "codex-rs/repo-benchmark/src/runner.rs",
+        "codex-rs/repo-benchmark/src/diagnostics.rs",
+        "scripts/kd4_timing_analysis.py"
+      ],
+      "facet_exclusions": {},
+      "feature_ids": [],
+      "generated_artifacts": [
+        "docs/benchmarks/repo-benchmark/accepted"
+      ],
+      "id": "repo-benchmark",
+      "invariants": [
+        {
+          "evidence": [
+            {
+              "path": "codex-rs/repo-benchmark/src/runner.rs",
+              "symbol": "execute"
+            },
+            {
+              "path": "codex-rs/repo-benchmark/src/schedule.rs",
+              "symbol": "schedule"
+            },
+            {
+              "path": "codex-rs/repo-benchmark/src/statistics.rs",
+              "symbol": "summarize"
+            }
+          ],
+          "id": "one-benchmark-two-sequential-segments",
+          "kind": "semantic",
+          "statement": "Repo Benchmark alone schedules and compares fork_off, fork_on and reference through native runtimes. Scripted execution precedes real-model execution; fast/full differ only in selected live tasks, finite budgets are ceilings, and performance has no pass/fail verdict.",
+          "tests": [
+            "codex-rs/repo-benchmark/src/schedule.rs",
+            "codex-rs/repo-benchmark/src/statistics.rs"
+          ]
+        },
+        {
+          "evidence": [
+            {
+              "path": "codex-rs/repo-benchmark/src/reports.rs",
+              "symbol": "validate_result"
+            },
+            {
+              "path": "codex-rs/repo-benchmark/src/reports.rs",
+              "symbol": "failure_fields"
+            },
+            {
+              "path": "codex-rs/repo-benchmark/src/reports.rs",
+              "symbol": "import"
+            }
+          ],
+          "id": "repo-benchmark-report-provenance-and-failures",
+          "kind": "semantic",
+          "statement": "Versioned reports preserve failed, incomplete and unrun attempts separately from completed timing, retain native failure and verifier outcomes independently, and import only hash-valid matching prepared identities without overwriting reports or changing historical provenance.",
+          "tests": [
+            "codex-rs/repo-benchmark/src/reports.rs"
+          ]
+        },
+        {
+          "evidence": [
+            {
+              "path": "codex-rs/repo-benchmark/src/prepare.rs",
+              "symbol": "resolve_source"
+            },
+            {
+              "path": "codex-rs/repo-benchmark/src/prepare/builds.rs",
+              "symbol": "build"
+            },
+            {
+              "path": "codex-rs/repo-benchmark/src/workloads.rs",
+              "symbol": "verify_fixture_with_env"
+            }
+          ],
+          "id": "native-source-and-independent-verification-integrity",
+          "kind": "semantic",
+          "statement": "One frozen harness launches each selected revision's own app-server. Preparation pins clean sources, locked dependencies, six-job release settings, shared inputs and environment; protected verifiers assert expected task results after final mutation. B need not descend from A.",
+          "tests": [
+            "codex-rs/repo-benchmark/src/prepare/tests.rs",
+            "codex-rs/repo-benchmark/src/workloads/tests.rs"
+          ]
+        },
+        {
+          "evidence": [
+            {
+              "path": "codex-rs/repo-benchmark/src/statistics.rs",
+              "symbol": "compare"
+            },
+            {
+              "path": "codex-rs/repo-benchmark/src/statistics.rs",
+              "symbol": "bootstrap"
+            }
+          ],
+          "id": "paired-statistics-respect-task-and-run-populations",
+          "kind": "semantic",
+          "statement": "Comparisons reuse original sample IDs, pair only matching workload/run-cluster/repetition observations, preserve 10000-resample hierarchical bootstrap intervals where supported, and never treat different live tasks or individual tool events as repetitions.",
+          "tests": [
+            "codex-rs/repo-benchmark/src/statistics.rs"
+          ]
+        },
+        {
+          "evidence": [
+            {
+              "path": "codex-rs/repo-benchmark/src/diagnostics.rs",
+              "symbol": "analyze_with_timeout"
+            },
+            {
+              "path": "scripts/kd4_timing_analysis.py",
+              "symbol": "analyze_runner_evidence"
+            },
+            {
+              "path": "scripts/kd4_timing_analysis.py",
+              "symbol": "disabled_tokens"
+            },
+            {
+              "path": "codex-rs/repo-benchmark/src/runner.rs",
+              "symbol": "analysis_only"
+            }
+          ],
+          "id": "one-canonical-session-diagnostic-implementation",
+          "kind": "compatibility",
+          "statement": "Rust captures lightweight evidence and persists results before invoking the frozen Python session audit. Python alone defines generation, retry, timing and token diagnostics; it has no A/B mode. Scripted token computation is disabled, missing telemetry stays unavailable, and analyzer failures preserve raw results and support analysis-only reruns.",
+          "tests": [
+            "codex-rs/repo-benchmark/src/diagnostics.rs",
+            "scripts/test_kd4_timing_analysis.py",
+            "scripts/test_kd4_turn_latency_audit.py"
+          ]
+        }
+      ],
+      "primary_entries": [
+        {
+          "path": "codex-rs/repo-benchmark/src/main.rs",
+          "symbol": "main"
+        },
+        {
+          "path": "codex-rs/repo-benchmark/src/cli.rs",
+          "symbol": "run"
+        },
+        {
+          "path": "scripts/kd4_turn_latency_audit.py",
+          "symbol": "main"
+        }
+      ],
+      "roots": [
+        "codex-rs/repo-benchmark",
+        "docs/benchmarks/repo-benchmark",
+        "scripts/kd4_timing_analysis.py",
+        "scripts/kd4_turn_latency_audit.py",
+        "scripts/kd4_first_useful_action_analysis.py",
+        "scripts/test_kd4_timing_analysis.py",
+        "scripts/test_kd4_turn_latency_audit.py",
+        "scripts/test_kd4_first_useful_action_analysis.py"
+      ],
+      "tests": [
+        "codex-rs/repo-benchmark/src/prepare/tests.rs",
+        "codex-rs/repo-benchmark/src/schedule.rs",
+        "codex-rs/repo-benchmark/src/workloads/tests.rs",
+        "codex-rs/repo-benchmark/src/statistics.rs",
+        "codex-rs/repo-benchmark/src/diagnostics.rs",
+        "codex-rs/repo-benchmark/src/reports.rs",
+        "scripts/test_kd4_timing_analysis.py",
+        "scripts/test_kd4_turn_latency_audit.py",
+        "scripts/test_kd4_first_useful_action_analysis.py"
+      ],
+      "validation": [
+        {
+          "argv": [
+            "cargo",
+            "test",
+            "--locked",
+            "--jobs",
+            "6",
+            "-p",
+            "repo-benchmark",
+            "--lib"
+          ],
+          "cwd": "codex-rs",
+          "id": "repo-benchmark-focused",
+          "role": "focused_tests"
+        },
+        {
+          "argv": [
+            "python",
+            "-m",
+            "unittest",
+            "scripts.test_kd4_timing_analysis",
+            "scripts.test_kd4_turn_latency_audit",
+            "scripts.test_kd4_first_useful_action_analysis"
+          ],
+          "cwd": ".",
+          "id": "session-diagnostics-focused",
+          "role": "focused_tests"
+        }
+      ]
+    },
+    {
+      "configuration": [
         "AGENTS.md"
       ],
       "facet_exclusions": {
@@ -985,121 +1181,6 @@
           ],
           "cwd": "codex-rs",
           "id": "repository-context-focused",
-          "role": "focused_tests"
-        }
-      ]
-    },
-    {
-      "configuration": [
-        "codex-rs/core/benches/turn_latency.rs",
-        "scripts/kd4_live_agent_benchmark.py"
-      ],
-      "facet_exclusions": {
-        "configuration_and_gates": "The benchmark command selects a workflow directly; no repository feature or configuration file owns that selection."
-      },
-      "feature_ids": [],
-      "generated_artifacts": [
-        "docs/benchmarks/turn-latency/accepted"
-      ],
-      "id": "rust-turn-latency-benchmark",
-      "invariants": [
-        {
-          "evidence": [
-            {
-              "path": "codex-rs/core/benches/turn_latency.rs",
-              "symbol": "BenchmarkCommand"
-            }
-          ],
-          "id": "separate-capture-and-comparison-verdicts",
-          "kind": "semantic",
-          "statement": "Code-mode capture emits one-build raw samples and a nested-dispatch quality verdict, while synthetic reports alone emit local baseline/candidate non-inferiority verdicts.",
-          "tests": [
-            "codex-rs/core/tests/turn_latency_bench.rs"
-          ]
-        },
-        {
-          "evidence": [
-            {
-              "path": "codex-rs/core/benches/turn_latency/ab_runner.rs",
-              "symbol": "import_accepted_ab_report"
-            }
-          ],
-          "id": "accepted-turn-latency-reports-are-verified",
-          "kind": "semantic",
-          "statement": "Only hash-valid, complete, uncapped, passing batch and final A/B reports enter the tracked accepted-report mirror.",
-          "tests": [
-            "codex-rs/core/benches/turn_latency/tests.rs"
-          ]
-        },
-        {
-          "evidence": [
-            {
-              "path": "scripts/kd4_live_agent_benchmark.py",
-              "symbol": "exact_source_state"
-            },
-            {
-              "path": "scripts/kd4_live_agent_benchmark.py",
-              "symbol": "summarize"
-            },
-            {
-              "path": "scripts/kd4_live_agent_benchmark.py",
-              "symbol": "classify_diagnostics"
-            }
-          ],
-          "id": "live-agent-source-and-scoring-integrity",
-          "kind": "semantic",
-          "statement": "Live-agent reports bind each binary to a clean exact commit and tree, report outcome correctness separately from task-contract compliance, and retain structured diagnostic categories.",
-          "tests": [
-            "scripts/test_kd4_live_agent_benchmark.py"
-          ]
-        }
-      ],
-      "primary_entries": [
-        {
-          "path": "codex-rs/core/benches/turn_latency.rs",
-          "symbol": "main"
-        },
-        {
-          "path": "scripts/kd4_live_agent_benchmark.py",
-          "symbol": "main"
-        }
-      ],
-      "roots": [
-        "codex-rs/core/benches/turn_latency.rs",
-        "codex-rs/core/benches/turn_latency/ab_contract.rs",
-        "codex-rs/core/benches/turn_latency/ab_runner.rs",
-        "codex-rs/core/benches/turn_latency/runtime_fixtures.rs",
-        "codex-rs/core/benches/turn_latency/tests.rs",
-        "codex-rs/core/tests/turn_latency_bench.rs",
-        "docs/benchmarks/turn-latency/README.md",
-        "scripts/kd4_live_agent_benchmark.py",
-        "scripts/test_kd4_live_agent_benchmark.py"
-      ],
-      "tests": [
-        "codex-rs/core/benches/turn_latency/tests.rs",
-        "codex-rs/core/tests/turn_latency_bench.rs",
-        "scripts/test_kd4_live_agent_benchmark.py"
-      ],
-      "validation": [
-        {
-          "argv": [
-            "just",
-            "core-test-fast",
-            "turn_latency_bench"
-          ],
-          "cwd": "codex-rs",
-          "id": "rust-turn-latency-focused",
-          "role": "focused_tests"
-        },
-        {
-          "argv": [
-            "python",
-            "-m",
-            "unittest",
-            "scripts.test_kd4_live_agent_benchmark"
-          ],
-          "cwd": ".",
-          "id": "live-agent-benchmark-focused",
           "role": "focused_tests"
         }
       ]
@@ -2725,6 +2806,231 @@
     },
     {
       "category": "callers_consumers",
+      "confidence": "declared",
+      "evidence": [
+        {
+          "path": "justfile",
+          "symbol": "repo-benchmark *args:"
+        },
+        {
+          "path": "codex-rs/repo-benchmark/src/cli.rs",
+          "symbol": "parse"
+        }
+      ],
+      "kind": "consumed_by",
+      "source": "owner:repo-benchmark",
+      "target": "path:justfile"
+    },
+    {
+      "category": "configuration",
+      "confidence": "declared",
+      "evidence": [
+        {
+          "path": "codex-rs/repo-benchmark/src/prepare.rs",
+          "symbol": "feature_overrides"
+        },
+        {
+          "path": "codex-rs/repo-benchmark/src/prepare/environment.rs",
+          "symbol": "BASE_CONFIG"
+        },
+        {
+          "path": "codex-rs/repo-benchmark/src/schedule.rs",
+          "symbol": "Mode"
+        }
+      ],
+      "kind": "reads_config",
+      "source": "owner:repo-benchmark",
+      "target": "path:kd4_features.toml"
+    },
+    {
+      "category": "control_flow",
+      "confidence": "declared",
+      "evidence": [
+        {
+          "path": "codex-rs/repo-benchmark/src/native.rs",
+          "symbol": "run_attempt"
+        },
+        {
+          "path": "codex-rs/repo-benchmark/src/native/client.rs",
+          "symbol": "NativeClient"
+        }
+      ],
+      "kind": "calls",
+      "source": "owner:repo-benchmark",
+      "target": "owner:app-server-runtime"
+    },
+    {
+      "category": "control_flow",
+      "confidence": "declared",
+      "evidence": [
+        {
+          "path": "codex-rs/repo-benchmark/src/native/scripted.rs",
+          "symbol": "ScriptedProvider"
+        },
+        {
+          "path": "codex-rs/app-server-test-client/src/lib.rs",
+          "symbol": "LoopbackResponsesServer"
+        }
+      ],
+      "kind": "calls",
+      "source": "owner:repo-benchmark",
+      "target": "path:codex-rs/app-server-test-client/src/lib.rs"
+    },
+    {
+      "category": "control_flow",
+      "confidence": "declared",
+      "evidence": [
+        {
+          "path": "scripts/kd4_turn_latency_audit.py",
+          "symbol": "kd4_first_useful_action_analysis.analyze_records"
+        },
+        {
+          "path": "scripts/kd4_first_useful_action_analysis.py",
+          "symbol": "analyze_records"
+        }
+      ],
+      "kind": "calls",
+      "source": "owner:repo-benchmark",
+      "target": "path:scripts/kd4_first_useful_action_analysis.py"
+    },
+    {
+      "category": "control_flow",
+      "confidence": "declared",
+      "evidence": [
+        {
+          "path": "scripts/kd4_turn_latency_audit.py",
+          "symbol": "analyze_timing"
+        },
+        {
+          "path": "scripts/kd4_turn_latency_audit.py",
+          "symbol": "analyze_runner_evidence"
+        }
+      ],
+      "kind": "calls",
+      "source": "owner:repo-benchmark",
+      "target": "path:scripts/kd4_timing_analysis.py"
+    },
+    {
+      "category": "control_flow",
+      "confidence": "declared",
+      "evidence": [
+        {
+          "path": "codex-rs/repo-benchmark/src/diagnostics.rs",
+          "symbol": "analyze_with_timeout"
+        },
+        {
+          "path": "scripts/kd4_turn_latency_audit.py",
+          "symbol": "analyze_session_path"
+        }
+      ],
+      "kind": "calls",
+      "source": "owner:repo-benchmark",
+      "target": "path:scripts/kd4_turn_latency_audit.py"
+    },
+    {
+      "category": "generated_artifacts",
+      "confidence": "declared",
+      "evidence": [
+        {
+          "path": "codex-rs/repo-benchmark/src/reports.rs",
+          "symbol": "import"
+        }
+      ],
+      "kind": "emits",
+      "source": "owner:repo-benchmark",
+      "target": "path:docs/benchmarks/repo-benchmark"
+    },
+    {
+      "category": "runtime_registration",
+      "confidence": "manifest_derived",
+      "evidence": [
+        {
+          "path": "codex-rs/Cargo.toml",
+          "symbol": "\"repo-benchmark\""
+        },
+        {
+          "path": "codex-rs/repo-benchmark/Cargo.toml",
+          "symbol": "name = \"repo-benchmark\""
+        }
+      ],
+      "kind": "registers",
+      "source": "owner:repo-benchmark",
+      "target": "path:codex-rs/Cargo.toml"
+    },
+    {
+      "category": "tests_contracts",
+      "confidence": "declared",
+      "evidence": [
+        {
+          "path": "codex-rs/repo-benchmark/src/diagnostics.rs",
+          "symbol": "real_python_audit_consumes_startup_failure_and_disables_token_analysis"
+        },
+        {
+          "path": "codex-rs/repo-benchmark/src/diagnostics.rs",
+          "symbol": "hung_python_analyzer_is_terminated_without_changing_native_evidence"
+        }
+      ],
+      "kind": "validated_by",
+      "source": "owner:repo-benchmark",
+      "target": "path:codex-rs/repo-benchmark/src/diagnostics.rs"
+    },
+    {
+      "category": "tests_contracts",
+      "confidence": "declared",
+      "evidence": [
+        {
+          "path": "codex-rs/repo-benchmark/src/prepare/tests.rs",
+          "symbol": "selected_reference_head_can_come_from_an_unrelated_repository"
+        },
+        {
+          "path": "codex-rs/repo-benchmark/src/prepare/tests.rs",
+          "symbol": "pinned_snapshot_uses_commit_blobs_instead_of_index_or_working_directory"
+        }
+      ],
+      "kind": "validated_by",
+      "source": "owner:repo-benchmark",
+      "target": "path:codex-rs/repo-benchmark/src/prepare.rs"
+    },
+    {
+      "category": "tests_contracts",
+      "confidence": "declared",
+      "evidence": [
+        {
+          "path": "codex-rs/repo-benchmark/src/workloads/tests.rs",
+          "symbol": "rust_oracle_accepts_correct_parser_and_rejects_overflow_bug"
+        },
+        {
+          "path": "codex-rs/repo-benchmark/src/workloads/tests.rs",
+          "symbol": "typescript_oracle_requires_aggregation_and_tests_that_catch_it"
+        },
+        {
+          "path": "codex-rs/repo-benchmark/src/workloads/tests.rs",
+          "symbol": "python_refactor_checks_real_helper_use_and_preserved_results"
+        }
+      ],
+      "kind": "validated_by",
+      "source": "owner:repo-benchmark",
+      "target": "path:codex-rs/repo-benchmark/src/workloads.rs"
+    },
+    {
+      "category": "tests_contracts",
+      "confidence": "declared",
+      "evidence": [
+        {
+          "path": "scripts/test_kd4_timing_analysis.py",
+          "symbol": "test_audit_and_runner_share_independent_expected_metrics"
+        },
+        {
+          "path": "scripts/test_kd4_timing_analysis.py",
+          "symbol": "test_no_token_function_runs_in_scripted_audit_or_runner"
+        }
+      ],
+      "kind": "validated_by",
+      "source": "owner:repo-benchmark",
+      "target": "path:scripts/kd4_timing_analysis.py"
+    },
+    {
+      "category": "callers_consumers",
       "confidence": "compiler_resolved",
       "evidence": [
         {
@@ -2774,84 +3080,6 @@
       "kind": "validated_by",
       "source": "owner:repository-context-discovery",
       "target": "path:codex-rs/core/src/git_workspace_tests.rs"
-    },
-    {
-      "category": "callers_consumers",
-      "confidence": "declared",
-      "evidence": [
-        {
-          "path": "codex-rs/core/Cargo.toml",
-          "symbol": "name = \"turn_latency\""
-        }
-      ],
-      "kind": "consumed_by",
-      "source": "owner:rust-turn-latency-benchmark",
-      "target": "path:codex-rs/core/Cargo.toml"
-    },
-    {
-      "category": "control_flow",
-      "confidence": "declared",
-      "evidence": [
-        {
-          "path": "codex-rs/core/benches/turn_latency.rs",
-          "symbol": "run_code_mode_capture"
-        }
-      ],
-      "kind": "calls",
-      "source": "owner:rust-turn-latency-benchmark",
-      "target": "owner:core-agent-runtime"
-    },
-    {
-      "category": "generated_artifacts",
-      "confidence": "declared",
-      "evidence": [
-        {
-          "path": "codex-rs/core/benches/turn_latency/ab_runner.rs",
-          "symbol": "import_accepted_ab_report"
-        }
-      ],
-      "kind": "emits",
-      "source": "owner:rust-turn-latency-benchmark",
-      "target": "path:docs/benchmarks/turn-latency/accepted"
-    },
-    {
-      "category": "runtime_registration",
-      "confidence": "declared",
-      "evidence": [
-        {
-          "path": "codex-rs/core/Cargo.toml",
-          "symbol": "name = \"turn_latency\""
-        }
-      ],
-      "kind": "registers",
-      "source": "owner:rust-turn-latency-benchmark",
-      "target": "path:codex-rs/core/Cargo.toml"
-    },
-    {
-      "category": "tests_contracts",
-      "confidence": "declared",
-      "evidence": [
-        {
-          "path": "codex-rs/core/tests/turn_latency_bench.rs",
-          "symbol": "include"
-        }
-      ],
-      "kind": "validated_by",
-      "source": "owner:rust-turn-latency-benchmark",
-      "target": "path:codex-rs/core/benches/turn_latency.rs"
-    },
-    {
-      "category": "tests_contracts",
-      "confidence": "declared",
-      "evidence": [
-        {
-          "path": "scripts/test_kd4_live_agent_benchmark.py",
-          "symbol": "Kd4LiveAgentBenchmarkTest"
-        }
-      ],
-      "kind": "validated_by",
-      "source": "owner:rust-turn-latency-benchmark",
-      "target": "path:scripts/kd4_live_agent_benchmark.py"
     },
     {
       "category": "callers_consumers",
@@ -3571,7 +3799,7 @@
       "target": "path:codex-rs/windows-sandbox-rs/src/winutil.rs"
     }
   ],
-  "repository_revision": "manifest:da7a4cd9da9e872f5c317ecc7800c0730d10a77758b4d7deccf4602696ce3f93:sources:c2cbf9a54fb0c388972ac80a77684f883d5b2862b35814a325b48da9410956fa",
+  "repository_revision": "manifest:c444eac5825b5ed5ecffa2d84b01edaed0859edcec6490590fc0a04db880b679:sources:7baba78ac33f001d99eba1a8508e62d9a66069797cbc6665c296f0857c363127",
   "schema_version": 2,
   "status": "complete",
   "unresolved": []

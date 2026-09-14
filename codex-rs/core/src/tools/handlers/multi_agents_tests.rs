@@ -6379,6 +6379,25 @@ async fn live_runtime_windows_sandbox_is_projected_into_child_config() {
 }
 
 #[tokio::test]
+async fn kd4_runtime_control_is_inherited_by_spawned_and_resumed_agents() {
+    let (_session, mut turn) = make_session_and_context().await;
+    for enabled in [false, true] {
+        let mut parent = (*turn.config).clone();
+        parent
+            .features
+            .set_enabled(Feature::Kd4Runtime, enabled)
+            .expect("set runtime control");
+        turn.config = Arc::new(parent);
+        for child in [
+            build_agent_spawn_config(&turn).expect("spawn config"),
+            build_agent_resume_config(&turn).expect("resume config"),
+        ] {
+            assert_eq!(child.features.enabled(Feature::Kd4Runtime), enabled);
+        }
+    }
+}
+
+#[tokio::test]
 async fn build_agent_resume_config_clears_base_instructions() {
     let (_session, mut turn) = make_session_and_context().await;
     let mut base_config = (*turn.config).clone();

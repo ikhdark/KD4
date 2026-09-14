@@ -11,26 +11,53 @@ import json
 import os
 import re
 import uuid
-from collections.abc import Callable, Iterable
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any, Sequence
 
 try:
     from scripts import kd4_first_useful_action_analysis
+    from scripts.kd4_timing_analysis import (
+        _MAX_SLOW_TOOL_CALLS,
+        _SLOW_TOOL_CALL_NS,
+        _diagnostic_token_report,
+        analyze_runner_evidence,
+        _population_report,
+        _request_metric,
+        _selected_requests,
+        _token_intervals,
+        _tool_model_visible_at_ms,
+        _tool_relay_report,
+        analyze_timing,
+    )
+    from scripts.kd4_timing_analysis import (
+        _token_report as _token_report,
+    )
     from scripts.rollout_snapshot import read_rollout_snapshot
 except ImportError:
     import kd4_first_useful_action_analysis
+    from kd4_timing_analysis import (
+        _MAX_SLOW_TOOL_CALLS,
+        _SLOW_TOOL_CALL_NS,
+        _diagnostic_token_report,
+        analyze_runner_evidence,
+        _population_report,
+        _request_metric,
+        _selected_requests,
+        _token_intervals,
+        _tool_model_visible_at_ms,
+        _tool_relay_report,
+        analyze_timing,
+    )
+    from kd4_timing_analysis import (
+        _token_report as _token_report,
+    )
     from rollout_snapshot import read_rollout_snapshot
 
 
-REPORT_SCHEMA_VERSION = 16
-_OUTPUT_COLLECTED_LIFECYCLE_SCHEMA_VERSION = 25
-_CORRELATED_NESTED_LIFECYCLE_SCHEMA_VERSION = 25
-
+REPORT_SCHEMA_VERSION = 18
 _NANOSECONDS_PER_SECOND = 1_000_000_000
-_SLOW_TOOL_CALL_NS = 5 * _NANOSECONDS_PER_SECOND
-_MAX_SLOW_TOOL_CALLS = 8
-_MAX_EXCLUSIVE_GATE_CONVOYS = 8
+
 _MAX_RENDERED_TURNS = 10
 _MAX_SUMMARY_TURNS = 20
 _MAX_SUMMARY_TOKEN_INTERVALS = 16
@@ -63,18 +90,6 @@ _SOURCE_DISCOVERY_PATH_PATTERN = re.compile(
 _SOURCE_DISCOVERY_RG_PATTERN = re.compile(
     r"(?i)(?<![A-Za-z0-9_])(?:rg(?:\.exe)?|grep)\s+([^\r\n;]+)"
 )
-_TOOL_PHASE_OWNERS = {
-    "itemToFirstPollMs": "ToolDispatchQueue",
-    "parallelGateWaitMs": "ExclusiveGate",
-    "authorizationStateCoordinationMs": "AuthorizationStateCoordination",
-    "workspaceEvidenceBeforeMs": "WorkspaceEvidenceBefore",
-    "preToolHookMs": "PreToolUse",
-    "processRuntimeMs": "ProcessExecution",
-    "workspaceEvidenceAfterMs": "WorkspaceEvidenceAfter",
-    "postToolHookMs": "PostToolUse",
-    "outputProjectionMs": "OutputProjection",
-    "historyPersistenceMs": "HistoryPersistence",
-}
 
 
 def _path_key(path: str | os.PathLike[str]) -> str:
@@ -609,222 +624,6 @@ def _terminal_record(
     }
 
 
-def _selected_requests(timing: dict[str, Any]) -> list[dict[str, Any]]:
-    return [item for item in timing.get("modelRequests", []) if isinstance(item, dict)]
-
-
-def _physical_attempt_count(request: dict[str, Any]) -> int:
-    attempt_ids = request.get("physicalAttemptIds")
-    if isinstance(attempt_ids, list):
-        distinct_ids = {
-            attempt_id
-            for attempt_id in attempt_ids
-            if isinstance(attempt_id, str) and attempt_id
-        }
-        if distinct_ids:
-            return len(distinct_ids)
-    return 1
-
-
-def _token_report(requests: Iterable[dict[str, Any]]) -> dict[str, Any]:
-    request_list = list(requests)
-    physical_attempts = sum(
-        _physical_attempt_count(request) for request in request_list
-    )
-    totals = collections.Counter()
-    prompt_categories = collections.Counter()
-    covered_attempts = 0
-    categorized_attempts = 0
-    for request in request_list:
-        usage = request.get("tokenUsage")
-        if isinstance(usage, dict):
-            covered_attempts += 1
-            input_tokens = max(0, int(usage.get("inputTokens", 0)))
-            cached_input_tokens = max(0, int(usage.get("cachedInputTokens", 0)))
-            visible_output_tokens = max(0, int(usage.get("visibleOutputTokens", 0)))
-            reasoning_tokens = max(0, int(usage.get("reasoningTokens", 0)))
-            total_tokens = max(
-                0,
-                int(
-                    usage.get(
-                        "totalTokens",
-                        input_tokens + visible_output_tokens + reasoning_tokens,
-                    )
-                ),
-            )
-        else:
-            input_tokens = 0
-            cached_input_tokens = 0
-            output_tokens = max(0, int(request.get("outputTokens", 0)))
-            reasoning_tokens = max(0, int(request.get("reasoningOutputTokens", 0)))
-            visible_output_tokens = max(0, output_tokens - reasoning_tokens)
-            total_tokens = output_tokens
-        totals["inputTokens"] += input_tokens
-        totals["cachedInputTokens"] += min(input_tokens, cached_input_tokens)
-        totals["visibleOutputTokens"] += visible_output_tokens
-        totals["reasoningTokens"] += reasoning_tokens
-        totals["outputTokens"] += visible_output_tokens + reasoning_tokens
-        totals["totalTokens"] += total_tokens
-        categories = request.get("requestTokenCategories")
-        if isinstance(categories, dict):
-            categorized_attempts += 1
-            for key in (
-                "baseInstructions",
-                "toolSchemas",
-                "conversationHistory",
-                "currentInput",
-                "repositoryContext",
-                "skills",
-                "otherInjectedContext",
-                "logicalTotal",
-                "localInputEstimate",
-                "repeatedUnchangedContext",
-            ):
-                prompt_categories[key] += max(0, int(categories.get(key, 0)))
-
-    for key in (
-        "inputTokens",
-        "cachedInputTokens",
-        "visibleOutputTokens",
-        "reasoningTokens",
-        "outputTokens",
-        "totalTokens",
-    ):
-        totals[key] += 0
-    totals["nonCachedInputTokens"] = max(
-        0, totals["inputTokens"] - totals["cachedInputTokens"]
-    )
-    observed_blended_tokens = totals["nonCachedInputTokens"] + totals["outputTokens"]
-    observed_billable_tokens = totals["inputTokens"] + totals["outputTokens"]
-    input_tokens = totals["inputTokens"]
-    usage_complete = covered_attempts == physical_attempts
-    return {
-        "physicalAttempts": physical_attempts,
-        "providerUsageAttempts": covered_attempts,
-        "coverage": covered_attempts / physical_attempts if physical_attempts else None,
-        "complete": usage_complete,
-        **dict(totals),
-        "billableTokens": observed_billable_tokens if usage_complete else None,
-        "observedBillableTokens": observed_billable_tokens,
-        "billableDefinition": "provider_input_including_cached_plus_output",
-        "blendedTokens": observed_blended_tokens if usage_complete else None,
-        "observedBlendedTokens": observed_blended_tokens,
-        "blendedDefinition": "non_cached_input_plus_output",
-        "promptCategoryAttempts": categorized_attempts,
-        "promptCategories": dict(prompt_categories),
-        "cacheShare": totals["cachedInputTokens"] / input_tokens
-        if input_tokens
-        else None,
-    }
-
-
-def _token_intervals(
-    requests: Iterable[dict[str, Any]], tool_calls: Iterable[dict[str, Any]]
-) -> list[dict[str, Any]]:
-    """Attribute provider usage to each logical generation between tool batches.
-
-    Retry and fallback attempts share a generation index. Keeping one interval
-    per physical request would attach the same emitted tool batch to every
-    attempt, inflating the apparent number of model/tool handoffs.
-    """
-    request_list = list(requests)
-    calls_by_generation: dict[int, list[dict[str, Any]]] = collections.defaultdict(list)
-    for call in tool_calls:
-        generation_index = call.get("generationIndex")
-        if isinstance(generation_index, int):
-            calls_by_generation[generation_index].append(call)
-
-    request_groups: dict[tuple[str, int], list[tuple[int, dict[str, Any]]]] = {}
-    for request_index, request in enumerate(request_list):
-        generation_index = request.get("generationIndex")
-        group_key = (
-            ("generation", generation_index)
-            if isinstance(generation_index, int)
-            else ("request", request_index)
-        )
-        request_groups.setdefault(group_key, []).append((request_index, request))
-
-    intervals: list[dict[str, Any]] = []
-    for grouped_requests in request_groups.values():
-        request_indexes = [request_index for request_index, _ in grouped_requests]
-        interval_requests = [request for _, request in grouped_requests]
-        request = interval_requests[0]
-        generation_index = request.get("generationIndex")
-        prior_generation = None
-        emitted_calls: list[dict[str, Any]] = []
-        preceding_calls: list[dict[str, Any]] = []
-        if isinstance(generation_index, int):
-            emitted_calls = calls_by_generation.get(generation_index, [])
-            prior_generation = max(
-                (
-                    candidate
-                    for candidate in calls_by_generation
-                    if candidate < generation_index
-                ),
-                default=None,
-            )
-            if prior_generation is not None:
-                preceding_calls = calls_by_generation[prior_generation]
-
-        preceding_model_visible_ms = [
-            _tool_model_visible_at_ms(call)
-            for call in preceding_calls
-            if _tool_model_visible_at_ms(call) is not None
-        ]
-        emitted_acceptance_ms = [
-            int(call["acceptedAtMs"])
-            for call in emitted_calls
-            if isinstance(call.get("acceptedAtMs"), int)
-        ]
-        dispatch_ms = [
-            int(item["dispatchMs"])
-            for item in interval_requests
-            if isinstance(item.get("dispatchMs"), int)
-        ]
-        completed_ms = [
-            int(item["completedMs"])
-            for item in interval_requests
-            if isinstance(item.get("completedMs"), int)
-        ]
-        attempt_kinds = [
-            str(item.get("attemptKind", "primary")) for item in interval_requests
-        ]
-        intervals.append(
-            {
-                "requestIndex": request_indexes[0],
-                "requestIndexes": request_indexes,
-                "generationIndex": generation_index,
-                "attemptKind": attempt_kinds[0]
-                if len(attempt_kinds) == 1
-                else "multiple",
-                "attemptKinds": attempt_kinds,
-                "physicalAttempts": sum(
-                    _physical_attempt_count(item) for item in interval_requests
-                ),
-                "generationPurpose": request.get("generationPurpose"),
-                "dispatchMs": min(dispatch_ms) if dispatch_ms else None,
-                "completedMs": max(completed_ms) if completed_ms else None,
-                "precedingToolGenerationIndex": prior_generation,
-                "precedingToolCallIds": [
-                    str(call.get("callId") or "") for call in preceding_calls
-                ],
-                "precedingResultsModelVisibleAtMs": (
-                    max(preceding_model_visible_ms)
-                    if preceding_model_visible_ms
-                    else None
-                ),
-                "emittedToolCallIds": [
-                    str(call.get("callId") or "") for call in emitted_calls
-                ],
-                "emittedToolsAcceptedAtMs": (
-                    min(emitted_acceptance_ms) if emitted_acceptance_ms else None
-                ),
-                "tokens": _token_report(interval_requests),
-            }
-        )
-    return intervals
-
-
 def _iso_from_unix_ms(value: int | None) -> str | None:
     if value is None:
         return None
@@ -853,70 +652,6 @@ def _turn_boundaries(timing: dict[str, Any], terminal_timestamp: Any) -> dict[st
         "completedAt": _iso_from_unix_ms(completed_ms),
         "boundarySource": source,
     }
-
-
-def _diagnostic_token_report(aggregates: Iterable[dict[str, Any]]) -> dict[str, int]:
-    totals = collections.Counter()
-    for aggregate in aggregates:
-        for key in (
-            "logicalGenerations",
-            "inputTokens",
-            "cachedInputTokens",
-            "visibleOutputTokens",
-            "reasoningTokens",
-            "totalTokens",
-        ):
-            totals[key] += max(0, int(aggregate.get(key, 0)))
-    totals["outputTokens"] = totals["visibleOutputTokens"] + totals["reasoningTokens"]
-    totals["nonCachedInputTokens"] = max(
-        0, totals["inputTokens"] - totals["cachedInputTokens"]
-    )
-    totals["observedBillableTokens"] = totals["inputTokens"] + totals["outputTokens"]
-    return dict(totals)
-
-
-def _tool_model_visible_at_ms(call: dict[str, Any]) -> int | None:
-    model_visible_at = call.get("outputModelVisibleAtMs")
-    if isinstance(model_visible_at, int):
-        return model_visible_at
-    delivered_at = call.get("deliveredAtMs")
-    return delivered_at if isinstance(delivered_at, int) else None
-
-
-def _tool_call_end_to_end_duration_ms(call: dict[str, Any]) -> int:
-    accepted_at = call.get("acceptedAtMs")
-    model_visible_at = _tool_model_visible_at_ms(call)
-    if isinstance(accepted_at, int) and model_visible_at is not None:
-        return max(0, model_visible_at - accepted_at)
-
-    relay_ms = max(0, int(call.get("totalDurationMs") or 0))
-    queued_ms = max(0, int(call.get("itemToFirstPollMs") or 0))
-    return queued_ms + relay_ms
-
-
-def _tool_phase_durations_ms(call: dict[str, Any]) -> dict[str, int]:
-    phases = {
-        key: max(0, int(call.get(key) or 0))
-        for key in _TOOL_PHASE_OWNERS
-        if key != "processRuntimeMs"
-    }
-    process_spawned_at = call.get("processSpawnedAtMs")
-    process_exited_at = call.get("processExitedAtMs")
-    phases["processRuntimeMs"] = (
-        max(0, process_exited_at - process_spawned_at)
-        if isinstance(process_spawned_at, int) and isinstance(process_exited_at, int)
-        else 0
-    )
-    return phases
-
-
-def _dominant_tool_phase(phases: dict[str, int]) -> tuple[str | None, str | None, int]:
-    if not phases:
-        return None, None, 0
-    phase, duration_ms = max(phases.items(), key=lambda item: item[1])
-    if duration_ms <= 0:
-        return None, None, 0
-    return phase, _TOOL_PHASE_OWNERS[phase], duration_ms
 
 
 def _apply_detailed_tool_timing(
@@ -1057,308 +792,6 @@ def _apply_detailed_tool_timing(
     return dict(stats)
 
 
-def _tool_lifecycle_missing_boundaries(call: dict[str, Any]) -> list[str]:
-    source = call.get("source", "direct")
-    timing_schema_version = call.get("_timingSchemaVersion")
-    legacy_nested_lifecycle = (
-        source != "direct"
-        and isinstance(timing_schema_version, int)
-        and 0 < timing_schema_version < _OUTPUT_COLLECTED_LIFECYCLE_SCHEMA_VERSION
-    )
-    required = ["acceptedAtMs"]
-    if not legacy_nested_lifecycle:
-        required.append("outputCollectedAtMs")
-    missing = [field for field in required if not isinstance(call.get(field), int)]
-    if source == "direct":
-        direct_required = ["deliveredAtMs"]
-        if call.get("_turnStatus") != "turn_aborted":
-            direct_required.append("outputModelVisibleAtMs")
-        missing.extend(
-            field for field in direct_required if not isinstance(call.get(field), int)
-        )
-    elif (
-        isinstance(timing_schema_version, int)
-        and timing_schema_version >= _CORRELATED_NESTED_LIFECYCLE_SCHEMA_VERSION
-    ):
-        missing.extend(
-            field
-            for field in ("parentCallId", "parentCellId", "runtimeToolCallId")
-            if not isinstance(call.get(field), str) or not call[field]
-        )
-    return missing
-
-
-def _expected_terminal_abort_model_visibility_truncation(
-    call: dict[str, Any],
-) -> bool:
-    return (
-        call.get("source", "direct") == "direct"
-        and call.get("_turnStatus") == "turn_aborted"
-        and not isinstance(call.get("outputModelVisibleAtMs"), int)
-        and all(
-            isinstance(call.get(field), int)
-            for field in ("acceptedAtMs", "outputCollectedAtMs", "deliveredAtMs")
-        )
-    )
-
-
-def _tool_relay_report(
-    records: Iterable[dict[str, Any]], overflow_count: int = 0
-) -> dict[str, Any]:
-    calls = [record for record in records if isinstance(record, dict)]
-    totals = collections.Counter()
-    generation_calls: dict[tuple[Any, int], list[dict[str, Any]]] = (
-        collections.defaultdict(list)
-    )
-    incomplete = 0
-    incomplete_reasons = collections.Counter()
-    incomplete_direct = 0
-    incomplete_nested = 0
-    expected_terminal_abort_truncations = 0
-    for call in calls:
-        model_visible_at = _tool_model_visible_at_ms(call)
-        generation_index = call.get("generationIndex")
-        if isinstance(generation_index, int):
-            generation_calls[(call.get("_turnId"), generation_index)].append(call)
-        totals["endToEndDurationMs"] += _tool_call_end_to_end_duration_ms(call)
-        for key in (
-            "itemToFirstPollMs",
-            "parallelGateWaitMs",
-            "authorizationStateCoordinationMs",
-            "handlerDurationMs",
-            "workspaceEvidenceBeforeMs",
-            "workspaceEvidenceAfterMs",
-            "preToolHookMs",
-            "postToolHookMs",
-            "outputProjectionMs",
-            "historyPersistenceMs",
-            "postHandlerMs",
-            "totalDurationMs",
-        ):
-            totals[key] += max(0, int(call.get(key) or 0))
-        for key, start_key, end_key in (
-            ("requestToProcessSpawnMs", "acceptedAtMs", "processSpawnedAtMs"),
-            ("firstPollToHandlerEntryMs", "firstPollAtMs", "handlerEntryAtMs"),
-            ("handlerEntryToProcessSpawnMs", "handlerEntryAtMs", "processSpawnedAtMs"),
-            ("processRuntimeMs", "processSpawnedAtMs", "processExitedAtMs"),
-            (
-                "processExitToOutputCollectedMs",
-                "processExitedAtMs",
-                "outputCollectedAtMs",
-            ),
-        ):
-            start = call.get(start_key)
-            end = call.get(end_key)
-            if isinstance(start, int) and isinstance(end, int):
-                totals[key] += max(0, end - start)
-        process_exited_at = call.get("processExitedAtMs")
-        output_collected_at = call.get("outputCollectedAtMs")
-        model_resumed_at = call.get("modelResumedAtMs")
-        if isinstance(process_exited_at, int) and model_visible_at is not None:
-            totals["processExitToModelVisibleMs"] += max(
-                0, model_visible_at - process_exited_at
-            )
-            totals["modelVisibleToProcessExitMs"] += max(
-                0, process_exited_at - model_visible_at
-            )
-        if isinstance(output_collected_at, int) and model_visible_at is not None:
-            totals["outputCollectedToModelVisibleMs"] += max(
-                0, model_visible_at - output_collected_at
-            )
-        if isinstance(model_resumed_at, int) and model_visible_at is not None:
-            totals["modelVisibleToModelResumeMs"] += max(
-                0, model_resumed_at - model_visible_at
-            )
-        missing_boundaries = _tool_lifecycle_missing_boundaries(call)
-        if _expected_terminal_abort_model_visibility_truncation(call):
-            expected_terminal_abort_truncations += 1
-        if missing_boundaries:
-            incomplete += 1
-            incomplete_reasons.update(missing_boundaries)
-            if call.get("source", "direct") == "direct":
-                incomplete_direct += 1
-            else:
-                incomplete_nested += 1
-
-    dominant_phase, dominant_owner, dominant_phase_ms = _dominant_tool_phase(
-        {phase: int(totals.get(phase, 0)) for phase in _TOOL_PHASE_OWNERS}
-    )
-    slow_calls = sorted(
-        (
-            {
-                "callId": str(call.get("callId") or ""),
-                "tool": str(call.get("toolName") or "unknown"),
-                "source": str(call.get("source") or "direct"),
-                "totalDurationMs": max(0, int(call.get("totalDurationMs") or 0)),
-                "endToEndDurationMs": _tool_call_end_to_end_duration_ms(call),
-                "processAliveAtDelivery": bool(call.get("processAliveAtDelivery")),
-                "outputModelVisibilityRecorded": isinstance(
-                    call.get("outputModelVisibleAtMs"), int
-                ),
-                "dominantPhase": _dominant_tool_phase(_tool_phase_durations_ms(call))[
-                    0
-                ],
-                "dominantPhaseOwner": _dominant_tool_phase(
-                    _tool_phase_durations_ms(call)
-                )[1],
-                "dominantPhaseMs": _dominant_tool_phase(_tool_phase_durations_ms(call))[
-                    2
-                ],
-            }
-            for call in calls
-            if _tool_call_end_to_end_duration_ms(call)
-            >= _SLOW_TOOL_CALL_NS // 1_000_000
-        ),
-        key=lambda call: call["endToEndDurationMs"],
-        reverse=True,
-    )
-    generation_counts = {
-        key: len(group_calls) for key, group_calls in generation_calls.items()
-    }
-    batch_groups = sum(count > 1 for count in generation_counts.values())
-    batched_calls = sum(count for count in generation_counts.values() if count > 1)
-    convoys = sorted(
-        (
-            {
-                "turnId": str(turn_id) if turn_id is not None else None,
-                "generationIndex": generation_index,
-                "callIds": [str(call.get("callId") or "") for call in group_calls],
-                "waitingCallIds": [
-                    str(call.get("callId") or "")
-                    for call in group_calls
-                    if max(0, int(call.get("parallelGateWaitMs") or 0)) > 0
-                ],
-                "parallelGateWaitMs": sum(
-                    max(0, int(call.get("parallelGateWaitMs") or 0))
-                    for call in group_calls
-                ),
-            }
-            for (turn_id, generation_index), group_calls in generation_calls.items()
-            if len(group_calls) > 1
-            and sum(
-                max(0, int(call.get("parallelGateWaitMs") or 0)) for call in group_calls
-            )
-            >= _SLOW_TOOL_CALL_NS // 1_000_000
-        ),
-        key=lambda convoy: convoy["parallelGateWaitMs"],
-        reverse=True,
-    )
-    return {
-        "evidenceSource": "toolCalls" if calls else "none",
-        "calls": len(calls),
-        "timingOverflowCalls": max(0, int(overflow_count)),
-        "directCalls": sum(call.get("source", "direct") == "direct" for call in calls),
-        "nestedCalls": sum(call.get("source") == "code_mode" for call in calls),
-        "eagerCalls": sum(bool(call.get("eager")) for call in calls),
-        "processAliveAtDeliveryCalls": sum(
-            bool(call.get("processAliveAtDelivery")) for call in calls
-        ),
-        "outputModelVisibilityRecordedCalls": sum(
-            isinstance(call.get("outputModelVisibleAtMs"), int) for call in calls
-        ),
-        "incompleteLifecycleCalls": incomplete,
-        "incompleteDirectLifecycleCalls": incomplete_direct,
-        "incompleteNestedLifecycleCalls": incomplete_nested,
-        "incompleteLifecycleReasonCounts": dict(sorted(incomplete_reasons.items())),
-        "expectedTerminalAbortModelVisibilityTruncations": (
-            expected_terminal_abort_truncations
-        ),
-        "generationGroups": len(generation_counts),
-        "batchGroups": batch_groups,
-        "batchedCalls": batched_calls,
-        "singleCallGroups": sum(count == 1 for count in generation_counts.values()),
-        "phaseTotalsMs": dict(totals),
-        "dominantPhase": dominant_phase,
-        "dominantPhaseOwner": dominant_owner,
-        "dominantPhaseMs": dominant_phase_ms,
-        "exclusiveGateConvoyCount": len(convoys),
-        "topExclusiveGateConvoys": convoys[:_MAX_EXCLUSIVE_GATE_CONVOYS],
-        "omittedExclusiveGateConvoys": max(
-            0, len(convoys) - _MAX_EXCLUSIVE_GATE_CONVOYS
-        ),
-        "slowCallThresholdMs": _SLOW_TOOL_CALL_NS // 1_000_000,
-        "slowCallCount": len(slow_calls),
-        "topSlowCalls": slow_calls[:_MAX_SLOW_TOOL_CALLS],
-        "omittedSlowCalls": max(0, len(slow_calls) - _MAX_SLOW_TOOL_CALLS),
-    }
-
-
-def _request_metric(
-    requests: Iterable[dict[str, Any]],
-    includes: Callable[[dict[str, Any]], bool],
-) -> dict[str, int]:
-    request_list = list(requests)
-    generation_ids = {
-        request["generationIndex"]
-        for request in request_list
-        if request.get("attemptKind", "primary") == "primary"
-        and request.get("generationIndex") is not None
-        and includes(request)
-    }
-    matching = [
-        request
-        for request in request_list
-        if request.get("generationIndex") in generation_ids
-    ]
-    decision_ready = [
-        request for request in matching if request.get("decisionLatencyNs") is not None
-    ]
-    return {
-        "logicalGenerations": len(generation_ids),
-        "physicalAttempts": sum(
-            _physical_attempt_count(request) for request in matching
-        ),
-        "modelStreamWaitNs": sum(
-            int(request.get("modelStreamWaitNs", 0)) for request in matching
-        ),
-        "decisionReadyAttempts": len(decision_ready),
-        "decisionLatencyNs": sum(
-            int(request["decisionLatencyNs"]) for request in decision_ready
-        ),
-        "toolCalls": sum(int(request.get("toolCallCount", 0)) for request in matching),
-        "toolActiveUnionNs": sum(
-            int(request.get("toolActiveUnionNs", 0)) for request in matching
-        ),
-    }
-
-
-def _sum_metric(target: dict[str, int], source: dict[str, Any]) -> None:
-    for key in target:
-        target[key] += int(source.get(key, 0))
-
-
-def _generation_purpose_latency_report(
-    requests: Iterable[dict[str, Any]],
-) -> dict[str, dict[str, int]]:
-    by_purpose: dict[str, collections.Counter[str]] = collections.defaultdict(
-        collections.Counter
-    )
-    for request in requests:
-        purpose = str(request.get("generationPurpose") or "unknown")
-        metrics = by_purpose[purpose]
-        metrics["logicalGenerations"] += int(
-            request.get("attemptKind", "primary") == "primary"
-        )
-        metrics["physicalAttempts"] += _physical_attempt_count(request)
-        metrics["modelStreamWaitNs"] += max(0, int(request.get("modelStreamWaitNs", 0)))
-        decision_latency = request.get("decisionLatencyNs")
-        if decision_latency is not None:
-            metrics["decisionReadyAttempts"] += 1
-            metrics["decisionLatencyNs"] += max(0, int(decision_latency))
-        metrics["toolCalls"] += max(0, int(request.get("toolCallCount", 0)))
-
-    report: dict[str, dict[str, int]] = {}
-    for purpose, metrics in sorted(
-        by_purpose.items(),
-        key=lambda item: (-item[1]["modelStreamWaitNs"], item[0]),
-    ):
-        metrics["retryAttempts"] = max(
-            0, metrics["physicalAttempts"] - metrics["logicalGenerations"]
-        )
-        report[purpose] = dict(metrics)
-    return report
-
-
 def _latency_breakdown(
     population: dict[str, Any],
     command_orchestration: dict[str, Any],
@@ -1448,259 +881,13 @@ def _latency_breakdown(
     }
 
 
-def _population_report(records: list[dict[str, Any]]) -> dict[str, Any]:
-    totals = collections.Counter()
-    local_totals = collections.Counter()
-    pre_first_output_totals = collections.Counter()
-    nonprogress = {
-        "logicalGenerations": 0,
-        "physicalAttempts": 0,
-        "modelStreamWaitNs": 0,
-        "decisionReadyAttempts": 0,
-        "decisionLatencyNs": 0,
-        "toolCalls": 0,
-        "toolActiveUnionNs": 0,
-    }
-    deterministic = dict(nonprogress)
-    decision_ready_attempts = 0
-    decision_latency_ns = 0
-    request_count = 0
-    status_counts: collections.Counter[str] = collections.Counter()
-    all_requests: list[dict[str, Any]] = []
-    all_tool_calls: list[dict[str, Any]] = []
-    nonprogress_token_aggregates: list[dict[str, Any]] = []
-    tool_call_timing_overflow = 0
-
-    for record in records:
-        timing = record["timing"]
-        exclusive = timing.get("exclusive", {})
-        unions = timing.get("unions", {})
-        local = timing.get("local", {})
-        counters = timing.get("counters", {})
-        requests = _selected_requests(timing)
-        all_requests.extend(requests)
-        all_tool_calls.extend(
-            {
-                **call,
-                "_turnId": record["turn_id"],
-                "_timingSchemaVersion": timing.get("schemaVersion"),
-            }
-            for call in timing.get("toolCalls", [])
-            if isinstance(call, dict)
-        )
-        tool_call_timing_overflow += max(
-            0, int(timing.get("toolCallTimingOverflow", 0))
-        )
-        recorded_nonprogress_tokens = timing.get("observationalNonprogressTokens")
-        if isinstance(recorded_nonprogress_tokens, dict):
-            nonprogress_token_aggregates.append(recorded_nonprogress_tokens)
-        status_counts[record["status"]] += 1
-        inclusive_ns = int(timing.get("inclusiveDurationNs", 0))
-        machine_ns = int(
-            timing.get(
-                "machineDurationNs",
-                max(
-                    0,
-                    inclusive_ns - int(exclusive.get("interactiveOnlyWaitNs", 0)),
-                ),
-            )
-        )
-        orchestration_ns = int(exclusive.get("orchestrationNs", 0))
-        totals["inclusiveDurationNs"] += inclusive_ns
-        totals["machineDurationNs"] += machine_ns
-        totals["modelOnlyNs"] += int(exclusive.get("modelOnlyNs", 0))
-        totals["toolOnlyNs"] += int(exclusive.get("toolOnlyNs", 0))
-        totals["modelPlusToolNs"] += int(exclusive.get("modelPlusToolNs", 0))
-        totals["orchestrationNs"] += orchestration_ns
-        totals["orchestrationMajorityTurns"] += int(
-            machine_ns > 0 and orchestration_ns * 2 >= machine_ns
-        )
-        totals["retryOnlyNs"] += int(exclusive.get("retryOnlyNs", 0))
-        totals["interactiveOnlyWaitNs"] += int(
-            exclusive.get("interactiveOnlyWaitNs", 0)
-        )
-        totals["interactivePlusMachineNs"] += int(
-            exclusive.get("interactivePlusMachineNs", 0)
-        )
-        totals["interactiveWaitUnionNs"] += int(
-            unions.get(
-                "interactiveWaitUnionNs",
-                int(exclusive.get("interactiveOnlyWaitNs", 0))
-                + int(exclusive.get("interactivePlusMachineNs", 0)),
-            )
-        )
-        totals["finalizationNs"] += int(exclusive.get("finalizationNs", 0))
-        totals["standaloneWorkNs"] += int(exclusive.get("standaloneWorkNs", 0))
-        totals["unclassifiedNs"] += int(exclusive.get("unclassifiedNs", 0))
-        totals["modelActiveUnionNs"] += int(unions.get("modelActiveUnionNs", 0))
-        totals["modelRequestWaitNs"] += int(unions.get("modelRequestWaitUnionNs", 0))
-        totals["modelStreamWaitNs"] += int(unions.get("modelStreamWaitUnionNs", 0))
-        totals["modelStreamProcessingNs"] += int(
-            unions.get("modelStreamProcessingUnionNs", 0)
-        )
-        for key in (
-            "preparationUnionNs",
-            "planningUnionNs",
-            "planningExclusiveUnionNs",
-            "planningCompactionOverlapUnionNs",
-            "compactionUnionNs",
-            "persistenceUnionNs",
-            "serializationUnionNs",
-            "routerBuildUnionNs",
-            "startupPrewarmWaitUnionNs",
-            "executorReadinessWaitUnionNs",
-        ):
-            local_totals[key] += int(local.get(key, 0))
-        pre_first_output = timing.get("preFirstModelOutput")
-        if isinstance(pre_first_output, dict):
-            pre_first_output_totals["profiles"] += 1
-            for key in (
-                "clientCriticalPathNs",
-                "attributedClientUnionNs",
-                "unattributedPreOutputNs",
-                "historySnapshotNs",
-                "normalizationNs",
-                "promptConstructionNs",
-                "requestTransformationNs",
-                "serializationNs",
-                "transportReadinessNs",
-            ):
-                pre_first_output_totals[key] += int(pre_first_output.get(key, 0))
-        totals["logicalGenerations"] += int(counters.get("logicalGenerationCount", 0))
-        totals["toolCallCount"] += int(counters.get("toolCallCount", 0))
-        totals["samePurposeContinuationCount"] += int(
-            counters.get("samePurposeContinuationCount", 0)
-        )
-        totals["suppressedDeterministicContinuationCount"] += int(
-            counters.get("suppressedDeterministicContinuationCount", 0)
-        )
-        for key in (
-            "residualDeterministicGenerationCount",
-            "ownerDrainedContinuationCount",
-            "executedValidationCount",
-            "exactRepeatedWaitCount",
-            "waitOnlyGenerationCount",
-            "internallyDrainedWaitCount",
-            "noProgressDirectiveCount",
-            "provenLoopActivationCount",
-        ):
-            totals[key] += int(counters.get(key, 0))
-        request_count += sum(_physical_attempt_count(request) for request in requests)
-        decision_ready = [
-            request
-            for request in requests
-            if request.get("decisionLatencyNs") is not None
-        ]
-        decision_ready_attempts += len(decision_ready)
-        decision_latency_ns += sum(
-            int(request["decisionLatencyNs"]) for request in decision_ready
-        )
-
-        recorded_nonprogress = timing.get("observationalNonprogressLatency")
-        if isinstance(recorded_nonprogress, dict):
-            _sum_metric(nonprogress, recorded_nonprogress)
-        else:
-            _sum_metric(
-                nonprogress,
-                _request_metric(
-                    requests,
-                    lambda request: (
-                        bool(request.get("unchangedRelevantState"))
-                        and not bool(request.get("nextStructuredActionChanged"))
-                    ),
-                ),
-            )
-        _sum_metric(
-            deterministic,
-            _request_metric(
-                requests,
-                lambda request: (
-                    request.get("generationPurpose")
-                    == "deterministic_tool_continuation"
-                ),
-            ),
-        )
-
-    inclusive = totals["inclusiveDurationNs"]
-    machine = totals["machineDurationNs"]
-    model = totals["modelOnlyNs"]
-    tool = totals["toolOnlyNs"]
-    return {
-        "turns": len(records),
-        "statusCounts": dict(sorted(status_counts.items())),
-        **dict(totals),
-        "modelShare": model / machine if machine else None,
-        "toolShare": tool / machine if machine else None,
-        "agentActiveShareOfWall": machine / inclusive if inclusive else None,
-        "modelToolRatio": model / tool if tool else None,
-        "modelDominatedTurns": sum(
-            int(record["timing"].get("exclusive", {}).get("modelOnlyNs", 0))
-            > int(record["timing"].get("exclusive", {}).get("toolOnlyNs", 0))
-            for record in records
-        ),
-        "modelOverFiveTimesToolTurns": sum(
-            int(record["timing"].get("exclusive", {}).get("modelOnlyNs", 0))
-            > 5 * int(record["timing"].get("exclusive", {}).get("toolOnlyNs", 0))
-            for record in records
-        ),
-        "decisionLatency": {
-            "physicalAttempts": request_count,
-            "decisionReadyAttempts": decision_ready_attempts,
-            "coverage": decision_ready_attempts / request_count
-            if request_count
-            else None,
-            "totalNs": decision_latency_ns,
-        },
-        "localActivityUnionsNs": {
-            "preparationNs": local_totals["preparationUnionNs"],
-            "planningNs": local_totals["planningUnionNs"],
-            "planningExclusiveNs": local_totals["planningExclusiveUnionNs"],
-            "planningCompactionOverlapNs": local_totals[
-                "planningCompactionOverlapUnionNs"
-            ],
-            "compactionNs": local_totals["compactionUnionNs"],
-            "persistenceNs": local_totals["persistenceUnionNs"],
-            "serializationNs": local_totals["serializationUnionNs"],
-            "routerBuildNs": local_totals["routerBuildUnionNs"],
-            "startupPrewarmWaitNs": local_totals["startupPrewarmWaitUnionNs"],
-            "executorReadinessWaitNs": local_totals["executorReadinessWaitUnionNs"],
-        },
-        "preFirstModelOutput": {
-            "profiles": pre_first_output_totals["profiles"],
-            **{
-                key: pre_first_output_totals[key]
-                for key in (
-                    "clientCriticalPathNs",
-                    "attributedClientUnionNs",
-                    "unattributedPreOutputNs",
-                    "historySnapshotNs",
-                    "normalizationNs",
-                    "promptConstructionNs",
-                    "requestTransformationNs",
-                    "serializationNs",
-                    "transportReadinessNs",
-                )
-            },
-        },
-        "generationPurposeLatency": _generation_purpose_latency_report(all_requests),
-        "tokens": _token_report(all_requests),
-        "observationalNonprogressTokens": _diagnostic_token_report(
-            nonprogress_token_aggregates
-        ),
-        "toolRelay": _tool_relay_report(all_tool_calls, tool_call_timing_overflow),
-        "observationalNonprogressLatency": nonprogress,
-        "deterministicToolContinuationLatency": deterministic,
-    }
-
-
 def _turn_report(
     record: dict[str, Any],
     repo_root: Path,
     command_records: list[dict[str, Any]],
+    *, include_tokens: bool = True,
 ) -> dict[str, Any]:
     timing = record["timing"]
-    exclusive = timing.get("exclusive", {})
-    unions = timing.get("unions", {})
     counters = timing.get("counters", {})
     requests = _selected_requests(timing)
     tool_calls = [
@@ -1712,21 +899,15 @@ def _turn_report(
         for call in timing.get("toolCalls", [])
         if isinstance(call, dict)
     ]
-    tokens = _token_report(requests)
-    token_intervals = _token_intervals(requests, tool_calls)
-    relay = _tool_relay_report(tool_calls, int(timing.get("toolCallTimingOverflow", 0)))
+    analysis = analyze_timing(timing, status=record["status"], include_tokens=include_tokens)
+    tokens = analysis["tokens"]
+    token_intervals = _token_intervals(requests, tool_calls) if include_tokens else []
+    relay = analysis["toolRelay"]
     orchestration = _command_orchestration_report(command_records)
-    inclusive_ns = int(timing.get("inclusiveDurationNs", 0))
-    human_wait_ns = int(exclusive.get("interactiveOnlyWaitNs", 0))
-    human_wait_union_ns = int(
-        unions.get(
-            "interactiveWaitUnionNs",
-            human_wait_ns + int(exclusive.get("interactivePlusMachineNs", 0)),
-        )
-    )
-    machine_ns = int(
-        timing.get("machineDurationNs", max(0, inclusive_ns - human_wait_ns))
-    )
+    inclusive_ns = analysis["inclusiveDurationNs"]
+    human_wait_ns = analysis["interactiveOnlyWaitNs"]
+    human_wait_union_ns = analysis["interactiveWaitUnionNs"]
+    machine_ns = analysis["machineDurationNs"]
     nonprogress = timing.get("observationalNonprogressLatency")
     if not isinstance(nonprogress, dict):
         nonprogress = _request_metric(
@@ -1754,7 +935,7 @@ def _turn_report(
         signals.append("incomplete_tool_lifecycle")
     if record.get("unresolvedTools"):
         signals.append("terminal_with_unresolved_tool_call")
-    if requests and tokens["providerUsageAttempts"] < len(requests):
+    if include_tokens and requests and tokens["providerUsageAttempts"] < len(requests):
         signals.append("partial_token_coverage")
     if int(nonprogress.get("logicalGenerations", 0)):
         signals.append("observational_nonprogress")
@@ -1775,15 +956,8 @@ def _turn_report(
         "profileValid": timing.get("profileValid") is True,
         "classificationComplete": timing.get("classificationComplete") is True,
         "inclusiveDurationNs": inclusive_ns,
-        "firstUsefulActionMs": (
-            timing.get("milestones", {}).get("firstUsefulActionMs")
-            if isinstance(timing.get("milestones"), dict)
-            and isinstance(
-                timing.get("milestones", {}).get("firstUsefulActionMs"),
-                (int, float),
-            )
-            else None
-        ),
+        "firstUsefulActionMs": analysis["firstUsefulActionMs"],
+        "continuationCount": analysis["continuationCount"],
         "agentActiveDurationNs": machine_ns,
         "humanWaitNs": human_wait_ns,
         "humanOnlyWaitNs": human_wait_ns,
@@ -1800,7 +974,7 @@ def _turn_report(
         },
         **_turn_boundaries(timing, record["timestamp"]),
         "exclusive": {
-            key: int(exclusive.get(key, 0))
+            key: analysis[key]
             for key in (
                 "modelOnlyNs",
                 "toolOnlyNs",
@@ -1821,7 +995,7 @@ def _turn_report(
         "tokenIntervals": token_intervals,
         "observationalNonprogressTokens": _diagnostic_token_report(
             [timing.get("observationalNonprogressTokens", {})]
-        ),
+        ) if include_tokens else {},
         "observationalNonprogressLatency": nonprogress,
         "toolRelay": relay,
         "commandOrchestration": orchestration,
@@ -1878,8 +1052,8 @@ def _behavior_report(
     }
 
 
-def analyze_session_path(source: Path, repo_root: Path) -> dict[str, Any]:
-    files = [source] if source.is_file() else sorted(source.rglob("*.jsonl"))
+def analyze_session_path(source: Path | None, repo_root: Path, *, include_tokens: bool = True, runner_evidence: dict[str, Any] | None = None) -> dict[str, Any]:
+    files = ([source] if source.is_file() else sorted(source.rglob("*.jsonl"))) if source else []
     started_turns: set[str] = set()
     turn_starts: dict[str, dict[str, Any]] = {}
     unresolved_tools_by_turn: dict[str, list[str]] = collections.defaultdict(list)
@@ -1902,6 +1076,7 @@ def analyze_session_path(source: Path, repo_root: Path) -> dict[str, Any]:
     execution_loop_ns: collections.Counter[str] = collections.Counter()
     first_timestamp_ns: int | None = None
     last_timestamp_ns: int | None = None
+    native_events: list[dict[str, Any]] = []
 
     for file in files:
         pending_tool_calls: dict[str, dict[str, Any]] = {}
@@ -1935,6 +1110,8 @@ def analyze_session_path(source: Path, repo_root: Path) -> dict[str, Any]:
                             }
                         )
                     continue
+                if runner_evidence is None:
+                    native_events.append({"message": item, "file": str(file), "line": line_number, "elapsedMs": ((_timestamp_ns(item.get("timestamp")) - first_timestamp_ns) / 1_000_000 if first_timestamp_ns is not None and _timestamp_ns(item.get("timestamp")) is not None else None)})
                 payload = item.get("payload")
                 if not isinstance(payload, dict):
                     payload = {}
@@ -2214,6 +1391,7 @@ def analyze_session_path(source: Path, repo_root: Path) -> dict[str, Any]:
                 record,
                 repo_root,
                 commands_by_turn[record["turn_id"]],
+                include_tokens=include_tokens,
             )
             for record in records
         ),
@@ -2297,7 +1475,8 @@ def analyze_session_path(source: Path, repo_root: Path) -> dict[str, Any]:
     report = {
         "schemaVersion": REPORT_SCHEMA_VERSION,
         "observedAt": dt.datetime.now(dt.timezone.utc).isoformat(),
-        "source": str(source.resolve()),
+        "source": str(source.resolve()) if source else None,
+        "tokenAnalysisEnabled": include_tokens,
         "repoRoot": str(repo_root.resolve()),
         "coverage": coverage,
         "executionLoop": execution_loop,
@@ -2315,7 +1494,7 @@ def analyze_session_path(source: Path, repo_root: Path) -> dict[str, Any]:
             tool_relay,
         ),
         "populations": {
-            name: _population_report(population_records)
+            name: _population_report(population_records, include_tokens=include_tokens)
             for name, population_records in populations.items()
         },
     }
@@ -2325,6 +1504,7 @@ def analyze_session_path(source: Path, repo_root: Path) -> dict[str, Any]:
         tool_relay,
     )
     report["auditDecision"] = _audit_decision(report)
+    report["runnerDiagnostics"] = analyze_runner_evidence(runner_evidence if runner_evidence is not None else {"schemaVersion": 1, "events": native_events}, include_tokens=include_tokens)
     return report
 
 
@@ -2682,6 +1862,8 @@ def render_report(report: dict[str, Any]) -> str:
         f"{decision['dominantNs'] / 1e9:.1f}s/{dominant_share_text}; "
         f"codes={','.join(codes) or 'none'}. {decision['instruction']}"
     )
+    runner = report.get("runnerDiagnostics", {})
+    lines.append("runner diagnostics: " + json.dumps(runner, sort_keys=True))
     return "\n".join(lines)
 
 
@@ -2866,7 +2048,7 @@ def bounded_summary(report: dict[str, Any]) -> dict[str, Any]:
             )
         },
     }
-    return {
+    result = {
         "schemaVersion": report["schemaVersion"],
         "observedAt": report["observedAt"].replace("+00:00", "Z"),
         "source": report["source"],
@@ -2900,6 +2082,26 @@ def bounded_summary(report: dict[str, Any]) -> dict[str, Any]:
         "populations": bounded_populations,
         "auditDecision": report["auditDecision"],
     }
+
+    def compact_tokens(value: Any) -> Any:
+        if isinstance(value, list):
+            return [compact_tokens(item) for item in value]
+        if isinstance(value, dict):
+            # Complete category provenance and full totals remain in --json;
+            # the bounded form retains observed totals and coverage once.
+            return {key: compact_tokens(item) for key, item in value.items()
+                    if key not in ("promptCategoryEvidence", "accountingNote", "providerTotals", "rankedPromptConsumers", "promptCategoryBasis", "promptCategoryCoverage", "available")}
+        return value
+    result["tokenAnalysisEnabled"] = report.get("tokenAnalysisEnabled", True)
+    runner = report.get("runnerDiagnostics", {})
+    result["runnerDiagnostics"] = {key: runner.get(key) for key in (
+        "schemaVersion", "attemptId", "status", "elapsedMs", "coverage", "logicalGenerations",
+        "physicalRequests", "directToolCount", "nestedToolCount", "lastProgress")}
+    for key in ("failures", "symptoms", "pendingTools"):
+        rows = runner.get(key, [])
+        result["runnerDiagnostics"][key] = rows[:8]
+        result["runnerDiagnostics"]["omitted" + key[0].upper() + key[1:]] = max(0, len(rows) - 8)
+    return compact_tokens(result)
 
 
 def _canonical_session_uuid(value: str) -> str | None:
@@ -2946,7 +2148,7 @@ def resolve_rollout_source(source: str, sessions_root: Path | None = None) -> Pa
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "source", help="Rollout JSONL path, session directory, or exact session UUID"
+        "source", nargs="?", help="Rollout JSONL path, session directory, or exact session UUID"
     )
     parser.add_argument(
         "--sessions-root",
@@ -2968,12 +2170,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         action="store_true",
         help="Emit bounded JSON without per-record diagnostic arrays",
     )
+    parser.add_argument("--runner-evidence", type=Path, help="Version 1 native runner evidence JSON for one attempt")
+    parser.add_argument("--tokens", choices=("on", "off"), default="on", help="Disable token computation for scripted execution")
     args = parser.parse_args(argv)
+    if args.source is None and args.runner_evidence is None:
+        parser.error("a source or --runner-evidence is required")
     try:
-        source = resolve_rollout_source(args.source, args.sessions_root)
-    except (FileNotFoundError, OSError) as error:
+        source = resolve_rollout_source(args.source, args.sessions_root) if args.source else None
+        evidence = json.loads(args.runner_evidence.read_text(encoding="utf-8")) if args.runner_evidence else None
+        report = analyze_session_path(source, args.repo_root, include_tokens=args.tokens == "on", runner_evidence=evidence)
+    except (FileNotFoundError, OSError, ValueError, TypeError) as error:
         parser.error(str(error))
-    report = analyze_session_path(source, args.repo_root)
     if args.json:
         print(json.dumps(report, indent=2, sort_keys=True))
     elif args.summary_json:

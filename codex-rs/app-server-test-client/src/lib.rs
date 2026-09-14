@@ -91,6 +91,12 @@ mod plugin_analytics_smoke;
 mod process;
 mod request_user_input;
 
+// The benchmark uses the same loopback provider and owned-process launcher as
+// this client, without exposing the interactive client's listener management.
+pub use loopback_responses_server::LoopbackResponsesServer;
+pub use process::native_stdio_command;
+pub use process::terminate_owned_process;
+
 use process::add_codex_parent_to_path;
 use process::build_serve_command;
 use process::listener_pids_on_port;

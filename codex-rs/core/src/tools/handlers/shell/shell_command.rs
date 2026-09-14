@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use codex_features::Feature;
 use codex_protocol::models::ShellCommandToolCallParams;
 use codex_tools::ToolName;
 use codex_utils_absolute_path::AbsolutePathBuf;
@@ -23,7 +24,7 @@ use crate::tools::command_execution::CommandAttemptKey;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
-use crate::tools::handlers::command_preflight::preflight_invocation_with_equivalent_repair_async;
+use crate::tools::handlers::command_preflight::preflight_invocation_for_kd4_runtime;
 use crate::tools::handlers::command_search::classify_rg_search_with_repository;
 use crate::tools::handlers::command_search::observe_rg_search_scope_state;
 use crate::tools::handlers::command_shape::CommandInvocation;
@@ -335,7 +336,9 @@ impl ShellCommandHandler {
         } else {
             Some(original_safety_shell.shell_type)
         };
-        let preflight = preflight_invocation_with_equivalent_repair_async(
+        let preflight = preflight_invocation_for_kd4_runtime(
+            turn.config.features.enabled(Feature::Kd4Runtime),
+            false,
             &original_invocation,
             &original_safety_command,
             original_shell_type,

@@ -813,94 +813,154 @@ argv = ["python", "scripts/app_server_schema_runtime_check.py", "--mode", "check
 role = "generated_contract_check"
 
 [[owners]]
-id = "rust-turn-latency-benchmark"
-concern_ids = ["turn-latency", "code-mode-capture", "synthetic-non-inferiority", "live-agent-task-compliance"]
-aliases = ["Rust turn latency benchmark", "turn_latency bench", "paired live-agent benchmark"]
-phrases = ["single-build code-mode capture and synthetic latency comparison", "paired live-agent outcome and task-contract compliance benchmark"]
-roots = ["codex-rs/core/benches/turn_latency.rs", "codex-rs/core/benches/turn_latency/ab_contract.rs", "codex-rs/core/benches/turn_latency/ab_runner.rs", "codex-rs/core/benches/turn_latency/runtime_fixtures.rs", "codex-rs/core/benches/turn_latency/tests.rs", "codex-rs/core/tests/turn_latency_bench.rs", "docs/benchmarks/turn-latency/README.md", "scripts/kd4_live_agent_benchmark.py", "scripts/test_kd4_live_agent_benchmark.py"]
-primary_entries = [{ path = "codex-rs/core/benches/turn_latency.rs", symbol = "main" }, { path = "scripts/kd4_live_agent_benchmark.py", symbol = "main" }]
+id = "repo-benchmark"
+concern_ids = ["repo-benchmark", "native-runtime-measurement", "live-task-verification", "session-diagnostics"]
+aliases = ["Repo Benchmark", "Rust repository benchmark", "session latency diagnostics"]
+phrases = ["one Rust benchmark with sequential scripted and real-model segments", "fork_off fork_on reference comparisons and independent verification", "canonical Python generation retry and token analysis"]
+roots = ["codex-rs/repo-benchmark", "docs/benchmarks/repo-benchmark", "scripts/kd4_timing_analysis.py", "scripts/kd4_turn_latency_audit.py", "scripts/kd4_first_useful_action_analysis.py", "scripts/test_kd4_timing_analysis.py", "scripts/test_kd4_turn_latency_audit.py", "scripts/test_kd4_first_useful_action_analysis.py"]
+primary_entries = [{ path = "codex-rs/repo-benchmark/src/main.rs", symbol = "main" }, { path = "codex-rs/repo-benchmark/src/cli.rs", symbol = "run" }, { path = "scripts/kd4_turn_latency_audit.py", symbol = "main" }]
 instructions = ["AGENTS.md"]
-consumers = ["codex-rs/core/Cargo.toml"]
-contracts = ["codex-rs/core/benches/turn_latency.rs", "scripts/kd4_live_agent_benchmark.py"]
-generated_mirrors = ["docs/benchmarks/turn-latency/accepted"]
-tests = ["codex-rs/core/benches/turn_latency/tests.rs", "codex-rs/core/tests/turn_latency_bench.rs", "scripts/test_kd4_live_agent_benchmark.py"]
-
-[owners.facet_exclusions]
-configuration_and_gates = "The benchmark command selects a workflow directly; no repository feature or configuration file owns that selection."
+consumers = ["justfile", "codex-rs/Cargo.toml"]
+contracts = ["codex-rs/repo-benchmark/src/prepare.rs", "codex-rs/repo-benchmark/src/schedule.rs", "codex-rs/repo-benchmark/src/runner.rs", "codex-rs/repo-benchmark/src/diagnostics.rs", "scripts/kd4_timing_analysis.py"]
+generated_mirrors = ["docs/benchmarks/repo-benchmark/accepted"]
+tests = ["codex-rs/repo-benchmark/src/prepare/tests.rs", "codex-rs/repo-benchmark/src/schedule.rs", "codex-rs/repo-benchmark/src/workloads/tests.rs", "codex-rs/repo-benchmark/src/statistics.rs", "codex-rs/repo-benchmark/src/diagnostics.rs", "codex-rs/repo-benchmark/src/reports.rs", "scripts/test_kd4_timing_analysis.py", "scripts/test_kd4_turn_latency_audit.py", "scripts/test_kd4_first_useful_action_analysis.py"]
 
 [[owners.relationships]]
 category = "generated_artifacts"
 kind = "emits"
-target = "path:docs/benchmarks/turn-latency/accepted"
+target = "path:docs/benchmarks/repo-benchmark"
 confidence = "declared"
-evidence = [{ path = "codex-rs/core/benches/turn_latency/ab_runner.rs", symbol = "import_accepted_ab_report" }]
+evidence = [{ path = "codex-rs/repo-benchmark/src/reports.rs", symbol = "import" }]
 
 [[owners.relationships]]
 category = "control_flow"
 kind = "calls"
-target = "owner:core-agent-runtime"
+target = "owner:app-server-runtime"
 confidence = "declared"
-evidence = [{ path = "codex-rs/core/benches/turn_latency.rs", symbol = "run_code_mode_capture" }]
+evidence = [{ path = "codex-rs/repo-benchmark/src/native.rs", symbol = "run_attempt" }, { path = "codex-rs/repo-benchmark/src/native/client.rs", symbol = "NativeClient" }]
+
+[[owners.relationships]]
+category = "control_flow"
+kind = "calls"
+target = "path:codex-rs/app-server-test-client/src/lib.rs"
+confidence = "declared"
+evidence = [{ path = "codex-rs/repo-benchmark/src/native/scripted.rs", symbol = "ScriptedProvider" }, { path = "codex-rs/app-server-test-client/src/lib.rs", symbol = "LoopbackResponsesServer" }]
 
 [[owners.relationships]]
 category = "callers_consumers"
 kind = "consumed_by"
-target = "path:codex-rs/core/Cargo.toml"
+target = "path:justfile"
 confidence = "declared"
-evidence = [{ path = "codex-rs/core/Cargo.toml", symbol = "name = \"turn_latency\"" }]
+evidence = [{ path = "justfile", symbol = "repo-benchmark *args:" }, { path = "codex-rs/repo-benchmark/src/cli.rs", symbol = "parse" }]
 
 [[owners.relationships]]
 category = "runtime_registration"
 kind = "registers"
-target = "path:codex-rs/core/Cargo.toml"
+target = "path:codex-rs/Cargo.toml"
+confidence = "manifest_derived"
+evidence = [{ path = "codex-rs/Cargo.toml", symbol = "\"repo-benchmark\"" }, { path = "codex-rs/repo-benchmark/Cargo.toml", symbol = "name = \"repo-benchmark\"" }]
+
+[[owners.relationships]]
+category = "configuration"
+kind = "reads_config"
+target = "path:kd4_features.toml"
 confidence = "declared"
-evidence = [{ path = "codex-rs/core/Cargo.toml", symbol = "name = \"turn_latency\"" }]
+evidence = [{ path = "codex-rs/repo-benchmark/src/prepare.rs", symbol = "feature_overrides" }, { path = "codex-rs/repo-benchmark/src/prepare/environment.rs", symbol = "BASE_CONFIG" }, { path = "codex-rs/repo-benchmark/src/schedule.rs", symbol = "Mode" }]
 
 [[owners.relationships]]
 category = "tests_contracts"
 kind = "validated_by"
-target = "path:codex-rs/core/benches/turn_latency.rs"
+target = "path:codex-rs/repo-benchmark/src/prepare.rs"
 confidence = "declared"
-evidence = [{ path = "codex-rs/core/tests/turn_latency_bench.rs", symbol = "include" }]
+evidence = [{ path = "codex-rs/repo-benchmark/src/prepare/tests.rs", symbol = "selected_reference_head_can_come_from_an_unrelated_repository" }, { path = "codex-rs/repo-benchmark/src/prepare/tests.rs", symbol = "pinned_snapshot_uses_commit_blobs_instead_of_index_or_working_directory" }]
 
 [[owners.relationships]]
 category = "tests_contracts"
 kind = "validated_by"
-target = "path:scripts/kd4_live_agent_benchmark.py"
+target = "path:codex-rs/repo-benchmark/src/workloads.rs"
 confidence = "declared"
-evidence = [{ path = "scripts/test_kd4_live_agent_benchmark.py", symbol = "Kd4LiveAgentBenchmarkTest" }]
+evidence = [{ path = "codex-rs/repo-benchmark/src/workloads/tests.rs", symbol = "rust_oracle_accepts_correct_parser_and_rejects_overflow_bug" }, { path = "codex-rs/repo-benchmark/src/workloads/tests.rs", symbol = "typescript_oracle_requires_aggregation_and_tests_that_catch_it" }, { path = "codex-rs/repo-benchmark/src/workloads/tests.rs", symbol = "python_refactor_checks_real_helper_use_and_preserved_results" }]
 
 [[owners.invariants]]
-id = "separate-capture-and-comparison-verdicts"
+id = "one-benchmark-two-sequential-segments"
 kind = "semantic"
-statement = "Code-mode capture emits one-build raw samples and a nested-dispatch quality verdict, while synthetic reports alone emit local baseline/candidate non-inferiority verdicts."
-evidence = [{ path = "codex-rs/core/benches/turn_latency.rs", symbol = "BenchmarkCommand" }]
-tests = ["codex-rs/core/tests/turn_latency_bench.rs"]
+statement = "Repo Benchmark alone schedules and compares fork_off, fork_on and reference through native runtimes. Scripted execution precedes real-model execution; fast/full differ only in selected live tasks, finite budgets are ceilings, and performance has no pass/fail verdict."
+evidence = [{ path = "codex-rs/repo-benchmark/src/runner.rs", symbol = "execute" }, { path = "codex-rs/repo-benchmark/src/schedule.rs", symbol = "schedule" }, { path = "codex-rs/repo-benchmark/src/statistics.rs", symbol = "summarize" }]
+tests = ["codex-rs/repo-benchmark/src/schedule.rs", "codex-rs/repo-benchmark/src/statistics.rs"]
 
 [[owners.invariants]]
-id = "accepted-turn-latency-reports-are-verified"
+id = "repo-benchmark-report-provenance-and-failures"
 kind = "semantic"
-statement = "Only hash-valid, complete, uncapped, passing batch and final A/B reports enter the tracked accepted-report mirror."
-evidence = [{ path = "codex-rs/core/benches/turn_latency/ab_runner.rs", symbol = "import_accepted_ab_report" }]
-tests = ["codex-rs/core/benches/turn_latency/tests.rs"]
+statement = "Versioned reports preserve failed, incomplete and unrun attempts separately from completed timing, retain native failure and verifier outcomes independently, and import only hash-valid matching prepared identities without overwriting reports or changing historical provenance."
+evidence = [{ path = "codex-rs/repo-benchmark/src/reports.rs", symbol = "validate_result" }, { path = "codex-rs/repo-benchmark/src/reports.rs", symbol = "failure_fields" }, { path = "codex-rs/repo-benchmark/src/reports.rs", symbol = "import" }]
+tests = ["codex-rs/repo-benchmark/src/reports.rs"]
 
 [[owners.invariants]]
-id = "live-agent-source-and-scoring-integrity"
+id = "native-source-and-independent-verification-integrity"
 kind = "semantic"
-statement = "Live-agent reports bind each binary to a clean exact commit and tree, report outcome correctness separately from task-contract compliance, and retain structured diagnostic categories."
-evidence = [{ path = "scripts/kd4_live_agent_benchmark.py", symbol = "exact_source_state" }, { path = "scripts/kd4_live_agent_benchmark.py", symbol = "summarize" }, { path = "scripts/kd4_live_agent_benchmark.py", symbol = "classify_diagnostics" }]
-tests = ["scripts/test_kd4_live_agent_benchmark.py"]
+statement = "One frozen harness launches each selected revision's own app-server. Preparation pins clean sources, locked dependencies, six-job release settings, shared inputs and environment; protected verifiers assert expected task results after final mutation. B need not descend from A."
+evidence = [{ path = "codex-rs/repo-benchmark/src/prepare.rs", symbol = "resolve_source" }, { path = "codex-rs/repo-benchmark/src/prepare/builds.rs", symbol = "build" }, { path = "codex-rs/repo-benchmark/src/workloads.rs", symbol = "verify_fixture_with_env" }]
+tests = ["codex-rs/repo-benchmark/src/prepare/tests.rs", "codex-rs/repo-benchmark/src/workloads/tests.rs"]
+
+[[owners.invariants]]
+id = "paired-statistics-respect-task-and-run-populations"
+kind = "semantic"
+statement = "Comparisons reuse original sample IDs, pair only matching workload/run-cluster/repetition observations, preserve 10000-resample hierarchical bootstrap intervals where supported, and never treat different live tasks or individual tool events as repetitions."
+evidence = [{ path = "codex-rs/repo-benchmark/src/statistics.rs", symbol = "compare" }, { path = "codex-rs/repo-benchmark/src/statistics.rs", symbol = "bootstrap" }]
+tests = ["codex-rs/repo-benchmark/src/statistics.rs"]
+
+[[owners.relationships]]
+category = "control_flow"
+kind = "calls"
+target = "path:scripts/kd4_turn_latency_audit.py"
+confidence = "declared"
+evidence = [{ path = "codex-rs/repo-benchmark/src/diagnostics.rs", symbol = "analyze_with_timeout" }, { path = "scripts/kd4_turn_latency_audit.py", symbol = "analyze_session_path" }]
+
+[[owners.relationships]]
+category = "control_flow"
+kind = "calls"
+target = "path:scripts/kd4_timing_analysis.py"
+confidence = "declared"
+evidence = [{ path = "scripts/kd4_turn_latency_audit.py", symbol = "analyze_timing" }, { path = "scripts/kd4_turn_latency_audit.py", symbol = "analyze_runner_evidence" }]
+
+[[owners.relationships]]
+category = "control_flow"
+kind = "calls"
+target = "path:scripts/kd4_first_useful_action_analysis.py"
+confidence = "declared"
+evidence = [{ path = "scripts/kd4_turn_latency_audit.py", symbol = "kd4_first_useful_action_analysis.analyze_records" }, { path = "scripts/kd4_first_useful_action_analysis.py", symbol = "analyze_records" }]
+
+[[owners.relationships]]
+category = "tests_contracts"
+kind = "validated_by"
+target = "path:scripts/kd4_timing_analysis.py"
+confidence = "declared"
+evidence = [{ path = "scripts/test_kd4_timing_analysis.py", symbol = "test_audit_and_runner_share_independent_expected_metrics" }, { path = "scripts/test_kd4_timing_analysis.py", symbol = "test_no_token_function_runs_in_scripted_audit_or_runner" }]
+
+[[owners.relationships]]
+category = "tests_contracts"
+kind = "validated_by"
+target = "path:codex-rs/repo-benchmark/src/diagnostics.rs"
+confidence = "declared"
+evidence = [{ path = "codex-rs/repo-benchmark/src/diagnostics.rs", symbol = "real_python_audit_consumes_startup_failure_and_disables_token_analysis" }, { path = "codex-rs/repo-benchmark/src/diagnostics.rs", symbol = "hung_python_analyzer_is_terminated_without_changing_native_evidence" }]
+
+[[owners.invariants]]
+id = "one-canonical-session-diagnostic-implementation"
+kind = "compatibility"
+statement = "Rust captures lightweight evidence and persists results before invoking the frozen Python session audit. Python alone defines generation, retry, timing and token diagnostics; it has no A/B mode. Scripted token computation is disabled, missing telemetry stays unavailable, and analyzer failures preserve raw results and support analysis-only reruns."
+evidence = [{ path = "codex-rs/repo-benchmark/src/diagnostics.rs", symbol = "analyze_with_timeout" }, { path = "scripts/kd4_timing_analysis.py", symbol = "analyze_runner_evidence" }, { path = "scripts/kd4_timing_analysis.py", symbol = "disabled_tokens" }, { path = "codex-rs/repo-benchmark/src/runner.rs", symbol = "analysis_only" }]
+tests = ["codex-rs/repo-benchmark/src/diagnostics.rs", "scripts/test_kd4_timing_analysis.py", "scripts/test_kd4_turn_latency_audit.py"]
 
 [[owners.validation]]
-id = "rust-turn-latency-focused"
+id = "repo-benchmark-focused"
 cwd = "codex-rs"
-argv = ["just", "core-test-fast", "turn_latency_bench"]
+argv = ["cargo", "test", "--locked", "--jobs", "6", "-p", "repo-benchmark", "--lib"]
 role = "focused_tests"
 
 [[owners.validation]]
-id = "live-agent-benchmark-focused"
+id = "session-diagnostics-focused"
 cwd = "."
-argv = ["python", "-m", "unittest", "scripts.test_kd4_live_agent_benchmark"]
+argv = ["python", "-m", "unittest", "scripts.test_kd4_timing_analysis", "scripts.test_kd4_turn_latency_audit", "scripts.test_kd4_first_useful_action_analysis"]
 role = "focused_tests"
 
 # Manually reviewed KDA repair ownership; relationships use declared provenance.

@@ -15,8 +15,9 @@ use crate::guardian::routes_approval_to_guardian;
 use crate::responses_metadata::CodexResponsesMetadata;
 use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::session::INITIAL_SUBMIT_ID;
+use crate::session::reasoning_governor::SamplingGenerationDisposition;
 use crate::session::reasoning_governor::SamplingReasoningPhase;
-use crate::session::reasoning_governor::resolve_request_policy;
+use crate::session::reasoning_governor::resolve_request_policy_for_runtime;
 use crate::session::session::Session;
 use crate::session::turn::build_prompt;
 use crate::session::turn::built_tools;
@@ -545,11 +546,16 @@ async fn schedule_startup_prewarm_inner(
         .reasoning_phase_efforts
         .as_ref()
         .map(|_| SamplingReasoningPhase::Orient);
-    let request_effort = resolve_request_policy(
+    let request_effort = resolve_request_policy_for_runtime(
+        startup_turn_context
+            .config
+            .features
+            .enabled(Feature::Kd4Runtime),
         reasoning_phase,
         startup_turn_context.config.reasoning_phase_efforts.as_ref(),
         startup_turn_context.reasoning_effort.clone(),
         &startup_turn_context.model_info,
+        &SamplingGenerationDisposition::DecisionBearing,
     )
     .request_effort;
     client_session

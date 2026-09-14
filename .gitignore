@@ -74,7 +74,7 @@ apply_patch/
 coverage/
 
 # benchmarks
-/docs/benchmarks/turn-latency/
+/docs/benchmarks/repo-benchmark/accepted/
 
 # personal files
 /current-diff.txt

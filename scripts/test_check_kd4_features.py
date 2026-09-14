@@ -226,6 +226,51 @@ class CheckKd4FeaturesTest(unittest.TestCase):
                         rust,
                     )
 
+    def test_inline_suite_shard_verification_requires_the_registered_binary(self) -> None:
+        owner = self.repo_root / "owner"
+        (owner / "Cargo.toml").write_text('[package]\nname = "fixture"\n')
+        suite = owner / "tests/suite"
+        suite.mkdir(parents=True)
+        (suite / "behavior.rs").write_text(
+            "#[test]\nfn expected_behavior() { assert_eq!(2 + 2, 4); }\n"
+        )
+        shard = owner / "tests/alpha.rs"
+        shard.write_text(
+            '#[path = "suite"]\nmod suite {\n'
+            '    #[path = "behavior.rs"]\n    mod behavior;\n}\n'
+        )
+        (owner / "tests/beta.rs").write_text(
+            '#[path = "suite"]\nmod suite {\n'
+            '    #[path = "other.rs"]\n    mod other;\n}\n'
+        )
+        gates = self.repo_root / "codex-rs/.config/kd4-rust-tests.toml"
+        gates.parent.mkdir(parents=True)
+        gates.write_text(
+            'version = 1\n[helpers]\n'
+            '[targets.alpha]\npackage = "fixture"\ntest = "alpha"\nhelpers = []\n'
+            '[targets.beta]\npackage = "fixture"\ntest = "beta"\nhelpers = []\n'
+            '[gates.alpha]\n[[gates.alpha.steps]]\ntarget = "alpha"\n'
+            'tests = ["suite::behavior::expected_behavior"]\nhelpers = []\n'
+            '[gates.beta]\n[[gates.beta.steps]]\ntarget = "beta"\n'
+            'tests = ["suite::behavior::expected_behavior"]\nhelpers = []\n'
+        )
+        verification = {
+            "path": "owner/tests/suite/behavior.rs",
+            "symbol": "expected_behavior",
+            "command": ["python", "scripts/rust_test_runner.py", "run-gate", "alpha", "--profile", "fast"],
+        }
+        self.assertEqual(
+            check_kd4_features._verification_route(verification, self.repo_root),
+            "nextest",
+        )
+        wrong_binary = {**verification, "command": [*verification["command"]]}
+        wrong_binary["command"][3] = "beta"
+        with self.assertRaisesRegex(ValueError, "source's package and test binary"):
+            check_kd4_features._verification_route(wrong_binary, self.repo_root)
+        shard.write_text('mod suite {}\n')
+        with self.assertRaisesRegex(ValueError, "resolve to one integration test binary"):
+            check_kd4_features._verification_route(verification, self.repo_root)
+
     def test_desktop_runtime_receipt_feature_is_absent(self) -> None:
         with check_kd4_features.DEFAULT_MANIFEST.open("rb") as manifest_file:
             manifest = tomllib.load(manifest_file)

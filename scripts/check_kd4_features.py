@@ -140,13 +140,29 @@ def _verification_route(
         if len(relative.parts) == 2:
             selector = ["--test", source.stem]
         else:
-            # Existing suite aggregators register their first module explicitly.
+            # Legacy aggregators use `mod suite;`; bounded shards keep `suite`
+            # inline and explicitly register the selected source within it.
             candidates = [
                 p
                 for p in (cargo_path.parent / "tests").glob("*.rs")
                 if re.search(
                     r"\bmod\s+" + re.escape(relative.parts[1]) + r"\s*;",
                     p.read_text(encoding="utf-8"),
+                )
+                or (
+                    len(relative.parts) == 3
+                    and re.search(
+                        r"\bmod\s+" + re.escape(relative.parts[1]) + r"\s*\{",
+                        p.read_text(encoding="utf-8"),
+                    )
+                    and re.search(
+                        r'#\[path\s*=\s*"'
+                        + re.escape(source.name)
+                        + r'"\]\s*mod\s+'
+                        + re.escape(source.stem)
+                        + r"\s*;",
+                        p.read_text(encoding="utf-8"),
+                    )
                 )
             ]
             if len(candidates) != 1:

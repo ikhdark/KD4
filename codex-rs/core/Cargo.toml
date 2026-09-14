@@ -168,6 +168,3 @@ walkdir = { workspace = true }
 wiremock = { workspace = true }
 zstd = { workspace = true }
 
-[[bench]]
-name = "turn_latency"
-harness = false

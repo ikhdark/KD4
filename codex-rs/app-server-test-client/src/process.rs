@@ -10,6 +10,34 @@ use anyhow::Result;
 
 use anyhow::bail;
 
+/// Construct a native app-server child without changing its executable search
+/// path. The caller supplies its isolated environment and pipes before spawn.
+pub fn native_stdio_command(app_server_bin: &Path, config_overrides: &[String]) -> Command {
+    use std::os::windows::process::CommandExt;
+    let mut command = Command::new(app_server_bin);
+    for override_kv in config_overrides {
+        command.arg("--config").arg(override_kv);
+    }
+    command.arg("--listen").arg("stdio://");
+    command.creation_flags(0x0000_0200 | 0x0800_0000);
+    command
+}
+
+/// Terminate only the process tree rooted at a child owned by the caller.
+pub fn terminate_owned_process(child: &mut std::process::Child) -> Result<()> {
+    if child.try_wait()?.is_none() {
+        let status = terminate_process(child.id(), true)?;
+        if !status.success() && child.try_wait()?.is_none() {
+            bail!(
+                "could not terminate owned app-server process {}: {status}",
+                child.id()
+            );
+        }
+    }
+    child.wait().context("wait for owned app-server shutdown")?;
+    Ok(())
+}
+
 pub(super) fn runtime_dir() -> PathBuf {
     env::temp_dir().join("codex-app-server-test-client")
 }

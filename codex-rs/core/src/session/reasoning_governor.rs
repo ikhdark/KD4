@@ -3148,6 +3148,25 @@ pub(crate) fn resolve_request_policy(
     )
 }
 
+/// Resolve the actual provider request, including callers that supply a per-turn
+/// config directly rather than using the persisted config loader.
+pub(crate) fn resolve_request_policy_for_runtime(
+    kd4_runtime: bool,
+    phase: Option<SamplingReasoningPhase>,
+    config: Option<&ReasoningPhaseEfforts>,
+    turn_fallback: Option<ReasoningEffort>,
+    model_info: &ModelInfo,
+    sampling: &SamplingGenerationDisposition,
+) -> SamplingRequestPolicy {
+    if kd4_runtime {
+        resolve_request_policy_for_generation(phase, config, turn_fallback, model_info, sampling)
+    } else {
+        // Clearing phase overrides alone is insufficient: residual sampling can
+        // independently select low effort. Bypass both decisions together.
+        resolve_request_policy(None, None, turn_fallback, model_info)
+    }
+}
+
 pub(crate) fn resolve_request_policy_for_generation(
     phase: Option<SamplingReasoningPhase>,
     config: Option<&ReasoningPhaseEfforts>,
@@ -3338,6 +3357,42 @@ mod tests {
             finalize: Some(ReasoningEffort::Low),
             deterministic_continuation: Some(ReasoningEffort::Low),
         }
+    }
+
+    #[test]
+    fn kd4_runtime_off_preserves_high_even_for_residual_sampling() {
+        let model = model(
+            &[ReasoningEffort::Low, ReasoningEffort::High],
+            ReasoningEffort::Low,
+        );
+        let config = config();
+        let sampling = SamplingGenerationDisposition::ResidualDeterministic(
+            ResidualDeterministicSamplingProof {
+                relevant_state_fingerprint: "unchanged".to_string(),
+                exact_action: ResidualDeterministicAction::CompleteProtocolTurn,
+            },
+        );
+        let policy = resolve_request_policy_for_runtime(
+            false,
+            Some(SamplingReasoningPhase::Verify),
+            Some(&config),
+            Some(ReasoningEffort::High),
+            &model,
+            &sampling,
+        );
+        assert_eq!(policy.request_effort, Some(ReasoningEffort::High));
+        assert_eq!(policy.phase, None);
+        assert_eq!(policy.source, SamplingRequestPolicySource::TurnFallback);
+        let enabled = resolve_request_policy_for_runtime(
+            true,
+            Some(SamplingReasoningPhase::Verify),
+            Some(&config),
+            Some(ReasoningEffort::High),
+            &model,
+            &SamplingGenerationDisposition::DecisionBearing,
+        );
+        assert_eq!(enabled.request_effort, Some(ReasoningEffort::Low));
+        assert_eq!(enabled.phase, Some(SamplingReasoningPhase::Verify));
     }
 
     fn model(levels: &[ReasoningEffort], default: ReasoningEffort) -> ModelInfo {

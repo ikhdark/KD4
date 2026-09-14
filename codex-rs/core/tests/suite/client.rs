@@ -2160,6 +2160,92 @@ async fn skills_are_omitted_from_developer_message_under_budget_pressure() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kd4_runtime_off_preserves_effort_after_tool_and_followup() -> anyhow::Result<()> {
+    let server = MockServer::start().await;
+    let response_mock = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("phase-tool"),
+                ev_function_call(
+                    "plan-complete",
+                    "update_plan",
+                    r#"{"plan":[{"step":"Inspect","status":"completed"}]}"#,
+                ),
+                ev_completed("phase-tool"),
+            ]),
+            sse(vec![
+                ev_response_created("phase-finish"),
+                ev_completed("phase-finish"),
+            ]),
+            sse(vec![
+                ev_response_created("followup"),
+                ev_completed("followup"),
+            ]),
+        ],
+    )
+    .await;
+    let test = test_codex()
+        .with_model("gpt-5.4")
+        .with_config(|config| {
+            config
+                .features
+                .disable(Feature::Kd4Runtime)
+                .expect("disable KD4 runtime");
+            config
+                .features
+                .disable(Feature::CodeMode)
+                .expect("expose direct tools");
+            config.model_reasoning_effort = Some(ReasoningEffort::High);
+            // Deliberately retain conflicting overrides: request construction must
+            // respect the switch even for programmatically constructed configs.
+            config.reasoning_phase_efforts =
+                Some(codex_config::config_toml::ReasoningPhaseEfforts {
+                    orient: Some(ReasoningEffort::Low),
+                    finalize: Some(ReasoningEffort::Low),
+                    ..Default::default()
+                });
+        })
+        .build(&server)
+        .await?;
+    // TestCodex::submit_turn explicitly replaces collaboration-mode effort with
+    // None. Preserve the configured high effort when exercising this boundary.
+    for prompt in [
+        "Complete the inspection plan.",
+        "Continue with the next turn.",
+    ] {
+        test.codex
+            .submit(Op::UserInput {
+                items: vec![UserInput::Text {
+                    text: prompt.into(),
+                    text_elements: Vec::new(),
+                }],
+                final_output_json_schema: None,
+                responsesapi_client_metadata: None,
+                additional_context: Default::default(),
+                thread_settings: Default::default(),
+            })
+            .await?;
+        wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    }
+    let requests = response_mock.requests();
+    assert_eq!(
+        requests.len(),
+        3,
+        "tool continuation and next turn must both sample"
+    );
+    assert!(
+        requests[1]
+            .function_call_output_text("plan-complete")
+            .is_some_and(|text| text.contains("Plan updated"))
+    );
+    for request in requests {
+        assert_eq!(request.body_json()["reasoning"]["effort"], "high");
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn initial_turn_reasoning_policy_uses_compatibility_phase_efforts() -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
     let server = MockServer::start().await;

@@ -128,8 +128,10 @@ When encountering changes you did not make:
 Re-read relevant current content before editing a file that may have changed
 since it was last inspected.
 
-Do not assume that an earlier diff, snapshot, or plan still represents the live
-workspace.
+Reuse reads, searches, and agent evidence while they remain sufficient for the
+relevant current state. A new model turn, agent handoff, or unrelated edit does
+not by itself invalidate them. Refresh evidence when relevant inputs may have
+changed or an explicit freshness requirement applies.
 
 ## Git safety
 
@@ -161,9 +163,11 @@ the task.
 <!-- runtime-root-orchestration:start -->
 When several independent tool calls and their result handling are already
 known, request them together using available parallel tools or one `functions.exec` packet.
-Keep dependent calls ordered, never batch shared-state
-mutations, and split only for approvals, output bounds, or a result that changes
-the next action. Continue yielded commands through their existing wait or session path
+Do not run shared-state mutations concurrently. Keep predetermined dependent
+calls in one packet when supported, in dependency order, proceeding only when
+prerequisite results meet expected conditions. Stop on unexpected results and
+split only for approvals, output bounds, or substantive judgment about the next
+action. Continue yielded commands through their existing wait or session path
 instead of creating a duplicate operation.
 <!-- runtime-root-orchestration:end -->
 
@@ -180,42 +184,36 @@ Do not use `apply_patch` when:
 After a failed or stale patch, re-read the relevant current section before
 trying again. Do not repeatedly apply the same stale patch.
 
-Once dependencies are already known, default to available parallel tool
-execution for independent, read-only operations when it reduces latency without
-obscuring ordering or dependencies.
+For independent calls in `functions.exec`, attach success and failure handlers
+to each promise and `await notify(...)` inside each handler, so every settled
+result is delivered immediately. Then use `Promise.allSettled` only as a lifetime
+barrier that keeps the cell alive. Never put readers in a bare `Promise.all`,
+because one stalled call or interruption must not suppress completed results.
 
-When `functions.exec` is available and several tool calls plus their result
-handling are already known, prefer one well-designed `functions.exec` packet
-over a sequence of tiny shell or tool calls. For a potentially slow nested call,
-apply a 60-second bound only to one observation or poll when the tool documents
-a resumable wait or session path; it is never the operation's total lifetime. On
-expiry, preserve and resume the same valid operation through that path instead
-of abandoning or duplicating it. Otherwise follow the tool's documented timeout
-or runtime contract. Attach success and failure handlers to each independent
-promise and `await notify(...)` inside each handler, so every settled result is
-delivered immediately. Then use `Promise.allSettled` only as a lifetime barrier
-that keeps the cell alive. Never put readers in a bare `Promise.all`, because one
-stalled call or interruption must not suppress completed results. Keep
-deterministic dependent calls in the same script. Split when dependencies,
-mutation safety, approvals, output bounds, or a substantive decision require
-another model boundary.
+Do not parallelize dependent commands or commands that could produce conflicting
+outputs. Predetermined result handling may stay in the same packet: for example,
+read the unique exact match and stop if none or several match. Return to the
+model when choosing among candidate owners, diagnosing a failure, selecting
+validation, or changing mutation order requires substantive judgment. Never
+launch dependent work before its prerequisite results are available and checked.
+
+For a potentially slow nested call, apply a 60-second bound only to one
+observation or poll when the tool documents a resumable wait or session path;
+it is never the operation's total lifetime. On expiry, preserve and resume the
+same valid operation through that path instead of abandoning or duplicating it.
+Otherwise follow the tool's documented timeout or runtime contract.
 
 Do not return to the model merely to start another predetermined observation. In
 particular, keep yielded or running commands in the existing command wait path
 while the only possible decision is to wait again. Return when completion, new
 output, failure, approval, or user input can change the next action.
 
-Do not parallelize commands that mutate shared state, depend on one another, or
-could produce conflicting outputs.
-
-Keep a model boundary when the previous result determines file selection,
-diagnosis, validation choice, mutation ordering, or another substantive next
-step.
-
-During discovery, choose operations by expected uncertainty reduction rather
-than nominal cost. Run a precise symbol, reference, or owner query first when it
-can determine later scope, and run a broad inventory only if that result leaves
-the scope unresolved. Bound search and read output so relevant evidence remains
+Use sufficient current evidence and supplied paths first. Read known relevant
+locations directly; search only to resolve missing scope or information. During
+discovery, choose operations by expected uncertainty reduction rather than
+nominal cost. Run a precise symbol, reference, or owner query first when it can
+determine later scope, and run a broad inventory only if that result leaves the
+scope unresolved. Bound search and read output so relevant evidence remains
 model-visible instead of being displaced by truncation.
 
 ## Planning tools
@@ -317,6 +315,10 @@ The primary agent remains responsible for:
 The primary agent may continue useful non-overlapping work while sub-agents are
 running.
 
+Reuse a worker's successful checks when their coverage and relevant inputs still
+match the combined implementation. Root responsibility requires assessing that
+evidence and filling coverage gaps, not rerunning unchanged checks.
+
 Do not wait for every running agent before answering a direct user question.
 Answer the user first when possible, then continue coordination.
 
@@ -334,15 +336,20 @@ not available.
 
 ## Validation and completion
 
-Validate throughout the task rather than postponing all checks until the end.
+Validate completed, testable changes. Run an earlier focused check when it
+resolves uncertainty needed for the next step or prevents expensive rework.
+Reuse successful results that still cover the final relevant state; honor
+explicit freshness and repetition requirements.
 
-Use the narrowest useful validation first, then broader checks when the change
-or repository warrants them.
+Run validation required by the task and governing repository instructions.
+Otherwise, select existing checks that cover the changed behavior and affected
+consumers. Use a workspace-wide gate when explicitly required or when a narrower
+existing gate cannot cover the affected behavior, subject to governing limits
+on validation scope. Task categories alone do not require workspace-wide checks.
+A required broader check may replace a redundant narrower check.
 
-For package-local Rust changes, default Clippy and dead-code validation to the
-changed packages. Keep an explicit workspace-wide gate when the task is
-runtime-critical, cross-package, generated-contract, release-related, or the
-governing repository instructions require it.
+When Clippy or dead-code analysis is required, scope it to the changed packages
+and affected consumers unless a broader gate is required as described above.
 
 Do not run `cargo check` immediately before Clippy when the planned Clippy
 command covers exactly the same packages, targets, features, toolchain,
@@ -356,8 +363,11 @@ inspect `git diff`.
 
 Start independent non-Cargo checks alongside Rust validation when the execution
 policy permits it. Keep ordinary Cargo commands serialized when they share the
-target directory. Publish remains the final validation barrier after the source
-state and preceding validation results are fixed.
+target directory.
+
+When publishing is part of the authorized task, publish only after the source
+state is fixed and required validation is complete. Publishing is not required
+for edit-only, review, or diagnostic tasks.
 
 A successful patch, command, test, or build proves only what that operation
 actually establishes.
@@ -373,6 +383,11 @@ Before reporting completion, reconcile:
 
 Do not claim that an edit, command, test, or result occurred unless the available
 tool state establishes it.
+
+Repeat a failed operation only when relevant inputs changed, new evidence
+changes the approach, or a documented retry policy or explicit task requirement
+justifies repetition. Otherwise, report the blocker and continue independent
+work that can still be completed.
 
 When something fails, report:
 

@@ -18,6 +18,37 @@ python := "python"
 help:
     just -l
 
+# The sole repository A/B benchmark; Rust owns both sequential segments.
+[script("python")]
+repo-benchmark *args:
+    import hashlib
+    import json
+    import os
+    from pathlib import Path
+    import shutil
+    import subprocess
+    import sys
+    env = os.environ.copy()
+    env.pop("CARGO_TARGET_DIR", None)
+    env.update(CARGO_PROFILE_RELEASE_OPT_LEVEL="3", CARGO_PROFILE_RELEASE_LTO="thin", CARGO_PROFILE_RELEASE_CODEGEN_UNITS="4", CARGO_PROFILE_RELEASE_INCREMENTAL="false", CARGO_INCREMENTAL="0")
+    if shutil.which("sccache"):
+        env["RUSTC_WRAPPER"] = shutil.which("sccache")
+    command = ["cargo", "build", "--release", "--locked", "--jobs", "6", "--message-format=json-render-diagnostics", "--target-dir", "target/repo-benchmark/harness", "-p", "repo-benchmark", "--bin", "repo-benchmark"]
+    process = subprocess.Popen(command, env=env, stdout=subprocess.PIPE, text=True)
+    executable = None
+    for line in process.stdout:
+        event = json.loads(line)
+        if event.get("reason") == "compiler-artifact" and event.get("target", {}).get("name") == "repo-benchmark" and event.get("executable"):
+            executable = Path(event["executable"]).resolve()
+        if event.get("reason") == "compiler-message":
+            print(event["message"].get("rendered", ""), file=sys.stderr, end="")
+    status = process.wait()
+    if status or executable is None:
+        raise SystemExit(status or 1)
+    record = {"executable": str(executable), "sha256": hashlib.sha256(executable.read_bytes()).hexdigest(), "command": command, "settings": {key: value for key, value in env.items() if key.startswith("CARGO_PROFILE_RELEASE_") or key in ("CARGO_INCREMENTAL", "RUSTC_WRAPPER", "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS")}}
+    Path("target/repo-benchmark/harness/build-provenance.json").write_text(json.dumps(record, indent=2), encoding="utf-8")
+    raise SystemExit(subprocess.call([str(executable), *sys.argv[1:]], env=env))
+
 # `codex`
 alias c := codex
 codex *args:

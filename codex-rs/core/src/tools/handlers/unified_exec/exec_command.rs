@@ -18,7 +18,7 @@ use crate::tools::context::boxed_tool_output;
 use crate::tools::handlers::allows_inline_sandbox_approval;
 use crate::tools::handlers::apply_granted_turn_permissions_uri;
 use crate::tools::handlers::apply_patch::intercept_apply_patch;
-use crate::tools::handlers::command_preflight::preflight_invocation_for_runtime;
+use crate::tools::handlers::command_preflight::preflight_invocation_for_kd4_runtime;
 use crate::tools::handlers::command_search::classify_rg_search_narrowing_without_native_scope;
 use crate::tools::handlers::command_search::classify_rg_search_with_repository;
 use crate::tools::handlers::command_search::observe_rg_search_scope_state;
@@ -382,7 +382,8 @@ impl ExecCommandHandler {
         .await?;
         let original_safety_command = original_resolved_command.safety_command.clone();
         let direct_runtime = turn.config.features.enabled(Feature::DirectRuntime);
-        let preflight = preflight_invocation_for_runtime(
+        let preflight = preflight_invocation_for_kd4_runtime(
+            turn.config.features.enabled(Feature::Kd4Runtime),
             direct_runtime,
             &original_invocation,
             &original_safety_command,

@@ -3693,9 +3693,9 @@ impl Config {
             guardian_policy_config,
             model_reasoning_effort: cfg.model_reasoning_effort,
             plan_mode_reasoning_effort: cfg.plan_mode_reasoning_effort,
-            reasoning_phase_efforts: Some(effective_reasoning_phase_efforts(
-                cfg.reasoning_phase_efforts,
-            )),
+            reasoning_phase_efforts: features
+                .enabled(Feature::Kd4Runtime)
+                .then(|| effective_reasoning_phase_efforts(cfg.reasoning_phase_efforts)),
             model_reasoning_summary: cfg.model_reasoning_summary,
             model_catalog,
             model_verbosity: cfg.model_verbosity,

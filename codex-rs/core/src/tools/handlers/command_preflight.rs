@@ -206,6 +206,23 @@ pub(crate) async fn preflight_invocation_with_equivalent_repair_async(
     .map_err(|error| format!("command preflight worker failed: {error}"))?
 }
 
+pub(crate) async fn preflight_invocation_for_kd4_runtime(
+    kd4_runtime: bool,
+    direct_runtime: bool,
+    invocation: &CommandInvocation,
+    command: &[String],
+    shell_type: Option<ShellType>,
+) -> Result<CommandPreflightOutcome, String> {
+    if !kd4_runtime {
+        return Ok(CommandPreflightOutcome {
+            invocation: invocation.clone(),
+            validation_invocations: vec![invocation.clone()],
+            repair_notice: None,
+        });
+    }
+    preflight_invocation_for_runtime(direct_runtime, invocation, command, shell_type).await
+}
+
 pub(crate) async fn preflight_invocation_for_runtime(
     direct_runtime: bool,
     invocation: &CommandInvocation,

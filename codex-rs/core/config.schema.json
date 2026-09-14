@@ -4199,6 +4199,9 @@
         "in_app_updates": {
           "type": "boolean"
         },
+        "kd4_runtime": {
+          "type": "boolean"
+        },
         "known_delta_store": {
           "type": "boolean"
         },

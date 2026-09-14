@@ -122,6 +122,30 @@ def analyze_snapshots(snapshots: Sequence[RolloutSnapshot]) -> dict[str, Any]:
     )
 
 
+def canonical_milestones(timing: Any) -> dict[str, float] | None:
+    """Return complete canonical milestones; legacy reconstruction needs events."""
+    if not isinstance(timing, dict):
+        return None
+    version = timing.get("schemaVersion")
+    milestones = timing.get("milestones")
+    if (
+        isinstance(version, int)
+        and version >= CANONICAL_TIMING_SCHEMA_VERSION
+        and isinstance(milestones, dict)
+        and all(
+            isinstance(milestones.get(key), (int, float))
+            and not isinstance(milestones[key], bool)
+            for key in ("firstDomainActionMs", "firstUsefulActionMs")
+        )
+    ):
+        return {
+            key: float(value)
+            for key, value in milestones.items()
+            if isinstance(value, (int, float)) and not isinstance(value, bool)
+        }
+    return None
+
+
 def analyze_records(
     record_sets: Iterable[tuple[dict[str, str | int], Iterable[Any]]],
 ) -> dict[str, Any]:
@@ -180,27 +204,12 @@ def analyze_records(
 
             completed_turns += 1
             timing = payload.get("timing")
-            milestones = timing.get("milestones") if isinstance(timing, dict) else None
+            milestones = canonical_milestones(timing)
             schema_version = (
                 timing.get("schemaVersion") if isinstance(timing, dict) else None
             )
-            if (
-                isinstance(schema_version, int)
-                and schema_version >= CANONICAL_TIMING_SCHEMA_VERSION
-                and isinstance(milestones, dict)
-                and all(
-                    isinstance(milestones.get(key), (int, float))
-                    and not isinstance(milestones[key], bool)
-                    for key in ("firstDomainActionMs", "firstUsefulActionMs")
-                )
-            ):
-                canonical_rows.append(
-                    {
-                        key: float(value)
-                        for key, value in milestones.items()
-                        if isinstance(value, (int, float))
-                    }
-                )
+            if milestones is not None:
+                canonical_rows.append(milestones)
             elif (
                 isinstance(schema_version, int)
                 and schema_version >= CANONICAL_TIMING_SCHEMA_VERSION

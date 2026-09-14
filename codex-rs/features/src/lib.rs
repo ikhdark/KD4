@@ -99,6 +99,9 @@ impl Stage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Feature {
     // Stable.
+    /// Enable KD4 phase reasoning, governor intervention, and command preflight.
+    /// Other independently controlled or fixed fork differences remain separate.
+    Kd4Runtime,
     /// Enable the default shell tool.
     ShellTool,
     /// Enable Claude-style lifecycle hooks loaded from hooks.json files.
@@ -761,6 +764,12 @@ macro_rules! define_features {
 
 define_features! {
     // Stable features.
+    FeatureSpec {
+        id: Feature::Kd4Runtime,
+        key: "kd4_runtime",
+        stage: Stage::Stable,
+        default_enabled: true,
+    },
     FeatureSpec {
         id: Feature::ShellTool,
         key: "shell_tool",

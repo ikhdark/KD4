@@ -299,11 +299,11 @@ class Kd4TurnLatencyAuditTest(unittest.TestCase):
     def test_empty_token_report_keeps_the_per_turn_schema_complete(self) -> None:
         tokens = kd4_turn_latency_audit._token_report([])
 
-        self.assertTrue(tokens["complete"])
+        self.assertFalse(tokens["complete"])
         self.assertEqual(tokens["inputTokens"], 0)
         self.assertEqual(tokens["cachedInputTokens"], 0)
         self.assertEqual(tokens["outputTokens"], 0)
-        self.assertEqual(tokens["billableTokens"], 0)
+        self.assertIsNone(tokens["billableTokens"])
 
     def test_token_report_marks_internal_provider_retries_as_partial(self) -> None:
         request = dict(_timing()["modelRequests"][0])
@@ -843,7 +843,7 @@ class Kd4TurnLatencyAuditTest(unittest.TestCase):
             115,
         )
         self.assertEqual(report["populations"]["all"]["modelShare"], 2 / 3)
-        self.assertEqual(report["schemaVersion"], 16)
+        self.assertEqual(report["schemaVersion"], 18)
         breakdown = report["latencyBreakdown"]
         orchestration_breakdown = breakdown["orchestration"]
         self.assertEqual(orchestration_breakdown["exclusiveTotalNs"], 100_000_000)

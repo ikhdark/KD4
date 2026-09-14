@@ -76,11 +76,6 @@ package = "codex-core"
 test = "round_trip_batching"
 helpers = ["codex", "codex-code-mode-host"]
 
-[targets.turn_latency_bench]
-package = "codex-core"
-test = "turn_latency_bench"
-helpers = ["codex", "codex-code-mode-host"]
-
 # Bounded core integration targets. Every shard carries the conservative
 # runtime helper pair; MCP, stdio, and Windows sandbox helpers are added only
 # where the assigned modules need them.
@@ -277,6 +272,42 @@ description = "Active preflight with one bounded read-only equivalent repair and
 target = "core_lib"
 tests = ["tools::handlers::command_preflight::command_preflight_tests::never_repairs_mutating_command_flag_typos"]
 helpers = []
+
+[gates.capability-kd4-phase-reasoning]
+description = "Disabled KD4 runtime preserves configured effort through a real tool continuation and follow-up."
+[[gates.capability-kd4-phase-reasoning.steps]]
+target = "core_transport_telemetry"
+tests = ["suite::client::kd4_runtime_off_preserves_effort_after_tool_and_followup"]
+
+[gates.kd4-runtime-controls]
+description = "KD4 runtime configuration, request policy, preflight, and child inheritance."
+[[gates.kd4-runtime-controls.steps]]
+target = "core_lib"
+tests = [
+  "config::tests::load_config_kd4_runtime_off_disables_phase_overrides",
+  "session::reasoning_governor::tests::kd4_runtime_off_preserves_high_even_for_residual_sampling",
+  "tools::handlers::command_preflight::command_preflight_tests::kd4_runtime_off_preserves_command_without_repair",
+  "tools::handlers::multi_agents::tests::kd4_runtime_control_is_inherited_by_spawned_and_resumed_agents",
+]
+helpers = []
+
+[gates.capability-known-delta-store]
+description = "Known delta reuse preserves force-fresh command execution."
+[[gates.capability-known-delta-store.steps]]
+target = "core_lib"
+tests = ["tools::handlers::unified_exec::tests::known_delta_unified_exec_reuses_third_exact_git_show_and_force_fresh_launches"]
+
+[gates.capability-deferred-executor]
+description = "Deferred executor readiness updates live context and tools."
+[[gates.capability-deferred-executor.steps]]
+target = "core_cli_workspace"
+tests = ["suite::remote_env::deferred_executor_updates_context_and_tools_after_startup"]
+
+[gates.capability-code-mode-runtime]
+description = "Code mode executes a native command and delivers its output."
+[[gates.capability-code-mode-runtime.steps]]
+target = "core_code_mode_mcp"
+tests = ["suite::code_mode::code_mode_can_return_exec_command_output"]
 
 [gates.capability-shell-output-summary]
 description = "Bounded failure-focused output on classic and unified execution paths."

@@ -538,7 +538,12 @@ async fn root_production_request_contains_bounded_orchestration_guidance() -> an
         .expect("normal root request should contain registered orchestration guidance");
     assert!(guidance.contains("request them together using available parallel tools"));
     assert!(guidance.contains("one `functions.exec` packet"));
+    assert!(guidance.contains("Do not run shared-state mutations concurrently"));
+    assert!(guidance.contains("Keep predetermined dependent\ncalls in one packet when supported"));
+    assert!(guidance.contains("prerequisite results meet expected conditions"));
+    assert!(guidance.contains("Stop on unexpected results"));
     assert!(guidance.contains("split only for approvals, output bounds"));
+    assert!(guidance.contains("substantive judgment about the next\naction"));
     assert!(guidance.contains("existing wait or session path"));
     assert!(
         codex_utils_output_truncation::approx_token_count(guidance) <= 256,

@@ -818,6 +818,29 @@ fn accepts_posix_quoted_shell_text_and_comment_quotes() {
     }
 }
 
+#[tokio::test]
+async fn kd4_runtime_off_preserves_command_without_repair() {
+    let invocation = CommandInvocation::Argv {
+        program: "rg".to_string(),
+        args: strings(&["--ignorecase", "needle", "input.txt"]),
+    };
+    let command = invocation.to_direct_argv().unwrap();
+    let disabled = preflight_invocation_for_kd4_runtime(false, false, &invocation, &command, None)
+        .await
+        .expect("disabled preflight leaves command execution to the tool");
+    assert_eq!(disabled.invocation, invocation);
+    assert_eq!(disabled.repair_notice, None);
+    assert_eq!(disabled.validation_invocations, vec![invocation.clone()]);
+    let enabled = preflight_invocation_for_kd4_runtime(true, false, &invocation, &command, None)
+        .await
+        .expect("enabled preflight repairs known read-only flag typo");
+    assert_eq!(
+        enabled.invocation.to_direct_argv().unwrap(),
+        strings(&["rg", "--ignore-case", "needle", "input.txt"])
+    );
+    assert!(enabled.repaired());
+}
+
 #[test]
 fn rejects_rg_literal_glob_path_for_direct_argv() {
     let issue = preflight_command_issue(

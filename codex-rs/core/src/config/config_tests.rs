@@ -604,6 +604,32 @@ model_reasoning_effort = "medium"
 }
 
 #[tokio::test]
+async fn load_config_kd4_runtime_off_disables_phase_overrides() -> std::io::Result<()> {
+    let codex_home = tempdir()?;
+    let config_toml: ConfigToml = toml::from_str(
+        r#"
+model_reasoning_effort = "high"
+[features]
+kd4_runtime = false
+[reasoning_phase_efforts]
+orient = "low"
+deterministic_continuation = "low"
+"#,
+    )
+    .expect("valid runtime switch config");
+    let config = Config::load_from_base_config_with_overrides(
+        config_toml,
+        ConfigOverrides::default(),
+        codex_home.abs(),
+    )
+    .await?;
+    assert!(!config.features.enabled(Feature::Kd4Runtime));
+    assert_eq!(config.reasoning_phase_efforts, None);
+    assert_eq!(config.model_reasoning_effort, Some(ReasoningEffort::High));
+    Ok(())
+}
+
+#[tokio::test]
 async fn load_config_preserves_explicit_reasoning_phase_effort_overrides() -> std::io::Result<()> {
     let codex_home = tempdir()?;
     let config_toml: ConfigToml = toml::from_str(

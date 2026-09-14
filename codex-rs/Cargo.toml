@@ -81,6 +81,7 @@ members = [
     "rmcp-client",
     "responses-api-proxy",
     "response-debug-context",
+    "repo-benchmark",
     "sandboxing",
     "stdio-to-uds",
     "otel",
